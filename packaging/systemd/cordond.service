@@ -1,0 +1,29 @@
+# cordon gater — DEVELOPMENT user-mode unit (Phase 0).
+#
+# Run with:   systemctl --user start cordond
+# Install:    cp to ~/.config/systemd/user/ && systemctl --user daemon-reload
+#
+# This is the `--user` dev daemon with the `mock` backend. It is NOT a security
+# boundary (DESIGN §4/§10): it performs no kernel interception and its store is
+# user-writable. It exists for logic/CI iteration and to drive synthetic events
+# over IPC (`cordon submit ...`). Real enforcement is the root `fanotify`/ES
+# backend shipped as a system unit in a later phase.
+#
+# The daemon creates its own socket ($XDG_RUNTIME_DIR/cordon.sock) and store
+# ($XDG_STATE_HOME/cordon/cordon.db), so no RuntimeDirectory=/StateDirectory= is
+# needed here.
+
+[Unit]
+Description=cordon gater (dev, user-mode, mock backend — NOT a security boundary)
+
+[Service]
+Type=simple
+# Resolve `cordond` from PATH (e.g. ~/.cargo/bin after `cargo install --path crates/daemon`).
+ExecStart=cordond --backend mock
+Environment=CORDON_BACKEND=mock
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
