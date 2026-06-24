@@ -11,6 +11,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::{error, warn};
 
 /// Bind the socket and accept connections forever, one handler thread each.
 pub fn serve(socket_path: &Path, ctx: Arc<Ctx>) -> Result<()> {
@@ -33,11 +34,11 @@ pub fn serve(socket_path: &Path, ctx: Arc<Ctx>) -> Result<()> {
                 let ctx = Arc::clone(&ctx);
                 std::thread::spawn(move || {
                     if let Err(e) = handle_conn(stream, ctx) {
-                        eprintln!("cordond: connection error: {e}");
+                        warn!(error = %e, "connection error");
                     }
                 });
             }
-            Err(e) => eprintln!("cordond: accept error: {e}"),
+            Err(e) => error!(error = %e, "accept error"),
         }
     }
     Ok(())
