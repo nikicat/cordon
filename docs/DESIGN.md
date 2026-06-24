@@ -341,19 +341,26 @@ fires on a pre-existing unowned path and "approve permanently" persists.
 ### Test tiers (by privilege)
 - **Unprivileged (mock backend):** the policy core, store, decision flow, and IPC
   e2e — `cargo test`, CI-friendly, no root. Covers everything but the kernel hook.
-- **Privileged boundary (fanotify), without host root → libkrun microVM.** The
-  real `fanotify` backend needs `CAP_SYS_ADMIN`, but we get it from a **libkrun
-  microVM** (`krunvm` + `buildah unshare`) instead of host `sudo`: a *fixed*
-  kernel (libkrunfw's — **verified** to enable `FANOTIFY_ACCESS_PERMISSIONS` and
-  `FAN_MARK_FILESYSTEM` on tmpfs+rootfs), guest-root, needs only `/dev/kvm`
-  (group `kvm`). Same image runs locally (`packaging/test/run-in-vm.sh`) and in
-  CI, so the kernel never diverges. `sudo` and stock GHA runners also work, but
-  the fixed-kernel microVM is the reproducible default. (Rootless podman is
-  *not* an option: `FAN_OPEN_PERM` checks init-userns `CAP_SYS_ADMIN`; userns-root
-  isn't enough.)
+- **Privileged boundary (fanotify), without host root → virtme-ng VM.** The real
+  `fanotify` backend needs `CAP_SYS_ADMIN`, but we get it from a **virtme-ng VM**
+  (`packaging/test/run-in-vm.sh`) booting a **pinned upstream kernel** (Ubuntu
+  mainline, e.g. `v6.12`) as guest-root — needs only `/dev/kvm` (group `kvm`), no
+  host root. The VM runs qemu **directly** (no container), and virtme-ng reuses
+  the host userspace, so there is no rootfs to build and no glibc mismatch. The
+  *same* harness + kernel run locally and in CI, so the kernel never diverges.
+  (`CORDON_VM_KERNEL` selects the pinned version; unset = the host kernel for fast
+  local iteration.) Rootless podman is *not* an option for the backend itself:
+  `FAN_OPEN_PERM` checks init-userns `CAP_SYS_ADMIN`; userns-root isn't enough.
+- **Why not libkrun/krunvm:** it was evaluated and proven to *boot* fanotify
+  (libkrunfw's kernel enables `FANOTIFY_ACCESS_PERMISSIONS`), but getting `krunvm`
+  onto a CI runner means nesting it *inside a container*, which stacks two user
+  namespaces (`buildah unshare`) under the libkrun VMM. That nesting fails
+  **differently per environment** (`gid_map: operation not permitted` locally vs
+  `memfd_create: EINVAL` on GitHub) — non-reproducible, so undebuggable across
+  environments. virtme-ng collapses the stack to a single `/dev/kvm` dependency.
 - The Phase 1 smoke test (`packaging/test/phase1-fanotify-smoke.sh`) proves
-  owner-allow + scraper-deny (`EPERM`) through the real backend — green under
-  libkrun.
+  owner-allow + scraper-deny (`EPERM`) through the real backend — green in the
+  virtme-ng VM on both the host kernel and pinned `v6.12`.
 
 ## 12. Phased plan
 - **Phase 0 — skeleton + user-mode daemon.** Rust workspace; SQLite store +

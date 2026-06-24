@@ -1,38 +1,30 @@
 #!/usr/bin/env bash
-# Run the Phase 1 fanotify smoke test in a libkrun microVM — a FIXED kernel
-# (libkrunfw's bundled kernel, verified to enable FANOTIFY_ACCESS_PERMISSIONS),
-# as guest-root, with NO host root. Needs only /dev/kvm (group `kvm`) plus
-# krunvm + buildah. Same path works locally and in CI, so "works on my kernel"
-# never diverges from "works on the CI kernel".
+# Run the Phase 1 fanotify smoke test in a virtme-ng VM — a nested kernel, as
+# guest-root, with NO host root. Needs only /dev/kvm (group `kvm`) + virtme-ng +
+# qemu. The VM runs DIRECTLY on the host (no container / userns nesting), so it
+# behaves identically locally and in CI.
 #
-#   packaging/test/run-in-vm.sh
+#   packaging/test/run-in-vm.sh                          # host kernel (fast, local dev)
+#   CORDON_VM_KERNEL=v6.12 packaging/test/run-in-vm.sh   # pinned upstream kernel (reproducible / CI)
 #
-# The base image only provides userspace (bash, cat, coreutils) + a matching
-# glibc for the host-built binaries. Default is archlinux to match an Arch host's
-# rolling glibc; override with CORDON_VM_IMAGE for other hosts (or build static
-# musl binaries to decouple entirely).
+# A pinned kernel (e.g. v6.12) is fetched from the Ubuntu mainline repo by
+# virtme-ng (needs `dpkg` to unpack — present on Ubuntu/CI). The host userspace
+# (and the host-built cordon binaries) are exposed read-only via virtme-ng, so
+# there is no rootfs to build and no glibc mismatch.
+#
+# Why not libkrun/krunvm: booting libkrun *inside a container* (the only way to
+# get krunvm onto a CI runner without packaging it for the distro) fails with
+# environment-specific userns (gid_map) / memfd_create errors that diverge
+# between local and GitHub runners. virtme-ng runs qemu directly — robust and
+# reproducible.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-IMAGE="${CORDON_VM_IMAGE:-docker.io/library/archlinux:latest}"
-NAME="${CORDON_VM_NAME:-cordon-fanotify-test}"
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml"
+cd "$ROOT_DIR"
 
-if [ -z "${_CORDON_VM_INNER:-}" ]; then
-    # Host side: build, ensure the base image (buildah shares storage with krunvm;
-    # no podman needed), then re-enter under buildah unshare (krunvm requires a
-    # rootless user-namespace session).
-    cargo build --manifest-path "$ROOT_DIR/Cargo.toml"
-    buildah pull --policy missing "$IMAGE"
-    exec buildah unshare env _CORDON_VM_INNER=1 \
-        ROOT_DIR="$ROOT_DIR" IMAGE="$IMAGE" NAME="$NAME" bash "$0"
+if [ -n "${CORDON_VM_KERNEL:-}" ]; then
+    exec vng --run "$CORDON_VM_KERNEL" -- bash packaging/test/phase1-fanotify-smoke.sh
+else
+    exec vng --run -- bash packaging/test/phase1-fanotify-smoke.sh
 fi
-
-# Inside buildah unshare: drive the microVM.
-krunvm delete "$NAME" >/dev/null 2>&1 || true
-krunvm create "$IMAGE" --name "$NAME" --volume "$ROOT_DIR:/src" >/dev/null
-set +e
-krunvm start "$NAME" -- bash /src/packaging/test/phase1-fanotify-smoke.sh
-rc=$?
-set -e
-krunvm delete "$NAME" >/dev/null 2>&1 || true
-exit "$rc"

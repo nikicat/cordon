@@ -2,7 +2,7 @@
 
 **Phase: 1 in progress — fanotify enforcement done + validated.** Phase 0
 (core/store/daemon/CLI/mock) is complete; the real Linux `fanotify` backend now
-enforces non-owner read denial and is proven end-to-end in a libkrun microVM.
+enforces non-owner read denial and is proven end-to-end in a virtme-ng VM.
 This file is the resume point.
 
 ## Phase 1 (this phase)
@@ -16,22 +16,24 @@ This file is the resume point.
   the CLI keeps plain stderr (one-shot tool, not a service).
 - **Caller identity** (`crates/daemon/src/proc.rs`) — `/proc/<pid>/exe` +
   ppid-chain walk; the `parse_ppid` parser is unit-tested.
-- **Validated unprivileged via libkrun microVM** — `packaging/test/run-in-vm.sh`
-  boots a fixed-kernel (libkrunfw 6.12.91) microVM via `krunvm`, runs
-  `phase1-fanotify-smoke.sh`: owner reads its secret, scraper gets `EPERM`. Green.
-  No host root — only `/dev/kvm`. (Verified libkrunfw enables
-  `FANOTIFY_ACCESS_PERMISSIONS` + `FAN_MARK_FILESYSTEM`.)
+- **Validated unprivileged via virtme-ng VM** — `packaging/test/run-in-vm.sh`
+  boots a kernel as guest-root (host kernel locally, pinned `v6.12` Ubuntu mainline
+  in CI) and runs `phase1-fanotify-smoke.sh`: owner reads its secret, scraper gets
+  `EPERM`. Green on both. No host root — only `/dev/kvm`. qemu runs directly (no
+  container), so it's reproducible local↔CI.
 - **CI** (`.github/workflows/ci.yml`) — unprivileged `cargo test`/clippy/fmt job
-  + a libkrun fanotify job (the GHA libkrun-install line is the one piece not yet
-  validated on a real runner).
+  (blocking) + a **blocking** virtme-ng fanotify job on pinned `v6.12`. (libkrun/
+  krunvm was dropped: nesting it in a CI container fails per-environment —
+  `gid_map` locally, `memfd_create` on GitHub; see DESIGN §11.)
 
 ### Phase 1 remaining
 - **TOFU-on-create (decision-flow step 4)** under fanotify needs the `FAN_CREATE`
-  notify group (FID-based, second group). Until then, ownership for the fanotify
-  backend comes from `cordon adopt`. The engine already implements TOFU; only the
-  backend create-signal is missing.
-- (Optional) `seccomp-unotify` backend + `cordon run -- <tool>` — now lower
-  priority since libkrun gives unprivileged fanotify testing.
+  notify group (FID-based, second group; not wrapped by `nix` → raw libc +
+  `open_by_handle_at`). Until then, ownership for the fanotify backend comes from
+  `cordon adopt`. The engine already implements TOFU; only the backend
+  create-signal is missing.
+- (Optional) `seccomp-unotify` backend + `cordon run -- <tool>` — lower priority
+  since virtme-ng gives unprivileged fanotify testing.
 
 ## Where we are
 - Design converged + iterated. Captured in `docs/DESIGN.md`.
@@ -77,13 +79,14 @@ This file is the resume point.
 
 ## Decisions settled
 - **Project name `cordon` — final.**
-- **Privileged testing → libkrun microVM** (`krunvm`), fixed kernel, no host root.
+- **Privileged testing → virtme-ng VM** (qemu+KVM, pinned kernel), no host root.
+  (libkrun/krunvm evaluated + dropped — container-nesting too fragile; DESIGN §11.)
 - **fanotify bindings → `nix`** (not hand-rolled libc); daemon logging → `tracing`.
 
 ## Next action
 1. **Finish Phase 1: TOFU-on-create under fanotify** — add the `FAN_CREATE`
    notify group (FID/DFID, second fanotify group) so a tool that *creates* its
    config auto-claims ownership, matching the engine's existing step-4. Validate
-   in the libkrun harness.
+   in the virtme-ng harness.
 2. Then **Phase 2** — interactive deny-and-learn + the event-sourced lineage cache
    (DESIGN §8.2/§12). Nothing in `core`/`proto`/`cli` should need to change.

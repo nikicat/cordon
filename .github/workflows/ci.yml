@@ -19,36 +19,33 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
 
-  # Privileged boundary: the real fanotify backend, run in a libkrun microVM with
-  # a FIXED kernel (libkrunfw's, verified to enable FANOTIFY_ACCESS_PERMISSIONS).
-  # This is the reproducible alternative to `sudo` — the same kernel runs locally
-  # (packaging/test/run-in-vm.sh) and here, so a green local run means a green CI
-  # run. Needs /dev/kvm (present on GitHub Ubuntu runners) + krunvm + buildah.
-  #
-  # NOTE: the krunvm/libkrun install line is the one piece not yet validated on a
-  # real runner (it is proven locally). Fedora ships krunvm; adjust if the package
-  # path differs on the runner image.
-  fanotify-libkrun:
+  # Privileged boundary: the real fanotify backend, run in a virtme-ng VM booting
+  # a PINNED upstream kernel (Ubuntu mainline v6.12) as guest-root. The VM runs
+  # directly on the runner via qemu+KVM — no container/userns nesting — so it is
+  # reproducible: the same harness + kernel run locally (packaging/test/run-in-vm.sh)
+  # and here. Needs only /dev/kvm (present on GitHub Ubuntu runners), made
+  # group-accessible to the unprivileged runner user by the udev rule below.
+  fanotify-vm:
     runs-on: ubuntu-latest
     needs: test
-    # Non-blocking while the nested-virt setup is stabilized: booting libkrun
-    # inside a privileged GHA container hits memfd_create / subuid friction. The
-    # AUTHORITATIVE fixed-kernel check is the same harness run locally
-    # (packaging/test/run-in-vm.sh) — green there. Flip to blocking once this is
-    # reliably green on the runner.
-    continue-on-error: true
-    container:
-      image: fedora:latest
-      options: --device /dev/kvm --privileged
     steps:
       - uses: actions/checkout@v7
-      - name: Install toolchain + libkrun
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Enable KVM for the runner user
         run: |
-          dnf -y install rust cargo gcc krunvm buildah
-          # buildah/krunvm rootless userns needs subid ranges for the root user.
-          grep -q '^root:' /etc/subuid || echo 'root:100000:65536' >> /etc/subuid
-          grep -q '^root:' /etc/subgid || echo 'root:100000:65536' >> /etc/subgid
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install qemu + virtme-ng
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+          pipx install virtme-ng
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build
-      - name: Fanotify smoke test in libkrun microVM (fixed kernel)
+      - name: Fanotify smoke test in a virtme-ng VM (pinned kernel v6.12)
+        env:
+          CORDON_VM_KERNEL: v6.12
         run: packaging/test/run-in-vm.sh
