@@ -1,16 +1,20 @@
 # STATUS
 
-**Phase: 1 in progress — fanotify enforcement done + validated.** Phase 0
-(core/store/daemon/CLI/mock) is complete; the real Linux `fanotify` backend now
-enforces non-owner read denial and is proven end-to-end in a virtme-ng VM.
-This file is the resume point.
+**Phase: 1 functionally complete.** Phase 0 (core/store/daemon/CLI/mock) is done;
+the real Linux `fanotify` backend now enforces all of decision-flow steps 1–5
+(incl. TOFU-on-create) system-wide, with a fully-green CI that validates it in a
+virtme-ng VM on a pinned kernel. This file is the resume point.
 
-## Phase 1 (this phase)
+## Phase 1 (done)
 - **`fanotify` backend** (`crates/daemon/src/backend/fanotify.rs`) via the `nix`
   crate — **no hand-written `unsafe`**. Marks zone/subtree *filesystems*
   (`FAN_MARK_FILESYSTEM`), poll+drain loop, resolves caller exe + best-effort
   ancestry from `/proc`, runs the engine, answers `FAN_ALLOW`/`FAN_DENY`. Fails
   open on resolution errors; fast-allows the daemon's own pid (deadlock safety).
+- **TOFU-on-create** — `proc::access_op` reads the suspended caller's open flags
+  from `/proc/<pid>/syscall` (safe/race-free for open/openat/creat; openat2 warns
+  + falls back). `O_CREAT` → `Op::Create` → engine auto-claims. Also yields
+  write-detection. See the [why a miss is safe] reasoning in `proc.rs`.
 - **Backend selection** (`backend::select`) — `mock` | `fanotify` (Linux).
 - **`tracing`** logging in the daemon (denials at `info`, allows at `trace`);
   the CLI keeps plain stderr (one-shot tool, not a service).
@@ -26,12 +30,17 @@ This file is the resume point.
   krunvm was dropped: nesting it in a CI container fails per-environment —
   `gid_map` locally, `memfd_create` on GitHub; see DESIGN §11.)
 
+- **TOFU-on-create wired (decision-flow step 4).** Instead of the FID-based
+  `FAN_CREATE` group (raw libc + `open_by_handle_at`, racy/`unsafe`), the backend
+  reads the suspended caller's in-flight open flags from `/proc/<pid>/syscall`
+  (`proc::access_op`) — **safe, register-based, race-free** for `open`/`openat`/
+  `creat`. `O_CREAT` → `Op::Create` → the engine auto-claims. Validated in the
+  virtme-ng VM (create → owner-read allowed without `adopt`; scraper denied).
+  Known gap: `openat2` (flags behind a pointer) isn't decoded → logs a warning,
+  falls back to `Read` (use `adopt`). A miss is never a security issue — the op
+  only drives convenience; the boundary is op-independent.
+
 ### Phase 1 remaining
-- **TOFU-on-create (decision-flow step 4)** under fanotify needs the `FAN_CREATE`
-  notify group (FID-based, second group; not wrapped by `nix` → raw libc +
-  `open_by_handle_at`). Until then, ownership for the fanotify backend comes from
-  `cordon adopt`. The engine already implements TOFU; only the backend
-  create-signal is missing.
 - (Optional) `seccomp-unotify` backend + `cordon run -- <tool>` — lower priority
   since virtme-ng gives unprivileged fanotify testing.
 
@@ -84,9 +93,7 @@ This file is the resume point.
 - **fanotify bindings → `nix`** (not hand-rolled libc); daemon logging → `tracing`.
 
 ## Next action
-1. **Finish Phase 1: TOFU-on-create under fanotify** — add the `FAN_CREATE`
-   notify group (FID/DFID, second fanotify group) so a tool that *creates* its
-   config auto-claims ownership, matching the engine's existing step-4. Validate
-   in the virtme-ng harness.
-2. Then **Phase 2** — interactive deny-and-learn + the event-sourced lineage cache
-   (DESIGN §8.2/§12). Nothing in `core`/`proto`/`cli` should need to change.
+**Phase 1 is functionally complete** (enforcement + TOFU + CI, all validated).
+Next: **Phase 2** — interactive deny-and-learn (prompt agent, step 5) + the
+event-sourced lineage cache (DESIGN §8.2/§12). Nothing in `core`/`proto`/`cli`
+should need to change. (Optional Phase 1 extra: `seccomp-unotify` + `cordon run`.)

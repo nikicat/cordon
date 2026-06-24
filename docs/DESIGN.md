@@ -368,17 +368,19 @@ fires on a pre-existing unowned path and "approve permanently" persists.
   over IPC; daemon as `systemctl --user` with the `mock` backend — decision-flow,
   TOFU, and store unit-tested **without root**, CI-friendly. (Real fixtures run
   once an interception backend lands in Phase 1.)
-- **Phase 1 — Linux fanotify backend (root).** *Enforcement loop done +
-  validated.* `fanotify FAN_OPEN_PERM` backend (via `nix`, no hand-written
-  `unsafe`) behind the same core: marks zone/subtree filesystems, resolves caller
-  via `/proc`, runs the decision flow, answers ALLOW/DENY. Steps 1–3,5 enforced
-  system-wide; proven owner-allow + scraper-deny (`EPERM`) in a libkrun microVM
-  (§11). Ancestry is the best-effort `/proc/<pid>/stat` snapshot (upgraded in
-  Phase 2). **Remaining for Phase 1:** TOFU-on-create (step 4) via the
-  `FAN_CREATE` notify group (FID-based) — until then ownership comes from
-  `cordon adopt`. Optional dev extra: `seccomp-unotify` backend +
-  `cordon run -- <tool>` single-tool sandbox (unprivileged) — now lower priority
-  since libkrun gives unprivileged fanotify testing.
+- **Phase 1 — Linux fanotify backend (root).** *Done + validated.*
+  `fanotify FAN_OPEN_PERM` backend (via `nix`, no hand-written `unsafe`) behind
+  the same core: marks zone/subtree filesystems, resolves caller via `/proc`, runs
+  the decision flow, answers ALLOW/DENY. **All of steps 1–5 enforced
+  system-wide**, incl. **TOFU-on-create (step 4)**: rather than the FID-based
+  `FAN_CREATE` group (racy/`unsafe`), the backend reads the suspended caller's
+  in-flight open flags from `/proc/<pid>/syscall` — safe, register-based,
+  race-free for `open`/`openat`/`creat` (`openat2` logs a warning + falls back to
+  `Read`). Proven owner-allow + scraper-deny (`EPERM`) for both `adopt` and TOFU
+  in a virtme-ng VM (§11). Ancestry is the best-effort `/proc/<pid>/stat` snapshot
+  (upgraded in Phase 2). Optional dev extra: `seccomp-unotify` backend +
+  `cordon run -- <tool>` single-tool sandbox (unprivileged) — lower priority since
+  virtme-ng gives unprivileged fanotify testing.
 - **Phase 2 — chain + interactive.** Parent-chain owner-match (step 3 ancestry);
   prompt agent + deny-and-learn (step 5); prompt-outcome rules incl. TTL; subsume
   `adopt`. Interpreter fixture passes via chain.

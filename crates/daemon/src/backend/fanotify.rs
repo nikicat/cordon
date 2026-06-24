@@ -36,7 +36,7 @@
 use crate::proc;
 use cordon_core::backend::{Backend, Shutdown};
 use cordon_core::engine::Engine;
-use cordon_core::event::{AccessEvent, Op};
+use cordon_core::event::AccessEvent;
 use cordon_core::identity::Caller;
 use cordon_core::{Error, Result};
 use nix::errno::Errno;
@@ -181,8 +181,11 @@ fn decide(fd: BorrowedFd<'_>, pid: i32, engine: &Arc<Mutex<Engine>>, me: i32) ->
     let Some(exe) = proc::exe_of(pid) else {
         return true;
     };
+    // Read/write/create from the suspended caller's in-flight openat (drives
+    // TOFU). Race-free for open/openat (flags are in a register); see proc.rs.
+    let op = proc::access_op(pid);
     let caller = Caller::new(pid, exe).with_ancestors(proc::ancestry(pid));
-    let event = AccessEvent::new(path, Op::Read, caller);
+    let event = AccessEvent::new(path, op, caller);
 
     let decision = match engine.lock().unwrap().evaluate(&event) {
         Ok(d) => d,
