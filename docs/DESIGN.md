@@ -97,9 +97,10 @@ Backends sit behind one interface:
 | `fanotify` | **root** (CAP_SYS_ADMIN) | system-wide | **yes** | Linux production |
 | `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS production |
 
-So the daemon runs **`systemctl --user`** in dev with the `mock` or `seccomp`
-backend — no root, fast iteration, the whole policy engine testable — and swaps to
-the `fanotify`/ES backend (system service) for the real guarantee.
+So the daemon runs **`systemctl --user`** in dev with the `mock` backend — no
+root, fast iteration, the whole policy engine testable — and swaps to the
+`fanotify`/ES backend (system service) for the real guarantee. (The real
+`fanotify` backend is itself testable unprivileged via a virtme-ng VM — §11.)
 
 **Why `fanotify` needs root:** permission events (`FAN_OPEN_PERM`) let you *block,
 deny, and surveil* `open()` for *any* process on the box — a system-wide
@@ -126,6 +127,18 @@ into the target's memory (racy with a hostile target → guard with
 `SECCOMP_IOCTL_NOTIF_ID_VALID`); harmless for our own fixtures. Linux-only; macOS
 unprivileged dev-mode is `mock` only (no seccomp equivalent; real interception
 needs ES/root).
+
+> **Re-evaluated (post-Phase-1): not planned.** `seccomp-unotify` had two jobs —
+> (a) an *unprivileged test/dev* path, and (b) a `cordon run -- <tool>`
+> single-tool sandbox. (a) is fully obsoleted: **virtme-ng** now runs the *real*
+> `fanotify` backend unprivileged (no root, only `/dev/kvm`) for local dev and
+> CI, and the `mock` backend covers pure logic. (b) is a genuine feature but
+> **subject-centric and opt-in** — you only confine tools you *launch*, so it
+> doesn't touch the threat model (an unknown scraper you didn't launch); it's a
+> firejail-style sandbox orthogonal to the object-centric gater, at the cost of
+> real `unsafe` (BPF + user-notif + the path-arg TOCTOU above). So it's **dropped
+> from the plan** and kept only as an *optional future* sandbox mode, not a
+> deliverable.
 
 Locations: dev `--user` → socket `$XDG_RUNTIME_DIR/cordon.sock`, store
 `$XDG_STATE_HOME/cordon/`; prod system → `/run/cordon.sock`, `/var/lib/cordon/`
@@ -299,7 +312,7 @@ destroyed information. Stronger sources, weakest→strongest:
 | Need | Linux | macOS |
 |---|---|---|
 | Object-centric open authorizer | `fanotify FAN_OPEN_PERM` / LSM-BPF | **Endpoint Security** `AUTH_OPEN` |
-| Unprivileged dev backend | `seccomp-unotify` (launch-scoped) | `mock` only (no unpriv intercept) |
+| Unprivileged dev/testing | `mock` + **virtme-ng VM** (runs real `fanotify`, no root) | `mock` only (no unpriv intercept) |
 | Caller id (race-free) | `pidfd` (`FAN_REPORT_PIDFD`, ≥5.15) | per-conn audit token → code req |
 | Parent chain | `/proc/<pid>/stat` walk + start-time | ES process struct (parent + responsible pid) |
 | TOFU create signal | `FAN_CREATE` (FID/DFID) | ES create/exec events |
@@ -319,8 +332,8 @@ prompt agent + `cordon` CLI. Per-tool cost = a row, not a profile.
 - Confused-deputy: gating ≠ stopping a tool's own export surface (out of scope).
 - `fanotify` needs `CAP_SYS_ADMIN`; ES needs a restricted entitlement (SIP
   relaxation for personal use). Both production backends run as root.
-- **User-mode is not a boundary** — the `--user` dev daemon (`mock`/`seccomp`
-  backends) is for development/CI only; real protection needs the root
+- **User-mode is not a boundary** — the `--user` dev daemon (`mock` backend) is
+  for development/CI only; real protection needs the root
   `fanotify`/ES backend.
 - **macOS backend shares ES's ceiling** — open()-time mediation only (no
   `read(2)` event), symlinks not followed, ES "default mute set" binaries
@@ -378,23 +391,38 @@ fires on a pre-existing unowned path and "approve permanently" persists.
   race-free for `open`/`openat`/`creat` (`openat2` logs a warning + falls back to
   `Read`). Proven owner-allow + scraper-deny (`EPERM`) for both `adopt` and TOFU
   in a virtme-ng VM (§11). Ancestry is the best-effort `/proc/<pid>/stat` snapshot
-  (upgraded in Phase 2). Optional dev extra: `seccomp-unotify` backend +
-  `cordon run -- <tool>` single-tool sandbox (unprivileged) — lower priority since
-  virtme-ng gives unprivileged fanotify testing.
-- **Phase 2 — chain + interactive.** Parent-chain owner-match (step 3 ancestry);
-  prompt agent + deny-and-learn (step 5); prompt-outcome rules incl. TTL; subsume
-  `adopt`. Interpreter fixture passes via chain.
-  - **Lineage tracking (§8.2).** Replace the decision-time `/proc` snapshot with
-    an **event-sourced process-lineage cache**: subscribe to `fork`/`exec`/`exit`
-    via the **proc connector** (`NETLINK_CONNECTOR`/`CN_IDX_PROC`) — or **eBPF**
-    (`sched_process_{fork,exec}`/BPF-LSM) for higher fidelity + argv/cwd/creds —
-    and maintain a tree keyed by `(pid, starttime)`. Recording the parent **at
-    fork time** captures the *original* lineage before a double-fork can erase it,
-    defeating the **removal** evasion and pid-reuse races. Decision-time ancestry
-    becomes an O(1) cache lookup. (Ceiling: still does not defeat the
+  (upgraded in Phase 2). (The once-planned `seccomp-unotify` dev extra is
+  **dropped** — virtme-ng obsoleted the unprivileged-testing rationale; see the §4
+  re-evaluation.)
+- **Phase 2 — interactive + ancestry hardening.** (Basic parent-chain
+  owner-match — step 3 — already landed in Phase 1: `proc::ancestry` + the
+  engine's chain check. Phase 2 makes it *interactive* and *robust*.)
+  - **Interactive deny-and-learn (step 5) — the headline.** A per-session,
+    unprivileged **prompt agent** (polkit-style) that the root daemon routes
+    prompts to; the AUTH path stays synchronous-with-deadline (Santa's
+    deadline-safety dispatch, `docs/SANTA.md`) and **denies-then-learns** —
+    persist the user's choice, honor it next time. Prompt outcomes → rules:
+    deny-once / deny-perm / allow-once / allow-for-X-min (TTL) / allow-perm; the
+    last **subsumes `adopt`**. *Protocol work:* the IPC gains a **server-initiated
+    push channel** (today it's request/response only) so the daemon can deliver
+    prompts on the agent's long-lived connection; authenticate the agent via
+    `SO_PEERCRED`.
+  - **Lineage cache (§8.2) — ancestry hardening.** Replace the decision-time
+    `/proc` snapshot with an **event-sourced process-lineage cache**: subscribe to
+    `fork`/`exec`/`exit` via the **proc connector** (`NETLINK_CONNECTOR`/
+    `CN_IDX_PROC`) — or **eBPF** (`sched_process_{fork,exec}`/BPF-LSM) for higher
+    fidelity + argv/cwd/creds — keyed by `(pid, starttime)`. Recording the parent
+    **at fork time** captures the *original* lineage before a double-fork can
+    erase it, defeating the **removal** evasion and pid-reuse races; decision-time
+    ancestry becomes an O(1) lookup. (Ceiling: still doesn't defeat the
     *construction* attack — a real `exec` of a blessed binary — so ancestry stays
     best-effort, never the boundary.) Start with the proc connector (no eBPF
-    toolchain dep); migrate to eBPF if fidelity/overhead demands it.
+    toolchain dep).
+  - **Carry-over hardening from Phase 1:** `FAN_REPORT_TID` so op/identity
+    attribution reads the *triggering thread* (today `/proc/<tgid>/syscall` can
+    miss a non-main-thread create → falls back to `Read`); optional `openat2`
+    flag decode. The interpreter fixture (`python testtool.py`) lands here to
+    exercise the chain end-to-end.
 - **Phase 3 — full ownership.** Identity granularity (path/inode/signature),
   tool-groups, override CLI fully wired.
 - **Phase 4 — macOS gater.** Bespoke ES `AUTH_OPEN` client — **decided**: Santa's
