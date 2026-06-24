@@ -18,10 +18,11 @@ IMAGE="${CORDON_VM_IMAGE:-docker.io/library/archlinux:latest}"
 NAME="${CORDON_VM_NAME:-cordon-fanotify-test}"
 
 if [ -z "${_CORDON_VM_INNER:-}" ]; then
-    # Host side: build, ensure the base image, then re-enter under buildah unshare
-    # (krunvm requires a rootless user-namespace session).
+    # Host side: build, ensure the base image (buildah shares storage with krunvm;
+    # no podman needed), then re-enter under buildah unshare (krunvm requires a
+    # rootless user-namespace session).
     cargo build --manifest-path "$ROOT_DIR/Cargo.toml"
-    podman image exists "$IMAGE" || podman pull "$IMAGE"
+    buildah pull --policy missing "$IMAGE"
     exec buildah unshare env _CORDON_VM_INNER=1 \
         ROOT_DIR="$ROOT_DIR" IMAGE="$IMAGE" NAME="$NAME" bash "$0"
 fi
