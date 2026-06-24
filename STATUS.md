@@ -1,13 +1,43 @@
 # STATUS
 
-**Phase: 0 built (user-mode, mock backend).** The policy core, store, daemon,
-and CLI exist, build clean, and pass tests. This file is the resume point.
+**Phase: 1 in progress — fanotify enforcement done + validated.** Phase 0
+(core/store/daemon/CLI/mock) is complete; the real Linux `fanotify` backend now
+enforces non-owner read denial and is proven end-to-end in a libkrun microVM.
+This file is the resume point.
+
+## Phase 1 (this phase)
+- **`fanotify` backend** (`crates/daemon/src/backend/fanotify.rs`) via the `nix`
+  crate — **no hand-written `unsafe`**. Marks zone/subtree *filesystems*
+  (`FAN_MARK_FILESYSTEM`), poll+drain loop, resolves caller exe + best-effort
+  ancestry from `/proc`, runs the engine, answers `FAN_ALLOW`/`FAN_DENY`. Fails
+  open on resolution errors; fast-allows the daemon's own pid (deadlock safety).
+- **Backend selection** (`backend::select`) — `mock` | `fanotify` (Linux).
+- **`tracing`** logging in the daemon (denials at `info`, allows at `trace`);
+  the CLI keeps plain stderr (one-shot tool, not a service).
+- **Caller identity** (`crates/daemon/src/proc.rs`) — `/proc/<pid>/exe` +
+  ppid-chain walk; the `parse_ppid` parser is unit-tested.
+- **Validated unprivileged via libkrun microVM** — `packaging/test/run-in-vm.sh`
+  boots a fixed-kernel (libkrunfw 6.12.91) microVM via `krunvm`, runs
+  `phase1-fanotify-smoke.sh`: owner reads its secret, scraper gets `EPERM`. Green.
+  No host root — only `/dev/kvm`. (Verified libkrunfw enables
+  `FANOTIFY_ACCESS_PERMISSIONS` + `FAN_MARK_FILESYSTEM`.)
+- **CI** (`.github/workflows/ci.yml`) — unprivileged `cargo test`/clippy/fmt job
+  + a libkrun fanotify job (the GHA libkrun-install line is the one piece not yet
+  validated on a real runner).
+
+### Phase 1 remaining
+- **TOFU-on-create (decision-flow step 4)** under fanotify needs the `FAN_CREATE`
+  notify group (FID-based, second group). Until then, ownership for the fanotify
+  backend comes from `cordon adopt`. The engine already implements TOFU; only the
+  backend create-signal is missing.
+- (Optional) `seccomp-unotify` backend + `cordon run -- <tool>` — now lower
+  priority since libkrun gives unprivileged fanotify testing.
 
 ## Where we are
 - Design converged + iterated. Captured in `docs/DESIGN.md`.
 - Researched **Santa** (closest existing tool) → `docs/SANTA.md`. Verdict: not a
   drop-in (macOS-only; FAA static, non-TOFU, non-interactive, poll-reloaded).
-- **Phase 0 implemented** — Rust workspace, three crates, 18 tests green
+- **Phase 0 implemented** — Rust workspace, three crates, 22 tests green
   (`cargo test`), clippy clean (`-D warnings`), rustfmt clean.
 
 ## Built so far (Phase 0)
@@ -45,15 +75,15 @@ and CLI exist, build clean, and pass tests. This file is the resume point.
 - **Naming:** `container` → **`zone`** everywhere in code (avoids Docker/OCI
   confusion). DESIGN/SANTA prose updated to match.
 
-## Decisions still open
-1. **Project name** — working name `cordon` is in use throughout code + docs
-   (alts: `ward`, `obscura`, `hush`). Not yet finalized, but a rename is now a
-   find-replace.
+## Decisions settled
+- **Project name `cordon` — final.**
+- **Privileged testing → libkrun microVM** (`krunvm`), fixed kernel, no host root.
+- **fanotify bindings → `nix`** (not hand-rolled libc); daemon logging → `tracing`.
 
-## Next action — Phase 1 (Linux fanotify backend, root)
-Implement a `fanotify FAN_OPEN_PERM` + `FAN_CREATE` + `FAN_REPORT_PIDFD` backend
-behind the existing `Backend` trait: read events, map to `AccessEvent`, call
-`engine.evaluate`, write the verdict. Decision-flow steps 1–4 enforced
-system-wide; run the hermetic fixtures as a *real* boundary (root, CI note).
-Optional dev extra: `seccomp-unotify` backend + `cordon run -- <tool>`.
-Nothing in `core`/`proto`/`cli` should need to change.
+## Next action
+1. **Finish Phase 1: TOFU-on-create under fanotify** — add the `FAN_CREATE`
+   notify group (FID/DFID, second fanotify group) so a tool that *creates* its
+   config auto-claims ownership, matching the engine's existing step-4. Validate
+   in the libkrun harness.
+2. Then **Phase 2** — interactive deny-and-learn + the event-sourced lineage cache
+   (DESIGN §8.2/§12). Nothing in `core`/`proto`/`cli` should need to change.

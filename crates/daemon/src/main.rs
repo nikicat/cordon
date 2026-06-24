@@ -1,17 +1,22 @@
 //! `cordond` — the gater daemon.
 //!
-//! Phase 0 wires the privilege-agnostic policy core to the `mock` backend and
-//! serves the IPC control plane over a Unix socket (thread-per-connection). It
-//! holds the engine behind a `Mutex` so the backend thread and IPC threads share
-//! one store. Phase 1 swaps in the root `fanotify` backend behind the same trait.
+//! Wires the privilege-agnostic policy core to an enforcement backend and serves
+//! the IPC control plane over a Unix socket (thread-per-connection). It holds the
+//! engine behind a `Mutex` so the backend thread and IPC threads share one store.
+//! Dev runs the `mock` backend (`systemctl --user`); the real Linux boundary is
+//! the root `fanotify` backend.
 
+mod backend;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod proc;
 
 use clap::Parser;
-use cordon_core::backend::{Backend, MockBackend, Shutdown};
+use cordon_core::backend::Shutdown;
 use cordon_core::{Engine, Store, config};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tracing::{error, info};
 
 /// Shared daemon context handed to each IPC connection.
 pub struct Ctx {
@@ -30,19 +35,30 @@ struct Args {
     /// SQLite store path (overrides $CORDON_STORE / default).
     #[arg(long)]
     store: Option<PathBuf>,
-    /// Enforcement backend (Phase 0: only `mock`).
+    /// Enforcement backend: `mock` (dev) or `fanotify` (Linux, root).
     #[arg(long)]
     backend: Option<String>,
 }
 
 fn main() -> std::process::ExitCode {
+    init_tracing();
     match run(Args::parse()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("cordond: fatal: {e}");
+            error!(error = %e, "fatal");
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Logs to stderr; level via `RUST_LOG` (default `info`).
+fn init_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn run(args: Args) -> cordon_core::Result<()> {
@@ -52,30 +68,18 @@ fn run(args: Args) -> cordon_core::Result<()> {
 
     let store = Store::open(&store_path)?;
     if store.seed_zones(&config::default_zones())? {
-        eprintln!("cordond: seeded default zones");
+        info!("seeded default zones");
     }
     let engine = Arc::new(Mutex::new(Engine::new(store)?));
 
-    let backend: Box<dyn Backend> = match backend_name.as_str() {
-        "mock" => Box::new(MockBackend),
-        other => {
-            return Err(cordon_core::Error::msg(format!(
-                "unknown backend '{other}' (Phase 0 ships only 'mock'). \
-                 fanotify/endpoint-security land in later phases."
-            )));
-        }
-    };
+    let backend = backend::select(&backend_name)?;
 
-    eprintln!(
-        "cordond: backend={} store={} socket={} (privilege={})",
-        backend.name(),
-        store_path.display(),
-        socket_path.display(),
-        if config::is_root() {
-            "root"
-        } else {
-            "user — NOT a boundary"
-        },
+    info!(
+        backend = backend.name(),
+        store = %store_path.display(),
+        socket = %socket_path.display(),
+        privilege = if config::is_root() { "root" } else { "user (NOT a boundary)" },
+        "cordond started",
     );
 
     let shutdown = Shutdown::new();
@@ -95,6 +99,8 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let serve_result = ipc::serve(&socket_path, ctx);
 
     shutdown.trigger();
-    let _ = backend_thread.join();
+    if let Ok(Err(e)) = backend_thread.join() {
+        error!(error = %e, "backend exited with error");
+    }
     serve_result
 }

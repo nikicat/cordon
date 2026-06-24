@@ -242,6 +242,58 @@ once per session.
 - **hardening-vs-injectability tension** & **confused-deputy ceiling**: relevant
   only if we ever add the transparency shim (§7); v1 gates only.
 
+### 8.1 Caller vs. ancestry forgeability (sharpened)
+Treat the **immediate caller** and the **ancestry chain** as different security
+objects:
+- **Immediate caller — strong & race-free.** It is suspended in the kernel
+  awaiting our verdict, so it cannot exit/exec under us. Linux: exe path is
+  kernel-truth (race-free while blocked). macOS: the per-event `audit_token`
+  yields *cryptographic* code identity (`cdhash`/`team_id`/`signing_id`,
+  validated via `SecCodeCheckValidity`) — strictly stronger than a path, and the
+  real ES win.
+- **Ancestry — best-effort, two distinct attacks:**
+  - **Removal** (`double-fork` → reparent to init): erases the chain on Linux.
+    macOS resists this — `original_ppid` and the *responsible* audit token survive
+    reparenting.
+  - **Construction** (`fork(scraper); exec(real blessed binary)` in the parent):
+    builds *genuine* ancestry whose ancestor really is the blessed tool. This
+    defeats ancestry on **both** platforms and is **not** fixed by stricter
+    identity (`path+inode`/`signature` or macOS code-signing) — it is the
+    authentic binary, attested truthfully. Only a liveness window (the blessed
+    ancestor must be alive at access time) bounds it. macOS "responsible process"
+    attribution is also launcher-influenceable (`posix_spawn` disclaim
+    attributes), so it is not unforgeable either.
+- **Interpreter problem persists on macOS:** a script tool surfaces as
+  `/usr/bin/python3` (an Apple *platform binary*), so the strong code-identity is
+  the interpreter's, not the tool's — pushing you back onto the weaker
+  ancestry/responsible-pid link, as on Linux.
+- **Conclusion:** ancestry **raises cost, is never a boundary**; the construction
+  attacker is the conceded targeted-RE class (§2). The object-centric deny is the
+  boundary.
+
+### 8.2 Better Linux lineage sources (beyond the /proc snapshot)
+The `/proc` ppid walk is a snapshot taken *after* reparenting has already
+destroyed information. Stronger sources, weakest→strongest:
+- **Start-time keying** (`/proc/<pid>/stat` field 22): key each hop by
+  `(pid, starttime)`; a changed starttime ⇒ pid was recycled ⇒ reject. Kills
+  pid-reuse. (Cheap; DESIGN already assumes this.)
+- **pidfd**: free for the caller via `FAN_REPORT_PIDFD`; `pidfd_open(ppid)` +
+  starttime recheck pins ancestors. Race-free, but still a decision-time snapshot.
+- **`loginuid`/`sessionid`**: set at login, immutable without `CAP_AUDIT_CONTROL`,
+  inherited by all descendants — a fence the scraper can't shed (unlike `setsid`).
+  A robust *bound* on the walk, though it doesn't identify the tool.
+- **Proc connector** (`NETLINK_CONNECTOR`/`CN_IDX_PROC`) **or eBPF**
+  (`sched_process_{fork,exec}`, BPF-LSM): subscribe at startup, maintain a
+  lineage cache keyed by `(pid, starttime)`. Recording the parent **at fork time**
+  captures the *original* lineage **before** a later double-fork can erase it —
+  defeating the **removal** attack. eBPF is the high-fidelity option (also gets
+  argv/cwd/creds at exec); it's how Tetragon/Falco/Sysdig build process trees
+  (§13). Root-only — already required.
+- **Ceiling:** lineage tracking defeats *removal* + *reuse*, never *construction*
+  (a real `exec` is faithfully recorded as a genuine blessed ancestor). Not log
+  sources (`auditd` is async, log-only), not `/proc/.../children` (wrong
+  direction), not cgroup/session grouping (CLI tools share the shell's cgroup).
+
 ## 9. Cross-platform primitive map
 
 | Need | Linux | macOS |
@@ -285,7 +337,23 @@ exercise *identity* gating:
 Asserts: each tool reads its own secret across runs (TOFU); scraper denied on
 both; store shows expected owners; cross-owner read denied; (Phase 2) prompt
 fires on a pre-existing unowned path and "approve permanently" persists.
-`fanotify` needs root → tests run privileged (CI note).
+
+### Test tiers (by privilege)
+- **Unprivileged (mock backend):** the policy core, store, decision flow, and IPC
+  e2e — `cargo test`, CI-friendly, no root. Covers everything but the kernel hook.
+- **Privileged boundary (fanotify), without host root → libkrun microVM.** The
+  real `fanotify` backend needs `CAP_SYS_ADMIN`, but we get it from a **libkrun
+  microVM** (`krunvm` + `buildah unshare`) instead of host `sudo`: a *fixed*
+  kernel (libkrunfw's — **verified** to enable `FANOTIFY_ACCESS_PERMISSIONS` and
+  `FAN_MARK_FILESYSTEM` on tmpfs+rootfs), guest-root, needs only `/dev/kvm`
+  (group `kvm`). Same image runs locally (`packaging/test/run-in-vm.sh`) and in
+  CI, so the kernel never diverges. `sudo` and stock GHA runners also work, but
+  the fixed-kernel microVM is the reproducible default. (Rootless podman is
+  *not* an option: `FAN_OPEN_PERM` checks init-userns `CAP_SYS_ADMIN`; userns-root
+  isn't enough.)
+- The Phase 1 smoke test (`packaging/test/phase1-fanotify-smoke.sh`) proves
+  owner-allow + scraper-deny (`EPERM`) through the real backend — green under
+  libkrun.
 
 ## 12. Phased plan
 - **Phase 0 — skeleton + user-mode daemon.** Rust workspace; SQLite store +
@@ -293,14 +361,31 @@ fires on a pre-existing unowned path and "approve permanently" persists.
   over IPC; daemon as `systemctl --user` with the `mock` backend — decision-flow,
   TOFU, and store unit-tested **without root**, CI-friendly. (Real fixtures run
   once an interception backend lands in Phase 1.)
-- **Phase 1 — Linux fanotify backend (root).** Swap the privileged
-  `fanotify FAN_OPEN_PERM` + `FAN_CREATE` + pidfd backend behind the same core;
-  decision-flow steps 1–4 enforced system-wide; hermetic harness green as a real
-  boundary. Optional dev extra: `seccomp-unotify` backend + `cordon run -- <tool>`
-  single-tool sandbox (unprivileged).
+- **Phase 1 — Linux fanotify backend (root).** *Enforcement loop done +
+  validated.* `fanotify FAN_OPEN_PERM` backend (via `nix`, no hand-written
+  `unsafe`) behind the same core: marks zone/subtree filesystems, resolves caller
+  via `/proc`, runs the decision flow, answers ALLOW/DENY. Steps 1–3,5 enforced
+  system-wide; proven owner-allow + scraper-deny (`EPERM`) in a libkrun microVM
+  (§11). Ancestry is the best-effort `/proc/<pid>/stat` snapshot (upgraded in
+  Phase 2). **Remaining for Phase 1:** TOFU-on-create (step 4) via the
+  `FAN_CREATE` notify group (FID-based) — until then ownership comes from
+  `cordon adopt`. Optional dev extra: `seccomp-unotify` backend +
+  `cordon run -- <tool>` single-tool sandbox (unprivileged) — now lower priority
+  since libkrun gives unprivileged fanotify testing.
 - **Phase 2 — chain + interactive.** Parent-chain owner-match (step 3 ancestry);
   prompt agent + deny-and-learn (step 5); prompt-outcome rules incl. TTL; subsume
   `adopt`. Interpreter fixture passes via chain.
+  - **Lineage tracking (§8.2).** Replace the decision-time `/proc` snapshot with
+    an **event-sourced process-lineage cache**: subscribe to `fork`/`exec`/`exit`
+    via the **proc connector** (`NETLINK_CONNECTOR`/`CN_IDX_PROC`) — or **eBPF**
+    (`sched_process_{fork,exec}`/BPF-LSM) for higher fidelity + argv/cwd/creds —
+    and maintain a tree keyed by `(pid, starttime)`. Recording the parent **at
+    fork time** captures the *original* lineage before a double-fork can erase it,
+    defeating the **removal** evasion and pid-reuse races. Decision-time ancestry
+    becomes an O(1) cache lookup. (Ceiling: still does not defeat the
+    *construction* attack — a real `exec` of a blessed binary — so ancestry stays
+    best-effort, never the boundary.) Start with the proc connector (no eBPF
+    toolchain dep); migrate to eBPF if fidelity/overhead demands it.
 - **Phase 3 — full ownership.** Identity granularity (path/inode/signature),
   tool-groups, override CLI fully wired.
 - **Phase 4 — macOS gater.** Bespoke ES `AUTH_OPEN` client — **decided**: Santa's

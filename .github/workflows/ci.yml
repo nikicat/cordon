@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Unprivileged: the policy core, store, decision flow, and IPC e2e. Covers
+  # everything except the kernel interception (mock backend stands in).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  # Privileged boundary: the real fanotify backend, run in a libkrun microVM with
+  # a FIXED kernel (libkrunfw's, verified to enable FANOTIFY_ACCESS_PERMISSIONS).
+  # This is the reproducible alternative to `sudo` — the same kernel runs locally
+  # (packaging/test/run-in-vm.sh) and here, so a green local run means a green CI
+  # run. Needs /dev/kvm (present on GitHub Ubuntu runners) + krunvm + buildah.
+  #
+  # NOTE: the krunvm/libkrun install line is the one piece not yet validated on a
+  # real runner (it is proven locally). Fedora ships krunvm; adjust if the package
+  # path differs on the runner image.
+  fanotify-libkrun:
+    runs-on: ubuntu-latest
+    needs: test
+    container:
+      image: fedora:latest
+      options: --device /dev/kvm --privileged
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain + libkrun
+        run: |
+          dnf -y install rust cargo gcc krunvm buildah util-linux
+      - name: Build
+        run: cargo build
+      - name: Fanotify smoke test in libkrun microVM (fixed kernel)
+        run: packaging/test/run-in-vm.sh

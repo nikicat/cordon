@@ -15,6 +15,13 @@ cordon-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# fanotify permission events + write_response (most fanotify crates are
+# notification-only); nix wraps the unsafe syscalls in a safe, tested API.
+nix = { version = "0.31.3", features = ["fanotify", "poll"] }
 
 [dev-dependencies]
 tempfile = "3"
