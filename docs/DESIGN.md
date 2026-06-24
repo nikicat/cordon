@@ -143,11 +143,12 @@ Two rule sources; explicit wins over auto.
 both allow and **deny** (so a user can revoke an owner). Root-owned config.
 
 ### TOFU auto-ownership (creator-owns)
-- **Containers** — configured *traversable-but-never-owned* roots (`~`,
-  `~/.config`, `~/.local/share`, `~/.cache`). The first subtree level inside is
-  claimable; the container itself never is.
+- **Zones** — configured *traversable-but-never-owned* roots (`~`, `~/.config`,
+  `~/.local/share`, `~/.cache`). The first subtree level inside is claimable; the
+  zone root itself never is. (Named "zones" in code — `container` was avoided as
+  it reads as Docker/OCI.)
 - **Claim on create, never on read.** An exe that *creates* a new path in an
-  unclaimed container subtree becomes its owner (`O_CREAT` / `FAN_CREATE`),
+  unclaimed zone subtree becomes its owner (`O_CREAT` / `FAN_CREATE`),
   **never on read** — stops a scraper claiming a pre-existing secret.
 - **Pre-existing paths** have no auto-owner: handled by interactive mode (§6) or
   `cordon adopt`. Never auto-assigned on first access.
@@ -177,7 +178,7 @@ itself in as owner. Mutated only via the privileged `cordon` CLI → daemon IPC.
 1. Path not under any protected subtree → **allow** (unmediated).
 2. Explicit rule matches → **allow/deny** (user rules win → revocation works).
 3. Caller *or ancestor* in the subtree's owner group → **allow**.
-4. `O_CREAT` of a new path in an unclaimed container subtree → **TOFU claim** →
+4. `O_CREAT` of a new path in an unclaimed zone subtree → **TOFU claim** →
    allow.
 5. Else (protected, unowned/non-matching, not a create) → **interactive prompt**
    if a session agent is present, else the configured default (**deny**).
@@ -274,10 +275,10 @@ prompt agent + `cordon` CLI. Per-tool cost = a row, not a profile.
   unmediated. Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
 
 ## 11. Testing strategy — internal fixtures
-Hermetic, throwaway `$HOME` as the only container root. Distinct exe paths to
+Hermetic, throwaway `$HOME` as the only zone root. Distinct exe paths to
 exercise *identity* gating:
-- `testtool-oldstyle` → `$HOME/.ctest-old/secret` (dotfile; container = home)
-- `testtool-xdg` → `$HOME/.config/ctest-xdg/secret` (XDG; container = `~/.config`)
+- `testtool-oldstyle` → `$HOME/.ctest-old/secret` (dotfile; zone = home)
+- `testtool-xdg` → `$HOME/.config/ctest-xdg/secret` (XDG; zone = `~/.config`)
 - `testscraper` → walks & tries to read both; must be denied.
 - (later) an interpreted fixture (`python testtool.py`) to exercise the chain.
 
