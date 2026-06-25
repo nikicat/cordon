@@ -27,15 +27,23 @@ allowed, non-owner gets `EPERM`, in-kernel. Pure-Rust via aya, no clang/libbpf:*
   protected subtree, caller exe **(dev, inode)** → owner-identity lookup,
   `-EPERM`/allow by mode, `LearnEvent` to a ring buffer. All `unsafe` (kernel reads,
   ring writes) is confined to `kernel.rs` behind safe typed handles; `main.rs` is the
-  unsafe-free decision flow. `vmlinux.rs` generated from the host BTF and committed
-  (so building needs no libclang).
+  unsafe-free decision flow. **No committed `vmlinux.rs`**: rustc can't emit CO-RE
+  relocations (<https://github.com/rust-lang/rust/issues/158412>), so each kernel field
+  is read at a byte offset taken from an `OFFSETS` `.rodata` global the daemon fills
+  from the *running* kernel's BTF and injects at load — one object enforces on any
+  kernel (validated on `v6.12` with an object built against `6.18`).
 - **`crates/daemon` `bpf-lsm` feature** (`backend/bpf_lsm.rs`) — the aya loader:
-  `load_file` the object, seed `SUBTREES`/`OWNER_IDS`/`SETTINGS` from the store
-  (resolve each subtree + owner exe to a `FileId` — mount-table device + `stat`
-  inode, so it matches the kernel on overlayfs/btrfs), attach `file_open`,
-  then `poll`+drain the ring buffer into the journal (enforce → `info` deny, audit →
-  `warn` would-deny, exe path enriched from `/proc` only when the inode still
-  matches). **Map-sync-on-adopt**: a runtime `adopt`/`disown`/`claim` bumps the
+  resolve the running kernel's field offsets from its BTF (`btf.rs`, a minimal
+  read-only BTF parser — descends anonymous unions, fails loud on a missing field)
+  and inject them (`override_global("OFFSETS", …)`), `load_file` the object, attach
+  `file_open`, then **self-test** (protect a probe dir under an identity-less owner
+  and confirm our *own* open is denied — so a wrong-offset silent no-op aborts loudly
+  rather than pretending to enforce), seed `SUBTREES`/`OWNER_IDS`/`SETTINGS` from the
+  store (resolve each subtree + owner exe to a `FileId` — mount-table device + `stat`
+  inode, so it matches the kernel on overlayfs/btrfs), then `poll`+drain the ring
+  buffer into the journal (enforce → `info` deny, audit → `warn` would-deny, exe path
+  enriched from `/proc` only when the inode still matches). **Map-sync-on-adopt**: a
+  runtime `adopt`/`disown`/`claim` bumps the
   engine's `PolicyClock`; the serve loop re-seeds the maps within a poll interval —
   no restart. Off by default so the stock build stays on stable with no aya/eBPF
   deps. `BackendKind::BpfLsm` wired through config/CLI/`select`. `kernel_dev`
@@ -59,7 +67,6 @@ allowed, non-owner gets `EPERM`, in-kernel. Pure-Rust via aya, no clang/libbpf:*
   restrictive mode blocks `BPF_PROG_LOAD` — so the VM boots a minimal `lsm=…,bpf`.
 
 **Next increment:**
-- **CI job** mirroring the fanotify VM job (pinned kernel, `lsm=…,bpf`).
 - **Fail-safe pinning** — pin program + maps + link to bpffs so enforcement survives
   daemon death (the headline property; until then it fails open like fanotify).
 - **TOFU-on-create** via the learn path (the daemon claims, then re-syncs the maps).

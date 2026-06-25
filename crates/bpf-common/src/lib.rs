@@ -9,17 +9,22 @@
 //! - [`ids`] — the scalar domain newtypes (`Dev`, `Ino`, `OwnerId`, `Pid`, `Mode`,
 //!   `Decision`).
 //! - [`maps`] — the map names and the POD key/value/record types.
+//! - [`offsets`] — the running-kernel field offsets the daemon resolves from BTF
+//!   and injects into the program's `.rodata` (the CO-RE-substitute portability
+//!   shim).
 //!
 //! `#![no_std]` with no `aya` dependency by default, so the eBPF crate consumes it
 //! cleanly. The userspace loader turns on `features = ["user"]`, which adds the
-//! `aya::Pod` marker impls (required to use a type as a map key/value).
+//! `aya::Pod` marker impls (required to use a type as a map key/value or global).
 
 #![no_std]
 
 pub mod ids;
 pub mod maps;
+pub mod offsets;
 
 pub use ids::{Decision, Dev, Ino, Mode, OwnerId, Pid};
 pub use maps::{
     FileId, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES, OwnerKey, Settings,
 };
+pub use offsets::Offsets;

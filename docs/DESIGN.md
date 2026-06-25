@@ -237,8 +237,11 @@ reboot* (re-learned on next create) — acceptable for creator-owns.
 **Requirements / cost.** `CONFIG_BPF_LSM=y` **and** `bpf` in the active LSM list
 (`CONFIG_LSM=` / `lsm=` boot param — common but not universal); kernel ≥ 5.7 (the
 content-hash helpers are ≥ 5.11 / 6.x); `CAP_BPF` + `CAP_MAC_ADMIN`. Heavier to
-ship than `fanotify` (libbpf + CO-RE + a verifier-friendly program; path-prefix
-matching is the fiddly part). **Additive** to existing LSMs — it can only
+ship than `fanotify` (a verifier-friendly program, and — since rustc can't emit
+CO-RE relocations, <https://github.com/rust-lang/rust/issues/158412> — a userspace
+shim that reads the running kernel's BTF and injects field offsets into the program's
+`.rodata`, so one object runs on any kernel). **Additive** to existing LSMs — it can
+only
 *further* restrict, never loosen (a SELinux/AppArmor deny still denies). So
 `bpf-lsm` is the hardened production boundary where available; on older kernels (or
 with `bpf` absent from the LSM list) there is **no hardened Linux boundary** — the

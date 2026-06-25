@@ -7,6 +7,8 @@
 //! the root `fanotify` backend.
 
 mod backend;
+#[cfg(feature = "bpf-lsm")]
+mod btf;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod proc;

@@ -26,10 +26,12 @@
 //! daemon death). Until pinning lands this backend, like `fanotify`, stops enforcing
 //! when the daemon exits.
 
+use crate::btf::KernelBtf;
 use crate::proc;
 use aya::maps::{Array, HashMap as BpfHashMap, RingBuf};
 use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
+use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
     Decision, FileId, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES,
     Mode as BpfMode, OwnerId, OwnerKey, Pid, Settings,
@@ -76,14 +78,22 @@ impl Backend for BpfLsmBackend {
     }
 
     fn run(self: Box<Self>, engine: Arc<Mutex<Engine>>, shutdown: Arc<Shutdown>) -> Result<()> {
-        // Kernel BTF drives CO-RE relocation in the object and resolves the LSM
-        // hook's BTF id for attach.
+        // Kernel BTF resolves the LSM hook's BTF id for attach (and sanitizes the
+        // program's own BTF).
         let btf =
             Btf::from_sys_fs().map_err(|e| Error::msg(format!("bpf-lsm: kernel BTF: {e}")))?;
+
+        // The object carries no struct layout of its own (rustc can't emit CO-RE
+        // relocations — rust-lang/rust#158412). Resolve the running kernel's field
+        // offsets from its BTF and inject them into the program's `.rodata` so it
+        // reads `struct file`/`dentry`/`inode`/… correctly on *this* kernel. A field
+        // the kernel has renamed/removed fails here, loudly, before we attach.
+        let offsets = KernelBtf::from_running_kernel()?.offsets()?;
 
         let mut ebpf = EbpfLoader::new()
             .verifier_log_level(aya::VerifierLogLevel::VERBOSE)
             .btf(Some(&btf))
+            .override_global(GLOBAL_OFFSETS, &offsets, true)
             .load_file(&self.object)
             .map_err(|e| {
                 Error::msg(format!(
@@ -93,10 +103,10 @@ impl Backend for BpfLsmBackend {
             })?;
 
         // Attach the hook first (maps still empty ⇒ allow-all, transient), then
-        // PROVE it enforces before trusting it. A struct-layout mismatch between the
-        // object and the running kernel (the object is NOT CO-RE-relocatable) reads
-        // garbage, matches nothing, and silently allows everything — "active" but a
-        // no-op boundary. The self-test makes that a loud fatal error.
+        // PROVE it enforces before trusting it. If the injected offsets are wrong
+        // (a BTF-resolution bug), the program reads garbage, matches nothing, and
+        // silently allows everything — "active" but a no-op boundary. The self-test
+        // makes that a loud fatal error.
         let program: &mut Lsm = ebpf
             .program_mut(HOOK)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: program '{HOOK}' missing from object")))?
@@ -278,9 +288,9 @@ fn set_settings(ebpf: &mut Ebpf, pid: Pid, mode: BpfMode) -> Result<()> {
 /// a silent no-op. Protect a throwaway probe directory under an owner that has *no*
 /// identities (so nobody is an owner), make ourselves not-fast-allowed and enforce
 /// mode, and confirm our own open of it is denied. If the program is attached but
-/// its kernel reads are wrong (e.g. the object was built against a different
-/// kernel's struct layout — it is not CO-RE-relocatable), it matches nothing, the
-/// open is *allowed*, and we abort instead of pretending to protect.
+/// its kernel reads are wrong (e.g. the injected field offsets don't match the
+/// running kernel), it matches nothing, the open is *allowed*, and we abort instead
+/// of pretending to protect.
 fn self_test(ebpf: &mut Ebpf) -> Result<()> {
     let probe = std::env::temp_dir().join(format!("cordon-selftest.{}", std::process::id()));
     std::fs::create_dir_all(&probe)

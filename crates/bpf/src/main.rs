@@ -9,37 +9,23 @@
 //!   2. Walk the opened file's dentry ancestors; the first one whose **(dev, ino)**
 //!      is in `SUBTREES` is the most-specific protected subtree → its owner id.
 //!      No match ⇒ unprotected ⇒ allow.
-//!   3. Resolve the caller's exe path (`bpf_d_path`) and hash it; if `(owner, hash)`
-//!      is in `OWNER_IDS` the caller is an owner ⇒ allow.
+//!   3. Resolve the caller's exe inode `(dev, ino)`; if `(owner, exe)` is in
+//!      `OWNER_IDS` the caller is an owner of that subtree ⇒ allow.
 //!   4. Otherwise push a `LearnEvent` and return `-EPERM` (enforce) or allow (audit).
 //!
 //! Anything we can't read fails **open** — `None` from a [`kernel`] handle becomes
-//! an allow. All `unsafe` (kernel reads, `d_path`, ring writes) lives in [`kernel`];
-//! this file is the decision flow only.
+//! an allow. All `unsafe` (kernel reads, ring writes) lives in [`kernel`]; this file
+//! is the decision flow only. Field offsets come from the running kernel at load
+//! time (see [`kernel`]) — this object is not pinned to a build-time struct layout.
 //!
-//! NOTE: this compiles against the running kernel's BTF to a valid object, but
-//! load/verify/enforce is validated in a virtme-ng VM booted with `lsm=…,bpf` (the
-//! host kernel omits `bpf` from its active LSM list). Points for the verifier/
-//! allowlist to confirm there: `bpf_d_path` on `file_open`, and the bounded
-//! exe-hash loop.
+//! NOTE: load/verify/enforce is validated in a virtme-ng VM booted with `lsm=…,bpf`
+//! (the host kernel omits `bpf` from its active LSM list). The daemon's self-test
+//! proves the injected offsets actually mediate before the boundary is trusted.
 
 #![no_std]
 #![no_main]
 
 mod kernel;
-// Generated from the kernel BTF by `aya-tool` and committed (so building needs no
-// libclang). These lints are exempted *for this module only* — our hand-written
-// code is still linted. `unnecessary_transmutes` fires inside bindgen's bitfield
-// accessors, which we never call; there's nothing to fix short of hand-editing
-// generated output, which regenerating for another kernel would wipe.
-#[allow(
-    nonstandard_style,
-    dead_code,
-    unnecessary_transmutes,
-    improper_ctypes_definitions,
-    clippy::all
-)]
-mod vmlinux;
 
 use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
@@ -160,7 +146,7 @@ fn subtree_owner(key: FileId) -> Option<OwnerId> {
     unsafe { SUBTREES.get(&key).copied() }
 }
 
-/// Whether (owner, exe-hash) is a known owner identity.
+/// Whether (owner, exe inode) is a known owner identity.
 fn is_owner(key: OwnerKey) -> bool {
     unsafe { OWNER_IDS.get(&key).is_some() }
 }
