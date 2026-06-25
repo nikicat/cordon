@@ -44,7 +44,7 @@ mod vmlinux;
 use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
-use cordon_bpf_common::{OwnerId, OwnerKey, Settings, SubtreeKey};
+use cordon_bpf_common::{FileId, OwnerId, OwnerKey, Settings};
 
 /// The hook's verdict. The kernel wants a raw return (`0` allow / negative errno
 /// deny), but only the LSM ABI at the `file_open` signature does — the decision
@@ -75,7 +75,7 @@ const MAX_ANCESTORS: usize = 32;
 // ---- policy maps (filled by the daemon from the store) --------------------
 
 #[map]
-static SUBTREES: HashMap<SubtreeKey, OwnerId> = HashMap::with_max_entries(4096, 0);
+static SUBTREES: HashMap<FileId, OwnerId> = HashMap::with_max_entries(4096, 0);
 #[map]
 static OWNER_IDS: HashMap<OwnerKey, u8> = HashMap::with_max_entries(4096, 0);
 #[map]
@@ -84,8 +84,7 @@ static SETTINGS: Array<Settings> = Array::with_max_entries(1, 0);
 /// The matched protected subtree.
 struct Match {
     owner: OwnerId,
-    dev: cordon_bpf_common::Dev,
-    ino: cordon_bpf_common::Ino,
+    subtree: FileId,
 }
 
 #[lsm(hook = "file_open")]
@@ -111,22 +110,14 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
         return Some(Verdict::Allow);
     };
 
-    // (3) owner identity: hash the caller's exe and look up membership.
-    let exe = kernel::caller_exe_hash()?;
+    // (3) owner identity: the caller's exe inode → owner-membership lookup.
+    let exe = kernel::caller_exe()?;
     if is_owner(OwnerKey::new(matched.owner, exe)) {
         return Some(Verdict::Allow);
     }
 
     // (4) protected, non-owner → learn + deny (or would-deny in audit mode).
-    kernel::emit(
-        file,
-        pid,
-        matched.owner,
-        matched.dev,
-        matched.ino,
-        exe,
-        settings.mode,
-    );
+    kernel::emit(pid, matched.owner, matched.subtree, exe, settings.mode);
     Some(if settings.mode.enforces() {
         Verdict::Deny
     } else {
@@ -139,10 +130,9 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
 fn find_subtree(file: kernel::File) -> Option<Match> {
     let mut dentry = file.dentry()?;
     for _ in 0..MAX_ANCESTORS {
-        let dev = dentry.super_block()?.dev()?;
-        let ino = dentry.inode()?.ino()?;
-        if let Some(owner) = subtree_owner(SubtreeKey::new(dev, ino)) {
-            return Some(Match { owner, dev, ino });
+        let id = FileId::new(dentry.super_block()?.dev()?, dentry.inode()?.ino()?);
+        if let Some(owner) = subtree_owner(id) {
+            return Some(Match { owner, subtree: id });
         }
         let parent = dentry.parent()?;
         if parent == dentry {
@@ -165,8 +155,8 @@ fn settings() -> Option<Settings> {
     SETTINGS.get(0).copied()
 }
 
-/// The owner of a protected subtree keyed by (dev, ino), if any.
-fn subtree_owner(key: SubtreeKey) -> Option<OwnerId> {
+/// The owner of a protected subtree keyed by its `FileId`, if any.
+fn subtree_owner(key: FileId) -> Option<OwnerId> {
     unsafe { SUBTREES.get(&key).copied() }
 }
 

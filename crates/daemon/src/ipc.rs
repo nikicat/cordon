@@ -109,14 +109,15 @@ impl Ctx {
                     allow,
                     expires_at,
                 )?;
+                engine.bump_policy();
                 Ok(Response::RuleAdded { id })
             }
 
             Request::RemoveRule { id } => {
                 let engine = self.engine.lock().unwrap();
-                Ok(Response::Done {
-                    changed: engine.store().remove_rule(id)?,
-                })
+                let changed = engine.store().remove_rule(id)?;
+                engine.bump_policy();
+                Ok(Response::Done { changed })
             }
 
             Request::Adopt { path, identity } => {
@@ -128,6 +129,7 @@ impl Ctx {
                     .store()
                     .ensure_owner(&path, &PathBuf::from(identity))?;
                 engine.store().claim_subtree(&subtree, owner, now_secs())?;
+                engine.bump_policy();
                 Ok(Response::Done { changed: true })
             }
 
@@ -136,6 +138,7 @@ impl Ctx {
                 match engine.store().owner_of_subtree(&PathBuf::from(&subtree))? {
                     Some(owner) => {
                         engine.store().add_identity(owner, &PathBuf::from(add))?;
+                        engine.bump_policy();
                         Ok(Response::Done { changed: true })
                     }
                     None => Err(Error::msg(format!("no owned subtree at {subtree}"))),
@@ -144,15 +147,16 @@ impl Ctx {
 
             Request::Disown { subtree } => {
                 let engine = self.engine.lock().unwrap();
-                Ok(Response::Done {
-                    changed: engine.store().disown_subtree(&PathBuf::from(subtree))?,
-                })
+                let changed = engine.store().disown_subtree(&PathBuf::from(subtree))?;
+                engine.bump_policy();
+                Ok(Response::Done { changed })
             }
 
             Request::AddZone { path } => {
                 let mut engine = self.engine.lock().unwrap();
                 engine.store().add_zone(&PathBuf::from(path))?;
                 engine.reload_zones()?;
+                engine.bump_policy();
                 Ok(Response::Done { changed: true })
             }
 

@@ -10,44 +10,61 @@ validation in a VM is the next increment. This file is the resume point.
 The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an
 eBPF program on the `file_open` LSM hook, reading policy from BPF maps the daemon
 seeds from the store. Control-plane / data-plane split — the daemon is still
-required (load + seed maps + drain the learn ring buffer), but the verdict no longer
-waits on it.
+required (load + seed maps + re-sync on policy change + drain the learn ring
+buffer), but the verdict no longer waits on it.
 
-**Done (builds + lints + unit-tests green; pure-Rust via aya, no clang/libbpf):**
+**Done — validated end-to-end in a virtme-ng VM (`lsm=capability,bpf`): owner
+allowed, non-owner gets `EPERM`, in-kernel. Pure-Rust via aya, no clang/libbpf:**
 - **`crates/bpf-common`** — `#![no_std]` POD types shared byte-for-byte by the eBPF
-  program and the loader: map names, `SubtreeKey`/`OwnerKey`/`Settings`/`LearnEvent`,
-  the `Dev`/`Ino`/`OwnerId`/`ExeHash` newtypes, and the FNV-1a identity hash (the
-  `fnv` crate, used identically on both sides). `user` feature adds the `aya::Pod`
-  impls.
+  program and the loader: map names, the `FileId`/`OwnerKey`/`Settings`/`LearnEvent`
+  records, and the `Dev`/`Ino`/`OwnerId`/`Pid`/`Mode`/`Decision` newtypes. `user`
+  feature adds the `aya::Pod` impls.
 - **`crates/bpf`** — the eBPF data plane (`aya-ebpf`, standalone crate, pinned
   nightly via its own `rust-toolchain.toml` + `.cargo/config.toml`). `file_open`
   hook: fast-allow self, dentry **(dev, inode)** ancestor walk → most-specific
-  protected subtree, exe-path FNV hash → owner-identity lookup, `-EPERM`/allow by
-  mode, `LearnEvent` to a ring buffer. All `unsafe` (kernel reads, `bpf_d_path`,
+  protected subtree, caller exe **(dev, inode)** → owner-identity lookup,
+  `-EPERM`/allow by mode, `LearnEvent` to a ring buffer. All `unsafe` (kernel reads,
   ring writes) is confined to `kernel.rs` behind safe typed handles; `main.rs` is the
   unsafe-free decision flow. `vmlinux.rs` generated from the host BTF and committed
-  (so building needs no libclang). **Compiles clean** to a valid BPF ELF
-  (`lsm/file_open` + `maps` + `license`), clippy/fmt clean.
+  (so building needs no libclang).
 - **`crates/daemon` `bpf-lsm` feature** (`backend/bpf_lsm.rs`) — the aya loader:
   `load_file` the object, seed `SUBTREES`/`OWNER_IDS`/`SETTINGS` from the store
-  (`stat` each subtree → kernel-encoded (dev, inode); FNV the owner exes), attach
-  `file_open`, then `poll`+drain the ring buffer into the journal (enforce → `info`
-  deny, audit → `warn` would-deny). Off by default so the stock build stays on stable
-  with no aya/eBPF deps. `BackendKind::BpfLsm` wired through config/CLI/`select`
-  (helpful error when the feature/Linux is absent). `kernel_dev` glibc→kernel
-  `dev_t` re-encoding is unit-tested.
-- **`just build-ebpf`** stages the object at `target/bpf/cordon.bpf.o`;
-  `bpf_object`/`bpf_pin_dir` config keys (defaults `/usr/lib/cordon/cordon.bpf.o`,
-  `/sys/fs/bpf/cordon`).
+  (resolve each subtree + owner exe to a `FileId` — mount-table device + `stat`
+  inode, so it matches the kernel on overlayfs/btrfs), attach `file_open`,
+  then `poll`+drain the ring buffer into the journal (enforce → `info` deny, audit →
+  `warn` would-deny, exe path enriched from `/proc` only when the inode still
+  matches). **Map-sync-on-adopt**: a runtime `adopt`/`disown`/`claim` bumps the
+  engine's `PolicyClock`; the serve loop re-seeds the maps within a poll interval —
+  no restart. Off by default so the stock build stays on stable with no aya/eBPF
+  deps. `BackendKind::BpfLsm` wired through config/CLI/`select`. `kernel_dev`
+  glibc→kernel `dev_t` re-encoding is unit-tested.
+- **`just build-ebpf`** stages the object; `bpf_object`/`bpf_pin_dir` config keys.
+  `packaging/test/bpf-lsm-smoke.sh` + `run-bpf-lsm-vm.sh` are the e2e.
 
-**Next increment (needs a VM booted with `lsm=…,bpf` — the host omits `bpf` from its
-active LSM list, so the hook loads but never mediates):**
-- Load/verify/**enforce** validation: the BPF verifier must accept `bpf_d_path` on
-  `file_open` and the bounded exe-hash loop; then the Phase-1 smoke (owner allowed,
-  scraper `EPERM`) ported to the `bpf-lsm` backend. CI job mirroring the fanotify VM.
+**Key findings from the VM (these shaped the design):**
+- `bpf_d_path` is **not allowed** at the `file_open` LSM hook (`security_file_open`
+  isn't in the kernel's `btf_allowlist_d_path`), so there is **no in-kernel path
+  resolution**. Identity is therefore **inode (dev, inode)**, not a path hash —
+  resolved from paths by the daemon at seed time (the FNV-hash approach was removed).
+- `(dev, inode)` identity requires the daemon to compute the same device the
+  kernel's `inode->i_sb->s_dev` holds. `stat(2)`'s `st_dev` is **not** that on
+  overlayfs (containers) or btrfs (per-subvolume anon device) — so the daemon
+  resolves the device from the **mount table** (`/proc/self/mountinfo` reports the
+  mount's `sb->s_dev` verbatim; `proc::file_id`), which agrees with the kernel
+  everywhere. The inode number from `stat` already matches `i_ino`. The e2e runs on
+  the overlay `/tmp` to exercise exactly this.
+- Loading an LSM program needs `CAP_BPF` **+ `CAP_MAC_ADMIN`**, and `lockdown` in a
+  restrictive mode blocks `BPF_PROG_LOAD` — so the VM boots a minimal `lsm=…,bpf`.
+
+**Next increment:**
+- **CI job** mirroring the fanotify VM job (pinned kernel, `lsm=…,bpf`).
 - **Fail-safe pinning** — pin program + maps + link to bpffs so enforcement survives
   daemon death (the headline property; until then it fails open like fanotify).
-- **TOFU-on-create** via the learn path (the daemon claims, then updates the maps).
+- **TOFU-on-create** via the learn path (the daemon claims, then re-syncs the maps).
+- **Atomic map re-sync** (double-buffer) — today's clear-then-insert has a brief
+  window; and **content-digest identity** (fsverity/IMA) so identity survives an
+  inode change (package upgrade) and resists path-spoofing — the `(dev, inode)`
+  remaining caveat now that the overlay/btrfs device mismatch is handled.
 
 ## Phase 1 (done)
 - **`fanotify` backend** (`crates/daemon/src/backend/fanotify.rs`) via the `nix`

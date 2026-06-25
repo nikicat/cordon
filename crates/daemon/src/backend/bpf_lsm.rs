@@ -16,33 +16,33 @@
 //!
 //! ## Scope (increment 1)
 //! Mirrors the capability `fanotify` ships today — deny a non-owner's open under an
-//! owned subtree — but in-kernel. Subtree matching is a dentry **(dev, inode)**
-//! ancestor walk; identity is the FNV-1a hash of the caller's exe path (matching
-//! the path-keyed store). **Not yet** done here and explicitly deferred to the next
-//! increment: TOFU-on-create via the learn path, and fail-safe **pinning** (pin the
-//! program + maps + link to bpffs so enforcement survives daemon death). Until
-//! pinning lands this backend, like `fanotify`, stops enforcing when the daemon
-//! exits. Full load/verify/enforce validation happens in a virtme-ng VM booted with
-//! `lsm=…,bpf` (this host's running kernel omits `bpf` from its LSM list).
+//! owned subtree — but in-kernel. Both the subtree (a dentry **(dev, inode)**
+//! ancestor walk) and the caller's executable are matched by inode identity; the
+//! daemon resolves paths to `(dev, inode)` at seed time, taking the device from the
+//! mount table so it agrees with the kernel on overlayfs/btrfs (see `proc::file_id`).
+//! Validated end-to-end in a virtme-ng VM (`lsm=…,bpf`). **Not yet** done and
+//! deferred to the next increment: TOFU-on-create via the learn path, and fail-safe
+//! **pinning** (pin the program + maps + link to bpffs so enforcement survives
+//! daemon death). Until pinning lands this backend, like `fanotify`, stops enforcing
+//! when the daemon exits.
 
+use crate::proc;
 use aya::maps::{Array, HashMap as BpfHashMap, RingBuf};
 use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::{
-    Decision, Dev, Ino, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES,
-    Mode as BpfMode, OwnerId, OwnerKey, Pid, Settings, SubtreeKey, exe_hash,
+    Decision, FileId, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES,
+    Mode as BpfMode, OwnerId, OwnerKey, Pid, Settings,
 };
 use cordon_core::backend::{Backend, Shutdown};
 use cordon_core::config::Mode;
-use cordon_core::engine::Engine;
+use cordon_core::engine::{Engine, Generation, PolicyClock};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::os::linux::fs::MetadataExt;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Poll wakeup cadence so the ring-buffer reader re-checks the shutdown flag.
 const POLL_TIMEOUT_MS: u16 = 500;
@@ -82,6 +82,7 @@ impl Backend for BpfLsmBackend {
             Btf::from_sys_fs().map_err(|e| Error::msg(format!("bpf-lsm: kernel BTF: {e}")))?;
 
         let mut ebpf = EbpfLoader::new()
+            .verifier_log_level(aya::VerifierLogLevel::VERBOSE)
             .btf(Some(&btf))
             .load_file(&self.object)
             .map_err(|e| {
@@ -90,6 +91,12 @@ impl Backend for BpfLsmBackend {
                     self.object.display()
                 ))
             })?;
+
+        // Capture the policy generation *before* the snapshot, so a mutation that
+        // races the initial seed is still caught by the re-sync loop (at worst a
+        // redundant re-seed, never a missed one).
+        let policy = engine.lock().unwrap().policy_clock();
+        let baseline = policy.current();
 
         // Seed the maps from the store *before* attaching, so the program never
         // sees an empty policy window.
@@ -119,9 +126,10 @@ impl Backend for BpfLsmBackend {
             "bpf-lsm active on the file_open hook",
         );
 
-        // Drain the ring buffer of denials/would-denies into the journal until
-        // shutdown. The verdict already happened in-kernel; this is the learn path.
-        drain_events(&mut ebpf, &shutdown)
+        // Drain the ring buffer into the journal and keep the in-kernel maps in
+        // step with the store until shutdown. The verdict already happened
+        // in-kernel; this is the learn + control path.
+        serve(&mut ebpf, &engine, mode, policy, baseline, &shutdown)
     }
 }
 
@@ -189,14 +197,25 @@ fn snapshot_policy(engine: &Arc<Mutex<Engine>>) -> Result<PolicySnapshot> {
 /// Install each owned subtree as a (dev, inode) → owner entry. Returns how many
 /// were seeded; a subtree we can't `stat` is skipped (logged), not fatal.
 fn seed_subtrees(ebpf: &mut Ebpf, subtrees: &[SubtreeSeed]) -> Result<usize> {
-    let mut map: BpfHashMap<_, SubtreeKey, OwnerId> =
+    let mut map: BpfHashMap<_, FileId, OwnerId> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_SUBTREES)?)
             .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SUBTREES}: {e}")))?;
+    // Clear stale entries first so a re-sync reflects removals (e.g. disown). Not
+    // atomic with the re-insert — a concurrent open can briefly see a subtree as
+    // unprotected; an atomic double-buffer is a later hardening (DESIGN §4).
+    let stale: Vec<FileId> = map
+        .keys()
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::msg(format!("bpf-lsm: list {MAP_SUBTREES}: {e}")))?;
+    for k in stale {
+        map.remove(&k)
+            .map_err(|e| Error::msg(format!("bpf-lsm: clear subtree: {e}")))?;
+    }
     let mut seeded = 0usize;
     for st in subtrees {
-        match dev_ino(&st.path) {
-            Some((dev, ino)) => {
-                map.insert(SubtreeKey::new(dev, ino), OwnerId(st.owner_id), 0)
+        match proc::file_id(&st.path) {
+            Some(id) => {
+                map.insert(id, OwnerId(st.owner_id), 0)
                     .map_err(|e| Error::msg(format!("bpf-lsm: insert subtree: {e}")))?;
                 seeded += 1;
             }
@@ -208,17 +227,31 @@ fn seed_subtrees(ebpf: &mut Ebpf, subtrees: &[SubtreeSeed]) -> Result<usize> {
     Ok(seeded)
 }
 
-/// Install each owner identity as an (owner id, exe-hash) membership entry.
+/// Install each owner identity as an (owner id, exe `FileId`) membership entry.
 fn seed_owner_ids(ebpf: &mut Ebpf, identities: &[IdentitySeed]) -> Result<()> {
     let mut map: BpfHashMap<_, OwnerKey, u8> = BpfHashMap::try_from(map_mut(ebpf, MAP_OWNER_IDS)?)
         .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_OWNER_IDS}: {e}")))?;
+    let stale: Vec<OwnerKey> = map
+        .keys()
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::msg(format!("bpf-lsm: list {MAP_OWNER_IDS}: {e}")))?;
+    for k in stale {
+        map.remove(&k)
+            .map_err(|e| Error::msg(format!("bpf-lsm: clear owner id: {e}")))?;
+    }
     for id in identities {
-        let key = OwnerKey::new(
-            OwnerId(id.owner_id),
-            exe_hash(id.exe.as_os_str().as_bytes()),
-        );
-        map.insert(key, 1u8, 0)
-            .map_err(|e| Error::msg(format!("bpf-lsm: insert owner id: {e}")))?;
+        // The exe is identified by inode, so it must exist now to be resolved. An
+        // identity whose file is absent simply isn't enforced (its owner would be
+        // over-denied) — log it rather than failing the whole sync.
+        match proc::file_id(&id.exe) {
+            Some(exe) => {
+                map.insert(OwnerKey::new(OwnerId(id.owner_id), exe), 1u8, 0)
+                    .map_err(|e| Error::msg(format!("bpf-lsm: insert owner id: {e}")))?;
+            }
+            None => {
+                warn!(exe = %id.exe.display(), "bpf-lsm: cannot stat owner exe; identity not enforced")
+            }
+        }
     }
     Ok(())
 }
@@ -234,21 +267,34 @@ fn seed_settings(ebpf: &mut Ebpf, mode: BpfMode) -> Result<()> {
     Ok(())
 }
 
-/// Poll the ring buffer and log each mediated denial / would-deny until shutdown.
-fn drain_events(ebpf: &mut Ebpf, shutdown: &Arc<Shutdown>) -> Result<()> {
+/// Drain the ring buffer into the journal and re-sync the policy maps whenever the
+/// store changes, until shutdown. The ring-buffer poll doubles as the re-sync tick:
+/// each wakeup (event or `POLL_TIMEOUT_MS` timeout) we compare the policy
+/// generation and re-seed if it advanced — so a runtime `adopt`/`disown` reaches
+/// the kernel within one poll interval, no restart needed.
+fn serve(
+    ebpf: &mut Ebpf,
+    engine: &Arc<Mutex<Engine>>,
+    mode: BpfMode,
+    policy: PolicyClock,
+    mut last_gen: Generation,
+    shutdown: &Arc<Shutdown>,
+) -> Result<()> {
+    // `take_map` removes EVENTS from `ebpf`; the other (policy) maps stay, so
+    // `ebpf` is still usable for re-seeding alongside the owned ring buffer.
     let mut ring = RingBuf::try_from(
         ebpf.take_map(MAP_EVENTS)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: {MAP_EVENTS} missing from object")))?,
     )
     .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_EVENTS}: {e}")))?;
-
     let raw = ring.as_raw_fd();
+
     while !shutdown.is_triggered() {
         // SAFETY: `raw` is the ring buffer's fd, owned by `ring` for this scope.
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
-            Ok(0) => continue, // timeout → re-check shutdown
+            Ok(0) => {} // timeout → fall through to the re-sync check
             Ok(_) => {
                 while let Some(item) = ring.next() {
                     log_event(&item);
@@ -256,6 +302,14 @@ fn drain_events(ebpf: &mut Ebpf, shutdown: &Arc<Shutdown>) -> Result<()> {
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::msg(format!("bpf-lsm: poll: {e}"))),
+        }
+
+        let now = policy.current();
+        if now != last_gen {
+            match seed_maps(ebpf, engine, mode) {
+                Ok(()) => last_gen = now,
+                Err(e) => error!(error = %e, "bpf-lsm: policy re-sync failed; will retry"),
+            }
         }
     }
     Ok(())
@@ -270,13 +324,34 @@ fn log_event(bytes: &[u8]) {
         );
         return;
     };
-    let path = String::from_utf8_lossy(event.path_bytes());
-    let exe = String::from_utf8_lossy(event.exe_bytes());
+    // No path is available from the kernel (no `bpf_d_path` at this hook), so the
+    // record carries inode identities; enrich the caller's exe from /proc only if
+    // it still resolves to the same inode.
+    let exe = exe_path(event.pid, event.exe).unwrap_or_else(|| fileid_str(event.exe));
+    let subtree = fileid_str(event.subtree);
     if event.decision == Decision::WOULD_DENY {
-        warn!(pid = event.pid.0, %exe, %path, owner = event.owner.0, "would deny (audit mode)");
+        warn!(pid = event.pid.0, %exe, %subtree, owner = event.owner.0, "would deny (audit mode)");
     } else {
-        info!(pid = event.pid.0, %exe, %path, owner = event.owner.0, "deny");
+        info!(pid = event.pid.0, %exe, %subtree, owner = event.owner.0, "deny");
     }
+}
+
+/// A best-effort friendly path for the caller's exe. The ring buffer is drained
+/// asynchronously, so by now `pid` may have exited or been recycled — reading
+/// `/proc/<pid>/exe` blind would misattribute the denial. So we trust the path only
+/// when it *still* resolves to the exact inode the kernel recorded; otherwise the
+/// caller logs the inode. The kernel's `FileId` is the race-free anchor.
+fn exe_path(pid: Pid, exe: FileId) -> Option<String> {
+    let link = format!("/proc/{}/exe", pid.0);
+    if proc::file_id(Path::new(&link))? != exe {
+        return None; // exited or pid-recycled — don't misattribute
+    }
+    Some(std::fs::read_link(&link).ok()?.display().to_string())
+}
+
+/// A human-readable `dev/inode` for a [`FileId`] in a log line.
+fn fileid_str(id: FileId) -> String {
+    format!("dev={} ino={}", id.dev.0, id.ino.0)
 }
 
 /// Reinterpret a ring-buffer record as a [`LearnEvent`]. Returns `None` if the
@@ -290,45 +365,8 @@ fn parse_event(bytes: &[u8]) -> Option<LearnEvent> {
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const LearnEvent) })
 }
 
-/// A path's (device, inode) in the **kernel's** `s_dev` encoding, so it matches
-/// what the eBPF side reads from `inode->i_sb->s_dev`.
-fn dev_ino(path: &Path) -> Option<(Dev, Ino)> {
-    let md = std::fs::metadata(path).ok()?;
-    Some((kernel_dev(md.st_dev()), Ino(md.st_ino())))
-}
-
-/// Convert a glibc `st_dev` to the kernel's internal `dev_t` (`MKDEV` form,
-/// `MINORBITS = 20`). glibc and the kernel encode major/minor differently, so the
-/// device number the kernel stores in `super_block->s_dev` is **not** the integer
-/// `stat(2)` reports — we have to re-pack it, or the (dev, inode) keys won't match
-/// and every protected file would read as unprotected.
-fn kernel_dev(st_dev: u64) -> Dev {
-    let major = nix::libc::major(st_dev) as u64;
-    let minor = nix::libc::minor(st_dev) as u64;
-    Dev((major << 20) | (minor & 0x000f_ffff))
-}
-
 /// `ebpf.map_mut(name)` with a uniform error.
 fn map_mut<'a>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut aya::maps::Map> {
     ebpf.map_mut(name)
         .ok_or_else(|| Error::msg(format!("bpf-lsm: map '{name}' missing from object")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn kernel_dev_repacks_major_minor() {
-        // glibc encodes (major=8, minor=2) — a typical /dev/sda2 — as this st_dev.
-        let st_dev = nix::libc::makedev(8, 2);
-        // Kernel MKDEV(8, 2) = (8 << 20) | 2.
-        assert_eq!(kernel_dev(st_dev), Dev((8u64 << 20) | 2));
-    }
-
-    #[test]
-    fn kernel_dev_handles_large_minor() {
-        let st_dev = nix::libc::makedev(259, 1234);
-        assert_eq!(kernel_dev(st_dev), Dev((259u64 << 20) | 1234));
-    }
 }

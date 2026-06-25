@@ -25,11 +25,6 @@ pub struct Ino(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct OwnerId(pub i64);
 
-/// An FNV-1a hash of an executable path — the identity key (see [`crate::hash`]).
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ExeHash(pub u64);
-
 /// A process id (thread-group id). Wraps `u32` to match the natural width on both
 /// sides — `std::process::id()` and the kernel's `bpf_get_current_pid_tgid() >> 32`
 /// — distinct from core's `Pid(i32)`, which mirrors `/proc`/`nix`.
@@ -80,7 +75,6 @@ mod user {
     unsafe impl aya::Pod for Dev {}
     unsafe impl aya::Pod for Ino {}
     unsafe impl aya::Pod for OwnerId {}
-    unsafe impl aya::Pod for ExeHash {}
     unsafe impl aya::Pod for Pid {}
     unsafe impl aya::Pod for Mode {}
     unsafe impl aya::Pod for Decision {}

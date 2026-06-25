@@ -106,7 +106,16 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let shutdown = Shutdown::new();
     let backend_engine = Arc::clone(&engine);
     let backend_shutdown = Arc::clone(&shutdown);
-    let backend_thread = std::thread::spawn(move || backend.run(backend_engine, backend_shutdown));
+    // Log a backend failure the moment `run` returns, not at join — an
+    // un-graceful signal-kill never reaches the join below, and a backend that
+    // fails to load/attach (e.g. a BPF verifier rejection) must be visible.
+    let backend_thread = std::thread::spawn(move || {
+        let result = backend.run(backend_engine, backend_shutdown);
+        if let Err(e) = &result {
+            error!(error = %e, "backend exited with error");
+        }
+        result
+    });
 
     let ctx = Arc::new(Ctx {
         engine,
@@ -121,8 +130,6 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let serve_result = ctx.serve();
 
     shutdown.trigger();
-    if let Ok(Err(e)) = backend_thread.join() {
-        error!(error = %e, "backend exited with error");
-    }
+    let _ = backend_thread.join();
     serve_result
 }

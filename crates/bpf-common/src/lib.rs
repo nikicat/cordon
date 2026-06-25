@@ -4,9 +4,10 @@
 //! The eBPF program is the boundary: it reads policy from BPF maps and returns a
 //! verdict in-kernel (DESIGN §4, "BPF-LSM"). The daemon fills those maps from the
 //! SQLite store and drains the ring buffer. For that to work the two sides must
-//! agree exactly on every key, value, record, and hash — so they live here, once:
+//! agree exactly on every key, value, and record — so they live here, once:
 //!
-//! - [`hash`] — the one identity-hash function (wraps the `fnv` crate).
+//! - [`ids`] — the scalar domain newtypes (`Dev`, `Ino`, `OwnerId`, `Pid`, `Mode`,
+//!   `Decision`).
 //! - [`maps`] — the map names and the POD key/value/record types.
 //!
 //! `#![no_std]` with no `aya` dependency by default, so the eBPF crate consumes it
@@ -15,13 +16,10 @@
 
 #![no_std]
 
-pub mod hash;
 pub mod ids;
 pub mod maps;
 
-pub use hash::exe_hash;
-pub use ids::{Decision, Dev, ExeHash, Ino, Mode, OwnerId, Pid};
+pub use ids::{Decision, Dev, Ino, Mode, OwnerId, Pid};
 pub use maps::{
-    LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES, OwnerKey, PATH_CAP,
-    Settings, SubtreeKey,
+    FileId, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES, OwnerKey, Settings,
 };
