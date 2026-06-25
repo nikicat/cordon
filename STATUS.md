@@ -1,9 +1,53 @@
 # STATUS
 
-**Phase: 1 functionally complete.** Phase 0 (core/store/daemon/CLI/mock) is done;
-the real Linux `fanotify` backend now enforces all of decision-flow steps 1–5
-(incl. TOFU-on-create) system-wide, with a fully-green CI that validates it in a
-virtme-ng VM on a pinned kernel. This file is the resume point.
+**Phase: 3 (bpf-lsm) started.** Phase 0 (core/store/daemon/CLI/mock) and Phase 1
+(the real Linux `fanotify` boundary, decision-flow steps 1–5 incl. TOFU-on-create,
+validated in a virtme-ng VM) are done. Phase 3 adds the hardened **`bpf-lsm`**
+backend — in-kernel verdicts — building and compiling end-to-end; enforcement
+validation in a VM is the next increment. This file is the resume point.
+
+## Phase 3 (bpf-lsm — in progress)
+The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an
+eBPF program on the `file_open` LSM hook, reading policy from BPF maps the daemon
+seeds from the store. Control-plane / data-plane split — the daemon is still
+required (load + seed maps + drain the learn ring buffer), but the verdict no longer
+waits on it.
+
+**Done (builds + lints + unit-tests green; pure-Rust via aya, no clang/libbpf):**
+- **`crates/bpf-common`** — `#![no_std]` POD types shared byte-for-byte by the eBPF
+  program and the loader: map names, `SubtreeKey`/`OwnerKey`/`Settings`/`LearnEvent`,
+  the `Dev`/`Ino`/`OwnerId`/`ExeHash` newtypes, and the FNV-1a identity hash (the
+  `fnv` crate, used identically on both sides). `user` feature adds the `aya::Pod`
+  impls.
+- **`crates/bpf`** — the eBPF data plane (`aya-ebpf`, standalone crate, pinned
+  nightly via its own `rust-toolchain.toml` + `.cargo/config.toml`). `file_open`
+  hook: fast-allow self, dentry **(dev, inode)** ancestor walk → most-specific
+  protected subtree, exe-path FNV hash → owner-identity lookup, `-EPERM`/allow by
+  mode, `LearnEvent` to a ring buffer. All `unsafe` (kernel reads, `bpf_d_path`,
+  ring writes) is confined to `kernel.rs` behind safe typed handles; `main.rs` is the
+  unsafe-free decision flow. `vmlinux.rs` generated from the host BTF and committed
+  (so building needs no libclang). **Compiles clean** to a valid BPF ELF
+  (`lsm/file_open` + `maps` + `license`), clippy/fmt clean.
+- **`crates/daemon` `bpf-lsm` feature** (`backend/bpf_lsm.rs`) — the aya loader:
+  `load_file` the object, seed `SUBTREES`/`OWNER_IDS`/`SETTINGS` from the store
+  (`stat` each subtree → kernel-encoded (dev, inode); FNV the owner exes), attach
+  `file_open`, then `poll`+drain the ring buffer into the journal (enforce → `info`
+  deny, audit → `warn` would-deny). Off by default so the stock build stays on stable
+  with no aya/eBPF deps. `BackendKind::BpfLsm` wired through config/CLI/`select`
+  (helpful error when the feature/Linux is absent). `kernel_dev` glibc→kernel
+  `dev_t` re-encoding is unit-tested.
+- **`just build-ebpf`** stages the object at `target/bpf/cordon.bpf.o`;
+  `bpf_object`/`bpf_pin_dir` config keys (defaults `/usr/lib/cordon/cordon.bpf.o`,
+  `/sys/fs/bpf/cordon`).
+
+**Next increment (needs a VM booted with `lsm=…,bpf` — the host omits `bpf` from its
+active LSM list, so the hook loads but never mediates):**
+- Load/verify/**enforce** validation: the BPF verifier must accept `bpf_d_path` on
+  `file_open` and the bounded exe-hash loop; then the Phase-1 smoke (owner allowed,
+  scraper `EPERM`) ported to the `bpf-lsm` backend. CI job mirroring the fanotify VM.
+- **Fail-safe pinning** — pin program + maps + link to bpffs so enforcement survives
+  daemon death (the headline property; until then it fails open like fanotify).
+- **TOFU-on-create** via the learn path (the daemon claims, then updates the maps).
 
 ## Phase 1 (done)
 - **`fanotify` backend** (`crates/daemon/src/backend/fanotify.rs`) via the `nix`

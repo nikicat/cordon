@@ -92,7 +92,7 @@ fn run(args: Args) -> cordon_core::Result<()> {
     }
     let engine = Arc::new(Mutex::new(Engine::new(store)?));
 
-    let backend = backend::select(cfg.backend, cfg.mode)?;
+    let backend = backend::select(&cfg)?;
 
     info!(
         backend = backend.name(),

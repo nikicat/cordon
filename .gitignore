@@ -1,4 +1,7 @@
 /target
+# The eBPF crate is a standalone workspace (excluded from the root) and builds
+# into its own target dir.
+/crates/bpf/target
 **/*.rs.bk
 *.db
 *.db-wal

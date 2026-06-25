@@ -142,7 +142,7 @@ needs ES/root).
 > from the plan** and kept only as an *optional future* sandbox mode, not a
 > deliverable.
 
-### BPF-LSM — the hardened Linux boundary (planned; supersedes `fanotify` for production)
+### BPF-LSM — the hardened Linux boundary (in progress; supersedes `fanotify` for production)
 `fanotify` got us a correct, portable MVP fast, but it is the *wrong shape* for
 per-object policy — it was built for whole-volume AV/HSM scanning. It can only
 veto `open`/`access`/`exec` (no structural-op gating), and per-directory marks

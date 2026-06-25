@@ -19,8 +19,13 @@ pub enum BackendKind {
     /// Unprivileged dev/CI backend; events injected over IPC. Not a boundary.
     #[default]
     Mock,
-    /// Linux `fanotify FAN_OPEN_PERM` (root). The real boundary.
+    /// Linux `fanotify FAN_OPEN_PERM` (root). The portable boundary (fail-open).
     Fanotify,
+    /// Linux BPF-LSM (root, CAP_BPF + CAP_MAC_ADMIN). The hardened boundary:
+    /// in-kernel verdicts, fail-safe via pinned programs (DESIGN §4). Built into
+    /// the daemon only with the `bpf-lsm` cargo feature.
+    #[serde(rename = "bpf-lsm")]
+    BpfLsm,
 }
 
 impl BackendKind {
@@ -28,6 +33,7 @@ impl BackendKind {
         match self {
             BackendKind::Mock => "mock",
             BackendKind::Fanotify => "fanotify",
+            BackendKind::BpfLsm => "bpf-lsm",
         }
     }
 }
@@ -44,8 +50,9 @@ impl std::str::FromStr for BackendKind {
         match s {
             "mock" => Ok(BackendKind::Mock),
             "fanotify" => Ok(BackendKind::Fanotify),
+            "bpf-lsm" => Ok(BackendKind::BpfLsm),
             other => Err(Error::msg(format!(
-                "unknown backend '{other}' (expected 'mock' or 'fanotify')"
+                "unknown backend '{other}' (expected 'mock', 'fanotify', or 'bpf-lsm')"
             ))),
         }
     }

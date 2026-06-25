@@ -10,6 +10,13 @@ rust-version.workspace = true
 name = "cordond"
 path = "src/main.rs"
 
+[features]
+# The hardened Linux `bpf-lsm` backend. Off by default so the stock build stays on
+# stable with no aya/eBPF toolchain; turn on (Linux) to compile the in-kernel
+# boundary in. The eBPF *object* is built separately (`just build-ebpf`) and loaded
+# at runtime, so this feature only needs the userspace `aya` crate to compile.
+bpf-lsm = ["dep:aya", "dep:cordon-bpf-common"]
+
 [dependencies]
 cordon-core = { workspace = true }
 serde = { workspace = true }
@@ -17,10 +24,15 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# bpf-lsm backend (userspace control plane): the aya loader + the map/record types
+# shared with the eBPF program. Optional — pulled in only by the `bpf-lsm` feature.
+aya = { version = "0.14", optional = true }
+cordon-bpf-common = { path = "../bpf-common", features = ["user"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # fanotify permission events + write_response (most fanotify crates are
-# notification-only); nix wraps the unsafe syscalls in a safe, tested API.
+# notification-only); nix wraps the unsafe syscalls in a safe, tested API. The
+# bpf-lsm backend also reuses nix `poll` to drive the ring-buffer reader.
 nix = { version = "0.31.3", features = ["fanotify", "poll", "process"] }
 
 [dev-dependencies]
