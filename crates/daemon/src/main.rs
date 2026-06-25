@@ -61,13 +61,17 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Logs to stderr; level via `RUST_LOG` (default `info`).
+/// Logs to stderr; level via `RUST_LOG` (default `info`). ANSI styling only when
+/// stderr is a terminal, so a redirected log or journald capture stays free of
+/// escape codes (the default `fmt` colors unconditionally).
 fn init_tracing() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 }
 
