@@ -1,10 +1,12 @@
 # STATUS
 
-**Phase: 3 (bpf-lsm) started.** Phase 0 (core/store/daemon/CLI/mock) and Phase 1
-(the real Linux `fanotify` boundary, decision-flow steps 1–5 incl. TOFU-on-create,
-validated in a virtme-ng VM) are done. Phase 3 adds the hardened **`bpf-lsm`**
-backend — in-kernel verdicts — building and compiling end-to-end; enforcement
-validation in a VM is the next increment. This file is the resume point.
+**Phase: 3 (bpf-lsm) — in-kernel boundary enforcing, VM-validated.** Phase 0
+(core/store/daemon/CLI/mock) and Phase 1 (the Linux `fanotify` backend —
+decision-flow steps 1–5 incl. TOFU-on-create, in a virtme-ng VM) are done. Note
+`fanotify` is a **dev/test backend, not a security boundary** (fail-open + path-
+bypass); the real Linux boundary is **`bpf-lsm`**, which Phase 3 adds — in-kernel
+verdicts, validated end-to-end in a VM (owner allowed, non-owner `EPERM`). This file
+is the resume point.
 
 ## Phase 3 (bpf-lsm — in progress)
 The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an

@@ -15,10 +15,12 @@ gets `ENOENT`/`EACCES` (and, with the vault, only ciphertext at rest).
 > Working name. See the naming note in `DESIGN.md` — deliberately *not* in the
 > `gate`/`Gatekeeper` namespace.
 
-Status: **Phase 1 done** — policy core, SQLite store, `cordond` daemon, `cordon`
-CLI, and the real Linux **`fanotify`** backend (root) that denies non-owner opens
-of owned subtrees, with TOFU creator-owns and an enforce/audit mode. Validated in
-CI in a virtme-ng VM on a pinned kernel. See [`STATUS.md`](STATUS.md).
+Status: **Phase 3 in progress** — the in-kernel **`bpf-lsm`** backend (the real
+Linux boundary) denies non-owner opens of owned subtrees, validated end-to-end in a
+virtme-ng VM in CI. Phases 0–1 (policy core, SQLite store, `cordond` daemon,
+`cordon` CLI, TOFU creator-owns, enforce/audit) are done. The Linux **`fanotify`**
+backend is a **dev/test backend, NOT a security boundary** (it fails open and is
+path-bypassable). See [`STATUS.md`](STATUS.md).
 
 ## Build & try (dev, user-mode, mock backend)
 
@@ -45,6 +47,8 @@ export CORDON_CONFIG=/tmp/cordon.toml
 ./target/debug/cordon status
 ```
 
-For the **real** boundary (root `fanotify`), see `packaging/cordon.example.toml`
-and the smoke test `packaging/test/run-in-vm.sh` (runs it in a VM, no host root).
+For the **real** boundary (root **`bpf-lsm`**, in-kernel), see
+`packaging/cordon.example.toml` and `packaging/test/run-bpf-lsm-vm.sh` (runs it in a
+VM, no host root). The root `fanotify` backend (`run-in-vm.sh`) is dev/test only —
+not a security boundary.
 

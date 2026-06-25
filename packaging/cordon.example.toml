@@ -12,7 +12,9 @@
 
 # Enforcement backend:
 #   "mock"     — dev/CI, NOT a boundary (events injected over IPC).
-#   "fanotify" — Linux, root. Portable boundary; fail-OPEN if the daemon dies.
+#   "fanotify" — Linux, root. DEV/TEST ONLY, not a security boundary: it fails
+#                OPEN if the daemon dies and decides on the open-time path
+#                (rename-out-of-zone bypass). Use bpf-lsm for real protection.
 #   "bpf-lsm"  — Linux, root (CAP_BPF + CAP_MAC_ADMIN). Hardened boundary: the
 #                verdict is returned in-kernel from BPF maps. Needs a kernel with
 #                CONFIG_BPF_LSM=y and `bpf` in the active LSM list (`lsm=…,bpf` on

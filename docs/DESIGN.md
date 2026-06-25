@@ -95,14 +95,22 @@ Backends sit behind one interface:
 |---|---|---|---|---|
 | `mock`/`replay` | user | synthetic events | no | unit/logic tests |
 | `seccomp-unotify` | user (`no_new_privs`) | descendants of `cordon run -- <tool>` | partial (launch-scoped) | dev; single-tool sandbox |
-| `fanotify` | **root** (CAP_SYS_ADMIN) | system-wide | **yes** (fail-open) | Linux MVP / portable fallback |
-| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe) | Linux production (hardened) |
+| `fanotify` | **root** (CAP_SYS_ADMIN) | system-wide | **no** — fail-open + path-bypass | Linux **dev/test only** — NOT a security boundary |
+| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe) | Linux production — **the boundary** |
 | `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS production |
 
 So the daemon runs **`systemctl --user`** in dev with the `mock` backend — no
 root, fast iteration, the whole policy engine testable — and swaps to the
-`fanotify`/ES backend (system service) for the real guarantee. (The real
-`fanotify` backend is itself testable unprivileged via a virtme-ng VM — §11.)
+**`bpf-lsm`**/ES backend (system service) for the real guarantee.
+
+**`fanotify` is a dev/test backend, not a security boundary.** It enforces while
+running, which made it a fast MVP and a good way to exercise the engine against a
+real kernel (unprivileged via a virtme-ng VM — §11), but it is **not** something to
+rely on for protection: it **fails open** (daemon down/slow ⇒ every open allowed),
+it decides in **userspace on the open-time path** (the rename-out-of-zone bypass
+below), and its identity is a best-effort `/proc` read. The production Linux
+boundary is **`bpf-lsm`** (in-kernel verdict, fail-safe); on kernels without it
+there is simply no hardened Linux boundary yet.
 
 **Why `fanotify` needs root:** permission events (`FAN_OPEN_PERM`) let you *block,
 deny, and surveil* `open()` for *any* process on the box — a system-wide
@@ -164,25 +172,41 @@ answer), making the trade one-sided. Versus `fanotify`:
   secret out of a protected subtree, then opens it at an unprotected path —
   `fanotify` decides on the open-time path and allows it; BPF-LSM vetoes the
   rename (or keys identity on the inode, not the path).
-- **In-kernel zone filtering.** The program tests the path (`bpf_d_path`, or
-  `(dev,inode)` / LPM-trie keying) and allows non-zone opens *without leaving the
-  kernel* — no whole-`/` funnel; the hot path never crosses into userspace.
-- **Stronger identity, in-kernel.** Caller exe from `task->mm->exe_file`
-  (race-free, no `/proc` readlink); optional **content digest** of the opener via
+- **In-kernel matching → no funnel.** The program walks the opened file's dentry
+  ancestors by **`(dev,inode)`** and allows non-zone opens *without leaving the
+  kernel* — no whole-`/` funnel; the hot path never crosses into userspace. Path
+  *strings* are out: `bpf_d_path` is **not allowed at the `file_open` hook** (a
+  verifier discovery — `security_file_open` isn't in `btf_allowlist_d_path`), so
+  matching is inode-based. The daemon resolves paths → `(dev,inode)` at seed time,
+  taking the device from the **mount table** (`/proc/self/mountinfo` = the mount's
+  `sb->s_dev`) so it agrees with the kernel on overlayfs/btrfs — *not* `stat`'s
+  per-layer/-subvolume device.
+- **Stronger identity, in-kernel.** Caller exe identity is its **`(dev,inode)`**,
+  read straight from `task->mm->exe_file` — race-free, no `/proc` readlink. The
+  hardening beyond that is a **content digest** of the opener via
   `bpf_ima_file_hash()` (IMA) or `bpf_get_fsverity_digest()` (fs-verity) —
-  realizing the §5 `path+inode`/`signature` granularity against a hash, not a
-  spoofable path. (IMA *appraisal* + a keyring gets "verified-signed-by-key," the
-  closest Linux analog to ES code-signing — enterprise setup, not free.)
+  identifying the binary by *what it is*: surviving an inode change (package
+  upgrade) and resisting copy-to-a-blessed-path, against a hash not a spoofable
+  path. (IMA *appraisal* + a keyring gets "verified-signed-by-key," the closest
+  Linux analog to ES code-signing — enterprise setup, not free.)
 - **Fail-safe, not fail-open.** Pin the programs and their `bpf_link` to **bpffs**
   (`/sys/fs/bpf/…`) and enforcement persists with **no holding process** — the
   daemon can crash/restart with *zero* enforcement gap, inverting `fanotify`'s
   posture (kill the daemon → marks drop → fail-open).
 
+**Implemented so far (increment 1 — validated in a VM, see STATUS):** the
+`file_open` verdict (subtree `(dev,inode)` ancestor walk + exe-`(dev,inode)`
+identity), map-sync from the store on every ownership change, and the ring-buffer
+learn path. The **structural-op gating** (closing the rename bypass), **content-
+digest identity**, and **fail-safe pinning** described above are the design's next
+increments, not yet shipped — so today's `bpf-lsm` enforces reads like `fanotify`
+but in-kernel, and (until pinning) still fails open when the daemon dies.
+
 **Deny/learn delivery — decoupled from the verdict.** Unlike `fanotify` (where
 delivery to userspace *is* the decision), the in-kernel program has already
 decided; learning rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a deny
-/ would-deny (audit) / TOFU-claim the hook emits a record (pid, exe-hash, inode,
-op, reason, ts) and the daemon drains it asynchronously via `epoll`. It does
+/ would-deny (audit) the hook emits a record (pid, exe `(dev,inode)`, subtree
+`(dev,inode)`, decision) and the daemon drains it asynchronously. It does
 **not** block the syscall. Lossy under flood = you drop *observability records*,
 never *enforcement* (a discard counter bumps).
 
@@ -216,10 +240,11 @@ content-hash helpers are ≥ 5.11 / 6.x); `CAP_BPF` + `CAP_MAC_ADMIN`. Heavier t
 ship than `fanotify` (libbpf + CO-RE + a verifier-friendly program; path-prefix
 matching is the fiddly part). **Additive** to existing LSMs — it can only
 *further* restrict, never loosen (a SELinux/AppArmor deny still denies). So
-`fanotify` stays as the **portable fallback** (older kernels, or `bpf` absent from
-the LSM list); `bpf-lsm` is the hardened production boundary where available. Real
-precedent for exactly this allow/deny-by-path use: **KubeArmor**, **Tetragon**,
-**bpflock** (§13).
+`bpf-lsm` is the hardened production boundary where available; on older kernels (or
+with `bpf` absent from the LSM list) there is **no hardened Linux boundary** — the
+`fanotify` backend remains only as a **dev/test** harness, not a fallback to rely
+on (it fails open and is path-bypassable). Real precedent for exactly this
+allow/deny use: **KubeArmor**, **Tetragon**, **bpflock** (§13).
 
 **Lineage is subsumed here (cancels the standalone cache, §8.2/§12).** Because the
 backend already runs in-kernel, the §8.2 ancestry hardening is *folded in*, not a
@@ -432,18 +457,23 @@ Same shape both OSes: root authorizer daemon + shared SQLite store + per-session
 prompt agent + `cordon` CLI. Per-tool cost = a row, not a profile.
 
 ## 10. Honest limitations
-- Fail-open when the daemon is down (accepted in scope) — **except the `bpf-lsm`
-  backend**, which fails *safe*: pinned in-kernel programs survive daemon death (§4).
+- **`fanotify` is not a security boundary — dev/test only** (§4): it fails open
+  (daemon down ⇒ allowed), decides in userspace on the open-time path (rename-out-
+  of-zone bypass), and reads identity best-effort from `/proc`. The Linux boundary
+  is **`bpf-lsm`** (in-kernel, fail-safe once pinned); on kernels without it there
+  is no hardened Linux boundary yet.
+- Fail-open when the daemon is down — the `bpf-lsm` backend *will* fail *safe* once
+  its programs are bpffs-pinned (§4); until that increment lands it, too, fails open.
 - Parent chain is best-effort — double-fork launders ancestry; argv untrusted.
 - Interpreted tools surface as their interpreter → need ancestry or explicit rule.
 - Interactive mode: first-access denial friction; prompt-fatigue/habituation risk
   (mitigate: prompt only on protected subtrees, first touch, rich context).
 - Confused-deputy: gating ≠ stopping a tool's own export surface (out of scope).
-- `fanotify` needs `CAP_SYS_ADMIN`; ES needs a restricted entitlement (SIP
-  relaxation for personal use). Both production backends run as root.
-- **User-mode is not a boundary** — the `--user` dev daemon (`mock` backend) is
-  for development/CI only; real protection needs the root
-  `fanotify`/ES backend.
+- `bpf-lsm` needs `CAP_BPF` + `CAP_MAC_ADMIN`; `fanotify` needs `CAP_SYS_ADMIN`; ES
+  needs a restricted entitlement (SIP relaxation for personal use). All run as root.
+- **Neither user-mode nor `fanotify` is a boundary** — the `--user` dev daemon
+  (`mock`) and the root `fanotify` backend are both development/test only; real
+  protection needs the root `bpf-lsm`/ES backend.
 - **macOS backend shares ES's ceiling** — open()-time mediation only (no
   `read(2)` event), symlinks not followed, ES "default mute set" binaries
   unmediated. Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
@@ -463,10 +493,12 @@ fires on a pre-existing unowned path and "approve permanently" persists.
 ### Test tiers (by privilege)
 - **Unprivileged (mock backend):** the policy core, store, decision flow, and IPC
   e2e — `cargo test`, CI-friendly, no root. Covers everything but the kernel hook.
-- **Privileged boundary (fanotify), without host root → virtme-ng VM.** The real
-  `fanotify` backend needs `CAP_SYS_ADMIN`, but we get it from a **virtme-ng VM**
-  (`packaging/test/run-in-vm.sh`) booting a **pinned upstream kernel** (Ubuntu
-  mainline, e.g. `v6.12`) as guest-root — needs only `/dev/kvm` (group `kvm`), no
+- **Kernel backends in a VM, without host root → virtme-ng.** The `fanotify`
+  (dev/test) backend needs `CAP_SYS_ADMIN`, and the `bpf-lsm` (boundary) backend
+  needs `CAP_BPF`+`CAP_MAC_ADMIN` plus `bpf` in the LSM list — we get both from a
+  **virtme-ng VM** (`packaging/test/run-in-vm.sh`, `run-bpf-lsm-vm.sh`) booting a
+  **pinned upstream kernel** (Ubuntu mainline, e.g. `v6.12`) as guest-root — needs
+  only `/dev/kvm` (group `kvm`), no
   host root. The VM runs qemu **directly** (no container), and virtme-ng reuses
   the host userspace, so there is no rootfs to build and no glibc mismatch. The
   *same* harness + kernel run locally and in CI, so the kernel never diverges.
@@ -480,9 +512,10 @@ fires on a pre-existing unowned path and "approve permanently" persists.
   **differently per environment** (`gid_map: operation not permitted` locally vs
   `memfd_create: EINVAL` on GitHub) — non-reproducible, so undebuggable across
   environments. virtme-ng collapses the stack to a single `/dev/kvm` dependency.
-- The Phase 1 smoke test (`packaging/test/phase1-fanotify-smoke.sh`) proves
-  owner-allow + scraper-deny (`EPERM`) through the real backend — green in the
-  virtme-ng VM on both the host kernel and pinned `v6.12`.
+- The smoke tests prove owner-allow + scraper-deny (`EPERM`) through a real kernel
+  backend — green in the virtme-ng VM (host kernel + pinned `v6.12`):
+  `phase1-fanotify-smoke.sh` (fanotify) and `bpf-lsm-smoke.sh` (the `bpf-lsm`
+  boundary, booted `lsm=…,bpf`).
 
 ## 12. Phased plan
 - **Phase 0 — skeleton + user-mode daemon.** Rust workspace; SQLite store +
@@ -600,7 +633,7 @@ secret config dirs — transparently, cross-platform, zero per-tool policy."
 - **FUSE: bindfs / gocryptfs / fuse-t** — a userspace FS can gate on the caller's
   pid, and **fuse-t** does it on macOS without a kext. But the mount is global
   (not per-process), PID identity is racy, and macFUSE's kext *lowers* platform
-  security. We use a kernel authorizer (fanotify/ES) instead; `fuse-t` is kept
+  security. We use a kernel authorizer (bpf-lsm/ES) instead; `fuse-t` is kept
   only for the deferred transparency layer.
 
 ### Observability & eBPF enforcement
