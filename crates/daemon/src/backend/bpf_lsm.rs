@@ -92,22 +92,11 @@ impl Backend for BpfLsmBackend {
                 ))
             })?;
 
-        // Capture the policy generation *before* the snapshot, so a mutation that
-        // races the initial seed is still caught by the re-sync loop (at worst a
-        // redundant re-seed, never a missed one).
-        let policy = engine.lock().unwrap().policy_clock();
-        let baseline = policy.current();
-
-        // Seed the maps from the store *before* attaching, so the program never
-        // sees an empty policy window.
-        let mode = if self.mode.enforces() {
-            BpfMode::ENFORCE
-        } else {
-            BpfMode::AUDIT
-        };
-        seed_maps(&mut ebpf, &engine, mode)?;
-
-        // Attach the in-kernel verdict to the file_open LSM hook.
+        // Attach the hook first (maps still empty ⇒ allow-all, transient), then
+        // PROVE it enforces before trusting it. A struct-layout mismatch between the
+        // object and the running kernel (the object is NOT CO-RE-relocatable) reads
+        // garbage, matches nothing, and silently allows everything — "active" but a
+        // no-op boundary. The self-test makes that a loud fatal error.
         let program: &mut Lsm = ebpf
             .program_mut(HOOK)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: program '{HOOK}' missing from object")))?
@@ -119,11 +108,23 @@ impl Backend for BpfLsmBackend {
         program
             .attach()
             .map_err(|e| Error::msg(format!("bpf-lsm: attach {HOOK}: {e}")))?;
+        self_test(&mut ebpf)?;
+
+        // Now seed the real policy. Capture the generation before the snapshot so a
+        // mutation that races the seed is still caught by the re-sync loop.
+        let policy = engine.lock().unwrap().policy_clock();
+        let baseline = policy.current();
+        let mode = if self.mode.enforces() {
+            BpfMode::ENFORCE
+        } else {
+            BpfMode::AUDIT
+        };
+        seed_maps(&mut ebpf, &engine, mode)?;
 
         info!(
             mode = self.mode.as_str(),
             object = %self.object.display(),
-            "bpf-lsm active on the file_open hook",
+            "bpf-lsm active on the file_open hook (self-test passed)",
         );
 
         // Drain the ring buffer into the journal and keep the in-kernel maps in
@@ -259,12 +260,67 @@ fn seed_owner_ids(ebpf: &mut Ebpf, identities: &[IdentitySeed]) -> Result<()> {
 /// Set the one-element `SETTINGS` record: our pid (fast-allowed so we never
 /// deadlock on our own opens) and the enforce/audit mode.
 fn seed_settings(ebpf: &mut Ebpf, mode: BpfMode) -> Result<()> {
+    set_settings(ebpf, Pid(std::process::id()), mode)
+}
+
+/// Write the `SETTINGS` record with an explicit pid (used by the self-test to make
+/// the daemon itself *not* fast-allowed).
+fn set_settings(ebpf: &mut Ebpf, pid: Pid, mode: BpfMode) -> Result<()> {
     let mut settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
         .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SETTINGS}: {e}")))?;
     settings
-        .set(0, Settings::new(Pid(std::process::id()), mode), 0)
+        .set(0, Settings::new(pid, mode), 0)
         .map_err(|e| Error::msg(format!("bpf-lsm: set settings: {e}")))?;
     Ok(())
+}
+
+/// Prove the in-kernel boundary actually enforces before trusting it — never run as
+/// a silent no-op. Protect a throwaway probe directory under an owner that has *no*
+/// identities (so nobody is an owner), make ourselves not-fast-allowed and enforce
+/// mode, and confirm our own open of it is denied. If the program is attached but
+/// its kernel reads are wrong (e.g. the object was built against a different
+/// kernel's struct layout — it is not CO-RE-relocatable), it matches nothing, the
+/// open is *allowed*, and we abort instead of pretending to protect.
+fn self_test(ebpf: &mut Ebpf) -> Result<()> {
+    let probe = std::env::temp_dir().join(format!("cordon-selftest.{}", std::process::id()));
+    std::fs::create_dir_all(&probe)
+        .map_err(|e| Error::msg(format!("bpf-lsm self-test: mkdir probe: {e}")))?;
+    let outcome = run_self_test(ebpf, &probe);
+    let _ = std::fs::remove_dir_all(&probe);
+    outcome
+}
+
+fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
+    let id = proc::file_id(probe)
+        .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve probe FileId"))?;
+    set_settings(ebpf, Pid(u32::MAX), BpfMode::ENFORCE)?; // u32::MAX: an impossible pid
+    probe_subtree(ebpf, id, true)?;
+    let opened = std::fs::File::open(probe);
+    probe_subtree(ebpf, id, false)?;
+    match opened {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Ok(_) => Err(Error::msg(
+            "bpf-lsm self-test FAILED: a protected open was ALLOWED — the program is \
+             attached but not enforcing (eBPF object vs running-kernel struct-layout \
+             mismatch?). Refusing to run as a silent no-op.",
+        )),
+        Err(e) => Err(Error::msg(format!(
+            "bpf-lsm self-test: probe open failed unexpectedly (not a deny): {e}"
+        ))),
+    }
+}
+
+/// Add (or remove) a probe subtree owned by a sentinel owner with no identities.
+fn probe_subtree(ebpf: &mut Ebpf, id: FileId, present: bool) -> Result<()> {
+    let mut map: BpfHashMap<_, FileId, OwnerId> =
+        BpfHashMap::try_from(map_mut(ebpf, MAP_SUBTREES)?)
+            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SUBTREES}: {e}")))?;
+    if present {
+        map.insert(id, OwnerId(-1), 0)
+    } else {
+        map.remove(&id)
+    }
+    .map_err(|e| Error::msg(format!("bpf-lsm self-test: probe map: {e}")))
 }
 
 /// Drain the ring buffer into the journal and re-sync the policy maps whenever the
