@@ -34,7 +34,7 @@ use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
     Decision, FileId, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES,
-    Mode as BpfMode, OwnerId, OwnerKey, Pid, Settings,
+    Mode as BpfMode, Offsets, OwnerId, OwnerKey, Pid, Settings,
 };
 use cordon_core::backend::{Backend, Shutdown};
 use cordon_core::config::Mode;
@@ -52,6 +52,10 @@ const POLL_TIMEOUT_MS: u16 = 500;
 /// The LSM hook we attach to, and the name of the program in the ELF (the eBPF
 /// function is `#[lsm(hook = "file_open")] fn file_open(..)`).
 const HOOK: &str = "file_open";
+
+/// Test-only env var: when set, [`maybe_poison_offsets`] forces deliberately wrong
+/// field offsets so the self-test's failure path can be exercised end-to-end.
+const POISON_OFFSETS_ENV: &str = "CORDON_SELFTEST_POISON_OFFSETS";
 
 pub struct BpfLsmBackend {
     mode: Mode,
@@ -88,7 +92,8 @@ impl Backend for BpfLsmBackend {
         // offsets from its BTF and inject them into the program's `.rodata` so it
         // reads `struct file`/`dentry`/`inode`/… correctly on *this* kernel. A field
         // the kernel has renamed/removed fails here, loudly, before we attach.
-        let offsets = KernelBtf::from_running_kernel()?.offsets()?;
+        let mut offsets = KernelBtf::from_running_kernel()?.offsets()?;
+        maybe_poison_offsets(&mut offsets);
 
         let mut ebpf = EbpfLoader::new()
             .verifier_log_level(aya::VerifierLogLevel::VERBOSE)
@@ -282,6 +287,33 @@ fn set_settings(ebpf: &mut Ebpf, pid: Pid, mode: BpfMode) -> Result<()> {
         .set(0, Settings::new(pid, mode), 0)
         .map_err(|e| Error::msg(format!("bpf-lsm: set settings: {e}")))?;
     Ok(())
+}
+
+/// Test hook for the self-test's *failure* path. With `CORDON_SELFTEST_POISON_OFFSETS`
+/// set, throw away the BTF-resolved offsets and inject [`Offsets::POISON`] instead, so
+/// every in-kernel field read misses: the program attaches but matches nothing and
+/// would silently allow everything — exactly the kernel-mismatch no-op the self-test
+/// must catch. The negative-path e2e sets this and asserts the daemon aborts. Never
+/// set in production (a no-op otherwise).
+fn maybe_poison_offsets(offsets: &mut Offsets) {
+    if std::env::var_os(POISON_OFFSETS_ENV).is_some() {
+        warn!(
+            "{POISON_OFFSETS_ENV} set — injecting poison offsets; the self-test MUST now \
+             abort (test-only failure-path hook)"
+        );
+        // Keep `file_f_path_dentry`/`file_f_inode` real: they're the offsets applied to
+        // the *trusted* `file` ctx pointer, and the verifier bounds-checks trusted-pointer
+        // math against `.rodata` constants — an out-of-range value is rejected at *load*
+        // (a different, also-loud guard). Poison only the downstream offsets, which apply
+        // to scalar pointers read out of kernel memory (no verifier constraint): the dentry
+        // walk then reads garbage, finds no subtree, and would silently allow — exactly the
+        // no-op the self-test must catch.
+        *offsets = Offsets {
+            file_f_path_dentry: offsets.file_f_path_dentry,
+            file_f_inode: offsets.file_f_inode,
+            ..Offsets::POISON
+        };
+    }
 }
 
 /// Prove the in-kernel boundary actually enforces before trusting it — never run as
