@@ -14,8 +14,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-# Build the feature daemon + the eBPF object on the host (both reach the guest RO).
+# Build the feature daemon + the `cordon` CLI (the smoke's `adopt`) + the eBPF
+# object on the host (all reach the guest read-only).
 cargo build -p cordon-daemon --features bpf-lsm
+cargo build -p cordon-cli
 just build-ebpf
 
 # Activate `bpf` in the LSM list (override via CORDON_VM_LSM). Kept minimal —
