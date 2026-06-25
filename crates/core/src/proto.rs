@@ -8,12 +8,15 @@
 //! same `Request`/`Response` and `handle` logic work whether the daemon's accept
 //! loop is threads or async.
 
-use crate::Result;
+use crate::backend::BackendKind;
+use crate::config::Mode;
 use crate::event::Op;
 use crate::store::{OwnerDetail, Rule};
+use crate::{Count, Result, RuleId, Secs, UnixSecs};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 /// A command from a client to the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,10 +33,10 @@ pub enum Request {
         path: String,
         mode: String,
         allow: bool,
-        ttl_secs: Option<i64>,
+        ttl_secs: Option<Secs>,
     },
     /// Remove an explicit rule by id.
-    RemoveRule { id: i64 },
+    RemoveRule { id: RuleId },
     /// Claim a pre-existing subtree for `identity` (subsumes the `adopt` flow).
     Adopt { path: String, identity: String },
     /// Add an identity to the owner group of an existing subtree.
@@ -63,49 +66,48 @@ pub enum Response {
     Owners(Vec<OwnerInfo>),
     Rules(Vec<RuleInfo>),
     Decision(crate::decision::Decision),
-    RuleAdded { id: i64 },
+    RuleAdded { id: RuleId },
     Done { changed: bool },
     Error { message: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatusInfo {
-    pub backend: String,
-    pub store_path: String,
-    pub socket_path: String,
-    pub zones: Vec<String>,
-    pub owners: i64,
-    pub subtrees: i64,
-    pub rules: i64,
+    pub backend: BackendKind,
+    pub mode: Mode,
+    pub store: PathBuf,
+    pub socket: PathBuf,
+    pub zones: Vec<PathBuf>,
+    pub owners: Count,
+    pub subtrees: Count,
+    pub rules: Count,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OwnerInfo {
     pub name: String,
-    pub identities: Vec<String>,
-    pub subtrees: Vec<String>,
+    /// Exe paths in the owner group.
+    pub identities: Vec<PathBuf>,
+    pub subtrees: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuleInfo {
-    pub id: i64,
+    pub id: RuleId,
+    /// Owning identity (`*` = any) — a token, not necessarily a path.
     pub identity: String,
-    pub path: String,
+    pub path: PathBuf,
     pub mode: String,
     pub allow: bool,
-    pub expires_at: Option<i64>,
+    pub expires_at: Option<UnixSecs>,
 }
 
 impl From<OwnerDetail> for OwnerInfo {
     fn from(o: OwnerDetail) -> Self {
         OwnerInfo {
             name: o.name,
-            identities: o
-                .identities
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
-            subtrees: o.subtrees.iter().map(|p| p.display().to_string()).collect(),
+            identities: o.identities,
+            subtrees: o.subtrees,
         }
     }
 }
@@ -115,7 +117,7 @@ impl From<Rule> for RuleInfo {
         RuleInfo {
             id: r.id,
             identity: r.identity_exe,
-            path: r.path_prefix.display().to_string(),
+            path: r.path_prefix,
             mode: r.mode,
             allow: r.allow,
             expires_at: r.expires_at,

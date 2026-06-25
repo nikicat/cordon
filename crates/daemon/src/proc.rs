@@ -8,6 +8,7 @@
 
 use cordon_core::event::Op;
 use cordon_core::identity::Process;
+use nix::unistd::Pid;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use tracing::warn;
@@ -36,7 +37,7 @@ const MAX_HOPS: usize = 32;
 /// Caveat: `/proc/<pid>/syscall` reflects the thread-group-leader; a create from
 /// a non-main thread reads the wrong thread → falls back to `Read`. Degrades to
 /// `adopt`, never to a wrong verdict.
-pub fn access_op(pid: i32) -> Op {
+pub fn access_op(pid: Pid) -> Op {
     const O_CREAT: u64 = 0o100;
     const O_ACCMODE: u64 = 0o3;
     match open_flags(pid) {
@@ -51,7 +52,7 @@ pub fn access_op(pid: i32) -> Op {
             // auto-TOFU (it can still use `cordon adopt`). May be chatty under a
             // busy openat2 user (container runtimes); rate-limit if it becomes so.
             warn!(
-                pid,
+                pid = %pid,
                 "openat2 flags not decoded (behind a struct pointer); treating as read — TOFU/write-detection skipped for this access"
             );
             Op::Read
@@ -75,7 +76,7 @@ enum OpenSyscall {
 /// `nr arg0 arg1 … sp pc`, nr decimal, args hex). The flags argument index
 /// differs by syscall: `open(path, flags, …)` → arg1; `openat(dfd, path, flags,
 /// …)` → arg2.
-fn open_flags(pid: i32) -> OpenSyscall {
+fn open_flags(pid: Pid) -> OpenSyscall {
     let Ok(line) = std::fs::read_to_string(format!("/proc/{pid}/syscall")) else {
         return OpenSyscall::Other;
     };
@@ -124,7 +125,7 @@ fn open_flags(pid: i32) -> OpenSyscall {
 
 /// Resolve a pid's executable path via `/proc/<pid>/exe`. Strips the trailing
 /// " (deleted)" the kernel appends when the binary was unlinked/replaced.
-pub fn exe_of(pid: i32) -> Option<PathBuf> {
+pub fn exe_of(pid: Pid) -> Option<PathBuf> {
     let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     Some(strip_deleted(link))
 }
@@ -142,16 +143,16 @@ fn strip_deleted(p: PathBuf) -> PathBuf {
 /// Best-effort parent chain (nearest-first), bounded at init (`ppid <= 1`) and a
 /// hop cap. Each hop is validated only by readability; a hole in the chain stops
 /// the walk.
-pub fn ancestry(pid: i32) -> Vec<Process> {
+pub fn ancestry(pid: Pid) -> Vec<Process> {
     let mut out = Vec::new();
     let mut cur = pid;
     for _ in 0..MAX_HOPS {
         let Some(ppid) = parent_of(cur) else { break };
-        if ppid <= 1 {
+        if ppid.as_raw() <= 1 {
             break; // reached init / session root
         }
         match exe_of(ppid) {
-            Some(exe) => out.push(Process::new(ppid, exe)),
+            Some(exe) => out.push(Process::new(ppid.as_raw(), exe)),
             None => break,
         }
         cur = ppid;
@@ -159,9 +160,9 @@ pub fn ancestry(pid: i32) -> Vec<Process> {
     out
 }
 
-fn parent_of(pid: i32) -> Option<i32> {
+fn parent_of(pid: Pid) -> Option<Pid> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_ppid(&stat)
+    parse_ppid(&stat).map(Pid::from_raw)
 }
 
 /// Parse the ppid (4th field) from a `/proc/<pid>/stat` line. The `comm` field

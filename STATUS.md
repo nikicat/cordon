@@ -16,8 +16,22 @@ virtme-ng VM on a pinned kernel. This file is the resume point.
   + falls back). `O_CREAT` → `Op::Create` → engine auto-claims. Also yields
   write-detection. See the [why a miss is safe] reasoning in `proc.rs`.
 - **Backend selection** (`backend::select`) — `mock` | `fanotify` (Linux).
-- **`tracing`** logging in the daemon (denials at `info`, allows at `trace`);
-  the CLI keeps plain stderr (one-shot tool, not a service).
+- **Config file** (`core::config::Config`) — optional TOML holding the
+  *operational* settings (`mode`, `backend`, `socket`/`store`, initial `zones`
+  seed) with `${ENV}` interpolation; precedence CLI > file > default. Dynamic
+  policy stays in the store. `packaging/cordon.example.toml`. (Replaced the old
+  `CORDON_*` env overrides; tests/smoke now write a config file.)
+- **Enforce / audit mode** — `mode = "audit"` (or `--mode audit`) runs the full
+  decision flow but allows everything, logging would-be denials at `warn` — to
+  preview an ownership decision's blast radius. Default `enforce`. Validated in
+  the VM (scraper allowed + `would deny` logged).
+- **Typed boundaries** (review-driven): `BackendKind`/`Mode` enums (not strings),
+  a core `Pid` newtype + `nix::Pid` only at the syscall boundary, wire structs
+  carry `PathBuf`/enums so serde (not `.display()`) serializes them, and
+  `UnixSecs`/`Secs`/`Count`/`OwnerId`/`RuleId` aliases for the integers. `Ctx`
+  holds typed fields; the IPC server is `impl Ctx` methods.
+- **`tracing`** logging in the daemon (denials at `info`, allows at `trace`,
+  would-deny at `warn`); the CLI keeps plain stderr (one-shot tool, not a service).
 - **Caller identity** (`crates/daemon/src/proc.rs`) — `/proc/<pid>/exe` +
   ppid-chain walk; the `parse_ppid` parser is unit-tested.
 - **Validated unprivileged via virtme-ng VM** — `packaging/test/run-in-vm.sh`

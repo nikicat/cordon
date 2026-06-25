@@ -144,6 +144,13 @@ Locations: dev `--user` → socket `$XDG_RUNTIME_DIR/cordon.sock`, store
 `$XDG_STATE_HOME/cordon/`; prod system → `/run/cordon.sock`, `/var/lib/cordon/`
 (root-owned). The `cordon` CLI auto-detects.
 
+**Operational config** is an optional TOML file (`mode`, `backend`, `socket`/
+`store`, the initial `zones` seed), with `${ENV}` interpolation and precedence
+CLI > file > default; dynamic policy (owners/rules/zones) stays in the store.
+**Mode** is `enforce` (block) or `audit` (run the flow, log would-be denials,
+allow) — the latter previews an ownership decision's blast radius before it
+bites, mirroring the fail-open posture. See `packaging/cordon.example.toml`.
+
 Terminology: this daemon is the **gater**. The **broker** (§7) is the separate,
 deferred key-holder.
 

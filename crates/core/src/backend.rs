@@ -5,9 +5,51 @@
 //! store, IPC) is privilege-agnostic. Phase 0 ships only [`MockBackend`]; Phase 1
 //! adds a root `fanotify` backend implementing the same trait.
 
-use crate::Result;
 use crate::engine::Engine;
+use crate::{Error, Result};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Which enforcement backend to run. The concrete implementations live where
+/// their privilege/OS lands (`MockBackend` here; `fanotify` in the daemon crate;
+/// macOS Endpoint Security in Phase 4) — this enum is just the selector that
+/// flows from config/CLI to the daemon's backend factory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    /// Unprivileged dev/CI backend; events injected over IPC. Not a boundary.
+    #[default]
+    Mock,
+    /// Linux `fanotify FAN_OPEN_PERM` (root). The real boundary.
+    Fanotify,
+}
+
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Mock => "mock",
+            BackendKind::Fanotify => "fanotify",
+        }
+    }
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<BackendKind> {
+        match s {
+            "mock" => Ok(BackendKind::Mock),
+            "fanotify" => Ok(BackendKind::Fanotify),
+            other => Err(Error::msg(format!(
+                "unknown backend '{other}' (expected 'mock' or 'fanotify')"
+            ))),
+        }
+    }
+}
 
 /// A cooperative shutdown signal shared between the daemon and its backend
 /// thread. A backend's run loop parks on / polls this and returns when tripped.

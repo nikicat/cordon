@@ -35,6 +35,7 @@
 
 use crate::proc;
 use cordon_core::backend::{Backend, Shutdown};
+use cordon_core::config::Mode;
 use cordon_core::engine::Engine;
 use cordon_core::event::AccessEvent;
 use cordon_core::identity::Caller;
@@ -45,6 +46,7 @@ use nix::sys::fanotify::{
     EventFFlags, Fanotify, FanotifyEvent, FanotifyResponse, InitFlags, MarkFlags, MaskFlags,
     Response,
 };
+use nix::unistd::Pid;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::PathBuf;
@@ -54,11 +56,13 @@ use tracing::{error, info, trace, warn};
 /// Poll wakeup cadence so the loop re-checks the shutdown flag between events.
 const POLL_TIMEOUT_MS: u16 = 500;
 
-pub struct FanotifyBackend;
+pub struct FanotifyBackend {
+    mode: Mode,
+}
 
 impl FanotifyBackend {
-    pub fn new() -> Self {
-        FanotifyBackend
+    pub fn new(mode: Mode) -> Self {
+        FanotifyBackend { mode }
     }
 }
 
@@ -105,14 +109,19 @@ impl Backend for FanotifyBackend {
                 "fanotify: marked no filesystems (no zones/subtrees exist yet) — nothing to enforce",
             ));
         }
-        info!(filesystems = marked, "enforcing FAN_OPEN_PERM");
+        info!(
+            filesystems = marked,
+            mode = self.mode.as_str(),
+            "fanotify active on FAN_OPEN_PERM"
+        );
 
-        let me = std::process::id() as i32;
+        let mode = self.mode;
+        let me = Pid::this();
         while !shutdown.is_triggered() {
             let mut fds = [PollFd::new(group.as_fd(), PollFlags::POLLIN)];
             match poll(&mut fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
                 Ok(0) => continue, // timeout → re-check shutdown
-                Ok(_) => drain(&group, &engine, me),
+                Ok(_) => drain(&group, &engine, me, mode),
                 Err(Errno::EINTR) => continue,
                 Err(e) => return Err(Error::msg(format!("fanotify: poll: {e}"))),
             }
@@ -122,13 +131,13 @@ impl Backend for FanotifyBackend {
 }
 
 /// Read and dispatch all currently-pending events (NONBLOCK → until EAGAIN).
-fn drain(group: &Fanotify, engine: &Arc<Mutex<Engine>>, me: i32) {
+fn drain(group: &Fanotify, engine: &Arc<Mutex<Engine>>, me: Pid, mode: Mode) {
     loop {
         match group.read_events() {
             Ok(events) if events.is_empty() => break,
             Ok(events) => {
                 for ev in events {
-                    handle_event(group, ev, engine, me);
+                    handle_event(group, ev, engine, me, mode);
                 }
             }
             Err(Errno::EAGAIN) => break, // drained
@@ -143,7 +152,13 @@ fn drain(group: &Fanotify, engine: &Arc<Mutex<Engine>>, me: i32) {
 /// Decide and answer one event. The `FanotifyEvent` owns its object fd and closes
 /// it on drop, so we respond (kernel matches by fd) *before* `ev` goes out of
 /// scope at the end of this function.
-fn handle_event(group: &Fanotify, ev: FanotifyEvent, engine: &Arc<Mutex<Engine>>, me: i32) {
+fn handle_event(
+    group: &Fanotify,
+    ev: FanotifyEvent,
+    engine: &Arc<Mutex<Engine>>,
+    me: Pid,
+    mode: Mode,
+) {
     if !ev.check_version() {
         return;
     }
@@ -154,7 +169,7 @@ fn handle_event(group: &Fanotify, ev: FanotifyEvent, engine: &Arc<Mutex<Engine>>
         return; // FAN_NOFD (e.g. queue overflow) — nothing to act on
     };
 
-    let allow = decide(fd, ev.pid(), engine, me);
+    let allow = decide(fd, Pid::from_raw(ev.pid()), engine, me, mode);
     let response = if allow {
         Response::FAN_ALLOW
     } else {
@@ -165,9 +180,11 @@ fn handle_event(group: &Fanotify, ev: FanotifyEvent, engine: &Arc<Mutex<Engine>>
     }
 }
 
-/// Run the decision flow for one permission event. Fails **open** on any
-/// resolution error so a legitimate process is never hung by our own bugs.
-fn decide(fd: BorrowedFd<'_>, pid: i32, engine: &Arc<Mutex<Engine>>, me: i32) -> bool {
+/// Run the decision flow for one permission event and return whether to allow
+/// the open. Fails **open** on any resolution error so a legitimate process is
+/// never hung by our own bugs. In audit mode a denial is logged but still
+/// allowed.
+fn decide(fd: BorrowedFd<'_>, pid: Pid, engine: &Arc<Mutex<Engine>>, me: Pid, mode: Mode) -> bool {
     // Never gate the daemon's own opens (all our threads share this pid).
     if pid == me {
         return true;
@@ -184,7 +201,7 @@ fn decide(fd: BorrowedFd<'_>, pid: i32, engine: &Arc<Mutex<Engine>>, me: i32) ->
     // Read/write/create from the suspended caller's in-flight openat (drives
     // TOFU). Race-free for open/openat (flags are in a register); see proc.rs.
     let op = proc::access_op(pid);
-    let caller = Caller::new(pid, exe).with_ancestors(proc::ancestry(pid));
+    let caller = Caller::new(pid.as_raw(), exe).with_ancestors(proc::ancestry(pid));
     let event = AccessEvent::new(path, op, caller);
 
     let decision = match engine.lock().unwrap().evaluate(&event) {
@@ -194,14 +211,22 @@ fn decide(fd: BorrowedFd<'_>, pid: i32, engine: &Arc<Mutex<Engine>>, me: i32) ->
             return true;
         }
     };
-    // Denials are the security-relevant events → log at info; allows are noisy
-    // (every open on the marked fs) → trace.
+
+    let exe = event.caller.proc.exe.display();
+    let path = event.path.display();
+    let reason = decision.reason();
     if decision.allowed() {
-        trace!(pid, exe = %event.caller.proc.exe.display(), path = %event.path.display(), reason = ?decision.reason(), "allow");
+        // Allows are noisy (every open on the marked fs) → trace.
+        trace!(%pid, %exe, %path, ?reason, "allow");
+        true
+    } else if mode.enforces() {
+        info!(%pid, %exe, %path, ?reason, "deny");
+        false
     } else {
-        info!(pid, exe = %event.caller.proc.exe.display(), path = %event.path.display(), reason = ?decision.reason(), "deny");
+        // Audit mode: log the would-be denial but let the open through.
+        warn!(%pid, %exe, %path, ?reason, "would deny (audit mode)");
+        true
     }
-    decision.allowed()
 }
 
 /// The absolute path behind an event fd, via `/proc/self/fd/<fd>`.
