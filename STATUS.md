@@ -49,7 +49,11 @@ allowed, non-owner gets `EPERM`, in-kernel. Pure-Rust via aya, no clang/libbpf:*
   deps. `BackendKind::BpfLsm` wired through config/CLI/`select`. `kernel_dev`
   glibc→kernel `dev_t` re-encoding is unit-tested.
 - **`just build-ebpf`** stages the object; `bpf_object`/`bpf_pin_dir` config keys.
-  `packaging/test/bpf-lsm-smoke.sh` + `run-bpf-lsm-vm.sh` are the e2e.
+  `packaging/test/bpf-lsm-smoke.sh` + `run-bpf-lsm-vm.sh` are the e2e — a suite run in
+  one VM boot: enforce (owner-allow + scraper-deny + learn-path report), self-test
+  *negative* (poisoned offsets must abort, not silently allow), audit (would-deny
+  logged), nested subtrees (deepest match wins), multiple identities, disown re-sync,
+  and live-caller exe enrichment.
 
 **Key findings from the VM (these shaped the design):**
 - `bpf_d_path` is **not allowed** at the `file_open` LSM hook (`security_file_open`
