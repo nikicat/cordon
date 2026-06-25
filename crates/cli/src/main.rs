@@ -8,7 +8,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cordon_core::event::Op;
 use cordon_core::proto::{Request, Response, read_msg, write_msg};
-use cordon_core::{config, decision::Decision};
+use cordon_core::{Config, decision::Decision};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -21,7 +21,10 @@ use std::process::ExitCode;
     version
 )]
 struct Cli {
-    /// Daemon socket path (overrides $CORDON_SOCK / default).
+    /// Config file path (to locate the socket; overrides $CORDON_CONFIG / default).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Daemon socket path (overrides the config file).
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     /// Print the raw JSON response instead of a rendered view.
@@ -124,7 +127,13 @@ impl From<OpArg> for Op {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let socket = cli.socket.clone().unwrap_or_else(config::socket_path);
+    let socket = match resolve_socket(&cli) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cordon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let req = to_request(&cli.cmd);
     let is_submit = matches!(cli.cmd, Cmd::Submit(_));
 
@@ -185,6 +194,24 @@ fn to_request(cmd: &Cmd) -> Request {
     }
 }
 
+/// Render a list of paths for human output (`.display()` belongs here, at the
+/// terminal boundary — not on the wire).
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `--socket` wins; otherwise the socket from the config file (or its default).
+fn resolve_socket(cli: &Cli) -> cordon_core::Result<PathBuf> {
+    if let Some(s) = cli.socket.clone() {
+        return Ok(s);
+    }
+    Ok(Config::load(cli.config.as_deref())?.socket)
+}
+
 fn round_trip(socket: &std::path::Path, req: &Request) -> cordon_core::Result<Response> {
     let stream = UnixStream::connect(socket)?;
     let mut writer = BufWriter::new(stream.try_clone()?);
@@ -197,15 +224,16 @@ fn round_trip(socket: &std::path::Path, req: &Request) -> cordon_core::Result<Re
 fn render(resp: &Response) {
     match resp {
         Response::Status(s) => {
-            println!("backend:  {}", s.backend);
-            println!("store:    {}", s.store_path);
-            println!("socket:   {}", s.socket_path);
+            println!("backend:  {}", s.backend.as_str());
+            println!("mode:     {}", s.mode.as_str());
+            println!("store:    {}", s.store.display());
+            println!("socket:   {}", s.socket.display());
             println!("owners:   {}", s.owners);
             println!("subtrees: {}", s.subtrees);
             println!("rules:    {}", s.rules);
             println!("zones:");
             for z in &s.zones {
-                println!("  {z}");
+                println!("  {}", z.display());
             }
         }
         Response::Owners(owners) => {
@@ -214,9 +242,9 @@ fn render(resp: &Response) {
             }
             for o in owners {
                 println!("{}", o.name);
-                println!("  identities: {}", o.identities.join(", "));
+                println!("  identities: {}", join_paths(&o.identities));
                 if !o.subtrees.is_empty() {
-                    println!("  subtrees:   {}", o.subtrees.join(", "));
+                    println!("  subtrees:   {}", join_paths(&o.subtrees));
                 }
             }
         }
@@ -232,7 +260,12 @@ fn render(resp: &Response) {
                     .unwrap_or_default();
                 println!(
                     "#{} {} {} {} {}{}",
-                    r.id, pol, r.mode, r.identity, r.path, ttl
+                    r.id,
+                    pol,
+                    r.mode,
+                    r.identity,
+                    r.path.display(),
+                    ttl
                 );
             }
         }

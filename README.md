@@ -15,20 +15,25 @@ gets `ENOENT`/`EACCES` (and, with the vault, only ciphertext at rest).
 > Working name. See the naming note in `DESIGN.md` — deliberately *not* in the
 > `gate`/`Gatekeeper` namespace.
 
-Status: **Phase 0 built** — policy core, SQLite store, `cordond` daemon, and
-`cordon` CLI, all unprivileged with a `mock` backend (logic/CI only — *not* a
-security boundary yet; that's the root `fanotify` backend in Phase 1). See
-[`STATUS.md`](STATUS.md).
+Status: **Phase 1 done** — policy core, SQLite store, `cordond` daemon, `cordon`
+CLI, and the real Linux **`fanotify`** backend (root) that denies non-owner opens
+of owned subtrees, with TOFU creator-owns and an enforce/audit mode. Validated in
+CI in a virtme-ng VM on a pinned kernel. See [`STATUS.md`](STATUS.md).
 
-## Build & try (dev, user-mode)
+## Build & try (dev, user-mode, mock backend)
 
 ```sh
-cargo test                 # 18 tests: decision flow + IPC e2e
+cargo test                 # unprivileged: decision flow + IPC e2e
 cargo build
 
-# run the dev daemon (mock backend) against a throwaway $HOME
-export CORDON_SOCK=/tmp/cordon.sock CORDON_STORE=/tmp/cordon.db
-export CORDON_ZONES="$HOME:$HOME/.config"
+# a throwaway config (mock backend = not a boundary; for logic only)
+cat > /tmp/cordon.toml <<EOF
+backend = "mock"
+socket = "/tmp/cordon.sock"
+store  = "/tmp/cordon.db"
+zones  = ["${HOME}", "${HOME}/.config"]
+EOF
+export CORDON_CONFIG=/tmp/cordon.toml
 ./target/debug/cordond &
 
 # a tool that creates its own config becomes its owner (TOFU)...
@@ -37,6 +42,9 @@ export CORDON_ZONES="$HOME:$HOME/.config"
 ./target/debug/cordon submit --path "$HOME/.config/mytool/secret" --exe /usr/bin/mytool --op read
 # ...but a scraper is denied (exit 13):
 ./target/debug/cordon submit --path "$HOME/.config/mytool/secret" --exe /tmp/scraper --op read
-./target/debug/cordon owners
+./target/debug/cordon status
 ```
+
+For the **real** boundary (root `fanotify`), see `packaging/cordon.example.toml`
+and the smoke test `packaging/test/run-in-vm.sh` (runs it in a VM, no host root).
 

@@ -1,14 +1,154 @@
-//! Location resolution shared by the daemon and the CLI so they always agree on
-//! where the socket, the store, and the default zone roots live.
+//! Operational configuration.
 //!
-//! Dev (`--user`): socket `$XDG_RUNTIME_DIR/cordon.sock`, store
-//! `$XDG_STATE_HOME/cordon/cordon.db`. Prod (root): `/run/cordon.sock`,
-//! `/var/lib/cordon/cordon.db` (root-owned — a scraper must not be able to write
-//! itself in as owner, DESIGN §5). Every path honors an env override so tests
-//! can run fully hermetic.
+//! cordon's settings split in two:
+//! - **Bootstrap / operational** — `mode`, `backend`, and the `socket`/`store`
+//!   paths plus the initial `zones` seed — live in an optional **TOML config
+//!   file** (this module). They're needed before, or independent of, the store.
+//! - **Dynamic policy** — zones (after the first-run seed), owners, rules — live
+//!   in the SQLite store, mutated at runtime via the `cordon` CLI over IPC.
+//!
+//! Precedence is **CLI flag > config file > built-in default**. String values in
+//! the file may interpolate `${ENV}` (e.g. `socket = "${XDG_RUNTIME_DIR}/cordon.sock"`).
+//! The file is optional; absent ⇒ all defaults.
 
+use crate::backend::BackendKind;
+use crate::{Error, Result};
+use serde::Deserialize;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Whether the enforcement backend actually blocks (`Enforce`) or only logs what
+/// it *would* block (`Audit`) while allowing everything — for previewing the
+/// blast radius of an ownership decision before it bites.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Enforce,
+    Audit,
+}
+
+impl Mode {
+    /// True in enforce mode (the backend writes real denials).
+    pub fn enforces(self) -> bool {
+        matches!(self, Mode::Enforce)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Enforce => "enforce",
+            Mode::Audit => "audit",
+        }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Mode> {
+        match s {
+            "enforce" => Ok(Mode::Enforce),
+            "audit" => Ok(Mode::Audit),
+            other => Err(Error::msg(format!(
+                "invalid mode '{other}' (expected 'enforce' or 'audit')"
+            ))),
+        }
+    }
+}
+
+/// Fully-resolved operational config (file + defaults). The daemon applies CLI
+/// overrides on top of this.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub mode: Mode,
+    pub backend: BackendKind,
+    pub socket: PathBuf,
+    pub store: PathBuf,
+    /// Zone roots seeded into a fresh store (first run only; thereafter managed
+    /// via `cordon zone …`).
+    pub zones: Vec<PathBuf>,
+}
+
+/// The raw, all-optional TOML shape. Unknown keys are rejected so typos fail loud.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    mode: Option<String>,
+    backend: Option<String>,
+    socket: Option<String>,
+    store: Option<String>,
+    zones: Option<Vec<String>>,
+}
+
+impl Config {
+    /// Load config from `path` (else `$CORDON_CONFIG`, else the default
+    /// location), interpolating `${ENV}` and filling unset fields with defaults.
+    /// A missing file is fine — you get all defaults.
+    pub fn load(path: Option<&Path>) -> Result<Config> {
+        let path = path
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("CORDON_CONFIG").map(PathBuf::from))
+            .unwrap_or_else(default_config_path);
+        let file = match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str::<ConfigFile>(&text)
+                .map_err(|e| Error::msg(format!("config {}: {e}", path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
+            Err(e) => return Err(Error::msg(format!("config {}: {e}", path.display()))),
+        };
+        Config::resolve(file)
+    }
+
+    fn resolve(f: ConfigFile) -> Result<Config> {
+        Ok(Config {
+            mode: match f.mode {
+                Some(s) => interpolate(&s)?.parse()?,
+                None => Mode::default(),
+            },
+            backend: match f.backend {
+                Some(s) => interpolate(&s)?.parse()?,
+                None => BackendKind::default(),
+            },
+            socket: match f.socket {
+                Some(s) => PathBuf::from(interpolate(&s)?),
+                None => default_socket(),
+            },
+            store: match f.store {
+                Some(s) => PathBuf::from(interpolate(&s)?),
+                None => default_store(),
+            },
+            zones: match f.zones {
+                Some(list) => list
+                    .iter()
+                    .map(|s| interpolate(s).map(PathBuf::from))
+                    .collect::<Result<_>>()?,
+                None => default_zones(),
+            },
+        })
+    }
+}
+
+/// Expand `${VAR}` references from the environment. Errors on an unterminated
+/// `${` or an unset variable — misconfiguration should fail loudly, not silently
+/// produce an empty path.
+fn interpolate(s: &str) -> Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| Error::msg(format!("unterminated ${{...}} in config value: {s:?}")))?;
+        let var = &after[..end];
+        let val = env::var(var)
+            .map_err(|_| Error::msg(format!("config references unset env var ${{{var}}}")))?;
+        out.push_str(&val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+// ---- defaults ---------------------------------------------------------------
 
 /// Effective uid, via a direct libc symbol so the core pulls in no extra crate.
 pub fn euid() -> u32 {
@@ -28,11 +168,19 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Path to the daemon's IPC socket. `CORDON_SOCK` overrides everything.
-pub fn socket_path() -> PathBuf {
-    if let Some(p) = env::var_os("CORDON_SOCK") {
-        return PathBuf::from(p);
+/// Default config-file location: `/etc/cordon/config.toml` (root) or
+/// `$XDG_CONFIG_HOME/cordon/config.toml` (user).
+fn default_config_path() -> PathBuf {
+    if is_root() {
+        return PathBuf::from("/etc/cordon/config.toml");
     }
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"));
+    base.join("cordon/config.toml")
+}
+
+fn default_socket() -> PathBuf {
     if is_root() {
         return PathBuf::from("/run/cordon.sock");
     }
@@ -42,11 +190,7 @@ pub fn socket_path() -> PathBuf {
     env::temp_dir().join(format!("cordon-{}.sock", euid()))
 }
 
-/// Path to the SQLite store file. `CORDON_STORE` overrides everything.
-pub fn store_path() -> PathBuf {
-    if let Some(p) = env::var_os("CORDON_STORE") {
-        return PathBuf::from(p);
-    }
+fn default_store() -> PathBuf {
     if is_root() {
         return PathBuf::from("/var/lib/cordon/cordon.db");
     }
@@ -56,16 +200,7 @@ pub fn store_path() -> PathBuf {
     base.join("cordon/cordon.db")
 }
 
-/// The zone roots seeded into a fresh store: configured
-/// traversable-but-never-owned roots inside which the first subtree level is
-/// claimable. `CORDON_ZONES` (colon-separated) overrides the HOME-derived
-/// defaults — used by the hermetic test harness to point at a throwaway `$HOME`.
-pub fn default_zones() -> Vec<PathBuf> {
-    if let Some(list) = env::var_os("CORDON_ZONES") {
-        return env::split_paths(&list)
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect();
-    }
+fn default_zones() -> Vec<PathBuf> {
     let h = home();
     vec![
         h.clone(),
@@ -75,7 +210,34 @@ pub fn default_zones() -> Vec<PathBuf> {
     ]
 }
 
-/// The backend name the daemon should run. Phase 0 ships only `mock`.
-pub fn backend_name() -> String {
-    env::var("CORDON_BACKEND").unwrap_or_else(|_| "mock".to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolate_expands_env() {
+        // SAFETY: single-threaded test.
+        unsafe { env::set_var("CORDON_TEST_X", "/tmp/x") };
+        assert_eq!(
+            interpolate("${CORDON_TEST_X}/cordon.sock").unwrap(),
+            "/tmp/x/cordon.sock"
+        );
+        assert_eq!(interpolate("no vars here").unwrap(), "no vars here");
+        assert!(interpolate("${CORDON_TEST_UNSET_ZZZ}").is_err());
+        assert!(interpolate("${unterminated").is_err());
+    }
+
+    #[test]
+    fn mode_parses() {
+        assert_eq!("audit".parse::<Mode>().unwrap(), Mode::Audit);
+        assert_eq!("enforce".parse::<Mode>().unwrap(), Mode::Enforce);
+        assert!("nope".parse::<Mode>().is_err());
+    }
+
+    #[test]
+    fn missing_file_yields_defaults() {
+        let cfg = Config::load(Some(Path::new("/nonexistent/cordon/config.toml"))).unwrap();
+        assert_eq!(cfg.mode, Mode::Enforce);
+        assert_eq!(cfg.backend, BackendKind::Mock);
+    }
 }

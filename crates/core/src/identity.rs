@@ -9,17 +9,42 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// A process id. A platform-neutral newtype (not `nix::unistd::Pid`) so `core`
+/// stays free of OS-syscall deps and serializes cleanly over IPC; OS backends
+/// convert at their boundary (e.g. `nix::Pid::as_raw()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Pid(pub i32);
+
+impl Pid {
+    pub fn as_raw(self) -> i32 {
+        self.0
+    }
+}
+
+impl From<i32> for Pid {
+    fn from(v: i32) -> Self {
+        Pid(v)
+    }
+}
+
+impl std::fmt::Display for Pid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A single process identified for policy purposes by its executable path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Process {
-    pub pid: i32,
+    pub pid: Pid,
     pub exe: PathBuf,
 }
 
 impl Process {
-    pub fn new(pid: i32, exe: impl Into<PathBuf>) -> Self {
+    pub fn new(pid: impl Into<Pid>, exe: impl Into<PathBuf>) -> Self {
         Process {
-            pid,
+            pid: pid.into(),
             exe: exe.into(),
         }
     }
@@ -37,7 +62,7 @@ pub struct Caller {
 }
 
 impl Caller {
-    pub fn new(pid: i32, exe: impl Into<PathBuf>) -> Self {
+    pub fn new(pid: impl Into<Pid>, exe: impl Into<PathBuf>) -> Self {
         Caller {
             proc: Process::new(pid, exe),
             ancestors: Vec::new(),

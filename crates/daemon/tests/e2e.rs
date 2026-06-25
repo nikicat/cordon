@@ -27,13 +27,27 @@ impl Daemon {
         let sock = dir.path().join("cordon.sock");
         let store = dir.path().join("store.db");
         let home = dir.path().join("home");
-        let zones = format!("{}:{}", home.display(), home.join(".config").display());
+        let config = dir.path().join("config.toml");
+        // Hermetic config file, serialized properly (no hand-rolled TOML).
+        #[derive(serde::Serialize)]
+        struct DaemonConfig {
+            backend: String,
+            socket: PathBuf,
+            store: PathBuf,
+            zones: Vec<PathBuf>,
+        }
+        let toml = toml::to_string(&DaemonConfig {
+            backend: "mock".into(),
+            socket: sock.clone(),
+            store: store.clone(),
+            zones: vec![home.clone(), home.join(".config")],
+        })
+        .unwrap();
+        std::fs::write(&config, toml).unwrap();
 
         let child = Command::new(env!("CARGO_BIN_EXE_cordond"))
-            .env("CORDON_SOCK", &sock)
-            .env("CORDON_STORE", &store)
-            .env("CORDON_ZONES", &zones)
-            .env("CORDON_BACKEND", "mock")
+            .arg("--config")
+            .arg(&config)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

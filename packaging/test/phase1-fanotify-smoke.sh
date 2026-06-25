@@ -43,19 +43,26 @@ SCRAPER="$TMP/scraper-tool"
 cp "$(command -v cat)" "$OWNER"
 cp "$(command -v cat)" "$SCRAPER"
 
-export CORDON_SOCK="$TMP/cordon.sock"
-export CORDON_STORE="$TMP/store.db"
-export CORDON_ZONES="$HOME_DIR:$HOME_DIR/.config"
+SOCK="$TMP/cordon.sock"
+CONFIG="$TMP/config.toml"
+cat > "$CONFIG" <<EOF
+backend = "fanotify"
+socket = "$SOCK"
+store = "$TMP/store.db"
+zones = ["$HOME_DIR", "$HOME_DIR/.config"]
+EOF
+# Both cordond and cordon read $CORDON_CONFIG to find the socket/config.
+export CORDON_CONFIG="$CONFIG"
 
 DPID=""
 cleanup() { [ -n "$DPID" ] && kill "$DPID" 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 
-RUST_LOG="${RUST_LOG:-info}" "$CORDOND" --backend fanotify &
+RUST_LOG="${RUST_LOG:-info}" "$CORDOND" &
 DPID=$!
 
-for _ in $(seq 1 40); do [ -S "$CORDON_SOCK" ] && break; sleep 0.1; done
-[ -S "$CORDON_SOCK" ] || { echo "error: cordond did not start" >&2; exit 1; }
+for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.1; done
+[ -S "$SOCK" ] || { echo "error: cordond did not start" >&2; exit 1; }
 
 # --- A) adopt: claim a pre-existing subtree. On the already-marked fs, so it is
 # enforced immediately.

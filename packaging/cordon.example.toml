@@ -1,0 +1,28 @@
+# cordon daemon configuration (operational settings).
+#
+# All keys are optional; an absent file or key falls back to a built-in default.
+# Precedence: CLI flag  >  this file  >  default.
+# String values may interpolate ${ENV} from the environment.
+#
+# Dynamic policy (owners, rules, and zones after the first-run seed) is NOT here —
+# it lives in the SQLite store and is managed at runtime via the `cordon` CLI.
+#
+# Default location: /etc/cordon/config.toml (root) or
+# $XDG_CONFIG_HOME/cordon/config.toml (user). Override with --config / $CORDON_CONFIG.
+
+# Enforcement backend: "mock" (dev — NOT a boundary) or "fanotify" (Linux, root).
+backend = "fanotify"
+
+# "enforce" blocks non-owner opens; "audit" only logs would-be denials and allows
+# them — use it to preview the blast radius of an ownership decision before it
+# bites, then switch back to "enforce".
+mode = "enforce"
+
+# IPC socket + SQLite store. Defaults: /run/cordon.sock + /var/lib/cordon/cordon.db
+# as root; under $XDG_RUNTIME_DIR / $XDG_STATE_HOME for a user daemon.
+# socket = "${XDG_RUNTIME_DIR}/cordon.sock"
+# store  = "${XDG_STATE_HOME}/cordon/cordon.db"
+
+# Zone roots seeded into a fresh store on first run (thereafter: `cordon zone add`).
+# The first subtree level inside each is claimable (TOFU); the root never is.
+zones = ["${HOME}", "${HOME}/.config", "${HOME}/.local/share", "${HOME}/.cache"]

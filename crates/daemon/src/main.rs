@@ -12,32 +12,40 @@ mod ipc;
 mod proc;
 
 use clap::Parser;
-use cordon_core::backend::Shutdown;
-use cordon_core::{Engine, Store, config};
+use cordon_core::backend::{BackendKind, Shutdown};
+use cordon_core::{Config, Engine, Mode, Store, config};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
-/// Shared daemon context handed to each IPC connection.
+/// Shared daemon state + the IPC server behavior over it (see `ipc.rs` for the
+/// `impl`). Held as `Arc<Ctx>`; each connection thread gets a clone.
 pub struct Ctx {
     pub engine: Arc<Mutex<Engine>>,
-    pub backend: String,
-    pub store_path: String,
-    pub socket_path: String,
+    pub backend: BackendKind,
+    pub mode: Mode,
+    pub store: PathBuf,
+    pub socket: PathBuf,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "cordond", about = "cordon gater daemon", version)]
 struct Args {
-    /// IPC socket path (overrides $CORDON_SOCK / default).
+    /// Config file path (overrides $CORDON_CONFIG / default).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// IPC socket path (overrides the config file).
     #[arg(long)]
     socket: Option<PathBuf>,
-    /// SQLite store path (overrides $CORDON_STORE / default).
+    /// SQLite store path (overrides the config file).
     #[arg(long)]
     store: Option<PathBuf>,
     /// Enforcement backend: `mock` (dev) or `fanotify` (Linux, root).
     #[arg(long)]
     backend: Option<String>,
+    /// Enforcement mode: `enforce` (block) or `audit` (log would-deny, allow).
+    #[arg(long)]
+    mode: Option<String>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -62,22 +70,35 @@ fn init_tracing() {
 }
 
 fn run(args: Args) -> cordon_core::Result<()> {
-    let socket_path = args.socket.unwrap_or_else(config::socket_path);
-    let store_path = args.store.unwrap_or_else(config::store_path);
-    let backend_name = args.backend.unwrap_or_else(config::backend_name);
+    // Config file (with ${ENV} interpolation) + built-in defaults, then CLI
+    // overrides on top.
+    let mut cfg = Config::load(args.config.as_deref())?;
+    if let Some(s) = args.socket {
+        cfg.socket = s;
+    }
+    if let Some(s) = args.store {
+        cfg.store = s;
+    }
+    if let Some(b) = args.backend {
+        cfg.backend = b.parse()?;
+    }
+    if let Some(m) = args.mode {
+        cfg.mode = m.parse()?;
+    }
 
-    let store = Store::open(&store_path)?;
-    if store.seed_zones(&config::default_zones())? {
-        info!("seeded default zones");
+    let store = Store::open(&cfg.store)?;
+    if store.seed_zones(&cfg.zones)? {
+        info!("seeded zones");
     }
     let engine = Arc::new(Mutex::new(Engine::new(store)?));
 
-    let backend = backend::select(&backend_name)?;
+    let backend = backend::select(cfg.backend, cfg.mode)?;
 
     info!(
         backend = backend.name(),
-        store = %store_path.display(),
-        socket = %socket_path.display(),
+        mode = cfg.mode.as_str(),
+        store = %cfg.store.display(),
+        socket = %cfg.socket.display(),
         privilege = if config::is_root() { "root" } else { "user (NOT a boundary)" },
         "cordond started",
     );
@@ -89,14 +110,15 @@ fn run(args: Args) -> cordon_core::Result<()> {
 
     let ctx = Arc::new(Ctx {
         engine,
-        backend: backend_name,
-        store_path: store_path.display().to_string(),
-        socket_path: socket_path.display().to_string(),
+        backend: cfg.backend,
+        mode: cfg.mode,
+        store: cfg.store,
+        socket: cfg.socket,
     });
 
     // Serve until the listener fails (or the process is signalled). On the next
     // start a stale socket is unlinked, so an un-graceful exit is harmless.
-    let serve_result = ipc::serve(&socket_path, ctx);
+    let serve_result = ctx.serve();
 
     shutdown.trigger();
     if let Ok(Err(e)) = backend_thread.join() {
