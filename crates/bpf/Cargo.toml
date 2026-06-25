@@ -1,0 +1,48 @@
+# The eBPF data plane: the in-kernel boundary that returns file_open verdicts.
+#
+# This crate is INTENTIONALLY a standalone workspace (`[workspace]` below) and is
+# `exclude`d from the root workspace — it compiles only for `bpfel-unknown-none`
+# with the pinned nightly (rust-toolchain.toml) + `bpf-linker`, driven by
+# `just build-ebpf`. It must never be built for the host.
+[package]
+name = "cordon-bpf"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "cordon"
+path = "src/main.rs"
+# No host unit-test/bench harness: this is a #![no_std]/#![no_main] BPF object that
+# can't link the `test` crate. Disabling these auto-targets also lets rust-analyzer
+# load this crate with its default `--all-targets` without a build error (it shares
+# one window with the host workspace, which keeps `--all-targets` on for its tests).
+test = false
+bench = false
+
+[dependencies]
+aya-ebpf = "0.1.1"
+# Shared map/record layout + identity hash (no_std, no `user` feature → no aya).
+cordon-bpf-common = { path = "../bpf-common" }
+
+# eBPF objects must be optimized (the verifier rejects the bloated, high-stack code
+# a debug build emits) and unwinding-free.
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone: do not join the parent workspace.
+[workspace]

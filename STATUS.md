@@ -1,9 +1,83 @@
 # STATUS
 
-**Phase: 1 functionally complete.** Phase 0 (core/store/daemon/CLI/mock) is done;
-the real Linux `fanotify` backend now enforces all of decision-flow steps 1–5
-(incl. TOFU-on-create) system-wide, with a fully-green CI that validates it in a
-virtme-ng VM on a pinned kernel. This file is the resume point.
+**Phase: 3 (bpf-lsm) — in-kernel boundary enforcing, VM-validated.** Phase 0
+(core/store/daemon/CLI/mock) and Phase 1 (the Linux `fanotify` backend —
+decision-flow steps 1–5 incl. TOFU-on-create, in a virtme-ng VM) are done. Note
+`fanotify` is a **dev/test backend, not a security boundary** (fail-open + path-
+bypass); the real Linux boundary is **`bpf-lsm`**, which Phase 3 adds — in-kernel
+verdicts, validated end-to-end in a VM (owner allowed, non-owner `EPERM`). This file
+is the resume point.
+
+## Phase 3 (bpf-lsm — in progress)
+The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an
+eBPF program on the `file_open` LSM hook, reading policy from BPF maps the daemon
+seeds from the store. Control-plane / data-plane split — the daemon is still
+required (load + seed maps + re-sync on policy change + drain the learn ring
+buffer), but the verdict no longer waits on it.
+
+**Done — validated end-to-end in a virtme-ng VM (`lsm=capability,bpf`): owner
+allowed, non-owner gets `EPERM`, in-kernel. Pure-Rust via aya, no clang/libbpf:**
+- **`crates/bpf-common`** — `#![no_std]` POD types shared byte-for-byte by the eBPF
+  program and the loader: map names, the `FileId`/`OwnerKey`/`Settings`/`LearnEvent`
+  records, and the `Dev`/`Ino`/`OwnerId`/`Pid`/`Mode`/`Decision` newtypes. `user`
+  feature adds the `aya::Pod` impls.
+- **`crates/bpf`** — the eBPF data plane (`aya-ebpf`, standalone crate, pinned
+  nightly via its own `rust-toolchain.toml` + `.cargo/config.toml`). `file_open`
+  hook: fast-allow self, dentry **(dev, inode)** ancestor walk → most-specific
+  protected subtree, caller exe **(dev, inode)** → owner-identity lookup,
+  `-EPERM`/allow by mode, `LearnEvent` to a ring buffer. All `unsafe` (kernel reads,
+  ring writes) is confined to `kernel.rs` behind safe typed handles; `main.rs` is the
+  unsafe-free decision flow. **No committed `vmlinux.rs`**: rustc can't emit CO-RE
+  relocations (<https://github.com/rust-lang/rust/issues/158412>), so each kernel field
+  is read at a byte offset taken from an `OFFSETS` `.rodata` global the daemon fills
+  from the *running* kernel's BTF and injects at load — one object enforces on any
+  kernel (validated on `v6.12` with an object built against `6.18`).
+- **`crates/daemon` `bpf-lsm` feature** (`backend/bpf_lsm.rs`) — the aya loader:
+  resolve the running kernel's field offsets from its BTF (`btf.rs`, a minimal
+  read-only BTF parser — descends anonymous unions, fails loud on a missing field)
+  and inject them (`override_global("OFFSETS", …)`), `load_file` the object, attach
+  `file_open`, then **self-test** (protect a probe dir under an identity-less owner
+  and confirm our *own* open is denied — so a wrong-offset silent no-op aborts loudly
+  rather than pretending to enforce), seed `SUBTREES`/`OWNER_IDS`/`SETTINGS` from the
+  store (resolve each subtree + owner exe to a `FileId` — mount-table device + `stat`
+  inode, so it matches the kernel on overlayfs/btrfs), then `poll`+drain the ring
+  buffer into the journal (enforce → `info` deny, audit → `warn` would-deny, exe path
+  enriched from `/proc` only when the inode still matches). **Map-sync-on-adopt**: a
+  runtime `adopt`/`disown`/`claim` bumps the
+  engine's `PolicyClock`; the serve loop re-seeds the maps within a poll interval —
+  no restart. Off by default so the stock build stays on stable with no aya/eBPF
+  deps. `BackendKind::BpfLsm` wired through config/CLI/`select`. `kernel_dev`
+  glibc→kernel `dev_t` re-encoding is unit-tested.
+- **`just build-ebpf`** stages the object; `bpf_object`/`bpf_pin_dir` config keys.
+  `packaging/test/bpf-lsm-smoke.sh` + `run-bpf-lsm-vm.sh` are the e2e — a suite run in
+  one VM boot: enforce (owner-allow + scraper-deny + learn-path report), self-test
+  *negative* (poisoned offsets must abort, not silently allow), audit (would-deny
+  logged), nested subtrees (deepest match wins), multiple identities, disown re-sync,
+  and live-caller exe enrichment.
+
+**Key findings from the VM (these shaped the design):**
+- `bpf_d_path` is **not allowed** at the `file_open` LSM hook (`security_file_open`
+  isn't in the kernel's `btf_allowlist_d_path`), so there is **no in-kernel path
+  resolution**. Identity is therefore **inode (dev, inode)**, not a path hash —
+  resolved from paths by the daemon at seed time (the FNV-hash approach was removed).
+- `(dev, inode)` identity requires the daemon to compute the same device the
+  kernel's `inode->i_sb->s_dev` holds. `stat(2)`'s `st_dev` is **not** that on
+  overlayfs (containers) or btrfs (per-subvolume anon device) — so the daemon
+  resolves the device from the **mount table** (`/proc/self/mountinfo` reports the
+  mount's `sb->s_dev` verbatim; `proc::file_id`), which agrees with the kernel
+  everywhere. The inode number from `stat` already matches `i_ino`. The e2e runs on
+  the overlay `/tmp` to exercise exactly this.
+- Loading an LSM program needs `CAP_BPF` **+ `CAP_MAC_ADMIN`**, and `lockdown` in a
+  restrictive mode blocks `BPF_PROG_LOAD` — so the VM boots a minimal `lsm=…,bpf`.
+
+**Next increment:**
+- **Fail-safe pinning** — pin program + maps + link to bpffs so enforcement survives
+  daemon death (the headline property; until then it fails open like fanotify).
+- **TOFU-on-create** via the learn path (the daemon claims, then re-syncs the maps).
+- **Atomic map re-sync** (double-buffer) — today's clear-then-insert has a brief
+  window; and **content-digest identity** (fsverity/IMA) so identity survives an
+  inode change (package upgrade) and resists path-spoofing — the `(dev, inode)`
+  remaining caveat now that the overlay/btrfs device mismatch is handled.
 
 ## Phase 1 (done)
 - **`fanotify` backend** (`crates/daemon/src/backend/fanotify.rs`) via the `nix`

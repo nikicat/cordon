@@ -10,22 +10,70 @@ use crate::paths::{self, normalize};
 use crate::store::Store;
 use crate::{Result, now_secs};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A monotonic counter of ownership/rule mutations, shared via a cloneable handle.
+/// A backend that *caches* policy out of the store — the `bpf-lsm` backend, whose
+/// verdict reads BPF maps — clones this and polls [`PolicyClock::current`] to learn
+/// when to re-sync. Live backends (`fanotify`) read the store per event and never
+/// touch it.
+#[derive(Clone)]
+pub struct PolicyClock(Arc<AtomicU64>);
+
+impl PolicyClock {
+    fn new() -> PolicyClock {
+        PolicyClock(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Advance the clock — called after any store mutation.
+    pub fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A snapshot of the current generation, to compare against a later one.
+    pub fn current(&self) -> Generation {
+        Generation(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// A snapshot of a [`PolicyClock`]. Two unequal snapshots mean policy changed; it
+/// is otherwise opaque (no arithmetic, no confusion with another counter).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Generation(u64);
 
 pub struct Engine {
     store: Store,
     /// Cached zone roots, refreshed from the store on mutation. Read on every
     /// evaluate, so we keep them in memory rather than re-querying per event.
     zones: Vec<PathBuf>,
+    /// Ticks on every ownership/rule mutation; watched by a cache-backed backend.
+    policy: PolicyClock,
 }
 
 impl Engine {
     pub fn new(store: Store) -> Result<Engine> {
         let zones = store.zones()?;
-        Ok(Engine { store, zones })
+        Ok(Engine {
+            store,
+            zones,
+            policy: PolicyClock::new(),
+        })
     }
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// A handle to the policy clock (clone it once, then poll `current()`).
+    pub fn policy_clock(&self) -> PolicyClock {
+        self.policy.clone()
+    }
+
+    /// Signal that ownership/rules changed — call after any store mutation so a
+    /// cache-backed backend re-syncs.
+    pub fn bump_policy(&self) {
+        self.policy.bump();
     }
 
     /// Re-read the zone roots after a mutation (e.g. `cordon zone add`).
@@ -78,6 +126,7 @@ impl Engine {
                 .store
                 .ensure_owner(&zone_owner_name(&claimable), &event.caller.proc.exe)?;
             self.store.claim_subtree(&claimable, owner, now)?;
+            self.bump_policy();
             return Ok(Decision::allow(Reason::TofuClaim));
         }
 

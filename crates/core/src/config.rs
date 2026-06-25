@@ -66,6 +66,12 @@ pub struct Config {
     /// Zone roots seeded into a fresh store (first run only; thereafter managed
     /// via `cordon zone …`).
     pub zones: Vec<PathBuf>,
+    /// `bpf-lsm` backend: the compiled eBPF object to load at runtime (built by
+    /// `just build-ebpf`). Ignored by the other backends.
+    pub bpf_object: PathBuf,
+    /// `bpf-lsm` backend: the bpffs directory to pin the program + maps under, so
+    /// enforcement survives the daemon dying (fail-safe, DESIGN §4).
+    pub bpf_pin_dir: PathBuf,
 }
 
 /// The raw, all-optional TOML shape. Unknown keys are rejected so typos fail loud.
@@ -77,6 +83,8 @@ struct ConfigFile {
     socket: Option<String>,
     store: Option<String>,
     zones: Option<Vec<String>>,
+    bpf_object: Option<String>,
+    bpf_pin_dir: Option<String>,
 }
 
 impl Config {
@@ -121,6 +129,14 @@ impl Config {
                     .map(|s| interpolate(s).map(PathBuf::from))
                     .collect::<Result<_>>()?,
                 None => default_zones(),
+            },
+            bpf_object: match f.bpf_object {
+                Some(s) => PathBuf::from(interpolate(&s)?),
+                None => default_bpf_object(),
+            },
+            bpf_pin_dir: match f.bpf_pin_dir {
+                Some(s) => PathBuf::from(interpolate(&s)?),
+                None => default_bpf_pin_dir(),
             },
         })
     }
@@ -198,6 +214,17 @@ fn default_store() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/state"));
     base.join("cordon/cordon.db")
+}
+
+/// Default eBPF object location: where production packaging installs it. In dev,
+/// point `bpf_object` at the `just build-ebpf` output (`target/bpf/cordon.bpf.o`).
+fn default_bpf_object() -> PathBuf {
+    PathBuf::from("/usr/lib/cordon/cordon.bpf.o")
+}
+
+/// Default bpffs pin directory for the `bpf-lsm` backend's fail-safe pinning.
+fn default_bpf_pin_dir() -> PathBuf {
+    PathBuf::from("/sys/fs/bpf/cordon")
 }
 
 fn default_zones() -> Vec<PathBuf> {

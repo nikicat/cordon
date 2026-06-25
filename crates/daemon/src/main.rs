@@ -7,6 +7,8 @@
 //! the root `fanotify` backend.
 
 mod backend;
+#[cfg(feature = "bpf-lsm")]
+mod btf;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod proc;
@@ -59,13 +61,17 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Logs to stderr; level via `RUST_LOG` (default `info`).
+/// Logs to stderr; level via `RUST_LOG` (default `info`). ANSI styling only when
+/// stderr is a terminal, so a redirected log or journald capture stays free of
+/// escape codes (the default `fmt` colors unconditionally).
 fn init_tracing() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 }
 
@@ -92,7 +98,7 @@ fn run(args: Args) -> cordon_core::Result<()> {
     }
     let engine = Arc::new(Mutex::new(Engine::new(store)?));
 
-    let backend = backend::select(cfg.backend, cfg.mode)?;
+    let backend = backend::select(&cfg)?;
 
     info!(
         backend = backend.name(),
@@ -106,7 +112,16 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let shutdown = Shutdown::new();
     let backend_engine = Arc::clone(&engine);
     let backend_shutdown = Arc::clone(&shutdown);
-    let backend_thread = std::thread::spawn(move || backend.run(backend_engine, backend_shutdown));
+    // Log a backend failure the moment `run` returns, not at join — an
+    // un-graceful signal-kill never reaches the join below, and a backend that
+    // fails to load/attach (e.g. a BPF verifier rejection) must be visible.
+    let backend_thread = std::thread::spawn(move || {
+        let result = backend.run(backend_engine, backend_shutdown);
+        if let Err(e) = &result {
+            error!(error = %e, "backend exited with error");
+        }
+        result
+    });
 
     let ctx = Arc::new(Ctx {
         engine,
@@ -121,8 +136,6 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let serve_result = ctx.serve();
 
     shutdown.trigger();
-    if let Ok(Err(e)) = backend_thread.join() {
-        error!(error = %e, "backend exited with error");
-    }
+    let _ = backend_thread.join();
     serve_result
 }

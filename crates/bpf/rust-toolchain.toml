@@ -1,0 +1,6 @@
+# The eBPF crate compiles only with a nightly toolchain (aya-ebpf + build-std).
+# Pinned to a specific date for reproducible objects — `just build-ebpf` resolves
+# it automatically (rustup fetches it on first use).
+[toolchain]
+channel = "nightly-2026-06-23"
+components = ["rust-src", "rustfmt", "clippy"]

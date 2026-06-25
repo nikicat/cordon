@@ -1,0 +1,26 @@
+# Types shared verbatim between the eBPF program (crates/bpf, no_std, BPF target)
+# and the userspace loader (crates/daemon, the `bpf-lsm` feature). Keeping the map
+# key/value/record layouts in ONE place is what keeps the two sides from drifting.
+#
+# Default build is `#![no_std]` with NO aya dependency, so the eBPF crate can pull
+# it in cleanly. The userspace side enables `features = ["user"]`, which adds the
+# `aya::Pod` impls (so these types can be map keys/values) — that's the only thing
+# that needs the userspace `aya` crate.
+[package]
+name = "cordon-bpf-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "cordon_bpf_common"
+path = "src/lib.rs"
+
+[features]
+# Enabled by the userspace loader: pulls `aya` only to mark these POD types `Pod`.
+user = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.14", optional = true, default-features = false }
