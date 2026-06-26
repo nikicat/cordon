@@ -652,6 +652,33 @@ secret config dirs — transparently, cross-platform, zero per-tool policy."
   backend — but it's container/k8s-oriented and heavyweight to drive as a
   per-user desktop secret gate.
 
+### aya-ecosystem peers (our toolchain — pure-Rust eBPF via aya)
+The eBPF enforcers above (Tetragon/Falco/KubeArmor/bpflock) are the **mechanism**
+precedent but all **Go/libbpf**. The projects that share cordon's actual *toolchain*
+— a `no_std` `aya-ebpf` kernel crate + an `aya` userspace loader, maps/ring-buffers,
+and the same CO-RE/BTF offset problem (rustc can't emit CO-RE relocations,
+<https://github.com/rust-lang/rust/issues/158412>) — live in
+[`aya-rs/awesome-aya`](https://github.com/aya-rs/awesome-aya), and **every security
+one is subject-centric, most observe-only**. None is an object-centric file
+authorizer for a personal box, so cordon shares their plumbing, not their shape:
+- **lockc** — eBPF **LSM-MAC** for *containers* (Docker/k8s), Rust/aya. Closest
+  cousin by mechanism (LSM hooks → MAC), but **container/profile-centric** and
+  audit-framed/experimental — it restricts the confined workload, not an *object*
+  the way we protect a subtree.
+- **suidsnoop** — aya **LSM programs**, the only peer that actually **denies**
+  (audit-or-enforce) — but scoped to **suid `execve`** and keyed on **uid**
+  (subject-centric); a research demo, not a file-read gate.
+- **bombini** — aya **LSM-BPF**, but **observe-only**: modular "detectors"
+  (exec / connect / file-access) emit JSON, no veto. Subject-centric, k8s runtime-sec.
+- **kunai** — aya, kprobes/tracepoints (not LSM enforcement); **observe-only** host
+  threat-hunting (Sysmon-for-Linux). The most mature of the set and the **least**
+  like cordon — it logs events, it doesn't gate opens.
+
+So in the aya world cordon's niche is empty: object-centric, enforcing,
+personal-desktop, TOFU + interactive. The precedent for the *use* (allow/deny on LSM
+hooks) is the Go tools above; the precedent for the *stack* is these — and they all
+answer "what may this subject do?", never "who may touch this resource?"
+
 ### Authorization-agent architecture
 - **polkit** — privileged daemon + **unprivileged per-session agent** that draws
   the prompt. Exactly our daemon/agent split (§6). But polkit authorizes D-Bus
