@@ -228,14 +228,16 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     let id = proc::file_id(probe)
         .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve probe FileId"))?;
     let obj = ObjId(0);
-    // A deny-all rule (any subject, any action) on the probe object; u32::MAX pid so we
-    // are *not* fast-allowed; enforce so the deny actually blocks.
+    // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX
+    // pid so we are *not* fast-allowed; enforce so the deny actually blocks. SILENCE
+    // (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
+    // logged probe-deny would spam a spurious record into the ring on every startup.
     seed::set_settings(ebpf, Pid(u32::MAX), BpfMode::ENFORCE)?;
     seed::protected_insert(ebpf, id, obj)?;
     seed::rules_set(
         ebpf,
         seed::rule_index(obj, 0),
-        CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::DENY),
+        CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
     )?;
     seed::rule_count_insert(ebpf, obj, 1)?;
 

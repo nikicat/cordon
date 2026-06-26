@@ -279,4 +279,18 @@ mod tests {
         assert_eq!(ActionName::Write.bit(), bpf::Action::WRITE);
         assert_eq!(PolicyName::Silence.lower(), bpf::Policy::SILENCE);
     }
+
+    /// The shipped example policy must always parse + resolve (group refs, action
+    /// names, paths) — guards `packaging/cordon.example.policy.toml` against drift.
+    /// Inode resolution (compile) is left out: the example's exes/dirs need not exist
+    /// on the test box.
+    #[test]
+    fn shipped_example_policy_resolves() {
+        let text = include_str!("../../../../packaging/cordon.example.policy.toml");
+        let parsed = parse(text).expect("example policy parses");
+        let resolved =
+            resolve(&parsed, std::path::Path::new("/home/u")).expect("example policy resolves");
+        assert_eq!(resolved.mode, Mode::Enforce);
+        assert!(!resolved.rules.is_empty());
+    }
 }

@@ -1,0 +1,72 @@
+# cordon policy — the flat rule model (DESIGN §15). Root-owned, NOT user-writable
+# (else a scraper writes itself in). Authored as text, applied explicitly with
+# `cordon policy apply`; compiled in userspace and enforced in-kernel by the bpf-lsm
+# backend. Default location: /etc/cordon/policy.toml (override via the daemon's
+# `policy = …` config key).
+#
+# A rule is `(who, where, action, policy)`:
+#   who    — subject: an exe path, `*` (any), or `@subject-group`. (uid/cgroup/argv0
+#            predicates arrive in M2.)
+#   where  — object: a file or a directory (matched recursively as a subtree). `*` is
+#            NOT allowed — the whole filesystem can't be default-denied.
+#   action — read | write | create (M1, at open) [ execute | listdir | unlink | mkdir
+#            | rmdir | rename arrive with their hooks]; a single value, a list, `*`
+#            (all), or `@action-group`.
+#   policy — allow (allow, silent) | audit (allow, log) | deny (deny, log) |
+#            silence (deny, silent).
+#
+# Precedence (resolved in userspace; the kernel just takes the first match):
+#   1. most-specific `where` wins (a file rule beats the subtree it sits in);
+#   2. ancestor rules are inherited downward, so a file is still governed by its
+#      subtree's rules for anything it doesn't override (copy-down);
+#   3. deny beats allow at the same specificity (fail-safe);
+#   4. a protected object with no matching rule is default-denied;
+#   5. anything not under any rule is unmediated (allowed).
+
+# enforce | permissive | off.  permissive downgrades every deny to a logged allow
+# (the safe-rollout lever — watch the journal, then switch to enforce). off disables
+# mediation entirely.
+mode = "enforce"
+
+# --- groups: named, nestable, symmetric across all three axes ----------------
+[group.subject.ssh-tools]
+members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
+
+[group.object.cloud-creds]
+members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
+
+[group.action.ro]
+members = ["read", "listdir"]
+
+# --- rules -------------------------------------------------------------------
+
+# ssh tooling may read ~/.ssh; every other opener there is default-denied.
+[[rule]]
+who = "@ssh-tools"
+where = "~/.ssh"
+action = "@ro"
+policy = "allow"
+
+# the aws cli reads + writes its own creds.
+[[rule]]
+who = "/usr/bin/aws"
+where = "~/.aws"
+action = ["read", "write"]
+policy = "allow"
+
+# log (but allow) every *other* reader of the cloud-credential dirs — preview who
+# touches them before tightening to a deny.
+[[rule]]
+who = "*"
+where = "@cloud-creds"
+action = "read"
+policy = "audit"
+
+# copy-down exception: aws may read ~/.aws (above), but never this one stashed token,
+# and silently (deny + no log line). More-specific object → wins over the subtree
+# allow, but only for this file and only for aws.
+[[rule]]
+who = "/usr/bin/aws"
+where = "~/.aws/.danger-token"
+action = "*"
+policy = "silence"

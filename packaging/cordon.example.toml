@@ -45,3 +45,8 @@ zones = ["${HOME}", "${HOME}/.config", "${HOME}/.local/share", "${HOME}/.cache"]
 # bpffs directory the program + maps are pinned under for fail-safe enforcement
 # (planned; see DESIGN §4). Default: /sys/fs/bpf/cordon.
 # bpf_pin_dir = "/sys/fs/bpf/cordon"
+#
+# The root-owned text policy (the flat rule model — see cordon.example.policy.toml)
+# the bpf-lsm backend compiles at startup and seeds the maps from. Default:
+# /etc/cordon/policy.toml. In a dev tree:
+# policy = "${PWD}/packaging/cordon.example.policy.toml"

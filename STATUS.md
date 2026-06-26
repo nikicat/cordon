@@ -29,8 +29,13 @@ encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed)
   source `Pos` (rule/group granularity). 27 unit tests incl. both copy-down exception
   scenarios.
 
-**Landed (M1 1c + 1d + 1e — the in-kernel enforcement path; compiles across all three
-build modes, but NOT yet VM-validated — `1h` is the gate):**
+**Landed (M1 1c + 1d + 1e + 1h — the in-kernel enforcement path, VM-validated):**
+The rule-model `file_open` boundary is proven end-to-end in a virtme-ng VM
+(`lsm=capability,bpf`, host kernel) — all 9 `bpf-lsm-smoke.sh` scenarios green:
+allow + default-deny + learn record, self-test-negative abort, per-action (read
+allowed / write default-denied), subject group, object group, deny>allow, **copy-down**
+(subtree allow + a file-specific deny for one subject; the sibling stays readable),
+permissive (logged, not blocked), and silence (denied, not logged).
 - **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
   intent at open); the global `Mode` is now `enforce`/`permissive`/`off`; the ring-buffer
   record is reshaped + renamed `LearnEvent` → **`DecisionEvent`** (it records a decision
@@ -49,12 +54,17 @@ build modes, but NOT yet VM-validated — `1h` is the gate):**
   (`proc::file_id` resolver) and seeds `PROTECTED`/`RULES`/`RULE_COUNT`/`SETTINGS`; refuses
   on error diagnostics; self-test adapted to a deny-all rule. `config.policy` path added.
 
+- **1h validation** — `packaging/test/bpf-lsm-smoke.sh` rewritten for the rule model
+  (policy-file driven, no runtime adopt) + `packaging/cordon.example.policy.toml` (a
+  documented example, regression-tested through parse→resolve in `cargo test`). The
+  smoke caught + fixed a real bug: the self-test seeded a `DENY` (logging) probe rule,
+  spamming a spurious deny record on every startup → now `SILENCE` (block, no log).
+
 **Next (M1 remainder):** 1f `cordon policy check/apply/show` + remove owner CLI/IPC verbs
 (today the owner verbs still exist and back the `mock`/`fanotify` backends; the `bpf-lsm`
 backend already ignores the store and uses the policy file); live apply = the atomic
-double-buffer swap in `seed.rs`. 1g event coalescing (in `events.rs`). 1h VM e2e — rewrite
-`packaging/test/bpf-lsm-smoke.sh` for the rule model (the current owner-model smoke is
-stale) and validate enforce/permissive/deny/audit/most-specific/coalescing in a VM.
+double-buffer swap in `seed.rs`. 1g event coalescing (in `events.rs`) + a coalescing
+smoke scenario (a tight open-loop → one record + count).
 
 The Phase-3 section below describes the **superseded** owner model still backing the
 `mock`/`fanotify` backends until 1f.
