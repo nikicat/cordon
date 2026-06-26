@@ -8,10 +8,10 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cordon_core::event::Op;
 use cordon_core::proto::{Request, Response, read_msg, write_msg};
-use cordon_core::{Config, decision::Decision};
+use cordon_core::{Config, decision::Decision, policy};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
@@ -68,6 +68,22 @@ enum Cmd {
     },
     /// Drive a synthetic access event and print the verdict (dev/test).
     Submit(SubmitArgs),
+    /// Inspect the text policy (the flat rule model).
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    /// Parse + compile a policy file and print diagnostics (nonzero exit on error).
+    /// Local — does not contact the daemon, so it lints in CI. Inode resolution uses
+    /// `stat`, so unknown-exe / missing-path findings reflect *this* host.
+    Check {
+        /// Policy file (default: the configured `policy` path).
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -127,6 +143,15 @@ impl From<OpArg> for Op {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Local commands that never touch the daemon socket.
+    if let Cmd::Policy {
+        cmd: PolicyCmd::Check { file },
+    } = &cli.cmd
+    {
+        return policy_check(file.as_deref(), &cli);
+    }
+
     let socket = match resolve_socket(&cli) {
         Ok(s) => s,
         Err(e) => {
@@ -191,7 +216,80 @@ fn to_request(cmd: &Cmd) -> Request {
             op: s.op.into(),
             pid: None,
         },
+        // `policy` subcommands are handled locally in `main` before this point.
+        Cmd::Policy { .. } => unreachable!("policy commands do not round-trip"),
     }
+}
+
+/// `cordon policy check` — compile a policy file locally and report diagnostics.
+/// Local + daemon-free so it lints in CI; exits non-zero if the policy has errors.
+fn policy_check(file: Option<&Path>, cli: &Cli) -> ExitCode {
+    let cfg = match Config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cordon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = file.map(PathBuf::from).unwrap_or(cfg.policy);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cordon: read {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    // parse/resolve errors are fatal + structural (the message carries `line:col`).
+    let parsed = match policy::parse(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let resolved = match policy::resolve(&parsed, &home()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let compiled = policy::compile(&resolved, policy::stat_resolver);
+    for d in &compiled.diagnostics {
+        eprintln!("{}:{d}", path.display());
+    }
+    if compiled.has_errors() {
+        eprintln!(
+            "cordon: {} has errors — `apply` would reject it",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let rules: usize = compiled.objects.iter().map(|o| o.rules.len()).sum();
+    println!(
+        "{}: ok — mode={} objects={} rules={} pending={}",
+        path.display(),
+        mode_str(compiled.mode),
+        compiled.objects.len(),
+        rules,
+        compiled.pending.len(),
+    );
+    ExitCode::SUCCESS
+}
+
+fn mode_str(m: policy::Mode) -> &'static str {
+    match m {
+        policy::Mode::Enforce => "enforce",
+        policy::Mode::Permissive => "permissive",
+        policy::Mode::Off => "off",
+    }
+}
+
+/// `$HOME` for `~`-expansion in the policy being checked (falls back to `/`).
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Render a list of paths for human output (`.display()` belongs here, at the

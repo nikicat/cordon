@@ -26,7 +26,7 @@ mod compile;
 mod parse;
 mod resolve;
 
-pub use compile::{CompiledObject, CompiledPolicy, compile};
+pub use compile::{CompiledObject, CompiledPolicy, compile, stat_resolver};
 pub use parse::{ParsedPolicy, parse};
 pub use resolve::{ResolvedPolicy, ResolvedRule, SubjectSpec, resolve};
 

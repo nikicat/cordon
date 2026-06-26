@@ -60,6 +60,18 @@ impl CompiledPolicy {
     }
 }
 
+/// A `stat(2)`-based resolver for **linting** (`cordon policy check`): a path's
+/// `(dev,ino)` if it exists, else `None`. Uses `stat`'s `st_dev`, *not* the kernel's
+/// mount-table device — fine here, where resolution only drives existence + uniqueness
+/// diagnostics; the daemon's `apply` uses the mount-aware resolver (`proc::file_id`)
+/// for the identities it actually enforces on.
+pub fn stat_resolver(path: &Path) -> Option<FileId> {
+    use cordon_bpf_common::{Dev, Ino};
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(FileId::new(Dev(m.dev()), Ino(m.ino())))
+}
+
 /// A resolved protected object, before its bucket is built.
 struct Object {
     id: ObjId,
