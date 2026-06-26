@@ -52,7 +52,7 @@ pub enum Mode {
 
 /// A 1-based line/column into the policy source. Column is a byte offset within the
 /// line (fine for the ASCII paths/names a policy holds; not grapheme-aware).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pos {
     pub line: u32,
     pub col: u32,
@@ -99,14 +99,15 @@ impl LineIndex {
 /// `Error` means the policy must not be applied; `Warning` means it applies but
 /// something is off (a rule won't be enforced, a path is missing, …). `pos` points at
 /// the offending rule/group when the source location is known.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub pos: Option<Pos>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
     Warning,
     Error,

@@ -26,6 +26,9 @@
 #                       would-be denial is logged.
 #   9. silence        — a `silence` policy denies (EPERM) *without* a log record (vs a
 #                       `deny`, which logs).
+#  10. apply + show    — `cordon policy apply` re-seeds the live maps at runtime (a
+#                       previously-unprotected dir becomes protected), and `policy show`
+#                       reflects it.
 #
 # Coalescing (collapsing a tight open-loop into one record) is M1 §1g — not yet here.
 #
@@ -45,8 +48,10 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CORDOND="$ROOT_DIR/target/debug/cordond"
+CORDON="$ROOT_DIR/target/debug/cordon"
 OBJ="$ROOT_DIR/target/bpf/cordon.bpf.o"
 [ -x "$CORDOND" ] || { echo "missing $CORDOND — cargo build -p cordon-daemon --features bpf-lsm" >&2; exit 1; }
+[ -x "$CORDON" ]  || { echo "missing $CORDON — cargo build -p cordon-cli" >&2; exit 1; }
 [ -e "$OBJ" ]     || { echo "missing $OBJ — just build-ebpf" >&2; exit 1; }
 
 # --- shared per-scenario state + helpers -----------------------------------
@@ -82,10 +87,8 @@ write_policy() { # $1 = enforce|permissive|off ; rules on stdin
     cat > "$TMP/config.toml" <<EOF
 backend = "bpf-lsm"
 socket = "$SOCK"
-store = "$TMP/store.db"
 bpf_object = "$OBJ"
 policy = "$TMP/policy.toml"
-zones = []
 EOF
     export CORDON_CONFIG="$TMP/config.toml"
 }
@@ -334,6 +337,55 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario 10: policy apply + show (runtime re-seed via the CLI) ----------
+scenario_apply() {
+    echo "### scenario: policy apply + show (runtime re-seed)"
+    ws_new
+    # Start protecting an *unrelated* dir, so the vault is initially unprotected.
+    mkdir -p "$TMP/unrelated"
+    write_policy enforce <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$TMP/unrelated"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start
+    started || return 1
+    local fail=0
+    expect_allow "scraper reads before apply (vault unprotected)" read_as "$SCRAPER" "$SECRET" || fail=1
+
+    # Apply a new policy that protects the vault for the owner only.
+    cat > "$TMP/new.toml" <<EOF
+mode = "enforce"
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    if "$CORDON" policy apply "$TMP/new.toml" >/dev/null 2>&1; then
+        echo "  OK: policy apply succeeded"
+    else
+        echo "  FAIL: policy apply errored"
+        "$CORDON" policy apply "$TMP/new.toml" 2>&1 | sed 's/^/  cli| /'
+        fail=1
+    fi
+    # The re-seed took effect: owner reads, scraper now denied.
+    expect_allow "owner reads after apply" read_as "$OWNER" "$SECRET" || fail=1
+    expect_deny "scraper denied after apply" read_as "$SCRAPER" "$SECRET" || fail=1
+    # `show` reflects the applied policy.
+    if "$CORDON" policy show 2>/dev/null | grep -qF "$VAULT"; then
+        echo "  OK: policy show lists the applied object"
+    else
+        echo "  FAIL: policy show did not list the applied object"
+        "$CORDON" policy show 2>&1 | sed 's/^/  cli| /'
+        fail=1
+    fi
+    daemon_stop
+    return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -345,6 +397,7 @@ scenario_deny_wins         || rc=1
 scenario_copydown          || rc=1
 scenario_permissive        || rc=1
 scenario_silence           || rc=1
+scenario_apply             || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

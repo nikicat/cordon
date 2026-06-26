@@ -14,10 +14,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-# Build the feature daemon + the eBPF object on the host (both reach the guest
-# read-only). The rule-model smoke drives the kernel via a compiled policy file, not
-# the `cordon` CLI, so the CLI isn't needed here.
+# Build the feature daemon + the `cordon` CLI (for the policy apply/show scenario) +
+# the eBPF object on the host (all reach the guest read-only).
 cargo build -p cordon-daemon --features bpf-lsm
+cargo build -p cordon-cli
 just build-ebpf
 
 # Activate `bpf` in the LSM list (override via CORDON_VM_LSM). Kept minimal —

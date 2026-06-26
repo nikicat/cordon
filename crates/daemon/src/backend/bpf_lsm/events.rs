@@ -7,20 +7,27 @@ use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
 use cordon_bpf_common::{Decision, DecisionEvent, FileId, MAP_EVENTS, Pid};
-use cordon_core::backend::Shutdown;
+use cordon_core::backend::{ApplyOutcome, PolicyControl, Shutdown};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::fmt;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-/// Poll wakeup cadence so the ring-buffer reader re-checks the shutdown flag.
+/// Poll wakeup cadence so the reader re-checks shutdown + the apply channel.
 const POLL_TIMEOUT_MS: u16 = 500;
 
-/// Drain the ring buffer into the journal until shutdown.
-pub(super) fn serve(ebpf: &mut Ebpf, shutdown: &Arc<Shutdown>) -> Result<()> {
+/// Drain the ring buffer into the journal and honor `policy apply` requests until
+/// shutdown. The ring poll's timeout doubles as the apply-channel tick: each wakeup
+/// (event or `POLL_TIMEOUT_MS`) we also service any pending apply, so a `cordon policy
+/// apply` lands within one poll interval.
+pub(super) fn serve(
+    ebpf: &mut Ebpf,
+    control: &PolicyControl,
+    shutdown: &Arc<Shutdown>,
+) -> Result<()> {
     let mut ring = RingBuf::try_from(
         ebpf.take_map(MAP_EVENTS)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: {MAP_EVENTS} missing from object")))?,
@@ -33,7 +40,7 @@ pub(super) fn serve(ebpf: &mut Ebpf, shutdown: &Arc<Shutdown>) -> Result<()> {
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
-            Ok(0) => {} // timeout → re-check shutdown
+            Ok(0) => {} // timeout → re-check shutdown + apply channel
             Ok(_) => {
                 while let Some(item) = ring.next() {
                     log_event(&item);
@@ -42,8 +49,44 @@ pub(super) fn serve(ebpf: &mut Ebpf, shutdown: &Arc<Shutdown>) -> Result<()> {
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::msg(format!("bpf-lsm: poll: {e}"))),
         }
+        // Service any `policy apply` requests that arrived since the last tick.
+        while let Ok(req) = control.apply_rx.try_recv() {
+            apply(ebpf, control, &req.text, &req.reply);
+        }
     }
     Ok(())
+}
+
+/// Handle one `policy apply`: recompile the text, and if it has no errors re-seed the
+/// maps (clear-then-insert v1 — a brief non-atomic window; the double-buffer swap is
+/// the next increment) and republish the effective view. Always replies with the
+/// diagnostics so the CLI can show them whether or not it applied.
+fn apply(
+    ebpf: &mut Ebpf,
+    control: &PolicyControl,
+    text: &str,
+    reply: &std::sync::mpsc::Sender<ApplyOutcome>,
+) {
+    let compiled = super::compile_text(text);
+    let applied = if compiled.has_errors() {
+        false
+    } else {
+        match super::seed::seed_policy(ebpf, &compiled, super::bpf_mode(compiled.mode)) {
+            Ok(()) => {
+                *control.current.lock().unwrap() = Some(super::build_view(&compiled));
+                info!(objects = compiled.objects.len(), "policy applied");
+                true
+            }
+            Err(e) => {
+                error!(error = %e, "policy apply: seeding the maps failed; live policy unchanged");
+                false
+            }
+        }
+    };
+    let _ = reply.send(ApplyOutcome {
+        applied,
+        diagnostics: compiled.diagnostics,
+    });
 }
 
 /// Parse one ring-buffer record and journal it at the level its decision warrants.

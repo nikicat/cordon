@@ -34,12 +34,12 @@ use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
     Action, CompiledRule, Mode as BpfMode, ObjId, Offsets, Pid, Policy, SubjectMatch,
 };
-use cordon_core::backend::{Backend, Shutdown};
-use cordon_core::engine::Engine;
-use cordon_core::policy::{self, CompiledPolicy, Mode as PolicyMode, Severity};
+use cordon_core::backend::{Backend, PolicyControl, Shutdown};
+use cordon_core::policy::{self, CompiledPolicy, Diagnostic, Mode as PolicyMode, Severity};
+use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// The LSM hook we attach to (the eBPF fn is `#[lsm(hook = "file_open")]`).
@@ -74,9 +74,9 @@ impl Backend for BpfLsmBackend {
         "bpf-lsm"
     }
 
-    fn run(self: Box<Self>, _engine: Arc<Mutex<Engine>>, shutdown: Arc<Shutdown>) -> Result<()> {
-        // Compile the policy *before* loading anything — a bad policy fails fast,
-        // without touching the kernel.
+    fn run(self: Box<Self>, control: PolicyControl, shutdown: Arc<Shutdown>) -> Result<()> {
+        // Compile the policy *before* loading anything — a bad startup policy fails
+        // fast, without touching the kernel.
         let compiled = self.compile_policy()?;
         let mode = bpf_mode(compiled.mode);
 
@@ -115,8 +115,9 @@ impl Backend for BpfLsmBackend {
             .map_err(|e| Error::msg(format!("bpf-lsm: attach {HOOK}: {e}")))?;
         self_test(&mut ebpf)?;
 
-        // Seed the real, compiled policy.
+        // Seed the real, compiled policy and publish it for `cordon policy show`.
         seed::seed_policy(&mut ebpf, &compiled, mode)?;
+        *control.current.lock().unwrap() = Some(build_view(&compiled));
 
         info!(
             mode = mode_str(mode),
@@ -126,14 +127,14 @@ impl Backend for BpfLsmBackend {
             "bpf-lsm active on the file_open hook (self-test passed)",
         );
 
-        // Drain the ring buffer into the journal until shutdown.
-        events::serve(&mut ebpf, &shutdown)
+        // Drain the ring buffer + honor `policy apply` requests until shutdown.
+        events::serve(&mut ebpf, &control, &shutdown)
     }
 }
 
 impl BpfLsmBackend {
-    /// Read, parse, resolve, and compile the text policy. Logs every diagnostic;
-    /// returns an error (refusing to seed) if any is an error-severity finding.
+    /// Startup: read + compile the policy file. Returns an error (refusing to seed) if
+    /// it has any error-severity finding — a bad startup policy must not silently run.
     fn compile_policy(&self) -> Result<CompiledPolicy> {
         let text = std::fs::read_to_string(&self.policy).map_err(|e| {
             Error::msg(format!(
@@ -141,16 +142,7 @@ impl BpfLsmBackend {
                 self.policy.display()
             ))
         })?;
-        let parsed = policy::parse(&text)?;
-        let resolved = policy::resolve(&parsed, &policy_home())?;
-        let compiled = policy::compile(&resolved, proc::file_id);
-
-        for d in &compiled.diagnostics {
-            match d.severity {
-                Severity::Error => error!("policy: {d}"),
-                Severity::Warning => warn!("policy: {d}"),
-            }
-        }
+        let compiled = compile_text(&text);
         if compiled.has_errors() {
             return Err(Error::msg(format!(
                 "bpf-lsm: policy {} has errors; refusing to seed",
@@ -158,6 +150,61 @@ impl BpfLsmBackend {
             )));
         }
         Ok(compiled)
+    }
+}
+
+/// Parse → resolve → compile policy text, logging diagnostics. Always returns a
+/// `CompiledPolicy`: a structural parse/resolve failure becomes a single error
+/// diagnostic (so `policy apply` can report it instead of the daemon crashing). The
+/// caller decides whether to seed via [`CompiledPolicy::has_errors`].
+pub(super) fn compile_text(text: &str) -> CompiledPolicy {
+    let parsed = match policy::parse(text) {
+        Ok(p) => p,
+        Err(e) => return error_policy(e),
+    };
+    let resolved = match policy::resolve(&parsed, &policy_home()) {
+        Ok(r) => r,
+        Err(e) => return error_policy(e),
+    };
+    let compiled = policy::compile(&resolved, proc::file_id);
+    for d in &compiled.diagnostics {
+        match d.severity {
+            Severity::Error => error!("policy: {d}"),
+            Severity::Warning => warn!("policy: {d}"),
+        }
+    }
+    compiled
+}
+
+/// Wrap a structural parse/resolve error as an otherwise-empty compiled policy
+/// carrying it as one error diagnostic (its message already includes `line:col`).
+fn error_policy(e: Error) -> CompiledPolicy {
+    error!("policy: {e}");
+    CompiledPolicy {
+        mode: PolicyMode::Enforce,
+        objects: Vec::new(),
+        pending: Vec::new(),
+        diagnostics: vec![Diagnostic {
+            severity: Severity::Error,
+            message: e.to_string(),
+            pos: None,
+        }],
+    }
+}
+
+/// A human-facing view of a compiled policy for `cordon policy show`.
+pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
+    PolicyView {
+        mode: mode_str(bpf_mode(c.mode)).to_string(),
+        objects: c
+            .objects
+            .iter()
+            .map(|o| ObjectView {
+                path: o.path.clone(),
+                rules: o.rules.len(),
+            })
+            .collect(),
+        pending: c.pending.clone(),
     }
 }
 

@@ -29,13 +29,14 @@ encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed)
   source `Pos` (rule/group granularity). 27 unit tests incl. both copy-down exception
   scenarios.
 
-**Landed (M1 1c + 1d + 1e + 1h — the in-kernel enforcement path, VM-validated):**
-The rule-model `file_open` boundary is proven end-to-end in a virtme-ng VM
-(`lsm=capability,bpf`, host kernel) — all 9 `bpf-lsm-smoke.sh` scenarios green:
-allow + default-deny + learn record, self-test-negative abort, per-action (read
+**Landed (M1 1c + 1d + 1e + 1f + 1h — the in-kernel enforcement path + authoring CLI,
+VM-validated):** The rule-model `file_open` boundary is proven end-to-end in a
+virtme-ng VM (`lsm=capability,bpf`, host kernel) — all 10 `bpf-lsm-smoke.sh` scenarios
+green: allow + default-deny + learn record, self-test-negative abort, per-action (read
 allowed / write default-denied), subject group, object group, deny>allow, **copy-down**
 (subtree allow + a file-specific deny for one subject; the sibling stays readable),
-permissive (logged, not blocked), and silence (denied, not logged).
+permissive (logged, not blocked), silence (denied, not logged), and **runtime `policy
+apply` + `show`** (a previously-unprotected dir becomes protected without a restart).
 - **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
   intent at open); the global `Mode` is now `enforce`/`permissive`/`off`; the ring-buffer
   record is reshaped + renamed `LearnEvent` → **`DecisionEvent`** (it records a decision
@@ -54,20 +55,27 @@ permissive (logged, not blocked), and silence (denied, not logged).
   (`proc::file_id` resolver) and seeds `PROTECTED`/`RULES`/`RULE_COUNT`/`SETTINGS`; refuses
   on error diagnostics; self-test adapted to a deny-all rule. `config.policy` path added.
 
+- **1f CLI + owner-model retirement** — `cordon policy check` (local lint, daemon-free),
+  `policy apply` (send text → daemon recompiles with the mount-aware resolver →
+  clear-then-insert re-seed → reply with diagnostics), `policy show` / `status` (read the
+  effective policy via a `PolicyControl` shared between IPC and the backend thread). The
+  owner model was **retired**: removed the `engine`, the SQLite `store` (+ `rusqlite`),
+  `event`/`identity`/`decision`, the `mock` + `fanotify` backends, the owner CLI/IPC verbs
+  + `Submit`, and `config.mode`/`store`. `bpf-lsm` is now the only backend (so a stock,
+  no-feature build compiles but the daemon needs `--features bpf-lsm` to run). `apply`
+  uses clear-then-insert (a brief non-atomic window); the **double-buffer swap** is next.
 - **1h validation** — `packaging/test/bpf-lsm-smoke.sh` rewritten for the rule model
   (policy-file driven, no runtime adopt) + `packaging/cordon.example.policy.toml` (a
   documented example, regression-tested through parse→resolve in `cargo test`). The
   smoke caught + fixed a real bug: the self-test seeded a `DENY` (logging) probe rule,
   spamming a spurious deny record on every startup → now `SILENCE` (block, no log).
 
-**Next (M1 remainder):** 1f `cordon policy check/apply/show` + remove owner CLI/IPC verbs
-(today the owner verbs still exist and back the `mock`/`fanotify` backends; the `bpf-lsm`
-backend already ignores the store and uses the policy file); live apply = the atomic
-double-buffer swap in `seed.rs`. 1g event coalescing (in `events.rs`) + a coalescing
-smoke scenario (a tight open-loop → one record + count).
+**Next (M1 remainder):** 1g event coalescing — an in-kernel suppressor + daemon-side
+collapse so a tool re-opening the same file hundreds of times yields one record + a
+count (in `events.rs`), plus a coalescing smoke scenario. Then the deferred hardening:
+the atomic **double-buffer swap** for `apply` (`seed.rs`) and fail-safe **bpffs pinning**.
 
-The Phase-3 section below describes the **superseded** owner model still backing the
-`mock`/`fanotify` backends until 1f.
+The Phase-3 section below is **historical** — it describes the now-retired owner model.
 
 ## Phase 3 (bpf-lsm — in progress)
 The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an

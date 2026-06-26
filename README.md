@@ -15,40 +15,36 @@ gets `ENOENT`/`EACCES` (and, with the vault, only ciphertext at rest).
 > Working name. See the naming note in `DESIGN.md` — deliberately *not* in the
 > `gate`/`Gatekeeper` namespace.
 
-Status: **Phase 3 in progress** — the in-kernel **`bpf-lsm`** backend (the real
-Linux boundary) denies non-owner opens of owned subtrees, validated end-to-end in a
-virtme-ng VM in CI. Phases 0–1 (policy core, SQLite store, `cordond` daemon,
-`cordon` CLI, TOFU creator-owns, enforce/audit) are done. The Linux **`fanotify`**
-backend is a **dev/test backend, NOT a security boundary** (it fails open and is
-path-bypassable). See [`STATUS.md`](STATUS.md).
+Status: the flat **rule model** ([`DESIGN.md` §15](docs/DESIGN.md)) — a root-owned
+text policy of `(who, where, action, policy)` rules, compiled in userspace and
+enforced **in-kernel** by the `bpf-lsm` backend — is the architecture. M1 (TOML
+parser → copy-down compiler → flat BPF maps → in-kernel `file_open` verdicts for
+read/write/create, with `enforce`/`permissive`/`off` modes and `cordon policy
+check`/`apply`/`show`) is implemented and validated end-to-end in a virtme-ng VM. The
+earlier owner model (`fanotify`/`mock` backends, SQLite store, `adopt`/TOFU) has been
+retired in favor of the one model. See [`STATUS.md`](STATUS.md).
 
-## Build & try (dev, user-mode, mock backend)
+## Build & try
 
 ```sh
-cargo test                 # unprivileged: decision flow + IPC e2e
-cargo build
+cargo test                 # unprivileged: the policy parser + copy-down compiler
 
-# a throwaway config (mock backend = not a boundary; for logic only)
-cat > /tmp/cordon.toml <<EOF
-backend = "mock"
-socket = "/tmp/cordon.sock"
-store  = "/tmp/cordon.db"
-zones  = ["${HOME}", "${HOME}/.config"]
-EOF
-export CORDON_CONFIG=/tmp/cordon.toml
-./target/debug/cordond &
-
-# a tool that creates its own config becomes its owner (TOFU)...
-./target/debug/cordon submit --path "$HOME/.config/mytool/secret" --exe /usr/bin/mytool --op create
-# ...reads it back fine...
-./target/debug/cordon submit --path "$HOME/.config/mytool/secret" --exe /usr/bin/mytool --op read
-# ...but a scraper is denied (exit 13):
-./target/debug/cordon submit --path "$HOME/.config/mytool/secret" --exe /tmp/scraper --op read
-./target/debug/cordon status
+# Lint a policy file locally — no daemon, no root (great for CI):
+cargo build -p cordon-cli
+./target/debug/cordon policy check packaging/cordon.example.policy.toml
 ```
 
-For the **real** boundary (root **`bpf-lsm`**, in-kernel), see
-`packaging/cordon.example.toml` and `packaging/test/run-bpf-lsm-vm.sh` (runs it in a
-VM, no host root). The root `fanotify` backend (`run-in-vm.sh`) is dev/test only —
-not a security boundary.
+The **real boundary** is the in-kernel `bpf-lsm` backend (root, `CAP_BPF` +
+`CAP_MAC_ADMIN`, a kernel with `CONFIG_BPF_LSM=y` and `bpf` in the LSM list). The full
+end-to-end suite — allow/deny, per-action, groups, copy-down precedence, permissive,
+silence, and runtime `policy apply` — runs in a virtme-ng VM with no host root (just
+`/dev/kvm`):
+
+```sh
+packaging/test/run-bpf-lsm-vm.sh
+```
+
+The authoritative policy is a text file (see
+[`packaging/cordon.example.policy.toml`](packaging/cordon.example.policy.toml));
+`cordon policy apply` compiles it and atomically re-seeds the in-kernel maps.
 
