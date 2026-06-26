@@ -21,6 +21,14 @@ The big one: text policy → compiler → flat maps → in-kernel per-object eva
 open-time actions (`read`/`write`/`create`) already reachable at `file_open`. Delivers the
 whole model end-to-end and closes the in-kernel-rules gap.
 
+> **From the first real audit run** (~1031 events in 70s of normal dev work): tools re-open
+> the *same* config file dozens–hundreds of times per invocation (one `helm` run = 464 opens
+> of `~/.kube/config`; `gopass` 261×, `gpg` 146×). So **event coalescing is a hard M1
+> requirement** (§1g), not an M4 nicety. The run also confirmed multi-reader dirs are the
+> norm (`~/.kube` ← helm+kubectl+kubelogin; `~/.npmrc` ← node+deno), validating subject
+> groups, and that every match landed at the subtree level (no file-vs-subtree collisions) —
+> a signal for open decision #1.
+
 ### 1a. Policy file + parser — `crates/core/src/policy/`
 - TOML schema (see Appendix A): `mode`, `[group.{subject,object,action}.*]`, `[[rule]]`.
 - serde structs + a resolver: expand `@group` refs (all three axes), detect group cycles,
@@ -80,19 +88,32 @@ whole model end-to-end and closes the in-kernel-rules gap.
 - **Remove** `adopt`/`claim`/`disown`/`add`/`rm` (replaced by editing the text file +
   `apply`). `zones` config moves to autolearn scope (M4).
 
-### 1g. Validation
-- Unit: 1a/1b above.
+### 1g. Event coalescing (from audit findings)
+Tools re-open the same file hundreds of times per run, so raw 1-event-per-open floods the
+ring buffer (lossy under enforce) and the learn path (duplicate candidates).
+- **In-kernel suppressor**: a small `HashMap<(exe FileId, ObjId, action), u64 last_ns>` (or
+  an LRU) — emit a `LearnEvent` only if `now - last > window` (e.g. 1s); bump a per-key
+  `suppressed` counter otherwise. Keeps the ring quiet without losing the *first* occurrence.
+- **Daemon-side coalescing**: collapse drained events to one record per
+  `(exe, object, action)` with a count + first/last timestamp before logging/learning.
+- Carry the suppressed count into the (coalesced) record so volume is still visible.
+- Decide the window + map size during impl; both are bounded, verifier-friendly.
+
+### 1h. Validation
+- Unit: 1a/1b above; daemon-side coalescing (N identical events → 1 record + count).
 - VM e2e (extend `bpf-lsm-smoke.sh`): per-action (read-allow + write-deny on one object),
   subject group (two exes allowed, third denied), object group, `deny>allow` precedence,
   most-specific object, **permissive** mode (deny logged but allowed), `silence` (denied,
-  not logged). Keep the self-test-negative (poison offsets) scenario.
+  not logged), and **coalescing** (a tight open-loop yields one event, not thousands). Keep
+  the self-test-negative (poison offsets) scenario.
 
 ### M1 open decisions (confirm before coding)
 1. **Object precedence**: *wholesale-at-deepest* (deepest protected object's rules are the
    only ones consulted) vs *layered* (per-action most-specific across all protected
    ancestors). Proposed: **wholesale** for v1 (matches today's walk; simpler kernel),
    layering deferred. Flag because a file-specific rule then *shadows* an ancestor subtree's
-   rules entirely.
+   rules entirely. *Audit signal:* the first real run had **zero** file-vs-subtree
+   collisions (every match was at the subtree level) — so wholesale looks safe in practice.
 2. **Default for a protected object with no matching rule**: global **default-deny**
    (proposed) vs per-object default. Per-object deferred.
 3. **CLI surface**: remove the owner verbs (proposed) vs keep as text-file-editing sugar.
@@ -110,6 +131,13 @@ whole model end-to-end and closes the in-kernel-rules gap.
 - `argv0` (read `mm->arg_start..arg_end`, bounded) and `ancestor-exe` (`task->real_parent`
   chain, bounded) — the interpreter fix; document forgeability (double-fork, argv rewrite).
 - Compiler + TOML extended to author predicate conjunctions (Appendix A shows the object form).
+
+> *Audit signal:* this is **targeted, not universal**. In the first run almost every opener
+> was a compiled binary (helm, kubectl, gpg, gh, ssh, gopass) — fine at plain `exe`
+> granularity. Only shared runtimes needed it: `node`/`deno` on `~/.npmrc` (and `python` on
+> `~/.aws` once exercised). So argv0/ancestor matters per-interpreter-fronted-dir, not for
+> the policy as a whole — keep `exe`-only the default and opt into argv/ancestor where a
+> dir's opener is an interpreter.
 
 ## Milestone 3 — Mutation + exec hooks
 - Second eBPF program attaching `inode_unlink/_rmdir/_mkdir/_rename` and
