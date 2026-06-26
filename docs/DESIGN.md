@@ -274,6 +274,11 @@ deferred key-holder.
 
 ## 5. Coverage & ownership model
 
+> **Superseded by §15.** This section describes the v1 *owner* model as shipped
+> (Phases 0–1). The target is the flat **rule model** in §15, which subsumes owners,
+> explicit rules, and TOFU into one concept; §15.1 explains why. Kept here as the
+> record of what the current code does.
+
 Two rule sources; explicit wins over auto.
 
 ### Explicit rules (highest precedence)
@@ -654,3 +659,127 @@ secret config dirs — transparently, cross-platform, zero per-tool policy."
 
 ## 14. Open decisions
 See `STATUS.md`.
+
+## 15. Target architecture — the rule model (supersedes §5)
+
+§5 is the v1 *owner* model as shipped. The target is a flat **rule model** —
+`(who, where, action, policy)`, in the SELinux/AppArmor lineage — that subsumes
+owners, explicit rules, and TOFU into one concept. This section is the architecture;
+the step-by-step migration is in [`PLAN-rule-model.md`](PLAN-rule-model.md).
+
+### 15.1 Why
+The owner entity is reducible to allow-rules: `owner_match` ≡ "an allow rule exists for
+(caller-exe, subtree)." Owner groups bought grouping / dedup / naming — but a general
+**group** mechanism (§15.7) gives that for *all* axes, symmetrically, so a dedicated
+owner table is incidental complexity. Collapsing it also closes a real gap: the
+bpf-lsm backend today enforces only `subtrees` + `owner_identities`, **not** the
+`rules` table, so `cordon add` allow/deny and TOFU are silently unenforced in-kernel.
+One model, enforced uniformly.
+
+### 15.2 The rule
+`(who, where, action, policy)`:
+- **who** — subject: a *conjunction of predicates*, not just an exe (§15.4).
+- **where** — object: a file, directory, or **subtree** (recursive). Matched in-kernel
+  by the dentry ancestor walk (most-specific wins).
+- **action** — `read | write | create | execute | listdir | unlink | mkdir | rmdir |
+  rename` (extensible). Each maps to an LSM hook (§15.5).
+- **policy** — `allow | deny | audit | silence` = `{allow,deny} × {log,silent}`:
+  allow=allow+silent, audit=allow+log, deny=deny+log, silence=deny+silent.
+
+### 15.3 The compile principle (load-bearing)
+**Groups, nesting, defaults, and precedence are resolved entirely in userspace at
+compile time; the kernel evaluates a flat, pre-resolved decision table.** cordond
+parses the text policy → expands groups → resolves paths→`(dev,ino)` → flattens to a
+per-object rule table → loads BPF maps. Like SELinux's `checkpolicy`: expressive
+source, dumb-fast binary form. The eBPF program never sees a group or a nested ref,
+so it stays small and verifier-friendly no matter how expressive authoring gets.
+
+### 15.4 Subject = predicate set (the identity frontier)
+`who` is a conjunction of cheap-to-check predicates, ANDed:
+- `exe` — path/inode (cheap)
+- `uid` / `gid` — cheap (`bpf_get_current_uid_gid`)
+- `cgroup` / unit — cheap (`bpf_get_current_cgroup_id`); names a systemd service
+- `exe-hash` — content identity via **IMA/fsverity** (kernel-measured), *not* hashed in
+  BPF; survives upgrades, resists binary swap
+- `argv0` / `ancestor-exe` — moderate cost; the only real fix for the **interpreter
+  problem** (`~/.aws` is opened by `python3`, not `aws` — match "python3 whose
+  argv0/ancestor is aws", not all python)
+
+v1 ships `exe`+`uid`+`cgroup`; hash/argv/ancestor are opt-in later. No rule grammar
+fixes identity granularity — this axis is where the security actually lives.
+
+### 15.5 Action ↔ hook map (actions are not uniform)
+| action | LSM hook | notes |
+|---|---|---|
+| read / write / create | `file_open` | one program; `f_flags`/`f_mode` already encode RDONLY/WRONLY/RDWR/`O_CREAT` — three actions free at open time |
+| execute | `bprm_check_security` | exec of a binary |
+| unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | second program; fire on mutation (cheap) |
+| listdir | `file_open` of a directory (coarse) | no clean per-`getdents` hook; finer needs the hot `file_permission` |
+
+`file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
+is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewhere), so
+**identity is inode across all hooks** (the dentry walk), never path.
+
+### 15.6 Precedence (pin it explicitly)
+1. Most-specific **where** wins (exact file > deeper subtree > ancestor).
+2. Ties broken **deny > allow** (fail-safe).
+3. A *protected* object with no matching rule → **default-deny** (configurable
+   per-object).
+4. "Protected" = appears in / under any rule; everything else is unmediated **allow**
+   (you cannot default-deny the whole filesystem).
+
+Plus a **global mode** orthogonal to per-rule policy: `enforce | permissive | off`,
+where `permissive` downgrades every `deny`→`audit` system-wide (the safe-rollout
+lever; SELinux permissive).
+
+### 15.7 Groups
+Named, nestable, **symmetric across all three axes** (subject / object / action),
+cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Example
+(TOML):
+```toml
+[group.subject.ssh-tools]  members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/git"]
+[group.object.cloud-creds] members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
+[group.action.ro]          members = ["read", "listdir"]
+
+[[rule]]  who = "@ssh-tools"  where = "~/.ssh"        action = "@ro"             policy = "allow"
+[[rule]]  who = "*"           where = "@cloud-creds"  action = ["read", "write"] policy = "audit"
+```
+
+### 15.8 Storage
+- **Authoritative policy = a root-owned text file** (TOML v1; a compact DSL later if
+  TOML gets noisy). Not user-writable, else a scraper writes itself in. Git-versionable,
+  reviewable, diffable — policy as code.
+- **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
+  swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
+  only on an explicit apply, so an edit-in-progress is never half-enforced.
+- **`cordon policy check`** — linter/compiler: unknown exes, group cycles, shadowed /
+  unreachable rules, missing paths, deny-shadowed-by-allow.
+- **Atomic swap** in-kernel (double-buffer or generation field) — today's
+  clear-then-insert has a visible window; apply must be atomic.
+- **Learned rules** live in a *separate* SQLite db (high-churn, machine-managed),
+  **lower precedence**, never overriding a hand-written deny; promoted into the text
+  file on review (§15.9).
+
+### 15.9 Autolearn (the zones layer)
+TOFU generalized: a bounded **training mode** (AppArmor complain-mode / fapolicyd
+trust-DB lineage). `zones` = the scope where autolearn may propose rules.
+- Explicit activation (`cordon learn`), bounded window; **the trust window is the whole
+  vulnerability** (anything malicious running during learning gets blessed) — so never
+  auto-enforce, review before promote.
+- Generalize (collapse per-file opens into a subtree rule) + confidence (seen N times)
+  + dedup, or you drown in candidates.
+- Record the *rich* subject (argv0 / ancestor / hash) so promoted rules are tight, not
+  just `exe=python3`.
+- `cordon learn review` → diff of proposed rules → promote into the text file. The
+  learned db is throwaway; the text file is durable.
+
+### 15.10 Phasing
+1. **Rule core** — text policy + compiler (groups/precedence resolved in userspace) →
+   flat maps; keep open-time read/write/create via `f_flags`; global `permissive`
+   mode; explicit `policy apply`. Replaces the owner model, closes the in-kernel-rules
+   gap.
+2. **Subject predicates** beyond exe — uid, cgroup; then IMA hash; then argv0/ancestor.
+3. **Mutation hooks** — unlink/mkdir/rmdir/rename as a second program.
+4. **Autolearn** (sqlite) + review/promote, scoped to zones.
+5. **Fail-safe pinning** (orthogonal, already parked) so the compiled policy keeps
+   enforcing across daemon restarts.
