@@ -42,11 +42,16 @@ whole model end-to-end and closes the in-kernel-rules gap.
 - Cross-product `who × where × action` → concrete `(subject, object, action, policy)` rules.
 - Resolve each object path → `FileId` via `proc::file_id`; collect **pending** paths
   (don't exist yet) separately (re-resolved on a later apply / `inode_create` in M3).
-- Assign `ObjId`s; bucket rules per object; **sort by precedence** (§15.6: deny>allow within
-  an object; object-level specificity is handled by the kernel walk, not here).
-- Emit `CompiledPolicy { mode, protected: [(FileId, ObjId)], rules: [(ObjId, CompiledRule)],
-  pending: [(PathBuf, …)] }` (Appendix B).
-- Unit tests: expansion counts, precedence ordering, pending-path handling, dedup.
+- Assign `ObjId`s; build the protected-object **prefix forest**; **copy-down** — fold each
+  ancestor object's rules into every protected descendant's bucket (decision #1), so the
+  kernel consults only the deepest object's (pre-merged) bucket. **Sort each bucket**
+  most-specific-object-first, then **deny>allow** within a specificity level (§15.6); dedup;
+  enforce `MAX_RULES_PER_OBJ` (32 to start). The kernel does a dumb **first-match** scan of
+  one bucket — all precedence/inheritance resolved here (§15.3).
+- Emit `CompiledPolicy { mode, protected: [(FileId, ObjId)], rules: [(ObjId, CompiledRule)]
+  (packed per-object array), pending: [(PathBuf, …)] }` (Appendix B).
+- Unit tests: expansion counts, copy-down inheritance (both exception scenarios below),
+  precedence ordering, pending-path handling, dedup, per-object cap.
 
 ### 1c. Shared map/record types — `crates/bpf-common`
 - New module `policy_maps.rs`: map-name consts `MAP_PROTECTED`, `MAP_RULES`,
@@ -107,19 +112,35 @@ ring buffer (lossy under enforce) and the learn path (duplicate candidates).
   not logged), and **coalescing** (a tight open-loop yields one event, not thousands). Keep
   the self-test-negative (poison offsets) scenario.
 
-### M1 open decisions (confirm before coding)
-1. **Object precedence**: *wholesale-at-deepest* (deepest protected object's rules are the
-   only ones consulted) vs *layered* (per-action most-specific across all protected
-   ancestors). Proposed: **wholesale** for v1 (matches today's walk; simpler kernel),
-   layering deferred. Flag because a file-specific rule then *shadows* an ancestor subtree's
-   rules entirely. *Audit signal:* the first real run had **zero** file-vs-subtree
-   collisions (every match was at the subtree level) — so wholesale looks safe in practice.
-2. **Default for a protected object with no matching rule**: global **default-deny**
-   (proposed) vs per-object default. Per-object deferred.
-3. **CLI surface**: remove the owner verbs (proposed) vs keep as text-file-editing sugar.
-4. **Map encoding** for per-object rule lists: `HashMap<(ObjId, idx), CompiledRule>` +
-   `HashMap<ObjId, count>` (proposed) vs a packed `Array`. Affects the kernel scan.
-5. **Atomic swap** mechanism: double-buffered rule maps vs a generation field read-gate.
+### M1 decisions (locked 2026-06-26)
+1. **Object precedence → copy-down (compile-time layering).** Neither literal-wholesale nor a
+   runtime layered walk: the compiler folds each ancestor object's rules **down** into every
+   protected descendant's bucket, sorted most-specific-first then deny>allow; the kernel stays
+   dumb (deepest protected object → **first-match** scan of its one pre-merged bucket).
+   Satisfies §15.3 (*precedence resolved in userspace, flat in kernel*) **and** supports
+   per-subject sub-object exceptions, which literal-wholesale breaks. The two motivating cases:
+   - *broad-allow + narrow-deny* — `allow {A,B,S} read ./d` + `deny S read ./d/f`: A/B keep
+     reading `f`, only S denied. (Literal-wholesale would default-deny A/B on `f`.)
+   - *broad-deny + narrow-allow* — `deny {A,B,S} read ./d` + `allow S read ./d/f`: only S
+     reads `f`. (Both work under copy-down via the sorted first-match.)
+   - **Cost** (evaluated): total entries `= Σ_rule subtree_size(target)` — quadratic only in
+     *object-nesting depth* (≈1–2 here; the first real audit had **zero** file-vs-subtree
+     nesting ⇒ zero duplication). Binding constraint is the per-bucket cap, not memory; the
+     scan is paid only on protected-object opens (the unprotected majority short-circuits in
+     the dentry walk). Watch subject-group expansion × deep nesting; lever = keep groups as a
+     `(GroupId, exe)` membership map instead of expanding (deferred).
+2. **Default for a protected object with no matching rule → global default-deny** (§15.6.3).
+   Per-object default deferred.
+3. **CLI surface → remove the owner verbs** (`adopt`/`claim`/`disown`/`add`/`rm`) and their IPC
+   requests. Authoring is solely: edit the root-owned text policy + `cordon policy
+   check`/`apply`/`show`. One model (§15.8).
+4. **Map encoding → packed per-object array** (not `HashMap<(ObjId, idx)>`): one base + index
+   scan, cache-friendly, cheaper per-iteration now that copy-down can lengthen buckets.
+5. **Atomic swap → recompile whole table + double-buffer swap** on apply (copy-down makes a
+   single edit touch many buckets, so incremental in-place patching is out).
+
+`MAX_RULES_PER_OBJ = 32` to start (raise toward 64 if the verifier log demands; `cordon policy
+check` errors if a compiled bucket exceeds it).
 
 ---
 

@@ -8,6 +8,33 @@ bypass); the real Linux boundary is **`bpf-lsm`**, which Phase 3 adds — in-ker
 verdicts, validated end-to-end in a VM (owner allowed, non-owner `EPERM`). This file
 is the resume point.
 
+## Rule model (target architecture, DESIGN §15) — M1 in progress
+The owner model (Phase 3 below) is being replaced by the flat **rule model**
+(`(who, where, action, policy)`), per [`docs/PLAN-rule-model.md`]. M1 decisions are
+locked there (copy-down object precedence, `MAX_RULES_PER_OBJ = 32`, packed-array rule
+encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed).
+
+**Landed (M1 1a + 1b — userspace core, pure + unit-tested, no kernel changes yet):**
+- **`crates/bpf-common/src/policy_maps.rs`** — the compiled-form contract shared with
+  the eBPF program: `ObjId`, `Action` (a `bitflags` bitset, `#[repr(transparent)]` for
+  POD/map-layout soundness — validated compiling for `bpfel-unknown-none`), `Policy`,
+  `SubjectMatch`, `CompiledRule`, and the `PROTECTED`/`RULES`/`RULE_COUNT` map names.
+  Coexists with the v1 `SUBTREES`/`OWNER_IDS` schema during the migration.
+- **`crates/core/src/policy/`** — the three-stage userspace pipeline:
+  `parse` (TOML → spans via `toml::Spanned`; serde + `deny_unknown_fields` for structure),
+  `resolve` (group expansion on all three axes, cycle/ref/name validation, `~`-expansion;
+  the `@ref`/`*`/leaf lexical layer is a `Token`, leaf *semantics* stay here), and
+  `compile` (cross-product → **copy-down** object precedence → sorted, deduped, capped
+  per-object buckets, paths resolved via an injected resolver). Diagnostics carry a
+  source `Pos` (rule/group granularity). 27 unit tests incl. both copy-down exception
+  scenarios.
+
+**Next (M1 remainder):** 1c daemon-side map types/loading; 1d eBPF `file_open` rewrite
+(deepest-bucket first-match, `f_mode`/`f_flags` → read/write/create); 1e daemon backend
+(`seed_compiled_policy` + atomic swap); 1f `cordon policy check/apply/show` (remove owner
+verbs); 1g event coalescing; 1h VM e2e. The bits below describe the **superseded** owner
+model still in the code until 1c–1f land.
+
 ## Phase 3 (bpf-lsm — in progress)
 The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an
 eBPF program on the `file_open` LSM hook, reading policy from BPF maps the daemon

@@ -15,6 +15,7 @@ pub mod engine;
 pub mod event;
 pub mod identity;
 pub mod paths;
+pub mod policy;
 pub mod proto;
 pub mod store;
 

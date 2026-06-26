@@ -22,9 +22,14 @@
 pub mod ids;
 pub mod maps;
 pub mod offsets;
+pub mod policy_maps;
 
 pub use ids::{Decision, Dev, Ino, Mode, OwnerId, Pid};
 pub use maps::{
     FileId, LearnEvent, MAP_EVENTS, MAP_OWNER_IDS, MAP_SETTINGS, MAP_SUBTREES, OwnerKey, Settings,
 };
 pub use offsets::Offsets;
+pub use policy_maps::{
+    Action, CompiledRule, MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES, MAX_RULES_PER_OBJ, ObjId,
+    Policy, SubjectMatch,
+};
