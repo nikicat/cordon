@@ -19,7 +19,7 @@ encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed)
   the eBPF program: `ObjId`, `Action` (a `bitflags` bitset, `#[repr(transparent)]` for
   POD/map-layout soundness — validated compiling for `bpfel-unknown-none`), `Policy`,
   `SubjectMatch`, `CompiledRule`, and the `PROTECTED`/`RULES`/`RULE_COUNT` map names.
-  Coexists with the v1 `SUBTREES`/`OWNER_IDS` schema during the migration.
+  (The v1 `SUBTREES`/`OWNER_IDS` schema was removed in 1c, below.)
 - **`crates/core/src/policy/`** — the three-stage userspace pipeline:
   `parse` (TOML → spans via `toml::Spanned`; serde + `deny_unknown_fields` for structure),
   `resolve` (group expansion on all three axes, cycle/ref/name validation, `~`-expansion;
@@ -29,11 +29,35 @@ encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed)
   source `Pos` (rule/group granularity). 27 unit tests incl. both copy-down exception
   scenarios.
 
-**Next (M1 remainder):** 1c daemon-side map types/loading; 1d eBPF `file_open` rewrite
-(deepest-bucket first-match, `f_mode`/`f_flags` → read/write/create); 1e daemon backend
-(`seed_compiled_policy` + atomic swap); 1f `cordon policy check/apply/show` (remove owner
-verbs); 1g event coalescing; 1h VM e2e. The bits below describe the **superseded** owner
-model still in the code until 1c–1f land.
+**Landed (M1 1c + 1d + 1e — the in-kernel enforcement path; compiles across all three
+build modes, but NOT yet VM-validated — `1h` is the gate):**
+- **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
+  intent at open); the global `Mode` is now `enforce`/`permissive`/`off`; the ring-buffer
+  record is reshaped + renamed `LearnEvent` → **`DecisionEvent`** (it records a decision
+  for the journal; autolearn is a later M4 consumer) carrying `action` + matched `policy`;
+  the v1 owner maps (`SUBTREES`/`OWNER_IDS`/`OwnerKey`/`OwnerId`) are removed. `FileId` and
+  `Action` gained `Display` (canonical human forms — the daemon journals typed values, no
+  `String` helpers).
+- **1d eBPF program** (`crates/bpf`) — rewritten for the rule model: global-mode/daemon
+  fast-allow, dentry walk → deepest `PROTECTED` object, action from `f_mode`/`f_flags`
+  (empty ⇒ allow, e.g. `O_PATH`), **first-match** scan of the packed `RULES` bucket
+  (`RULE_COUNT`-bounded), default-deny, emit on `policy.logs()`. Builds + links for
+  `bpfel-unknown-none`.
+- **1e daemon backend** (`backend/bpf_lsm/`) — split into `mod.rs` (lifecycle: load →
+  attach → self-test → seed → drain), `seed.rs` (compile-policy → packed maps), and
+  `events.rs` (ring drain → journal). Compiles the **text policy file** at startup
+  (`proc::file_id` resolver) and seeds `PROTECTED`/`RULES`/`RULE_COUNT`/`SETTINGS`; refuses
+  on error diagnostics; self-test adapted to a deny-all rule. `config.policy` path added.
+
+**Next (M1 remainder):** 1f `cordon policy check/apply/show` + remove owner CLI/IPC verbs
+(today the owner verbs still exist and back the `mock`/`fanotify` backends; the `bpf-lsm`
+backend already ignores the store and uses the policy file); live apply = the atomic
+double-buffer swap in `seed.rs`. 1g event coalescing (in `events.rs`). 1h VM e2e — rewrite
+`packaging/test/bpf-lsm-smoke.sh` for the rule model (the current owner-model smoke is
+stale) and validate enforce/permissive/deny/audit/most-specific/coalescing in a VM.
+
+The Phase-3 section below describes the **superseded** owner model still backing the
+`mock`/`fanotify` backends until 1f.
 
 ## Phase 3 (bpf-lsm — in progress)
 The hardened Linux boundary (DESIGN §4): the verdict is returned **in-kernel** by an

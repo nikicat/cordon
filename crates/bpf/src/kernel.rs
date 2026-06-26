@@ -22,7 +22,7 @@
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel};
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::RingBuf;
-use cordon_bpf_common::{Decision, Dev, FileId, Ino, LearnEvent, Mode, Offsets, OwnerId, Pid};
+use cordon_bpf_common::{DecisionEvent, Dev, FileId, Ino, Offsets, Pid};
 
 /// Running-kernel field offsets, injected into `.rodata` by the daemon
 /// (`override_global("OFFSETS", …)`) after it parses the kernel BTF. The initializer
@@ -76,6 +76,14 @@ impl File {
     /// The file's inode (via the direct `f_inode` field).
     pub fn inode(self) -> Option<Inode> {
         Some(Inode(ptr_at(self.0, offset!(file_f_inode))?))
+    }
+    /// `f_mode` (`fmode_t`): `FMODE_READ`/`FMODE_WRITE` encode read/write intent at open.
+    pub fn f_mode(self) -> Option<u32> {
+        read_at::<u32>(self.0, offset!(file_f_mode))
+    }
+    /// `f_flags`: `O_CREAT` encodes create intent at open.
+    pub fn f_flags(self) -> Option<u32> {
+        read_at::<u32>(self.0, offset!(file_f_flags))
     }
 }
 
@@ -133,28 +141,18 @@ pub fn caller_exe() -> Option<FileId> {
     current_exe_file()?.inode()?.file_id()
 }
 
-/// Push one denial / would-deny record to the ring buffer. Best-effort: a full
-/// ring drops the *observation*, never the verdict.
-pub fn emit(pid: Pid, owner: OwnerId, subtree: FileId, exe: FileId, mode: Mode) {
-    let Some(mut entry) = EVENTS.reserve::<LearnEvent>(0) else {
+/// Push one logged decision to the ring buffer. Best-effort: a full ring drops the
+/// *observation*, never the verdict. The caller builds the record (it knows the
+/// matched policy and the mode-dependent decision); we just reserve + write + submit.
+pub fn emit(event: DecisionEvent) {
+    let Some(mut entry) = EVENTS.reserve::<DecisionEvent>(0) else {
         return;
     };
-    let decision = if mode.enforces() {
-        Decision::DENY
-    } else {
-        Decision::WOULD_DENY
-    };
     let e = entry.as_mut_ptr();
-    // SAFETY: `e` is a freshly reserved `LearnEvent` slot in ring memory; the write
+    // SAFETY: `e` is a freshly reserved `DecisionEvent` slot in ring memory; the write
     // initializes the whole record before `submit`.
     unsafe {
-        e.write(LearnEvent {
-            pid,
-            decision,
-            owner,
-            subtree,
-            exe,
-        });
+        e.write(event);
     }
     entry.submit(0);
 }

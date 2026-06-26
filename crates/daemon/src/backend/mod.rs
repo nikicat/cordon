@@ -37,9 +37,9 @@ pub fn select(cfg: &Config) -> Result<Box<dyn Backend>> {
             #[cfg(all(target_os = "linux", feature = "bpf-lsm"))]
             {
                 Ok(Box::new(bpf_lsm::BpfLsmBackend::new(
-                    cfg.mode,
                     cfg.bpf_object.clone(),
                     cfg.bpf_pin_dir.clone(),
+                    cfg.policy.clone(),
                 )))
             }
             #[cfg(not(all(target_os = "linux", feature = "bpf-lsm")))]

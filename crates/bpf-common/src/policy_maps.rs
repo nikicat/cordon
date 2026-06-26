@@ -39,6 +39,11 @@ pub const MAP_RULE_COUNT: &str = "RULE_COUNT";
 /// Start at 32; raise toward 64 if the verifier log demands (DESIGN §15, M1 #1).
 pub const MAX_RULES_PER_OBJ: usize = 32;
 
+/// Maximum number of protected objects (distinct `where` targets). Sizes the packed
+/// [`MAP_RULES`] array (`MAX_OBJECTS * MAX_RULES_PER_OBJ` slots) and bounds the dense
+/// [`ObjId`] space; the daemon rejects a compiled policy with more objects than this.
+pub const MAX_OBJECTS: usize = 1024;
+
 /// A protected object's id — a dense `u32` index assigned by the compiler, used to
 /// address the object's slot in [`MAP_RULES`]/[`MAP_RULE_COUNT`]. Distinct from
 /// [`FileId`]: the `(dev,ino)` is the *kernel's* key into [`MAP_PROTECTED`], the
@@ -73,6 +78,38 @@ bitflags! {
         const MKDIR   = 1 << 6;
         const RMDIR   = 1 << 7;
         const RENAME  = 1 << 8;
+    }
+}
+
+/// The canonical human form: `read|write|create|…` (or `none`). The lower-case names
+/// match the policy authoring vocabulary. `no_std`: `core::fmt`, no allocation.
+impl core::fmt::Display for Action {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const NAMED: [(Action, &str); 9] = [
+            (Action::READ, "read"),
+            (Action::WRITE, "write"),
+            (Action::CREATE, "create"),
+            (Action::EXECUTE, "execute"),
+            (Action::LISTDIR, "listdir"),
+            (Action::UNLINK, "unlink"),
+            (Action::MKDIR, "mkdir"),
+            (Action::RMDIR, "rmdir"),
+            (Action::RENAME, "rename"),
+        ];
+        if self.is_empty() {
+            return write!(f, "none");
+        }
+        let mut first = true;
+        for (bit, name) in NAMED {
+            if self.contains(bit) {
+                if !first {
+                    write!(f, "|")?;
+                }
+                write!(f, "{name}")?;
+                first = false;
+            }
+        }
+        Ok(())
     }
 }
 

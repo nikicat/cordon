@@ -72,6 +72,9 @@ pub struct Config {
     /// `bpf-lsm` backend: the bpffs directory to pin the program + maps under, so
     /// enforcement survives the daemon dying (fail-safe, DESIGN §4).
     pub bpf_pin_dir: PathBuf,
+    /// The root-owned text policy file (the flat rule model, DESIGN §15.8). The
+    /// `bpf-lsm` backend compiles it at startup and seeds the maps from it.
+    pub policy: PathBuf,
 }
 
 /// The raw, all-optional TOML shape. Unknown keys are rejected so typos fail loud.
@@ -85,6 +88,7 @@ struct ConfigFile {
     zones: Option<Vec<String>>,
     bpf_object: Option<String>,
     bpf_pin_dir: Option<String>,
+    policy: Option<String>,
 }
 
 impl Config {
@@ -137,6 +141,10 @@ impl Config {
             bpf_pin_dir: match f.bpf_pin_dir {
                 Some(s) => PathBuf::from(interpolate(&s)?),
                 None => default_bpf_pin_dir(),
+            },
+            policy: match f.policy {
+                Some(s) => PathBuf::from(interpolate(&s)?),
+                None => default_policy(),
             },
         })
     }
@@ -225,6 +233,18 @@ fn default_bpf_object() -> PathBuf {
 /// Default bpffs pin directory for the `bpf-lsm` backend's fail-safe pinning.
 fn default_bpf_pin_dir() -> PathBuf {
     PathBuf::from("/sys/fs/bpf/cordon")
+}
+
+/// Default text-policy location (root-owned). User-mode dev points it elsewhere via
+/// config; the rule-model backend compiles it at startup.
+fn default_policy() -> PathBuf {
+    if is_root() {
+        return PathBuf::from("/etc/cordon/policy.toml");
+    }
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"));
+    base.join("cordon/policy.toml")
 }
 
 fn default_zones() -> Vec<PathBuf> {

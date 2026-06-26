@@ -102,6 +102,8 @@ impl KernelBtf {
         Ok(Offsets {
             file_f_path_dentry: m("file", &["f_path", "dentry"])?,
             file_f_inode: m("file", &["f_inode"])?,
+            file_f_mode: m("file", &["f_mode"])?,
+            file_f_flags: m("file", &["f_flags"])?,
             dentry_d_inode: m("dentry", &["d_inode"])?,
             dentry_d_sb: m("dentry", &["d_sb"])?,
             dentry_d_parent: m("dentry", &["d_parent"])?,
