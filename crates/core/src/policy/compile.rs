@@ -230,15 +230,50 @@ where
 /// authoring order within a precedence class, so compiles are deterministic.
 fn sort_bucket(bucket: &mut [ProvRule]) {
     bucket.sort_by(|a, b| {
+        // DESIGN §15.6 precedence, most-specific first: (1) object depth, (2) subject
+        // specificity, (3) deny>allow as the tie-break among rules of *equal* object+
+        // subject specificity. The kernel then takes the first match. (1) and (2) are
+        // `b.cmp(a)` — descending, since a higher depth/specificity is more specific;
+        // (3) is `a.cmp(b)` — `Polarity::Deny` is declared first, so ascending puts it
+        // ahead of `Allow`.
         b.depth
             .cmp(&a.depth)
-            .then_with(|| deny_rank(a.rule).cmp(&deny_rank(b.rule)))
+            .then_with(|| subject_specificity(b.rule).cmp(&subject_specificity(a.rule)))
+            .then_with(|| polarity(a.rule).cmp(&polarity(b.rule)))
     });
 }
 
-/// `0` for a denying policy (sorts first), `1` otherwise.
-fn deny_rank(r: CompiledRule) -> u8 {
-    if r.policy.denies() { 0 } else { 1 }
+/// The count of non-wildcard subject predicates (DESIGN §15.6 step 2); a higher count is
+/// more specific. A concrete subject (`exe=X`) outranks a `who="*"` catch-all on the same
+/// object, so a specific `allow`/`deny` wins over a broad `audit`/`deny` — the basis of
+/// the audit→bless→enforce flow (§15.10 flow A): a blessed `allow exe=X` goes silent while
+/// the `*` catch-all keeps observing the not-yet-blessed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Specificity(u32);
+
+/// M1 fills only `exe`, so the count is 1 (concrete exe) or 0 (`*`); the popcount
+/// generalizes for free as M2 adds the uid/cgroup predicates.
+fn subject_specificity(r: CompiledRule) -> Specificity {
+    const PREDICATES: u32 =
+        SubjectMatch::FLAG_EXE_ANY | SubjectMatch::FLAG_UID_ANY | SubjectMatch::FLAG_CGROUP_ANY;
+    Specificity(PREDICATES.count_ones() - (r.subject.flags & PREDICATES).count_ones())
+}
+
+/// Allow-vs-deny polarity — the fail-safe tie-break (§15.6 step 3). `Deny` is declared
+/// first so the derived `Ord` sorts it ahead of `Allow`: among rules of equal object +
+/// subject specificity, a denying policy wins.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Polarity {
+    Deny,
+    Allow,
+}
+
+fn polarity(r: CompiledRule) -> Polarity {
+    if r.policy.denies() {
+        Polarity::Deny
+    } else {
+        Polarity::Allow
+    }
 }
 
 /// Drop later duplicates of an identical [`CompiledRule`], keeping the first (highest
@@ -367,6 +402,50 @@ mod tests {
         let p = compile_text(&text, &[("/a", 1), ("/d", 10)]);
         let d = object(&p, "/d");
         assert_eq!(d.rules[0].policy, Policy::DENY); // fail-safe tie-break
+    }
+
+    #[test]
+    fn concrete_subject_beats_wildcard_catchall() {
+        // §15.10 flow A step 2: a blessed `allow exe=X` must win over a `who="*"` audit
+        // catch-all on the same object, so the blessed exe goes silent while the catch-all
+        // keeps observing everyone else. Author the catch-all *first* to prove the order
+        // comes from specificity, not insertion order.
+        let text = format!(
+            "{}{}",
+            rule("\"*\"", "\"/d\"", "\"read\"", "\"audit\""),
+            rule("\"/a\"", "\"/d\"", "\"read\"", "\"allow\""),
+        );
+        let p = compile_text(&text, &[("/a", 1), ("/d", 10)]);
+        let d = object(&p, "/d");
+        assert_eq!(d.rules[0].policy, Policy::ALLOW);
+        assert_eq!(
+            d.rules[0].subject,
+            SubjectMatch::exe(FileId::new(Dev(0), Ino(1)))
+        );
+        // The wildcard audit catch-all still follows (so non-X openers are observed).
+        assert_eq!(d.rules[1].policy, Policy::AUDIT);
+        assert_eq!(d.rules[1].subject, SubjectMatch::ANY);
+    }
+
+    #[test]
+    fn concrete_allow_beats_wildcard_deny() {
+        // The motivating case for subject-specificity: without it, deny>allow would sort
+        // the `who="*"` deny first and block X. Specificity puts `allow exe=X` ahead, so X
+        // is allowed while everyone else is denied by the catch-all.
+        let text = format!(
+            "{}{}",
+            rule("\"*\"", "\"/d\"", "\"read\"", "\"deny\""),
+            rule("\"/a\"", "\"/d\"", "\"read\"", "\"allow\""),
+        );
+        let p = compile_text(&text, &[("/a", 1), ("/d", 10)]);
+        let d = object(&p, "/d");
+        assert_eq!(d.rules[0].policy, Policy::ALLOW);
+        assert_eq!(
+            d.rules[0].subject,
+            SubjectMatch::exe(FileId::new(Dev(0), Ino(1)))
+        );
+        assert_eq!(d.rules[1].policy, Policy::DENY);
+        assert_eq!(d.rules[1].subject, SubjectMatch::ANY);
     }
 
     #[test]

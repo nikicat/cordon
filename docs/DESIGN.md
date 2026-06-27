@@ -722,8 +722,8 @@ deliberately drops SELinux's `enforce|permissive|off`: cordon's user is their *o
 admin iterating live on one box, not an admin staging policy for a fleet, so a global
 "permissive" preview + "enforce" cutover is just the **audit→deny** progression (§15.10).
 "Off" is an empty policy (or a stopped daemon). *(M1 shipped a global enforce/permissive/off
-mode; it has since been **removed** — the kernel now blocks iff `policy.denies()`. The
-subject-specificity precedence key in (2) above is still tracked in
+mode; it has since been **removed** — the kernel now blocks iff `policy.denies()` — and the
+subject-specificity precedence key in (2) above is implemented. See
 [`PLAN-rule-model.md`](PLAN-rule-model.md).)*
 
 ### 15.7 Groups
