@@ -19,8 +19,9 @@ Status: the flat **rule model** ([`DESIGN.md` §15](docs/DESIGN.md)) — a root-
 text policy of `(who, where, action, policy)` rules, compiled in userspace and
 enforced **in-kernel** by the `bpf-lsm` backend — is the architecture. M1 (TOML
 parser → copy-down compiler → flat BPF maps → in-kernel `file_open` verdicts for
-read/write/create, with `enforce`/`permissive`/`off` modes and `cordon policy
-check`/`apply`/`show`) is implemented and validated end-to-end in a virtme-ng VM. The
+read/write/create, with the per-rule `allow`/`audit`/`deny`/`silence` policy as the only
+enforcement level — no global mode — and `cordon policy check`/`apply`/`show`) is
+implemented and validated end-to-end in a virtme-ng VM. The
 earlier owner model (`fanotify`/`mock` backends, SQLite store, `adopt`/TOFU) has been
 retired in favor of the one model. See [`STATUS.md`](STATUS.md).
 
@@ -36,7 +37,7 @@ cargo build -p cordon-cli
 
 The **real boundary** is the in-kernel `bpf-lsm` backend (root, `CAP_BPF` +
 `CAP_MAC_ADMIN`, a kernel with `CONFIG_BPF_LSM=y` and `bpf` in the LSM list). The full
-end-to-end suite — allow/deny, per-action, groups, copy-down precedence, permissive,
+end-to-end suite — allow/deny, per-action, groups, copy-down precedence, audit→deny,
 silence, and runtime `policy apply` — runs in a virtme-ng VM with no host root (just
 `/dev/kvm`):
 

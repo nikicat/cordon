@@ -20,7 +20,7 @@
 //! apply / `inode_create` in M3); an exe that doesn't resolve drops that one rule with
 //! a warning.
 
-use super::{Diagnostic, Mode, ResolvedPolicy, Severity, SubjectSpec};
+use super::{Diagnostic, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
 use cordon_bpf_common::{CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectMatch};
 use std::collections::BTreeSet;
@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 /// [`CompiledPolicy::has_errors`] is false.
 #[derive(Clone, Debug)]
 pub struct CompiledPolicy {
-    pub mode: Mode,
     pub objects: Vec<CompiledObject>,
     /// Object paths that don't currently resolve to an inode — re-tried on a later
     /// `cordon policy apply` (or when the path is created, M3).
@@ -191,7 +190,6 @@ where
     }
 
     CompiledPolicy {
-        mode: resolved.mode,
         objects: compiled,
         pending,
         diagnostics,

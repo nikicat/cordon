@@ -198,18 +198,21 @@ check` errors if a compiled bucket exceeds it).
 
 ## Decided refinements (2026-06-27)
 From working the real-system audit UX (DESIGN §15.6, §15.10). M1 shipped without these;
-DESIGN documents them as the target, and they're to be implemented next.
+DESIGN documents them as the target. **(1) is now done; (2) and (3) are next.**
 
-1. **Drop the global mode.** Remove `enforce|permissive|off` entirely — the `mode=` policy
-   key, `ids::Mode`, `Settings.mode`, and `Decision::WOULD_DENY`. The per-rule `policy` is
-   the *only* enforcement control: the kernel blocks iff `policy.denies()`; `audit` observes
-   an object, `deny` enforces it, per object. "Off" = an empty policy or a stopped daemon.
-   *Why:* the user is their own policy admin on one box, not an admin staging policy for a
-   fleet — SELinux's global permissive→enforce cutover is the per-object **audit→deny**
-   progression here (§15.10 flow A). *Touches:* bpf-common (ids/maps/Settings), bpf kernel
-   (`blocked = policy.denies()`, no off/permissive branches), core (config drops `mode`;
-   compile drops `PolicyMode`), daemon (`bpf_mode`/`mode_str` gone), cli (no mode in
-   status/show), the smoke (drop the permissive scenario, add an audit→deny one), docs.
+1. **Drop the global mode — ✅ done.** Removed `enforce|permissive|off` entirely — the
+   `mode=` policy key, `ids::Mode`, `Settings.mode`, and `Decision::WOULD_DENY` are gone.
+   The per-rule `policy` is the *only* enforcement control: the kernel blocks iff
+   `policy.denies()`; `audit` observes an object, `deny` enforces it, per object. "Off" =
+   an empty policy or a stopped daemon. *Why:* the user is their own policy admin on one
+   box, not an admin staging policy for a fleet — SELinux's global permissive→enforce
+   cutover is the per-object **audit→deny** progression here (§15.10 flow A). *Touched:*
+   bpf-common (ids/maps/Settings — `Settings` is now `{daemon_pid, active_bank}`), bpf
+   kernel (`blocked = policy.denies()`, no off/permissive branches), core (config + parse
+   drop `mode`; `parse` now *rejects* a leftover top-level `mode =` key; compile drops
+   `Mode`), daemon (`bpf_mode`/`mode_str` gone, `seed_policy`/`set_settings` lose the mode
+   arg), cli (no mode in `check`/status/show), the smoke (permissive scenario → audit→deny),
+   docs.
 
 2. **Subject-specificity in precedence.** `sort_bucket` gains a key between object-depth and
    deny>allow: a concrete subject (exe; later the count of non-wildcard predicates) outranks
@@ -225,7 +228,8 @@ DESIGN documents them as the target, and they're to be implemented next.
 
 ## Appendix A — policy TOML (proposed)
 ```toml
-mode = "permissive"                       # enforce | permissive | off
+# No global mode: the per-rule `policy` is the only enforcement level (use `audit` to
+# observe, `deny` to enforce). A top-level `mode =` key is rejected.
 
 [group.subject.ssh-tools]  members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/git"]
 [group.object.cloud-creds] members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
@@ -242,8 +246,7 @@ mode = "permissive"                       # enforce | permissive | off
 
 ## Appendix B — compiled shapes (proposed; refine during impl)
 ```
-CompiledPolicy { mode: Mode,
-                 protected: [(FileId, ObjId)],         // → MAP_PROTECTED
+CompiledPolicy { protected: [(FileId, ObjId)],         // → MAP_PROTECTED
                  rules:     [(ObjId, CompiledRule)],   // → MAP_RULES (+ MAP_RULE_COUNT)
                  pending:   [(PathBuf, ObjId)] }        // unresolved paths, re-tried on apply
 
@@ -252,4 +255,4 @@ SubjectMatch  { exe: FileId, uid: u32, cgroup: u64, flags: u32 /*which fields ar
 ```
 Kernel maps: `MAP_PROTECTED: HashMap<FileId, ObjId>`,
 `MAP_RULE_COUNT: HashMap<ObjId, u32>`, `MAP_RULES: HashMap<(ObjId,u32), CompiledRule>`,
-`MAP_SETTINGS: Array<Settings{ daemon_pid, mode }>`, `MAP_EVENTS: RingBuf`.
+`MAP_SETTINGS: Array<Settings{ daemon_pid, active_bank }>`, `MAP_EVENTS: RingBuf`.

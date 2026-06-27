@@ -19,7 +19,7 @@ use std::path::PathBuf;
 /// A command from a client to the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
-    /// Daemon summary (backend, mode, the effective policy's object count).
+    /// Daemon summary (backend, the effective policy's object count).
     Status,
     /// Compile + apply a text policy, atomically replacing the live one. The CLI
     /// sends the **text** (not a path): the daemon compiles it with its own
@@ -52,9 +52,6 @@ pub struct StatusInfo {
     pub socket: PathBuf,
     /// The policy file the backend compiles at startup / `apply` re-reads.
     pub policy: PathBuf,
-    /// The effective global mode (`enforce`/`permissive`/`off`), or `None` if no
-    /// policy is loaded yet.
-    pub mode: Option<String>,
     /// How many protected objects the effective policy has (`None` if none loaded).
     pub objects: Option<usize>,
 }
@@ -64,8 +61,6 @@ pub struct StatusInfo {
 /// a summary: the protected object paths, each with its rule count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyView {
-    /// `enforce` | `permissive` | `off`.
-    pub mode: String,
     pub objects: Vec<ObjectView>,
     /// Policy paths that don't exist yet (not enforced until created + re-applied).
     pub pending: Vec<PathBuf>,

@@ -4,7 +4,7 @@
 # adopt/claim: the daemon **compiles a text policy file** and seeds the maps at startup,
 # so once it logs "active …" enforcement is already live (no sync to wait for).
 #
-#   1. enforce        — a rule allows the owner exe to read its secret (ALLOW); a
+#   1. allow+deny     — a rule allows the owner exe to read its secret (ALLOW); a
 #                       scraper has no matching rule → default-deny (EPERM), reported on
 #                       the ring buffer with the object's inode + the requested action.
 #   2. self-test neg  — start with deliberately *wrong* field offsets; the program
@@ -22,8 +22,10 @@
 #                       a sibling under DIR (inheritance survives the carve-out). The
 #                       per-subject sub-object exception a "deepest bucket only" model
 #                       can't express.
-#   8. permissive     — global mode=permissive: a deny rule does NOT block, but the
-#                       would-be denial is logged.
+#   8. audit → deny   — there is no global mode (§15.6): a `who="*" … audit` catch-all
+#                       *observes* (allow + log); flipping that one rule to `deny`
+#                       *enforces* (block + log) — the per-object observe→enforce
+#                       progression that replaces SELinux's global permissive→enforce.
 #   9. silence        — a `silence` policy denies (EPERM) *without* a log record (vs a
 #                       `deny`, which logs).
 #  10. apply + show    — `cordon policy apply` re-seeds the live maps at runtime via the
@@ -81,11 +83,12 @@ ws_new() {
     SOCK="$TMP/cordon.sock"; LOG="$TMP/daemon.log"
 }
 
-# Write the policy (mode = $1, rules on stdin) + a matching config, then point the
-# daemon at it. Absolute paths only, so no `~` ambiguity. `zones = []` keeps the
+# Write the policy (rules on stdin) + a matching config, then point the daemon at it.
+# Absolute paths only, so no `~` ambiguity. There is no global mode — the per-rule
+# `policy` is the only enforcement level (DESIGN §15.6). `zones = []` keeps the
 # (rule-model-irrelevant) first-run zone seed empty.
-write_policy() { # $1 = enforce|permissive|off ; rules on stdin
-    { echo "mode = \"$1\""; cat; } > "$TMP/policy.toml"
+write_policy() { # rules on stdin
+    cat > "$TMP/policy.toml"
     cat > "$TMP/config.toml" <<EOF
 backend = "bpf-lsm"
 socket = "$SOCK"
@@ -138,11 +141,11 @@ started() { # gate on the daemon being active; dumps the log + fails on timeout
     if ! wait_active; then echo "  FAIL: daemon did not become active"; sed 's/^/  daemon| /' "$LOG"; daemon_stop; return 1; fi
 }
 
-# --- scenario 1: enforce — allow + default-deny + learn record ---------------
+# --- scenario 1: allow + default-deny + decision record ----------------------
 scenario_enforce() {
-    echo "### scenario: enforce (owner ALLOW + scraper default-DENY + learn record)"
+    echo "### scenario: allow + default-deny (owner ALLOW + scraper default-DENY + record)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "$OWNER"
 where = "$VAULT"
@@ -153,8 +156,8 @@ EOF
     local fail=0
     expect_allow "owner reads its secret"  read_as "$OWNER"   "$SECRET" || fail=1
     expect_deny  "scraper reads the secret" read_as "$SCRAPER" "$SECRET" || fail=1
-    if wait_log 'deny pid=[0-9]+ exe=.* object=dev=[0-9]+ ino=[0-9]+ action=read'; then
-        echo "  OK: denial reported on the ring buffer (object inode + action)"
+    if wait_log 'deny pid=[0-9]+ exe=.* object=.*vault action=read policy=default-deny'; then
+        echo "  OK: denial reported on the ring buffer (object path + action, default-deny cause)"
     else
         echo "  FAIL: no deny record with an object identity + action"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
@@ -165,7 +168,7 @@ EOF
 scenario_selftest_negative() {
     echo "### scenario: self-test negative (wrong offsets MUST abort, not silently allow)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "$OWNER"
 where = "$VAULT"
@@ -188,7 +191,7 @@ EOF
 scenario_per_action() {
     echo "### scenario: per-action (read allowed, write default-denied on the same object)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "$OWNER"
 where = "$VAULT"
@@ -206,7 +209,7 @@ EOF
 scenario_subject_group() {
     echo "### scenario: subject group (@tools allowed, third exe denied)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [group.subject.tools]
 members = ["$OWNER", "$OWNER_B"]
 [[rule]]
@@ -228,7 +231,7 @@ scenario_object_group() {
     echo "### scenario: object group (one rule governs @creds = two dirs)"
     ws_new
     local vault2="$TMP/vault2"; mkdir -p "$vault2"; echo S2 > "$vault2/secret"
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [group.object.creds]
 members = ["$VAULT", "$vault2"]
 [[rule]]
@@ -250,7 +253,7 @@ EOF
 scenario_deny_wins() {
     echo "### scenario: deny > allow (scraper loses the tie, others still read)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "*"
 where = "$VAULT"
@@ -273,7 +276,7 @@ EOF
 scenario_copydown() {
     echo "### scenario: copy-down (subtree allow + a file-specific deny for one subject)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = ["$OWNER", "$OWNER_B"]
 where = "$VAULT"
@@ -293,26 +296,52 @@ EOF
     daemon_stop; return $fail
 }
 
-# --- scenario 8: permissive (deny logged but not enforced) -------------------
-scenario_permissive() {
-    echo "### scenario: permissive (deny does NOT block, but is logged as would-deny)"
+# --- scenario 8: audit → deny (per-object observe → enforce; no global mode) --
+# Replaces the old global-permissive scenario. There is no enforce/permissive/off mode
+# (DESIGN §15.6): observe-vs-enforce is per object, flipped by editing that object's
+# rule. A `who="*" … audit` catch-all logs every read but blocks nothing; flipping the
+# same rule to `deny` (a runtime `policy apply`) makes the identical access block + log.
+scenario_audit_then_deny() {
+    echo "### scenario: audit → deny (observe with a catch-all, then enforce by flipping it)"
     ws_new
-    write_policy permissive <<EOF
+    # Observe: an audit catch-all allows but logs every read of the vault.
+    write_policy <<EOF
 [[rule]]
-who = "$SCRAPER"
+who = "*"
+where = "$VAULT"
+action = "read"
+policy = "audit"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    expect_allow "scraper reads under audit (observe, not enforce)" read_as "$SCRAPER" "$SECRET" || fail=1
+    if wait_log 'audit pid=[0-9]+ exe=.* object=.* action=read'; then
+        echo "  OK: the audit catch-all logged the read (allowed)"
+    else
+        echo "  FAIL: no audit record for the observed read"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+
+    # Enforce: flip that one rule audit → deny and apply; the same object now blocks.
+    cat > "$TMP/deny.toml" <<EOF
+[[rule]]
+who = "*"
 where = "$VAULT"
 action = "read"
 policy = "deny"
 EOF
-    daemon_start; started || return 1
-    local fail=0
-    # Drive reads until the would-deny is logged (or give up); permissive never blocks.
-    for _ in $(seq 1 50); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; log_has 'would deny \(permissive\)' && break; sleep 0.1; done
-    expect_allow "scraper reads (permissive allows)" read_as "$SCRAPER" "$SECRET" || fail=1
-    if log_has 'would deny \(permissive\) pid=[0-9]+ exe=.* action=read'; then
-        echo "  OK: would-deny logged under permissive"
+    if "$CORDON" policy apply "$TMP/deny.toml" >/dev/null 2>&1; then
+        echo "  OK: flip-to-deny applied at runtime"
     else
-        echo "  FAIL: no would-deny record under permissive"; sed 's/^/  daemon| /' "$LOG"; fail=1
+        echo "  FAIL: policy apply (audit→deny) errored"
+        "$CORDON" policy apply "$TMP/deny.toml" 2>&1 | sed 's/^/  cli| /'; fail=1
+    fi
+    expect_deny "scraper denied after the flip to deny" read_as "$SCRAPER" "$SECRET" || fail=1
+    # Drive reads to cross the in-kernel suppressor's 1s window, then assert a deny record.
+    for _ in $(seq 1 40); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; log_has 'deny pid=[0-9]+ exe=.* action=read' && break; sleep 0.1; done
+    if log_has 'deny pid=[0-9]+ exe=.* object=.* action=read'; then
+        echo "  OK: the same access now logs as deny (enforced)"
+    else
+        echo "  FAIL: no deny record after the flip to deny"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
     daemon_stop; return $fail
 }
@@ -321,7 +350,7 @@ EOF
 scenario_silence() {
     echo "### scenario: silence (deny enforced, but NO log record)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "$SCRAPER"
 where = "$VAULT"
@@ -347,7 +376,7 @@ scenario_apply() {
     ws_new
     # Start protecting an *unrelated* dir, so the vault is initially unprotected.
     mkdir -p "$TMP/unrelated"
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "$OWNER"
 where = "$TMP/unrelated"
@@ -361,7 +390,6 @@ EOF
 
     # Apply a new policy that protects the vault for the owner only.
     cat > "$TMP/new.toml" <<EOF
-mode = "enforce"
 [[rule]]
 who = "$OWNER"
 where = "$VAULT"
@@ -394,7 +422,7 @@ EOF
 scenario_coalesce() {
     echo "### scenario: coalescing (a repeat-open burst collapses to a few records + a count)"
     ws_new
-    write_policy enforce <<EOF
+    write_policy <<EOF
 [[rule]]
 who = "$SCRAPER"
 where = "$VAULT"
@@ -437,7 +465,7 @@ scenario_subject_group     || rc=1
 scenario_object_group      || rc=1
 scenario_deny_wins         || rc=1
 scenario_copydown          || rc=1
-scenario_permissive        || rc=1
+scenario_audit_then_deny   || rc=1
 scenario_silence           || rc=1
 scenario_apply             || rc=1
 scenario_coalesce          || rc=1

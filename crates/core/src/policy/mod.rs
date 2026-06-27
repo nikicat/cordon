@@ -35,21 +35,6 @@ use cordon_bpf_common as bpf;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// The global enforcement mode (DESIGN §15.6), orthogonal to per-rule policy. The
-/// policy file's top-level `mode = "…"`; omitted ⇒ [`Mode::Enforce`] (fail-safe).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    /// Per-rule policy applies as authored — a `deny`/`silence` blocks.
-    #[default]
-    Enforce,
-    /// Every denying policy is downgraded to a logged allow, system-wide — the
-    /// safe-rollout lever (SELinux permissive).
-    Permissive,
-    /// No mediation at all.
-    Off,
-}
-
 /// A 1-based line/column into the policy source. Column is a byte offset within the
 /// line (fine for the ASCII paths/names a policy holds; not grapheme-aware).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +231,7 @@ mod tests {
 
     #[test]
     fn line_index_maps_offsets() {
-        let src = "mode = \"off\"\n[[rule]]\nwho = \"*\"\n";
+        let src = "# first line\n[[rule]]\nwho = \"*\"\n";
         let idx = LineIndex::new(src);
         assert_eq!(idx.pos(0), Pos { line: 1, col: 1 });
         // first byte of line 2 ('[') is at offset 13
@@ -291,7 +276,6 @@ mod tests {
         let parsed = parse(text).expect("example policy parses");
         let resolved =
             resolve(&parsed, std::path::Path::new("/home/u")).expect("example policy resolves");
-        assert_eq!(resolved.mode, Mode::Enforce);
         assert!(!resolved.rules.is_empty());
     }
 }

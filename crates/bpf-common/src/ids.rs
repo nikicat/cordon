@@ -25,46 +25,22 @@ pub struct Ino(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Pid(pub u32);
 
-/// Enforcement mode, stored in `Settings`. A `repr(transparent)` `u32` rather than
-/// an enum *on purpose*: aya map values must be `Pod` (valid for any bit pattern),
-/// which an enum is not — reading a stray discriminant out of map memory would be
-/// UB. Named values live as associated consts.
-/// The **global** enforcement mode (DESIGN §15.6), orthogonal to per-rule policy and
-/// carried in `Settings`. Lowered from the policy file's `enforce | permissive | off`.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Mode(pub u32);
-
-impl Mode {
-    /// Per-rule policy applies: a `deny`/`silence` blocks in-kernel (`-EPERM`).
-    pub const ENFORCE: Mode = Mode(0);
-    /// Every denying policy is downgraded to a logged allow (safe rollout) — the
-    /// hook still emits the would-be denial, but returns allow.
-    pub const PERMISSIVE: Mode = Mode(1);
-    /// No mediation at all: the hook fast-allows everything (the boundary is off).
-    pub const OFF: Mode = Mode(2);
-
-    /// Whether a denying policy actually blocks (only in `ENFORCE`).
-    pub fn enforces(self) -> bool {
-        self == Mode::ENFORCE
-    }
-    /// Whether the hook should do nothing (allow without even matching).
-    pub fn is_off(self) -> bool {
-        self == Mode::OFF
-    }
-}
-
-/// How a mediated, logged access was handled — carried in [`crate::LearnEvent`] for
-/// the daemon's journal line. Same `repr(transparent)`-not-enum rationale as [`Mode`].
+/// How a mediated, logged access was handled — carried in [`crate::DecisionEvent`] for
+/// the daemon's journal line. A `repr(transparent)` `u32` rather than an enum *on
+/// purpose*: aya map values must be `Pod` (valid for any bit pattern), which an enum is
+/// not — reading a stray discriminant out of map memory would be UB. Named values live
+/// as associated consts.
+///
+/// There is no global enforcement mode (DESIGN §15.6): the per-rule `policy` is the only
+/// enforcement level, so a denying policy always blocks and only the `deny`-vs-`audit`
+/// distinction is journaled here.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Decision(pub u32);
 
 impl Decision {
-    /// A denying policy in `ENFORCE` mode → blocked (`-EPERM`).
+    /// A denying policy (`deny` / `silence` / the default-deny) → blocked (`-EPERM`).
     pub const DENY: Decision = Decision(0);
-    /// A denying policy in `PERMISSIVE` mode → allowed, logged as a would-be denial.
-    pub const WOULD_DENY: Decision = Decision(1);
     /// An `audit` policy (allow + log) → allowed, logged for visibility.
     pub const AUDIT: Decision = Decision(2);
 }
@@ -72,7 +48,7 @@ impl Decision {
 /// Which generation of the double-buffered rule table is live (DESIGN §15.8). The
 /// kernel reads `Settings.active_bank`; a `cordon policy apply` fills the other bank
 /// and [`flip`](Bank::flip)s to it in one atomic `SETTINGS` write. Only `0`/`1` are
-/// valid; same `repr(transparent)`-not-enum rationale as [`Mode`] (it's read out of
+/// valid; same `repr(transparent)`-not-enum rationale as [`Decision`] (it's read out of
 /// map memory, so every bit pattern must be a sound value — [`index`](Bank::index)
 /// masks a garbage read back into range).
 #[repr(transparent)]
@@ -114,7 +90,6 @@ mod user {
     unsafe impl aya::Pod for Dev {}
     unsafe impl aya::Pod for Ino {}
     unsafe impl aya::Pod for Pid {}
-    unsafe impl aya::Pod for Mode {}
     unsafe impl aya::Pod for Decision {}
     unsafe impl aya::Pod for Bank {}
 }

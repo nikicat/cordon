@@ -171,9 +171,8 @@ fn policy_check(file: Option<&Path>, cli: &Cli) -> ExitCode {
     }
     let rules: usize = compiled.objects.iter().map(|o| o.rules.len()).sum();
     println!(
-        "{}: ok — mode={} objects={} rules={} pending={}",
+        "{}: ok — objects={} rules={} pending={}",
         path.display(),
-        mode_str(compiled.mode),
         compiled.objects.len(),
         rules,
         compiled.pending.len(),
@@ -187,10 +186,6 @@ fn render(resp: &Response) {
             println!("backend: {}", s.backend.as_str());
             println!("socket:  {}", s.socket.display());
             println!("policy:  {}", s.policy.display());
-            println!(
-                "mode:    {}",
-                s.mode.as_deref().unwrap_or("(no policy loaded)")
-            );
             match s.objects {
                 Some(n) => println!("objects: {n}"),
                 None => println!("objects: (no policy loaded)"),
@@ -213,7 +208,6 @@ fn render(resp: &Response) {
             );
         }
         Response::PolicyView(Some(v)) => {
-            println!("mode: {}", v.mode);
             if v.objects.is_empty() {
                 println!("(no protected objects)");
             }
@@ -247,14 +241,6 @@ fn policy_path(file: Option<&Path>, cli: &Cli) -> Result<PathBuf> {
     match file {
         Some(p) => Ok(p.to_path_buf()),
         None => Ok(Config::load(cli.config.as_deref())?.policy),
-    }
-}
-
-fn mode_str(m: policy::Mode) -> &'static str {
-    match m {
-        policy::Mode::Enforce => "enforce",
-        policy::Mode::Permissive => "permissive",
-        policy::Mode::Off => "off",
     }
 }
 

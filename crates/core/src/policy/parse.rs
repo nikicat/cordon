@@ -6,7 +6,7 @@
 //! point a diagnostic at the offending source line. Semantic validation — `@ref`
 //! resolution, cycles, paths — is [`super::resolve`]'s job.
 
-use super::{LineIndex, Mode, PolicyName};
+use super::{LineIndex, PolicyName};
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -17,19 +17,17 @@ use toml::Spanned;
 /// [`super::resolve`].
 #[derive(Debug)]
 pub struct ParsedPolicy {
-    pub(crate) mode: Mode,
     pub(crate) groups: Groups,
     pub(crate) rules: Vec<Spanned<RuleDef>>,
     pub(crate) lines: LineIndex,
 }
 
-/// The top-level TOML shape. `mode` defaults to enforce; `[[rule]]` tables collect
-/// into `rules`; `[group.{subject,object,action}.NAME]` into `group`.
+/// The top-level TOML shape. `[[rule]]` tables collect into `rules`;
+/// `[group.{subject,object,action}.NAME]` into `group`. There is no top-level `mode`
+/// key — the per-rule `policy` is the only enforcement level (DESIGN §15.6).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
-    #[serde(default)]
-    mode: Mode,
     #[serde(default)]
     group: Groups,
     #[serde(default, rename = "rule")]
@@ -140,7 +138,6 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
     let raw: RawPolicy =
         toml::from_str(text).map_err(|e| Error::msg(format!("policy parse error: {e}")))?;
     Ok(ParsedPolicy {
-        mode: raw.mode,
         groups: raw.group,
         rules: raw.rules,
         lines: LineIndex::new(text),
@@ -152,10 +149,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_groups_rules_and_mode() {
+    fn parses_groups_and_rules() {
         let text = r#"
-            mode = "permissive"
-
             [group.subject.ssh-tools]
             members = ["/usr/bin/ssh", "/usr/bin/scp"]
 
@@ -175,7 +170,6 @@ mod tests {
             policy = "audit"
         "#;
         let p = parse(text).unwrap();
-        assert_eq!(p.mode, Mode::Permissive);
         assert_eq!(p.groups.subject.len(), 1);
         assert_eq!(p.groups.action.len(), 1);
         assert_eq!(p.rules.len(), 2);
@@ -208,16 +202,16 @@ mod tests {
         format!("[[rule]]\n{body}\n")
     }
 
+    /// The global mode is gone (DESIGN §15.6): a leftover top-level `mode = "…"` key
+    /// must fail loud (unknown field) rather than silently parse, so stale policies
+    /// surface at `cordon policy check` instead of being half-honored.
     #[test]
-    fn mode_defaults_to_enforce() {
-        let p = parse(&one_rule(
-            r#"who = "*"
-               where = "/x"
-               action = "read"
-               policy = "deny""#,
-        ))
-        .unwrap();
-        assert_eq!(p.mode, Mode::Enforce);
+    fn rejects_mode_key() {
+        let err = parse(
+            "mode = \"enforce\"\n[[rule]]\nwho = \"*\"\nwhere = \"/x\"\naction = \"read\"\npolicy = \"deny\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("mode") || format!("{err}").contains("unknown"));
     }
 
     #[test]
