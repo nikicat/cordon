@@ -178,7 +178,9 @@ open-time actions in-kernel and (until pinning) still fails open when the daemon
 **Deny/learn delivery — decoupled from the verdict.** The in-kernel program has already
 decided; observability rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a
 `deny` or `audit` the hook emits a record (pid, exe `(dev,inode)`, object
-`(dev,inode)`, action, decision), **coalesced by an in-kernel suppressor**, and the daemon
+`(dev,inode)`, the opened file's reconstructed leaf path, action, decision), **coalesced
+by an in-kernel suppressor** (keyed on the opened file, so distinct leaves surface), and
+the daemon
 drains it asynchronously. It does **not** block the syscall. Lossy under flood = you drop
 *observability records*, never *enforcement* (a discard counter bumps).
 
@@ -787,8 +789,9 @@ the matched `exe`/`object`/`action`/`policy`) is the whole feedback loop.
 Audit one exe across your home: `who=<app> where="~" action="*" policy="audit"`. Two wins
 over `strace`: the `where="~"` scope leaves `/usr/lib/*.so`, `/dev`, `/proc` *unprotected*
 → never logged (only home-subtree access surfaces), and coalescing prevents the flood. The
-discovered paths then graduate into `@secrets` under flow A. *Requires leaf-path
-reconstruction — the kernel reports the matched protected root, not the leaf file (PLAN);
+discovered paths then graduate into `@secrets` under flow A. *Implemented: the kernel
+reconstructs the opened file's path by walking `d_name` (no `bpf_d_path` at `file_open`)
+and the suppressor keys on the opened file, so each leaf surfaces with its real `path=` —
 the same mechanism M4 autolearn needs to collapse per-file opens into a subtree rule.*
 
 ### 15.11 Phasing (M1–M5; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))

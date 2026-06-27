@@ -25,8 +25,8 @@ pub mod policy_maps;
 
 pub use ids::{Bank, Decision, Dev, Ino, Pid};
 pub use maps::{
-    DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, MAP_SUPPRESS, Settings, SuppressKey,
-    SuppressVal,
+    DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, MAP_SUPPRESS, PATH_MAX_DEPTH, PATH_NAME_MAX,
+    PathComp, Settings, SuppressKey, SuppressVal,
 };
 pub use offsets::Offsets;
 pub use policy_maps::{

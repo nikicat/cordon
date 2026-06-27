@@ -86,13 +86,68 @@ impl Settings {
 /// the daemon reverse-resolves them and reads `/proc/<pid>/exe` for a friendly line.
 /// (Named for what it records — a decision — not a consumer; autolearn (M4) is one
 /// future reader, the journal is today's.)
+/// Max path components the kernel reconstructs (leaf → matched object). Deeper paths set
+/// [`DecisionEvent::trunc`]. Bounds the dentry walk (verifier-friendly) and the record.
+pub const PATH_MAX_DEPTH: usize = 8;
+/// Max bytes per path component (incl. the NUL `bpf_probe_read_kernel_str` writes). A
+/// longer name is truncated into the slot and sets [`DecisionEvent::trunc`].
+pub const PATH_NAME_MAX: usize = 32;
+
+/// One reconstructed path component in a [`DecisionEvent`]: a NUL-terminated (NUL-padded)
+/// name, at most `PATH_NAME_MAX` bytes including the terminator. The kernel fills it with
+/// `bpf_probe_read_kernel_str` (which always NUL-terminates within the slot); the daemon
+/// reads the name back with [`name`](PathComp::name). A `repr(transparent)` byte array, so
+/// it embeds in the POD record with no layout cost.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct PathComp(pub [u8; PATH_NAME_MAX]);
+
+impl PathComp {
+    /// The zero (all-NUL) component — the fill value for unused slots.
+    pub const EMPTY: PathComp = PathComp([0; PATH_NAME_MAX]);
+
+    /// The component name: the bytes up to the first NUL (the whole slot if somehow
+    /// unterminated). `no_std`/no-alloc, so it serves both the kernel and the daemon.
+    pub fn name(&self) -> &[u8] {
+        let end = match self.0.iter().position(|&b| b == 0) {
+            Some(i) => i,
+            None => self.0.len(),
+        };
+        &self.0[..end]
+    }
+}
+
+/// The mutable backing array, for the kernel's `bpf_probe_read_kernel_str` to fill.
+impl core::ops::DerefMut for PathComp {
+    fn deref_mut(&mut self) -> &mut [u8; PATH_NAME_MAX] {
+        &mut self.0
+    }
+}
+impl core::ops::Deref for PathComp {
+    type Target = [u8; PATH_NAME_MAX];
+    fn deref(&self) -> &[u8; PATH_NAME_MAX] {
+        &self.0
+    }
+}
+
+/// ## Leaf path (DESIGN §15.10 flow B)
+/// `bpf_d_path` is unavailable at `file_open`, so the kernel reconstructs the opened
+/// file's path *relative to the matched protected object* by walking `d_name` up the
+/// dentry chain: [`comps`](Self::comps) holds the component names **leaf-first**
+/// (`comps[0]` = the opened file's own name, `comps[1]` = its parent, …),
+/// [`depth`](Self::depth) of them, and [`trunc`](Self::trunc) marks a name/depth overflow.
+/// The daemon reverses + joins them onto the object's known path → the full opened path.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct DecisionEvent {
     /// The caller's executable identity (the subject that hit the rule).
     pub exe: FileId,
-    /// The matched protected object's inode identity.
+    /// The matched protected object's inode identity (the rule's `where`).
     pub object: FileId,
+    /// The **opened file's own** inode identity — the per-file key the suppressor and the
+    /// daemon coalesce on, so distinct files under one audited root surface separately
+    /// (DESIGN §15.10 flow B). Equals `object` when the rule targets the file directly.
+    pub leaf: FileId,
     /// The matched protected object's id.
     pub obj: ObjId,
     /// The requested action(s) at this access (`read`/`write`/`create`).
@@ -102,22 +157,34 @@ pub struct DecisionEvent {
     /// How it was handled (`DENY` blocked / `AUDIT` allowed-and-logged).
     pub decision: Decision,
     /// How many identical decisions the in-kernel suppressor folded into this one since
-    /// the previous emit for the same `(exe, object, action)` (M1 §1g). `0` on a first
+    /// the previous emit for the same `(exe, leaf, action)` (M1 §1g). `0` on a first
     /// occurrence; nonzero means a repeat burst was collapsed — the daemon adds it to
     /// the coalesced record so the true volume is visible.
     pub suppressed: u32,
     /// The matched policy — the cause, for the log: an authored `audit`/`deny`, or the
     /// synthetic `DEFAULT_DENY` when no rule matched (vs an explicit `deny`).
     pub policy: crate::policy_maps::Policy,
-    pub _pad: [u8; 3],
+    /// Number of valid entries in [`comps`](Self::comps) (`0` ⇒ the object *is* the
+    /// opened file, or reconstruction read nothing).
+    pub depth: u8,
+    /// `1` if the path was truncated (deeper than [`PATH_MAX_DEPTH`] or a name longer than
+    /// [`PATH_NAME_MAX`]) — the daemon renders a leading `…/` so it never reads as exact.
+    pub trunc: u8,
+    pub _pad: [u8; 1],
+    /// Leaf-first path components ([`PathComp`]), `depth` of them valid.
+    pub comps: [PathComp; PATH_MAX_DEPTH],
 }
 
 impl DecisionEvent {
+    /// Build a record with **no path** (`depth = 0`): for daemon-side tests and any
+    /// caller that doesn't reconstruct the leaf path. The kernel fills `depth`/`comps`
+    /// directly in the ring slot instead of going through this.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pid: Pid,
         exe: FileId,
         object: FileId,
+        leaf: FileId,
         obj: ObjId,
         action: Action,
         decision: Decision,
@@ -127,33 +194,47 @@ impl DecisionEvent {
         DecisionEvent {
             exe,
             object,
+            leaf,
             obj,
             action,
             pid,
             decision,
             suppressed,
             policy,
-            _pad: [0; 3],
+            depth: 0,
+            trunc: 0,
+            _pad: [0; 1],
+            comps: [PathComp::EMPTY; PATH_MAX_DEPTH],
         }
     }
 }
 
-/// The in-kernel suppressor key ([`MAP_SUPPRESS`]): one decision identity. Sized to be
-/// padding-free (16 + 4 + 4 = 24) so the BPF hash of the whole key is well-defined.
+/// The in-kernel suppressor key ([`MAP_SUPPRESS`]): one decision identity. Keyed on the
+/// **opened file** (`leaf`), not the protected object, so distinct files under one audited
+/// root each get their own throttle window (DESIGN §15.10 flow B). The explicit `_pad`
+/// keeps it padding-free (16 + 16 + 4 + 4 = 40, align 8) and **zeroed** — a BPF hash-map
+/// key hashes its whole byte span, so an uninitialized pad byte would split one logical
+/// key across buckets.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SuppressKey {
     /// The caller's executable identity.
     pub exe: FileId,
-    /// The matched protected object's id.
-    pub obj: ObjId,
+    /// The opened file's inode identity.
+    pub leaf: FileId,
     /// The requested action(s) for this open.
     pub action: Action,
+    pub _pad: [u8; 4],
 }
 
 impl SuppressKey {
-    pub const fn new(exe: FileId, obj: ObjId, action: Action) -> Self {
-        SuppressKey { exe, obj, action }
+    pub const fn new(exe: FileId, leaf: FileId, action: Action) -> Self {
+        SuppressKey {
+            exe,
+            leaf,
+            action,
+            _pad: [0; 4],
+        }
     }
 }
 

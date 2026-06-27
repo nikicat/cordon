@@ -40,6 +40,11 @@
 #                       ring records (the in-kernel 1s suppressor), and the folded
 #                       `suppressed` count is carried into a record so volume stays
 #                       visible (M1 §1g).
+#  13. leaf path      — audit one exe over a dir; opening distinct files under it yields
+#                       distinct records each carrying the ACTUAL opened path (DESIGN
+#                       §15.10 flow B), incl. a depth-2 nested file. The kernel walks
+#                       d_name (no bpf_d_path at file_open); the suppressor keys on the
+#                       opened file, so siblings don't coalesce away.
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -161,10 +166,10 @@ EOF
     local fail=0
     expect_allow "owner reads its secret"  read_as "$OWNER"   "$SECRET" || fail=1
     expect_deny  "scraper reads the secret" read_as "$SCRAPER" "$SECRET" || fail=1
-    if wait_log 'deny pid=[0-9]+ exe=.* object=.*vault action=read policy=default-deny'; then
-        echo "  OK: denial reported on the ring buffer (object path + action, default-deny cause)"
+    if wait_log 'deny pid=[0-9]+ exe=.* object=.*vault path=.*/vault/secret action=read policy=default-deny'; then
+        echo "  OK: denial reported on the ring buffer (object + opened path + action, default-deny)"
     else
-        echo "  FAIL: no deny record with an object identity + action"; sed 's/^/  daemon| /' "$LOG"; fail=1
+        echo "  FAIL: no deny record with the object, opened path, and action"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
     daemon_stop; return $fail
 }
@@ -488,6 +493,46 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario 13: leaf-path reconstruction (the actual opened file surfaces) ---
+scenario_leaf_path() {
+    echo "### scenario: leaf-path reconstruction (distinct files surface with their real path)"
+    ws_new
+    mkdir -p "$VAULT/sub"
+    echo "DEEP" > "$VAULT/sub/nested"
+    # Audit the owner across the whole vault (DESIGN §15.10 flow B "smart strace -efile").
+    write_policy <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "audit"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # Open three DISTINCT files under the one audited object.
+    read_as "$OWNER" "$SECRET"           >/dev/null 2>&1   # $VAULT/secret      (depth 1)
+    read_as "$OWNER" "$VAULT/other"      >/dev/null 2>&1   # $VAULT/other       (depth 1, sibling)
+    read_as "$OWNER" "$VAULT/sub/nested" >/dev/null 2>&1   # $VAULT/sub/nested  (depth 2, nested)
+    # Each distinct leaf surfaces its own audit record carrying the ACTUAL opened path —
+    # not just the matched root ($VAULT). Proves the d_name walk + leaf-keyed suppressor.
+    if wait_log "audit pid=[0-9]+ .*path=$VAULT/secret action=read"; then
+        echo "  OK: leaf path reported ($VAULT/secret)"
+    else
+        echo "  FAIL: no audit record with path=$VAULT/secret"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    if log_has "audit .*path=$VAULT/other action=read"; then
+        echo "  OK: sibling surfaces separately ($VAULT/other)"
+    else
+        echo "  FAIL: no audit record with path=$VAULT/other (siblings coalesced away?)"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    if log_has "audit .*path=$VAULT/sub/nested action=read"; then
+        echo "  OK: depth-2 nested path reconstructed ($VAULT/sub/nested)"
+    else
+        echo "  FAIL: no audit record with path=$VAULT/sub/nested"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    daemon_stop; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -502,6 +547,7 @@ scenario_audit_then_deny   || rc=1
 scenario_silence           || rc=1
 scenario_apply             || rc=1
 scenario_coalesce          || rc=1
+scenario_leaf_path         || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

@@ -43,6 +43,10 @@ pub struct Offsets {
     pub dentry_d_sb: u32,
     /// `dentry -> d_parent` (next ancestor; self-parent == mount root).
     pub dentry_d_parent: u32,
+    /// `dentry -> d_name.name` — the component name pointer, for leaf-path reconstruction
+    /// (DESIGN §15.10 flow B). It addresses a NUL-terminated string, so the program reads
+    /// it with `bpf_probe_read_kernel_str` and needs no separate length field.
+    pub dentry_d_name_name: u32,
     /// `inode -> i_ino`.
     pub inode_i_ino: u32,
     /// `inode -> i_sb` (super_block, for the device number).
@@ -68,6 +72,7 @@ impl Offsets {
         dentry_d_inode: u32::MAX,
         dentry_d_sb: u32::MAX,
         dentry_d_parent: u32::MAX,
+        dentry_d_name_name: u32::MAX,
         inode_i_ino: u32::MAX,
         inode_i_sb: u32::MAX,
         sb_s_dev: u32::MAX,

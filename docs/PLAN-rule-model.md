@@ -198,7 +198,7 @@ check` errors if a compiled bucket exceeds it).
 
 ## Decided refinements (2026-06-27)
 From working the real-system audit UX (DESIGN §15.6, §15.10). M1 shipped without these;
-DESIGN documents them as the target. **(1) and (2) are done; (3) is next.**
+DESIGN documents them as the target. **All three (1)–(3) are now done.**
 
 1. **Drop the global mode — ✅ done.** Removed `enforce|permissive|off` entirely — the
    `mode=` policy key, `ids::Mode`, `Settings.mode`, and `Decision::WOULD_DENY` are gone.
@@ -223,11 +223,16 @@ DESIGN documents them as the target. **(1) and (2) are done; (3) is next.**
    and VM smoke scenario 7. (The sort keys are now the `Polarity` enum / `Specificity`
    newtype, not bare ints.)
 
-3. **Leaf-path reconstruction (discovery).** Emit the *actual opened path*, not just the
-   matched protected root, by walking `d_name` up the dentry chain in-kernel (bounded;
-   `bpf_d_path` is disallowed at `file_open`). Enables §15.10 flow B (per-app discovery) and
-   M4 autolearn's per-file→subtree generalization. Bigger: a larger event record + an "audit
-   full paths" capability scoped by `where`.
+3. **Leaf-path reconstruction (discovery) — ✅ done.** The kernel emits the *actual opened
+   path*, not just the matched protected root, by walking `d_name` up the dentry chain
+   (bounded by `PATH_MAX_DEPTH = 8`; `bpf_d_path` is disallowed at `file_open`). The record
+   carries a leaf-first fixed component array (`PathComp`, `[[u8;32];8]` + `depth`/`trunc`)
+   built in a **per-CPU scratch** map and mem-copied to the ring (it overflows the BPF
+   stack otherwise). The suppressor + daemon coalescing rekeyed to the **opened file's
+   inode** (`leaf`) so distinct files under one audited root don't collapse; the daemon
+   reverses + joins the components onto the object's path → the `path=` journal field.
+   Enables §15.10 flow B (per-app discovery) and M4 autolearn's per-file→subtree
+   generalization. VM-validated (smoke scenario 13: siblings + a depth-2 nested file).
 
 ## Appendix A — policy TOML (proposed)
 ```toml

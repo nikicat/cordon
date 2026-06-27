@@ -100,8 +100,15 @@ smoke scenarios green):**
   newtype) → deny>allow (`Polarity`), so `allow exe=X` beats an `audit`/`deny` `who="*"`
   catch-all on the same object — the basis of the audit→bless→enforce flow A. VM-validated
   (smoke scenario 7: a concrete `allow` outranks a `who="*"` deny).
-- **(3) Leaf-path reconstruction — pending.** In-kernel `d_name` walk so a discovery audit
-  shows the actual file, not the protected root (enables flow B + M4 autolearn).
+- **(3) Leaf-path reconstruction — ✅ done.** On an emitted record the kernel walks
+  `d_name` from the opened file up to the matched protected object (`bpf_d_path` is
+  unavailable at `file_open`), filling a fixed leaf-first component array (`PathComp`,
+  `[[u8;32];8]`) assembled in a **per-CPU scratch** map (the record is too big for the BPF
+  stack) and mem-copied into the ring. The suppressor + daemon coalescing now key on the
+  **opened file's inode** (`leaf`), so distinct files under one audited root surface
+  separately; the daemon joins the reversed components onto the object's path → `path=…`.
+  Enables flow B (discovery) + M4 autolearn's per-file→subtree generalization. VM-validated
+  (smoke scenario 13: siblings + a depth-2 nested file each surface with their real path).
 
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
 + maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
