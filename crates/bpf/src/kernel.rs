@@ -21,11 +21,13 @@
 
 use aya_ebpf::helpers::{
     bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
+    bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{LruHashMap, RingBuf};
+use aya_ebpf::maps::{LruHashMap, PerCpuArray, RingBuf};
 use cordon_bpf_common::{
-    Action, DecisionEvent, Dev, FileId, Ino, ObjId, Offsets, Pid, SuppressKey, SuppressVal,
+    Action, Decision, DecisionEvent, Dev, FileId, Ino, ObjId, Offsets, PATH_MAX_DEPTH,
+    PATH_NAME_MAX, PathComp, Pid, Policy, SuppressKey, SuppressVal,
 };
 
 /// Running-kernel field offsets, injected into `.rodata` by the daemon
@@ -106,6 +108,18 @@ impl Dentry {
     pub fn parent(self) -> Option<Dentry> {
         Some(Dentry(ptr_at(self.0, offset!(dentry_d_parent))?))
     }
+    /// Read this dentry's component name (`d_name.name`, a NUL-terminated string) into
+    /// `slot`, for leaf-path reconstruction. Returns the byte length read (excluding the
+    /// NUL the helper writes), or `None` if the name pointer or string is unreadable. A
+    /// return `>= PATH_NAME_MAX - 1` means the name was truncated into the slot.
+    pub fn name_into(self, slot: &mut PathComp) -> Option<usize> {
+        let name = ptr_at(self.0, offset!(dentry_d_name_name))?;
+        // SAFETY: `name` is a kernel `const char *` to a NUL-terminated string; the
+        // helper is fault-safe (a bad address yields `Err`, never UB) and writes at most
+        // `slot.len()` bytes, always NUL-terminating.
+        let read = unsafe { bpf_probe_read_kernel_str_bytes(name, &mut slot.0) }.ok()?;
+        Some(read.len())
+    }
 }
 
 /// A `struct inode *`.
@@ -145,20 +159,105 @@ pub fn caller_exe() -> Option<FileId> {
     current_exe_file()?.inode()?.file_id()
 }
 
-/// Push one logged decision to the ring buffer. Best-effort: a full ring drops the
-/// *observation*, never the verdict. The caller builds the record (it knows the
-/// matched policy and the resulting decision); we just reserve + write + submit.
-pub fn emit(event: DecisionEvent) {
+/// Per-CPU scratch for assembling one [`DecisionEvent`] off the stack. The record is too
+/// large (it carries the reconstructed path) to build as a stack local — the BPF 512-byte
+/// stack won't hold it — so we fill this per-CPU slot, then mem-copy it into the ring.
+/// Per-CPU + the program being non-preemptible at this hook means no other invocation
+/// clobbers it between fill and copy.
+#[map]
+static SCRATCH: PerCpuArray<DecisionEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Assemble + push one logged decision to the ring buffer, reconstructing the opened
+/// file's leaf path (relative to the matched protected object) along the way. Best-effort:
+/// a full ring (or a missing scratch slot) drops the *observation*, never the verdict.
+#[allow(clippy::too_many_arguments)]
+pub fn emit(
+    pid: Pid,
+    exe: FileId,
+    object: FileId,
+    leaf: FileId,
+    obj: ObjId,
+    action: Action,
+    decision: Decision,
+    policy: Policy,
+    suppressed: u32,
+    file: File,
+    object_dentry: Dentry,
+) {
+    let Some(ev) = SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: `ev` is our per-CPU scratch `DecisionEvent`; we write every field below
+    // (scalars directly, the path via `fill_comps`) before copying it to the ring. Field
+    // writes go straight into map memory — no large stack temporary.
+    unsafe {
+        (*ev).exe = exe;
+        (*ev).object = object;
+        (*ev).leaf = leaf;
+        (*ev).obj = obj;
+        (*ev).action = action;
+        (*ev).pid = pid;
+        (*ev).decision = decision;
+        (*ev).suppressed = suppressed;
+        (*ev).policy = policy;
+        let (depth, trunc) = fill_comps(file, object_dentry, &mut (*ev).comps);
+        (*ev).depth = depth;
+        (*ev).trunc = trunc as u8;
+    }
+
     let Some(mut entry) = EVENTS.reserve::<DecisionEvent>(0) else {
         return;
     };
-    let e = entry.as_mut_ptr();
-    // SAFETY: `e` is a freshly reserved `DecisionEvent` slot in ring memory; the write
-    // initializes the whole record before `submit`.
+    // SAFETY: both regions are exactly `size_of::<DecisionEvent>()` and don't overlap
+    // (per-CPU scratch vs ring slot); a map→ring mem-copy avoids any stack-sized temporary.
     unsafe {
-        e.write(event);
+        core::ptr::copy_nonoverlapping(
+            ev as *const u8,
+            entry.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<DecisionEvent>(),
+        );
     }
     entry.submit(0);
+}
+
+/// Fill `comps` with the opened file's path components, **leaf-first**, by walking
+/// `d_name` from `file`'s dentry up to (but not including) `object_dentry` — the matched
+/// protected object. Returns `(depth, truncated)`: `depth` valid components, and whether
+/// the path was cut short (deeper than [`PATH_MAX_DEPTH`], a name longer than
+/// [`PATH_NAME_MAX`], or an unreadable component). `comps.get_mut` keeps each write
+/// in-bounds for the verifier; the same bound caps the walk.
+fn fill_comps(
+    file: File,
+    object_dentry: Dentry,
+    comps: &mut [PathComp; PATH_MAX_DEPTH],
+) -> (u8, bool) {
+    let Some(mut dentry) = file.dentry() else {
+        return (0, false);
+    };
+    let mut depth = 0usize;
+    for _ in 0..PATH_MAX_DEPTH {
+        if dentry == object_dentry {
+            return (depth as u8, false); // reached the object → path complete
+        }
+        let Some(slot) = comps.get_mut(depth) else {
+            return (depth as u8, true);
+        };
+        match dentry.name_into(slot) {
+            // A name that fills the slot was probably truncated.
+            Some(n) if n >= PATH_NAME_MAX - 1 => return (depth as u8 + 1, true),
+            Some(_) => depth += 1,
+            None => return (depth as u8, true), // unreadable component → stop, mark partial
+        }
+        let Some(parent) = dentry.parent() else {
+            return (depth as u8, true);
+        };
+        if parent == dentry {
+            return (depth as u8, true); // mount root before the object (shouldn't happen)
+        }
+        dentry = parent;
+    }
+    // Ran the depth cap without reaching the object → more components than slots.
+    (depth as u8, true)
 }
 
 /// The suppression window: at most one ring record per `(exe, object, action)` per this
@@ -176,11 +275,13 @@ static SUPPRESS: LruHashMap<SuppressKey, SuppressVal> = LruHashMap::with_max_ent
 /// Throttle a logged decision. Returns `Some(suppressed)` when this open should emit a
 /// ring record — `suppressed` being how many identical decisions were folded in since
 /// the previous emit for this key — or `None` when it falls inside the window and is
-/// suppressed (its only effect a bumped counter). Best-effort: a failed map write just
-/// means a slightly off count, never a missed *first* occurrence.
-pub fn throttle(exe: FileId, obj: ObjId, action: Action) -> Option<u32> {
+/// suppressed (its only effect a bumped counter). Keyed on the opened file (`leaf`), not
+/// the protected object, so distinct files under one audited root each surface (DESIGN
+/// §15.10 flow B). Best-effort: a failed map write just means a slightly off count, never
+/// a missed *first* occurrence.
+pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<u32> {
     let now = now_ns();
-    let key = SuppressKey::new(exe, obj, action);
+    let key = SuppressKey::new(exe, leaf, action);
     match suppress_get(&key) {
         // Seen before, still inside the window → suppress, bump the pending count.
         Some(prev) if now.wrapping_sub(prev.last_ns) < SUPPRESS_WINDOW_NS => {

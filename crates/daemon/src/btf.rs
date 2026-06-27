@@ -107,6 +107,9 @@ impl KernelBtf {
             dentry_d_inode: m("dentry", &["d_inode"])?,
             dentry_d_sb: m("dentry", &["d_sb"])?,
             dentry_d_parent: m("dentry", &["d_parent"])?,
+            // `d_name` is a `struct qstr`; `name` is a NUL-terminated string pointer, read
+            // with `bpf_probe_read_kernel_str` (so no separate `len` is needed).
+            dentry_d_name_name: m("dentry", &["d_name", "name"])?,
             inode_i_ino: m("inode", &["i_ino"])?,
             inode_i_sb: m("inode", &["i_sb"])?,
             sb_s_dev: m("super_block", &["s_dev"])?,

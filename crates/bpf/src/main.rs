@@ -36,7 +36,7 @@ use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
-    Action, Bank, BankedFile, BankedObj, CompiledRule, Decision, DecisionEvent, FileId, MAX_OBJECTS,
+    Action, Bank, BankedFile, BankedObj, CompiledRule, Decision, FileId, MAX_OBJECTS,
     MAX_RULES_PER_OBJ, NUM_BANKS, ObjId, Policy, Settings, SubjectMatch, rule_slot,
 };
 
@@ -90,10 +90,16 @@ static RULE_COUNT: HashMap<BankedObj, u32> =
 #[map]
 static SETTINGS: Array<Settings> = Array::with_max_entries(1, 0);
 
-/// The matched protected object.
+/// The matched protected object, plus what leaf-path reconstruction needs: the opened
+/// file's own identity (`leaf`, the suppressor/coalesce key) and the matched object's
+/// dentry (the stop point of the `d_name` walk).
 struct Match {
     obj: ObjId,
     object: FileId,
+    /// The opened file's own `(dev,ino)` — equals `object` when the rule targets the file.
+    leaf: FileId,
+    /// The matched object's dentry: the path walk stops here (pointer compare, cheap).
+    object_dentry: kernel::Dentry,
 }
 
 #[lsm(hook = "file_open")]
@@ -137,38 +143,59 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
     // The per-rule policy is the only enforcement level (no global mode): a denying
     // policy blocks outright.
     let blocked = policy.denies();
-    // Emit only when the policy logs *and* the suppressor lets this one through (a tight
-    // repeat-open burst collapses to its first event + a folded `suppressed` count).
+    // Emit only when the policy logs *and* the suppressor (keyed on the opened file, so
+    // distinct leaves surface) lets this one through — a tight repeat-open burst collapses
+    // to its first event + a folded `suppressed` count.
     if policy.logs() {
-        if let Some(suppressed) = kernel::throttle(exe, matched.obj, requested) {
+        if let Some(suppressed) = kernel::throttle(exe, matched.leaf, requested) {
             let decision = if blocked {
                 Decision::DENY
             } else {
                 Decision::AUDIT
             };
-            kernel::emit(DecisionEvent::new(
+            // `emit` assembles the record off-stack (per-CPU scratch) and reconstructs the
+            // opened file's path relative to the protected object (DESIGN §15.10 flow B) —
+            // no `bpf_d_path` here, so it walks `d_name` from the leaf to `object_dentry`.
+            kernel::emit(
                 pid,
                 exe,
                 matched.object,
+                matched.leaf,
                 matched.obj,
                 requested,
                 decision,
                 policy,
                 suppressed,
-            ));
+                file,
+                matched.object_dentry,
+            );
         }
     }
     Some(if blocked { Verdict::Deny } else { Verdict::Allow })
 }
 
 /// Walk the opened file's dentry ancestors; return the first (deepest, hence
-/// most-specific) one whose (dev, ino) is a protected object in the active `bank`.
+/// most-specific) one whose (dev, ino) is a protected object in the active `bank`. The
+/// opened file's own identity (`leaf`) is computed only on a match, so the unprotected
+/// majority pays nothing extra for it.
 fn find_object(file: kernel::File, bank: Bank) -> Option<Match> {
-    let mut dentry = file.dentry()?;
+    let leaf_dentry = file.dentry()?;
+    let mut dentry = leaf_dentry;
     for _ in 0..MAX_ANCESTORS {
         let id = FileId::new(dentry.super_block()?.dev()?, dentry.inode()?.ino()?);
         if let Some(obj) = protected_obj(bank, id) {
-            return Some(Match { obj, object: id });
+            // The opened file's own id: reuse `id` if the file *is* the object, else read it.
+            let leaf = if dentry == leaf_dentry {
+                id
+            } else {
+                FileId::new(leaf_dentry.super_block()?.dev()?, leaf_dentry.inode()?.ino()?)
+            };
+            return Some(Match {
+                obj,
+                object: id,
+                leaf,
+                object_dentry: dentry,
+            });
         }
         let parent = dentry.parent()?;
         if parent == dentry {
