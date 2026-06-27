@@ -86,6 +86,14 @@ smoke scenarios green):**
   Single-writer by construction (the `&mut Ebpf` lives on one backend thread; CLI applies
   serialize through one channel).
 
+**Decided refinements (2026-06-27, not yet implemented — see PLAN "Decided refinements" +
+DESIGN §15.6/§15.10):** **(1)** drop the global `enforce/permissive/off` mode — the per-rule
+`policy` is the only enforcement level (`audit` observes, `deny` enforces, per object); "off"
+= an empty policy. **(2)** add subject-specificity to the bucket sort so `allow exe=X` beats
+an `audit`/`deny` `who="*"` catch-all (needed for the audit→bless→enforce flow). **(3)**
+leaf-path reconstruction (in-kernel `d_name` walk) so a discovery audit shows the actual file,
+not the protected root (enables the per-app discovery flow + M4 autolearn).
+
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
 + maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
 **Pinning must ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active):

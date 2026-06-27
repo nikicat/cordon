@@ -196,6 +196,33 @@ check` errors if a compiled bucket exceeds it).
 
 ---
 
+## Decided refinements (2026-06-27)
+From working the real-system audit UX (DESIGN §15.6, §15.10). M1 shipped without these;
+DESIGN documents them as the target, and they're to be implemented next.
+
+1. **Drop the global mode.** Remove `enforce|permissive|off` entirely — the `mode=` policy
+   key, `ids::Mode`, `Settings.mode`, and `Decision::WOULD_DENY`. The per-rule `policy` is
+   the *only* enforcement control: the kernel blocks iff `policy.denies()`; `audit` observes
+   an object, `deny` enforces it, per object. "Off" = an empty policy or a stopped daemon.
+   *Why:* the user is their own policy admin on one box, not an admin staging policy for a
+   fleet — SELinux's global permissive→enforce cutover is the per-object **audit→deny**
+   progression here (§15.10 flow A). *Touches:* bpf-common (ids/maps/Settings), bpf kernel
+   (`blocked = policy.denies()`, no off/permissive branches), core (config drops `mode`;
+   compile drops `PolicyMode`), daemon (`bpf_mode`/`mode_str` gone), cli (no mode in
+   status/show), the smoke (drop the permissive scenario, add an audit→deny one), docs.
+
+2. **Subject-specificity in precedence.** `sort_bucket` gains a key between object-depth and
+   deny>allow: a concrete subject (exe; later the count of non-wildcard predicates) outranks
+   `who="*"`. **Required** so `allow exe=X` wins over an `audit`/`deny` `who="*"` catch-all on
+   the same object (§15.10 flow A, step 2). Small change; the existing copy-down tests differ
+   by object depth, so they're unaffected — but add tests for the subject tie-break.
+
+3. **Leaf-path reconstruction (discovery).** Emit the *actual opened path*, not just the
+   matched protected root, by walking `d_name` up the dentry chain in-kernel (bounded;
+   `bpf_d_path` is disallowed at `file_open`). Enables §15.10 flow B (per-app discovery) and
+   M4 autolearn's per-file→subtree generalization. Bigger: a larger event record + an "audit
+   full paths" capability scoped by `where`.
+
 ## Appendix A — policy TOML (proposed)
 ```toml
 mode = "permissive"                       # enforce | permissive | off

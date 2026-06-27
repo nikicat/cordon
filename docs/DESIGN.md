@@ -233,10 +233,10 @@ a boundary — only the root service enforces.
 
 **Operational config** is an optional TOML file (`backend`, `socket`, the eBPF-object /
 policy-file paths), `${ENV}`-interpolated, precedence CLI > file > default. The
-*enforcement policy* — the rules and the global `enforce`/`permissive`/`off` mode — is
-**not** here: it lives in the root-owned text policy (§15.8), applied with `cordon policy
-apply`. (`permissive` is the safe-rollout lever — log would-be denials, allow.) See
-`packaging/cordon.example.toml` + `cordon.example.policy.toml`.
+*enforcement policy* — the rules — is **not** here: it lives in the root-owned text policy
+(§15.8), applied with `cordon policy apply`. There is no global mode; observe-vs-enforce is
+the per-rule `audit`/`deny` choice (§15.6). See `packaging/cordon.example.toml` +
+`cordon.example.policy.toml`.
 
 Terminology: this daemon is the **gater**. The **broker** (§7) is the separate,
 deferred key-holder.
@@ -516,10 +516,10 @@ kernel (the unprivileged `cargo test` tier covers the parser + copy-down compile
 
 ## 12. Phased plan
 
-> **Superseded by [`PLAN-rule-model.md`](PLAN-rule-model.md) + §15.10 — historical.** The
+> **Superseded by [`PLAN-rule-model.md`](PLAN-rule-model.md) + §15.11 — historical.** The
 > phases below are the *owner-model* roadmap. They shipped through Phase 1, after which the
 > owner model + fanotify were **removed**; the **current** roadmap is the rule-model
-> milestones M1–M5 (M1 done) in PLAN-rule-model.md, summarized in §15.10. Kept for the
+> milestones M1–M5 (M1 done) in PLAN-rule-model.md, summarized in §15.11. Kept for the
 > design history and the macOS/ES notes (Phase 4), which still apply.
 
 - **Phases 0–3 (owner model — shipped, then retired).** Phase 0 built the
@@ -700,16 +700,28 @@ is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewher
 **identity is inode across all hooks** (the dentry walk), never path.
 
 ### 15.6 Precedence (pin it explicitly)
-1. Most-specific **where** wins (exact file > deeper subtree > ancestor).
-2. Ties broken **deny > allow** (fail-safe).
-3. A *protected* object with no matching rule → **default-deny** (configurable
-   per-object).
-4. "Protected" = appears in / under any rule; everything else is unmediated **allow**
-   (you cannot default-deny the whole filesystem).
+The kernel takes the **first matching rule** in the most-specific protected object's
+bucket; the compiler pre-sorts each bucket so first-match = most-specific-wins:
+1. Most-specific **where** — object depth (exact file > deeper subtree > ancestor).
+2. Most-specific **who** — a concrete subject (an `exe`; later, more predicates) beats
+   `who="*"`, so a specific `allow`/`deny` overrides a broad catch-all on the same object.
+3. **deny > allow** — fail-safe, but only as the tie-break among rules of *equal*
+   object+subject specificity (`allow X` vs `deny X` → deny; `allow *` vs `deny *` → deny).
 
-Plus a **global mode** orthogonal to per-rule policy: `enforce | permissive | off`,
-where `permissive` downgrades every `deny`→`audit` system-wide (the safe-rollout
-lever; SELinux permissive).
+A protected object with no matching rule → **default-deny** (logged with a distinct
+`default-deny` cause, so it reads apart from an explicit `deny`). "Protected" = appears
+in/under some rule; everything else is unmediated **allow** (you cannot default-deny the
+whole filesystem).
+
+**No global mode — the per-rule `policy` *is* the enforcement level.** `audit` (allow+log)
+*observes* an object; `deny` (block+log) *enforces* it — so observe-vs-enforce is
+per-object, flipped by editing that object's catch-all rule, not a system-wide switch. This
+deliberately drops SELinux's `enforce|permissive|off`: cordon's user is their *own* policy
+admin iterating live on one box, not an admin staging policy for a fleet, so a global
+"permissive" preview + "enforce" cutover is just the **audit→deny** progression (§15.10).
+"Off" is an empty policy (or a stopped daemon). *(M1 shipped a global enforce/permissive/off
+mode; its removal — and the subject-specificity key in (2) — are tracked in
+[`PLAN-rule-model.md`](PLAN-rule-model.md).)*
 
 ### 15.7 Groups
 Named, nestable, **symmetric across all three axes** (subject / object / action),
@@ -753,7 +765,30 @@ trust-DB lineage). `zones` = the scope where autolearn may propose rules.
 - `cordon learn review` → diff of proposed rules → promote into the text file. The
   learned db is throwaway; the text file is durable.
 
-### 15.10 Phasing (M1–M5; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
+### 15.10 Authoring flows
+Both flows are just *edit the root-owned text policy → `cordon policy apply`*. There is no
+global mode and no daemon-side wizard; the journal (`audit`/`deny`/`default-deny`, each with
+the matched `exe`/`object`/`action`/`policy`) is the whole feedback loop.
+
+**A. Protect a known dir — observe → bless → enforce.**
+1. *Observe.* Add the dir with a `who="*" … policy="audit"` catch-all. Every access logs as
+   `audit`, nothing blocks — the blast-radius preview.
+2. *Bless.* For each legit `(exe → dir)` the log shows, add `who=<exe> … policy="allow"`.
+   Subject-specificity (§15.6) makes the specific allow win over the `*` catch-all, so a
+   blessed exe goes silent and the catch-all keeps logging only the not-yet-blessed.
+3. *Enforce.* When the audit stream is quiet, flip the catch-all `policy="audit"` →
+   `"deny"`: blessed exes stay silent, everything else is blocked **and logged** (`deny`),
+   so a tool you broke surfaces and you add an allow. Per dir, on your own schedule.
+
+**B. Discover where an app hides secrets — a "smart `strace -efile`".**
+Audit one exe across your home: `who=<app> where="~" action="*" policy="audit"`. Two wins
+over `strace`: the `where="~"` scope leaves `/usr/lib/*.so`, `/dev`, `/proc` *unprotected*
+→ never logged (only home-subtree access surfaces), and coalescing prevents the flood. The
+discovered paths then graduate into `@secrets` under flow A. *Requires leaf-path
+reconstruction — the kernel reports the matched protected root, not the leaf file (PLAN);
+the same mechanism M4 autolearn needs to collapse per-file opens into a subtree rule.*
+
+### 15.11 Phasing (M1–M5; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
 1. **Rule core** — **done.** Text policy + compiler (groups/precedence resolved in
    userspace) → flat maps; open-time read/write/create via `f_flags`/`f_mode`; global
    `enforce`/`permissive`/`off` mode; explicit `policy apply` via an atomic double-buffer
