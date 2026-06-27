@@ -198,7 +198,7 @@ check` errors if a compiled bucket exceeds it).
 
 ## Decided refinements (2026-06-27)
 From working the real-system audit UX (DESIGN §15.6, §15.10). M1 shipped without these;
-DESIGN documents them as the target. **(1) is now done; (2) and (3) are next.**
+DESIGN documents them as the target. **(1) and (2) are done; (3) is next.**
 
 1. **Drop the global mode — ✅ done.** Removed `enforce|permissive|off` entirely — the
    `mode=` policy key, `ids::Mode`, `Settings.mode`, and `Decision::WOULD_DENY` are gone.
@@ -214,11 +214,14 @@ DESIGN documents them as the target. **(1) is now done; (2) and (3) are next.**
    arg), cli (no mode in `check`/status/show), the smoke (permissive scenario → audit→deny),
    docs.
 
-2. **Subject-specificity in precedence.** `sort_bucket` gains a key between object-depth and
-   deny>allow: a concrete subject (exe; later the count of non-wildcard predicates) outranks
-   `who="*"`. **Required** so `allow exe=X` wins over an `audit`/`deny` `who="*"` catch-all on
-   the same object (§15.10 flow A, step 2). Small change; the existing copy-down tests differ
-   by object depth, so they're unaffected — but add tests for the subject tie-break.
+2. **Subject-specificity in precedence — ✅ done.** `sort_bucket` gained a key between
+   object-depth and deny>allow: a concrete subject (exe; the count of non-wildcard
+   predicates, via a `Specificity(u32)` newtype) outranks `who="*"`. So `allow exe=X` wins
+   over an `audit`/`deny` `who="*"` catch-all on the same object (§15.10 flow A, step 2).
+   The existing copy-down tests differ by object depth, so they were unaffected; added
+   `concrete_subject_beats_wildcard_catchall` + `concrete_allow_beats_wildcard_deny` units
+   and VM smoke scenario 7. (The sort keys are now the `Polarity` enum / `Specificity`
+   newtype, not bare ints.)
 
 3. **Leaf-path reconstruction (discovery).** Emit the *actual opened path*, not just the
    matched protected root, by walking `d_name` up the dentry chain in-kernel (bounded;

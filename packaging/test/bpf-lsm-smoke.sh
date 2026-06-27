@@ -17,21 +17,26 @@
 #   5. object group   — one rule over `@creds = [v1, v2]` governs both dirs.
 #   6. deny > allow   — `allow * read` + `deny scraper read` on one object: the scraper
 #                       loses the tie (fail-safe), everyone else still reads.
-#   7. copy-down      — `allow {a,b} read DIR` + `deny b read DIR/secret`: a reads the
+#   7. subject-spec   — `deny * read` + `allow owner read` on one object: the concrete
+#                       `allow owner` outranks the `who="*"` deny (§15.6 step 2), so the
+#                       owner reads while everyone else is denied. Without subject-
+#                       specificity, deny>allow would sort the wildcard deny first and
+#                       block the owner too — proven by outcome, no log timing.
+#   8. copy-down      — `allow {a,b} read DIR` + `deny b read DIR/secret`: a reads the
 #                       secret (inherited allow), b is denied *that file* but still reads
 #                       a sibling under DIR (inheritance survives the carve-out). The
 #                       per-subject sub-object exception a "deepest bucket only" model
 #                       can't express.
-#   8. audit → deny   — there is no global mode (§15.6): a `who="*" … audit` catch-all
+#   9. audit → deny   — there is no global mode (§15.6): a `who="*" … audit` catch-all
 #                       *observes* (allow + log); flipping that one rule to `deny`
 #                       *enforces* (block + log) — the per-object observe→enforce
 #                       progression that replaces SELinux's global permissive→enforce.
-#   9. silence        — a `silence` policy denies (EPERM) *without* a log record (vs a
+#  10. silence        — a `silence` policy denies (EPERM) *without* a log record (vs a
 #                       `deny`, which logs).
-#  10. apply + show    — `cordon policy apply` re-seeds the live maps at runtime via the
+#  11. apply + show    — `cordon policy apply` re-seeds the live maps at runtime via the
 #                       atomic double-buffer swap (a previously-unprotected dir becomes
 #                       protected with no restart), and `policy show` reflects it.
-#  11. coalescing      — a tight loop of identical denied opens collapses to a handful of
+#  12. coalescing      — a tight loop of identical denied opens collapses to a handful of
 #                       ring records (the in-kernel 1s suppressor), and the folded
 #                       `suppressed` count is carried into a record so volume stays
 #                       visible (M1 §1g).
@@ -272,7 +277,34 @@ EOF
     daemon_stop; return $fail
 }
 
-# --- scenario 7: copy-down (per-subject sub-object exception) ----------------
+# --- scenario 7: subject-specificity (concrete allow beats a who=* deny) ------
+# DESIGN §15.6 step 2 / PLAN refinement 2: a concrete subject outranks a `who="*"`
+# catch-all on the SAME object. Both rules sit on $VAULT; without subject-specificity,
+# deny>allow would sort the wildcard deny first and block the owner too. Proven by
+# outcome (no log timing): owner allowed, scraper denied.
+scenario_subject_specificity() {
+    echo "### scenario: subject-specificity (concrete allow beats a who=* deny on one object)"
+    ws_new
+    write_policy <<EOF
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = "read"
+policy = "deny"
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    expect_allow "owner reads (concrete allow outranks the wildcard deny)" read_as "$OWNER"   "$SECRET" || fail=1
+    expect_deny  "scraper denied (only the wildcard deny matches it)"      read_as "$SCRAPER" "$SECRET" || fail=1
+    daemon_stop; return $fail
+}
+
+# --- scenario 8: copy-down (per-subject sub-object exception) ----------------
 scenario_copydown() {
     echo "### scenario: copy-down (subtree allow + a file-specific deny for one subject)"
     ws_new
@@ -296,7 +328,7 @@ EOF
     daemon_stop; return $fail
 }
 
-# --- scenario 8: audit → deny (per-object observe → enforce; no global mode) --
+# --- scenario 9: audit → deny (per-object observe → enforce; no global mode) --
 # Replaces the old global-permissive scenario. There is no enforce/permissive/off mode
 # (DESIGN §15.6): observe-vs-enforce is per object, flipped by editing that object's
 # rule. A `who="*" … audit` catch-all logs every read but blocks nothing; flipping the
@@ -346,7 +378,7 @@ EOF
     daemon_stop; return $fail
 }
 
-# --- scenario 9: silence (deny without a log record) -------------------------
+# --- scenario 10: silence (deny without a log record) -------------------------
 scenario_silence() {
     echo "### scenario: silence (deny enforced, but NO log record)"
     ws_new
@@ -370,7 +402,7 @@ EOF
     daemon_stop; return $fail
 }
 
-# --- scenario 10: policy apply + show (runtime re-seed via the CLI) ----------
+# --- scenario 11: policy apply + show (runtime re-seed via the CLI) ----------
 scenario_apply() {
     echo "### scenario: policy apply + show (runtime re-seed)"
     ws_new
@@ -418,7 +450,7 @@ EOF
     return $fail
 }
 
-# --- scenario 11: event coalescing (in-kernel suppressor + folded count) -----
+# --- scenario 12: event coalescing (in-kernel suppressor + folded count) -----
 scenario_coalesce() {
     echo "### scenario: coalescing (a repeat-open burst collapses to a few records + a count)"
     ws_new
@@ -464,6 +496,7 @@ scenario_per_action        || rc=1
 scenario_subject_group     || rc=1
 scenario_object_group      || rc=1
 scenario_deny_wins         || rc=1
+scenario_subject_specificity || rc=1
 scenario_copydown          || rc=1
 scenario_audit_then_deny   || rc=1
 scenario_silence           || rc=1

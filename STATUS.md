@@ -95,9 +95,11 @@ smoke scenarios green):**
   enforcement level — `audit` observes an object, `deny` enforces it, per object; "off" is
   an empty policy or a stopped daemon. The smoke's permissive scenario became an
   **audit→deny** one; `parse` now rejects a leftover top-level `mode =` key.
-- **(2) Subject-specificity in precedence — pending.** Add a tie-break to the bucket sort
-  so `allow exe=X` beats an `audit`/`deny` `who="*"` catch-all (needed for the
-  audit→bless→enforce flow A).
+- **(2) Subject-specificity in precedence — ✅ done.** `sort_bucket` now ranks by object
+  depth → **subject specificity** (count of non-wildcard predicates, via the `Specificity`
+  newtype) → deny>allow (`Polarity`), so `allow exe=X` beats an `audit`/`deny` `who="*"`
+  catch-all on the same object — the basis of the audit→bless→enforce flow A. VM-validated
+  (smoke scenario 7: a concrete `allow` outranks a `who="*"` deny).
 - **(3) Leaf-path reconstruction — pending.** In-kernel `d_name` walk so a discovery audit
   shows the actual file, not the protected root (enables flow B + M4 autolearn).
 
