@@ -9,7 +9,7 @@
 //! resolution is deferred to [`super::compile`].
 
 use super::parse::{GroupDef, ParsedPolicy, Token};
-use super::{ActionName, Mode, Pos, expand_path};
+use super::{ActionName, Pos, expand_path};
 use crate::{Error, Result};
 use cordon_bpf_common as bpf;
 use std::collections::BTreeMap;
@@ -42,7 +42,6 @@ pub struct ResolvedRule {
 /// resolves paths to inode identity and applies object precedence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPolicy {
-    pub mode: Mode,
     pub rules: Vec<ResolvedRule>,
 }
 
@@ -77,10 +76,7 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
             pos: Some(pos),
         });
     }
-    Ok(ResolvedPolicy {
-        mode: parsed.mode,
-        rules,
-    })
+    Ok(ResolvedPolicy { rules })
 }
 
 fn resolve_subjects(

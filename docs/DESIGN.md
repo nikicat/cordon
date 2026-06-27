@@ -166,9 +166,10 @@ in-kernel LSM shape buys:
 **Implemented (M1 — validated in a VM, see STATUS / [`PLAN-rule-model.md`](PLAN-rule-model.md)):**
 the `file_open` verdict over the **flat rule table** — deepest protected object via the
 `(dev,inode)` dentry walk, exe-`(dev,inode)` subject match, action from `f_mode`/`f_flags`
-(read/write/create), first-match on the copy-down-resolved bucket, default-deny, with the
-global `enforce`/`permissive`/`off` mode; the **text policy** compiled + seeded at startup
-and re-seeded by `cordon policy apply` via an **atomic double-buffer swap**; and the
+(read/write/create), first-match on the copy-down-resolved bucket, default-deny, the
+per-rule `policy` the only enforcement level (no global mode, §15.6); the **text policy**
+compiled + seeded at startup and re-seeded by `cordon policy apply` via an **atomic
+double-buffer swap**; and the
 ring-buffer learn path with **in-kernel event coalescing**. The **structural-op gating**
 (closing the rename bypass), **content-digest identity** (§15.4), and **fail-safe pinning**
 described above are the next increments, not yet shipped — so today's `bpf-lsm` enforces
@@ -176,7 +177,7 @@ open-time actions in-kernel and (until pinning) still fails open when the daemon
 
 **Deny/learn delivery — decoupled from the verdict.** The in-kernel program has already
 decided; observability rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a
-deny / would-deny (audit) the hook emits a record (pid, exe `(dev,inode)`, object
+`deny` or `audit` the hook emits a record (pid, exe `(dev,inode)`, object
 `(dev,inode)`, action, decision), **coalesced by an in-kernel suppressor**, and the daemon
 drains it asynchronously. It does **not** block the syscall. Lossy under flood = you drop
 *observability records*, never *enforcement* (a discard counter bumps).
@@ -290,8 +291,9 @@ itself in as owner. Mutated only via the privileged `cordon` CLI → daemon IPC.
 > **Superseded by §15.6 — historical.** The owner-model decision flow and interactive
 > deny-and-learn below were **removed** with the owner model. The live decision flow is
 > §15.6: most-specific protected object → first-match on the copy-down bucket →
-> default-deny, under a global `enforce`/`permissive`/`off` mode, with the verdict returned
-> **in-kernel** (so there is no synchronous prompt). TOFU's successor is **autolearn**
+> default-deny, the per-rule `policy` the only enforcement level (no global mode), with the
+> verdict returned **in-kernel** (so there is no synchronous prompt). TOFU's successor is
+> **autolearn**
 > (§15.9) — an explicit, reviewed training mode, not a per-open prompt (the deadline-safety
 > problem below is exactly why). Kept for that rationale and the prompt-UX design.
 
@@ -482,9 +484,9 @@ under a protected subtree, against a policy file:
   default-deny (`EPERM`), reported on the ring buffer with the object inode + action;
 - per-action (read allowed, write default-denied on the same object), subject + object
   **groups**, **deny > allow** ties, **copy-down** precedence (subtree allow + a
-  file-specific deny for one subject, the sibling still readable), **permissive** (logged,
-  not blocked), **silence** (denied, not logged), runtime **`policy apply`**, and **event
-  coalescing**.
+  file-specific deny for one subject, the sibling still readable), **audit→deny** (observe
+  with a catch-all, then enforce by flipping that one rule — no global mode), **silence**
+  (denied, not logged), runtime **`policy apply`**, and **event coalescing**.
 
 Asserts: the right subject reads, the wrong one is denied **in-kernel**, precedence
 resolves as §15.6 says, and a tight open-loop collapses to a few records — all on a real
@@ -510,7 +512,7 @@ kernel (the unprivileged `cargo test` tier covers the parser + copy-down compile
   not permitted` locally vs `memfd_create: EINVAL` on GitHub) — non-reproducible.
   virtme-ng collapses the stack to a single `/dev/kvm` dependency.
 - `bpf-lsm-smoke.sh` proves the rule model end-to-end (allow/deny, per-action, subject +
-  object groups, copy-down precedence, permissive, silence, runtime `policy apply`, event
+  object groups, copy-down precedence, audit→deny, silence, runtime `policy apply`, event
   coalescing) through a real kernel — green in the virtme-ng VM (host kernel + pinned
   `v6.12`, booted `lsm=…,bpf`).
 
@@ -720,7 +722,8 @@ deliberately drops SELinux's `enforce|permissive|off`: cordon's user is their *o
 admin iterating live on one box, not an admin staging policy for a fleet, so a global
 "permissive" preview + "enforce" cutover is just the **audit→deny** progression (§15.10).
 "Off" is an empty policy (or a stopped daemon). *(M1 shipped a global enforce/permissive/off
-mode; its removal — and the subject-specificity key in (2) — are tracked in
+mode; it has since been **removed** — the kernel now blocks iff `policy.denies()`. The
+subject-specificity precedence key in (2) above is still tracked in
 [`PLAN-rule-model.md`](PLAN-rule-model.md).)*
 
 ### 15.7 Groups
@@ -790,10 +793,10 @@ the same mechanism M4 autolearn needs to collapse per-file opens into a subtree 
 
 ### 15.11 Phasing (M1–M5; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
 1. **Rule core** — **done.** Text policy + compiler (groups/precedence resolved in
-   userspace) → flat maps; open-time read/write/create via `f_flags`/`f_mode`; global
-   `enforce`/`permissive`/`off` mode; explicit `policy apply` via an atomic double-buffer
-   swap; in-kernel event coalescing. Replaced the owner model and closed the
-   in-kernel-rules gap.
+   userspace) → flat maps; open-time read/write/create via `f_flags`/`f_mode`; the per-rule
+   `policy` the only enforcement level (no global mode — `audit` observes, `deny` enforces);
+   explicit `policy apply` via an atomic double-buffer swap; in-kernel event coalescing.
+   Replaced the owner model and closed the in-kernel-rules gap.
 2. **Subject predicates** beyond exe — uid, cgroup; then IMA/fsverity hash; then
    argv0/ancestor.
 3. **Mutation + exec hooks** — unlink/mkdir/rmdir/rename + `bprm_check_security` as a

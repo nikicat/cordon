@@ -18,9 +18,10 @@
 //!
 //! ## Scope (M1)
 //! Open-time actions (`read`/`write`/`create`): deepest protected object → first
-//! matching rule in its copy-down bucket → allow/deny/audit, with the global
-//! `enforce`/`permissive`/`off` mode. The policy is compiled + seeded at startup and
-//! re-seeded by `cordon policy apply` via an **atomic double-buffer swap** ([`seed`]).
+//! matching rule in its copy-down bucket → allow/deny/audit. The per-rule `policy` is
+//! the only enforcement level (no global mode, DESIGN §15.6). The policy is compiled +
+//! seeded at startup and re-seeded by `cordon policy apply` via an **atomic
+//! double-buffer swap** ([`seed`]).
 //! Fail-safe **pinning** (enforcement surviving daemon death) is the next increment.
 
 mod events;
@@ -32,11 +33,10 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, Bank, CompiledRule, FileId, Mode as BpfMode, ObjId, Offsets, Pid, Policy, SubjectMatch,
-    rule_slot,
+    Action, Bank, CompiledRule, FileId, ObjId, Offsets, Pid, Policy, SubjectMatch, rule_slot,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
-use cordon_core::policy::{self, CompiledPolicy, Diagnostic, Mode as PolicyMode, Severity};
+use cordon_core::policy::{self, CompiledPolicy, Diagnostic, Severity};
 use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
 use std::collections::HashMap;
@@ -80,7 +80,6 @@ impl Backend for BpfLsmBackend {
         // Compile the policy *before* loading anything — a bad startup policy fails
         // fast, without touching the kernel.
         let compiled = self.compile_policy()?;
-        let mode = bpf_mode(compiled.mode);
 
         // Kernel BTF resolves the hook's BTF id for attach (and sanitizes the program's
         // own BTF). The object carries no struct layout (rustc can't emit CO-RE
@@ -118,11 +117,10 @@ impl Backend for BpfLsmBackend {
         self_test(&mut ebpf)?;
 
         // Seed the real, compiled policy and publish it for `cordon policy show`.
-        seed::seed_policy(&mut ebpf, &compiled, mode)?;
+        seed::seed_policy(&mut ebpf, &compiled)?;
         *control.current.lock().unwrap() = Some(build_view(&compiled));
 
         info!(
-            mode = mode_str(mode),
             objects = compiled.objects.len(),
             policy = %self.policy.display(),
             object = %self.object.display(),
@@ -185,7 +183,6 @@ pub(super) fn compile_text(text: &str) -> CompiledPolicy {
 fn error_policy(e: Error) -> CompiledPolicy {
     error!("policy: {e}");
     CompiledPolicy {
-        mode: PolicyMode::Enforce,
         objects: Vec::new(),
         pending: Vec::new(),
         diagnostics: vec![Diagnostic {
@@ -199,7 +196,6 @@ fn error_policy(e: Error) -> CompiledPolicy {
 /// A human-facing view of a compiled policy for `cordon policy show`.
 pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
     PolicyView {
-        mode: mode_str(bpf_mode(c.mode)).to_string(),
         objects: c
             .objects
             .iter()
@@ -219,23 +215,6 @@ pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
 /// the *set* of protected objects changes).
 pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
     c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
-}
-
-/// Map the policy's global mode to the kernel `Settings` mode.
-fn bpf_mode(mode: PolicyMode) -> BpfMode {
-    match mode {
-        PolicyMode::Enforce => BpfMode::ENFORCE,
-        PolicyMode::Permissive => BpfMode::PERMISSIVE,
-        PolicyMode::Off => BpfMode::OFF,
-    }
-}
-
-fn mode_str(mode: BpfMode) -> &'static str {
-    match mode {
-        BpfMode::PERMISSIVE => "permissive",
-        BpfMode::OFF => "off",
-        _ => "enforce",
-    }
 }
 
 /// Where `~` in the (system-wide, root-owned) policy expands to. M1 uses the daemon's
@@ -272,9 +251,9 @@ fn maybe_poison_offsets(offsets: &mut Offsets) {
 }
 
 /// Prove the boundary actually enforces before trusting it. Protect a throwaway probe
-/// directory with a single deny-all rule, make ourselves not-fast-allowed in enforce
-/// mode, and confirm our own open of it is denied. A wrong-offset attach matches
-/// nothing, the open is *allowed*, and we abort instead of pretending to protect.
+/// directory with a single deny-all rule, make ourselves not-fast-allowed, and confirm
+/// our own open of it is denied. A wrong-offset attach matches nothing, the open is
+/// *allowed*, and we abort instead of pretending to protect.
 fn self_test(ebpf: &mut Ebpf) -> Result<()> {
     let probe = std::env::temp_dir().join(format!("cordon-selftest.{}", std::process::id()));
     std::fs::create_dir_all(&probe)
@@ -292,10 +271,10 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     // probe is live; the real `seed_policy` then fills bank 1 and flips away from this.
     let bank = Bank::ZERO;
     // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX
-    // pid so we are *not* fast-allowed; enforce so the deny actually blocks. SILENCE
-    // (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
-    // logged probe-deny would spam a spurious record into the ring on every startup.
-    seed::set_settings(ebpf, Pid(u32::MAX), BpfMode::ENFORCE, bank)?;
+    // pid so we are *not* fast-allowed (a denying policy always blocks — there is no
+    // global mode). SILENCE (deny + no log) not DENY: the self-test only needs the open
+    // *blocked*, and a logged probe-deny would spam a spurious record on every startup.
+    seed::set_settings(ebpf, Pid(u32::MAX), bank)?;
     seed::protected_insert(ebpf, bank, id, obj)?;
     seed::rules_set(
         ebpf,

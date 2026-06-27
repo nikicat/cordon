@@ -1,8 +1,8 @@
 //! Operational configuration — the bootstrap settings the daemon needs before (or
 //! independent of) the policy: the `backend`, the `socket` path, and the `bpf-lsm`
-//! object/pin/`policy` paths. The *enforcement* settings — the rules and the global
-//! `enforce|permissive|off` mode — live in the **text policy file** (`policy`), not
-//! here (DESIGN §15.8).
+//! object/pin/`policy` paths. The *enforcement* settings — the rules and their per-rule
+//! `policy` (the only enforcement level; there is no global mode) — live in the **text
+//! policy file** (`policy`), not here (DESIGN §15.8).
 //!
 //! Precedence is **CLI flag > config file > built-in default**. String values in the
 //! file may interpolate `${ENV}` (e.g. `socket = "${XDG_RUNTIME_DIR}/cordon.sock"`).

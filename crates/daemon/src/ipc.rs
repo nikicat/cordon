@@ -68,16 +68,17 @@ impl Ctx {
     fn dispatch(&self, req: Request) -> Result<Response> {
         match req {
             Request::Status => {
-                let current = self.control.current.lock().unwrap();
-                let (mode, objects) = match &*current {
-                    Some(v) => (Some(v.mode.clone()), Some(v.objects.len())),
-                    None => (None, None),
-                };
+                let objects = self
+                    .control
+                    .current
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|v| v.objects.len());
                 Ok(Response::Status(StatusInfo {
                     backend: self.backend,
                     socket: self.socket.clone(),
                     policy: self.policy.clone(),
-                    mode,
                     objects,
                 }))
             }

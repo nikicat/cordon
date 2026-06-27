@@ -4,9 +4,10 @@
 # Precedence: CLI flag  >  this file  >  default. String values may interpolate
 # ${ENV} from the environment.
 #
-# The *enforcement* policy — the rules and the global enforce/permissive/off mode —
-# is NOT here: it lives in the root-owned text policy file (see `policy` below and
-# cordon.example.policy.toml), applied with `cordon policy apply`.
+# The *enforcement* policy — the rules (and their per-rule `policy`, the only
+# enforcement level; there is no global mode) — is NOT here: it lives in the root-owned
+# text policy file (see `policy` below and cordon.example.policy.toml), applied with
+# `cordon policy apply`.
 #
 # Default location: /etc/cordon/config.toml (root) or
 # $XDG_CONFIG_HOME/cordon/config.toml (user). Override with --config / $CORDON_CONFIG.

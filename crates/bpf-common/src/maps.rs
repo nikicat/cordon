@@ -9,19 +9,19 @@
 //! paths to `(dev,inode)` via `stat(2)` + the mount table at seed time, and both the
 //! protected object and the caller's executable are matched by [`FileId`].
 
-use crate::ids::{Bank, Decision, Dev, Ino, Mode, Pid};
+use crate::ids::{Bank, Decision, Dev, Ino, Pid};
 use crate::policy_maps::{Action, ObjId};
 
 // ---- map names ------------------------------------------------------------
 // The program defines these maps; the loader resolves them by name. (The rule-table
 // maps `PROTECTED`/`RULES`/`RULE_COUNT` are named in `policy_maps`.)
 
-/// `Array<Settings>` (one element, index 0) — the daemon pid to fast-allow, the
-/// global enforce/permissive/off mode, and the live double-buffer bank. Written whole
-/// per update; the bank flip that publishes a new policy is one such write.
+/// `Array<Settings>` (one element, index 0) — the daemon pid to fast-allow and the live
+/// double-buffer bank. Written whole per update; the bank flip that publishes a new
+/// policy is one such write.
 pub const MAP_SETTINGS: &str = "SETTINGS";
-/// `RingBuf` — the async learn path: one [`DecisionEvent`] per logged decision (deny /
-/// would-deny / audit), drained by the daemon into the journal.
+/// `RingBuf` — the async learn path: one [`DecisionEvent`] per logged decision (`deny` /
+/// `audit`), drained by the daemon into the journal.
 pub const MAP_EVENTS: &str = "EVENTS";
 /// `LruHashMap<SuppressKey, SuppressVal>` — the in-kernel event suppressor (DESIGN
 /// §15, M1 §1g). Throttles the ring to ~one [`DecisionEvent`] per `(exe, object,
@@ -59,26 +59,23 @@ impl core::fmt::Display for FileId {
 }
 
 /// The one-element control record in `SETTINGS`: which pid is the daemon (always
-/// allowed, so we never deadlock on our own opens), the current global mode, and the
-/// live double-buffer [`Bank`]. The kernel reads all three from one `Array::get(0)`
-/// snapshot, so they stay mutually consistent; an `apply` fills the inactive bank and
-/// then writes this record with `active_bank` flipped (and the new mode) to publish.
+/// allowed, so we never deadlock on our own opens) and the live double-buffer [`Bank`].
+/// The kernel reads both from one `Array::get(0)` snapshot; an `apply` fills the
+/// inactive bank and then writes this record with `active_bank` flipped to publish.
+/// `daemon_pid` never changes after startup, so the flip's only moving part is the
+/// 4-byte `active_bank`, which can't tear.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub daemon_pid: Pid,
-    pub mode: Mode,
     pub active_bank: Bank,
-    pub _pad: [u8; 4],
 }
 
 impl Settings {
-    pub const fn new(daemon_pid: Pid, mode: Mode, active_bank: Bank) -> Self {
+    pub const fn new(daemon_pid: Pid, active_bank: Bank) -> Self {
         Settings {
             daemon_pid,
-            mode,
             active_bank,
-            _pad: [0; 4],
         }
     }
 }
@@ -102,7 +99,7 @@ pub struct DecisionEvent {
     pub action: Action,
     /// Thread-group id (userspace pid) of the caller.
     pub pid: Pid,
-    /// How it was handled (`DENY` blocked / `WOULD_DENY` permissive / `AUDIT`).
+    /// How it was handled (`DENY` blocked / `AUDIT` allowed-and-logged).
     pub decision: Decision,
     /// How many identical decisions the in-kernel suppressor folded into this one since
     /// the previous emit for the same `(exe, object, action)` (M1 §1g). `0` on a first

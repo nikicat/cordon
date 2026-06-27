@@ -7,9 +7,9 @@
 //! `Settings.active_bank` selects the live one. [`seed_policy`] fills the *inactive*
 //! bank (the kernel never reads it) and then flips `active_bank` in one `SETTINGS`
 //! write — an RCU-style publish, so a re-seed is never half-visible (no clear-then-
-//! insert window). The flip hinges on the 4-byte `active_bank`, which can't tear; every
-//! torn `Settings` a concurrent reader could observe pairs a fully-populated bank with
-//! either the old or new mode — safe, transient, never an out-of-range or torn pointer.
+//! insert window). The flip hinges on the 4-byte `active_bank`, which can't tear; since
+//! `daemon_pid` never changes after startup, `active_bank` is the only moving field, so a
+//! concurrent reader always observes a fully-populated bank — never a torn pointer.
 //!
 //! ## Single writer
 //! Every map write goes through `&mut Ebpf`, owned solely by the backend thread; the
@@ -25,17 +25,17 @@ use aya::Ebpf;
 use aya::maps::{Array, HashMap as BpfHashMap};
 use cordon_bpf_common::{
     Bank, BankedFile, BankedObj, CompiledRule, FileId, MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES,
-    MAP_SETTINGS, MAX_OBJECTS, Mode as BpfMode, ObjId, Pid, Settings, rule_slot,
+    MAP_SETTINGS, MAX_OBJECTS, ObjId, Pid, Settings, rule_slot,
 };
 use cordon_core::policy::CompiledPolicy;
 use cordon_core::{Error, Result};
 use tracing::{info, warn};
 
 /// Atomically seed a compiled policy: fill the inactive bank from `compiled`, then flip
-/// `active_bank` (carrying the new `mode`) so the kernel switches to it in one update.
-/// Used both at startup (from the zero-initialized `SETTINGS`, so the first fill targets
-/// bank 1) and on every `cordon policy apply`.
-pub(super) fn seed_policy(ebpf: &mut Ebpf, compiled: &CompiledPolicy, mode: BpfMode) -> Result<()> {
+/// `active_bank` so the kernel switches to it in one update. Used both at startup (from
+/// the zero-initialized `SETTINGS`, so the first fill targets bank 1) and on every
+/// `cordon policy apply`.
+pub(super) fn seed_policy(ebpf: &mut Ebpf, compiled: &CompiledPolicy) -> Result<()> {
     if compiled.objects.len() > MAX_OBJECTS {
         return Err(Error::msg(format!(
             "bpf-lsm: {} protected objects exceed MAX_OBJECTS ({MAX_OBJECTS})",
@@ -58,8 +58,8 @@ pub(super) fn seed_policy(ebpf: &mut Ebpf, compiled: &CompiledPolicy, mode: BpfM
         }
     }
 
-    // The flip: publish the freshly-filled bank (and the new mode) in one write.
-    set_settings(ebpf, Pid(std::process::id()), mode, target)?;
+    // The flip: publish the freshly-filled bank in one write.
+    set_settings(ebpf, Pid(std::process::id()), target)?;
 
     info!(
         objects = compiled.objects.len(),
@@ -131,13 +131,13 @@ pub(super) fn rules_set(ebpf: &mut Ebpf, index: u32, rule: CompiledRule) -> Resu
         .map_err(|e| Error::msg(format!("bpf-lsm: set rule[{index}]: {e}")))
 }
 
-/// Set the one-element `SETTINGS` record: our pid (fast-allowed), the global mode, and
-/// the live bank. Writing this with a flipped `bank` is the atomic policy publish.
-pub(super) fn set_settings(ebpf: &mut Ebpf, pid: Pid, mode: BpfMode, bank: Bank) -> Result<()> {
+/// Set the one-element `SETTINGS` record: our pid (fast-allowed) and the live bank.
+/// Writing this with a flipped `bank` is the atomic policy publish.
+pub(super) fn set_settings(ebpf: &mut Ebpf, pid: Pid, bank: Bank) -> Result<()> {
     let mut settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
         .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SETTINGS}: {e}")))?;
     settings
-        .set(0, Settings::new(pid, mode, bank), 0)
+        .set(0, Settings::new(pid, bank), 0)
         .map_err(|e| Error::msg(format!("bpf-lsm: set settings: {e}")))
 }
 

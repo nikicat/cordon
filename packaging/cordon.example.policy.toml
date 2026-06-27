@@ -22,11 +22,11 @@
 #   3. deny beats allow at the same specificity (fail-safe);
 #   4. a protected object with no matching rule is default-denied;
 #   5. anything not under any rule is unmediated (allowed).
-
-# enforce | permissive | off.  permissive downgrades every deny to a logged allow
-# (the safe-rollout lever — watch the journal, then switch to enforce). off disables
-# mediation entirely.
-mode = "enforce"
+#
+# There is no global mode (no enforce/permissive/off): the per-rule `policy` is the only
+# enforcement level. Use `audit` to observe an object (allow + log — the safe-rollout
+# preview), then switch that rule to `deny` to enforce it. "Off" is an empty policy (or a
+# stopped daemon).
 
 # --- groups: named, nestable, symmetric across all three axes ----------------
 [group.subject.ssh-tools]

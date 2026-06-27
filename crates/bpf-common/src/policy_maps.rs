@@ -180,10 +180,10 @@ impl core::fmt::Display for Action {
     }
 }
 
-/// A rule's effect = `{allow, deny} × {log, silent}` (DESIGN §15.2). The global
-/// `permissive` mode (in `Settings`) downgrades every denying policy to a logged
-/// allow at decision time — orthogonal to the value stored here, which is always the
-/// policy *as authored*.
+/// A rule's effect = `{allow, deny} × {log, silent}` (DESIGN §15.2). This per-rule
+/// policy is the *only* enforcement level — there is no global mode (§15.6): the kernel
+/// blocks iff [`denies`](Policy::denies), so `audit` observes an object and `deny`
+/// enforces it, per object.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Policy(pub u8);
@@ -305,8 +305,8 @@ mod user {
     // SAFETY: each is `repr(transparent)`/`repr(C)` over POD integer fields, so every
     // bit pattern is valid and the type is `Copy` with a fixed layout — aya's `Pod`
     // contract. (`Policy`/`Action` accept out-of-range discriminants in memory, like
-    // the existing `Mode`/`Decision`; that's a memory-safety statement, not a claim
-    // every value is semantically meaningful.)
+    // `Decision`; that's a memory-safety statement, not a claim every value is
+    // semantically meaningful.)
     unsafe impl aya::Pod for ObjId {}
     unsafe impl aya::Pod for BankedFile {}
     unsafe impl aya::Pod for BankedObj {}

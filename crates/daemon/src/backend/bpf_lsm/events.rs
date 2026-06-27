@@ -92,7 +92,7 @@ fn apply(
     let applied = if compiled.has_errors() {
         false
     } else {
-        match super::seed::seed_policy(ebpf, &compiled, super::bpf_mode(compiled.mode)) {
+        match super::seed::seed_policy(ebpf, &compiled) {
             Ok(()) => {
                 *control.current.lock().unwrap() = Some(super::build_view(&compiled));
                 *object_paths = super::object_paths(&compiled);
@@ -121,7 +121,7 @@ struct Coalesced {
     object: FileId,
     action: Action,
     /// Representative decision/policy/pid (the first occurrence; identical across the group
-    /// in practice — policy + mode are fixed within a single drain batch).
+    /// in practice — the policy is fixed within a single drain batch).
     decision: Decision,
     /// The matched policy — `audit`/`deny`, or `default-deny` (no rule matched). Lets the
     /// journal distinguish a default-deny from an explicit `deny` (DESIGN §15.6).
@@ -150,9 +150,6 @@ impl Coalesced {
         match self.decision {
             Decision::DENY => {
                 info!(pid = self.pid.0, %exe, %object, %action, %policy, count, suppressed, "deny")
-            }
-            Decision::WOULD_DENY => {
-                warn!(pid = self.pid.0, %exe, %object, %action, %policy, count, suppressed, "would deny (permissive)")
             }
             _ => {
                 info!(pid = self.pid.0, %exe, %object, %action, %policy, count, suppressed, "audit")

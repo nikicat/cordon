@@ -6,7 +6,7 @@
 //! ## The decision (rule model, M1)
 //! For each `open` (reading the live double-buffer `bank` from `SETTINGS.active_bank`,
 //! so a `policy apply` flips the whole table atomically — DESIGN §15.8):
-//!   1. Global mode `off` ⇒ allow; fast-allow the daemon's own pid.
+//!   1. Fast-allow the daemon's own pid (never deadlock on our own opens).
 //!   2. Walk the opened file's dentry ancestors; the first one whose **(bank, dev,
 //!      ino)** is in `PROTECTED` is the most-specific protected object → its `ObjId`. No
 //!      match ⇒ unprotected ⇒ allow (DESIGN §15.6.4 — the filesystem can't be
@@ -17,10 +17,11 @@
 //!      the packed `RULES` array, bounded by `MAX_RULES_PER_OBJ`) and apply the
 //!      **first** rule whose action mask intersects and whose subject matches. Copy-down
 //!      resolved all precedence in userspace, so first-match is correct (DESIGN §15.3).
-//!   5. No matching rule ⇒ **default-deny** (DESIGN §15.6.3). A denying policy blocks
-//!      only in `enforce`; `permissive` downgrades it to a logged allow. When the
-//!      matched policy logs (`audit`/`deny`), the in-kernel suppressor throttles a
-//!      repeat burst to one `DecisionEvent` + a folded count (M1 §1g) before emitting.
+//!   5. No matching rule ⇒ **default-deny** (DESIGN §15.6.3). The per-rule `policy` is
+//!      the only enforcement level — there is no global mode (§15.6): a denying policy
+//!      always blocks. When the matched policy logs (`audit`/`deny`), the in-kernel
+//!      suppressor throttles a repeat burst to one `DecisionEvent` + a folded count
+//!      (M1 §1g) before emitting.
 //!
 //! Anything we can't read fails **open** (a `None` becomes allow). All `unsafe`
 //! (kernel reads, ring writes) lives in [`kernel`]; this file is the decision flow.
@@ -85,7 +86,7 @@ static RULES: Array<CompiledRule> =
 #[map]
 static RULE_COUNT: HashMap<BankedObj, u32> =
     HashMap::with_max_entries((NUM_BANKS * MAX_OBJECTS) as u32, 0);
-/// The one-element control record (daemon pid + global mode + live bank).
+/// The one-element control record (daemon pid + live bank).
 #[map]
 static SETTINGS: Array<Settings> = Array::with_max_entries(1, 0);
 
@@ -104,10 +105,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
 fn decide(ctx: &LsmContext) -> Option<Verdict> {
     let settings = settings()?;
 
-    // (1) boundary off, or our own I/O → allow.
-    if settings.mode.is_off() {
-        return Some(Verdict::Allow);
-    }
+    // (1) our own I/O → allow (never deadlock on the daemon's own opens).
     let pid = kernel::current_pid();
     if pid == settings.daemon_pid {
         return Some(Verdict::Allow);
@@ -136,17 +134,17 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
     let exe = kernel::caller_exe()?;
     let policy = match_rule(matched.obj, requested, exe, bank).unwrap_or(Policy::DEFAULT_DENY);
 
-    let blocked = policy.denies() && settings.mode.enforces();
+    // The per-rule policy is the only enforcement level (no global mode): a denying
+    // policy blocks outright.
+    let blocked = policy.denies();
     // Emit only when the policy logs *and* the suppressor lets this one through (a tight
     // repeat-open burst collapses to its first event + a folded `suppressed` count).
     if policy.logs() {
         if let Some(suppressed) = kernel::throttle(exe, matched.obj, requested) {
-            let decision = if !policy.denies() {
-                Decision::AUDIT
-            } else if blocked {
+            let decision = if blocked {
                 Decision::DENY
             } else {
-                Decision::WOULD_DENY
+                Decision::AUDIT
             };
             kernel::emit(DecisionEvent::new(
                 pid,
@@ -229,7 +227,7 @@ fn subject_matches(subject: SubjectMatch, exe: FileId) -> bool {
 // mutable map memory); copying the value out behind a safe fn keeps the decision flow
 // `unsafe`-free. `Array::get` is already safe (bounds-checked).
 
-/// The one-element settings record (daemon pid + mode).
+/// The one-element settings record (daemon pid + live bank).
 fn settings() -> Option<Settings> {
     SETTINGS.get(0).copied()
 }

@@ -147,7 +147,7 @@ pub fn caller_exe() -> Option<FileId> {
 
 /// Push one logged decision to the ring buffer. Best-effort: a full ring drops the
 /// *observation*, never the verdict. The caller builds the record (it knows the
-/// matched policy and the mode-dependent decision); we just reserve + write + submit.
+/// matched policy and the resulting decision); we just reserve + write + submit.
 pub fn emit(event: DecisionEvent) {
     let Some(mut entry) = EVENTS.reserve::<DecisionEvent>(0) else {
         return;

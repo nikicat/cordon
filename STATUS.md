@@ -35,13 +35,15 @@ virtme-ng VM (`lsm=capability,bpf`, host kernel) — all 11 `bpf-lsm-smoke.sh` s
 green: allow + default-deny + learn record, self-test-negative abort, per-action (read
 allowed / write default-denied), subject group, object group, deny>allow, **copy-down**
 (subtree allow + a file-specific deny for one subject; the sibling stays readable),
-permissive (logged, not blocked), silence (denied, not logged), **runtime `policy
+audit→deny (observe with a `who="*"` catch-all, then enforce by flipping that one rule —
+no global mode), silence (denied, not logged), **runtime `policy
 apply` + `show`** (a previously-unprotected dir becomes protected without a restart), and
 **coalescing** (a 41-open burst collapses to ~2 records with the folded count carried).
 - **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
-  intent at open); the global `Mode` is now `enforce`/`permissive`/`off`; the ring-buffer
-  record is reshaped + renamed `LearnEvent` → **`DecisionEvent`** (it records a decision
-  for the journal; autolearn is a later M4 consumer) carrying `action` + matched `policy`.
+  intent at open); the ring-buffer record is reshaped + renamed `LearnEvent` →
+  **`DecisionEvent`** (it records a decision for the journal; autolearn is a later M4
+  consumer) carrying `action` + matched `policy`. *(1c originally shipped a global
+  `enforce`/`permissive`/`off` `Mode`; refinement (1) below has since removed it.)*
   `FileId` and `Action` gained `Display` (canonical human forms — the daemon journals typed
   values, no `String` helpers).
 - **1d eBPF program** (`crates/bpf`) — rewritten for the rule model: global-mode/daemon
@@ -86,13 +88,18 @@ smoke scenarios green):**
   Single-writer by construction (the `&mut Ebpf` lives on one backend thread; CLI applies
   serialize through one channel).
 
-**Decided refinements (2026-06-27, not yet implemented — see PLAN "Decided refinements" +
-DESIGN §15.6/§15.10):** **(1)** drop the global `enforce/permissive/off` mode — the per-rule
-`policy` is the only enforcement level (`audit` observes, `deny` enforces, per object); "off"
-= an empty policy. **(2)** add subject-specificity to the bucket sort so `allow exe=X` beats
-an `audit`/`deny` `who="*"` catch-all (needed for the audit→bless→enforce flow). **(3)**
-leaf-path reconstruction (in-kernel `d_name` walk) so a discovery audit shows the actual file,
-not the protected root (enables the per-app discovery flow + M4 autolearn).
+**Decided refinements (see PLAN "Decided refinements" + DESIGN §15.6/§15.10):**
+- **(1) Drop the global mode — ✅ done.** The `enforce/permissive/off` mode is gone
+  (`ids::Mode`, `Settings.mode`, the `mode=` policy key, and `Decision::WOULD_DENY` all
+  removed; the kernel blocks iff `policy.denies()`). The per-rule `policy` is the only
+  enforcement level — `audit` observes an object, `deny` enforces it, per object; "off" is
+  an empty policy or a stopped daemon. The smoke's permissive scenario became an
+  **audit→deny** one; `parse` now rejects a leftover top-level `mode =` key.
+- **(2) Subject-specificity in precedence — pending.** Add a tie-break to the bucket sort
+  so `allow exe=X` beats an `audit`/`deny` `who="*"` catch-all (needed for the
+  audit→bless→enforce flow A).
+- **(3) Leaf-path reconstruction — pending.** In-kernel `d_name` walk so a discovery audit
+  shows the actual file, not the protected root (enables flow B + M4 autolearn).
 
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
 + maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
