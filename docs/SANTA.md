@@ -9,7 +9,7 @@ we still build.
 
 ## TL;DR verdict
 - **Linux:** Santa is **macOS-only with no cross-platform plans** → irrelevant;
-  cordon's Linux (fanotify) backend must be built regardless. This alone justifies
+  cordon's Linux (bpf-lsm) backend must be built regardless. This alone justifies
   the project.
 - **macOS:** Santa's **File Access Authorization (FAA)** is a genuine
   object-centric, code-identity-keyed file gater on Endpoint Security — ~80% of

@@ -244,9 +244,10 @@ shim that reads the running kernel's BTF and injects field offsets into the prog
 only
 *further* restrict, never loosen (a SELinux/AppArmor deny still denies). So
 `bpf-lsm` is the hardened production boundary where available; on older kernels (or
-with `bpf` absent from the LSM list) there is **no hardened Linux boundary** — the
-`fanotify` backend remains only as a **dev/test** harness, not a fallback to rely
-on (it fails open and is path-bypassable). Real precedent for exactly this
+with `bpf` absent from the LSM list) there is **no hardened Linux boundary**. (The
+Phase-1 `fanotify` backend — a **dev/test** harness only, fail-open and
+path-bypassable, never a fallback to rely on — was **removed** in the §15 rule-model
+migration; `bpf-lsm` is now the sole Linux backend.) Real precedent for exactly this
 allow/deny use: **KubeArmor**, **Tetragon**, **bpflock** (§13).
 
 **Lineage is subsumed here (cancels the standalone cache, §8.2/§12).** Because the
@@ -499,31 +500,28 @@ both; store shows expected owners; cross-owner read denied; (Phase 2) prompt
 fires on a pre-existing unowned path and "approve permanently" persists.
 
 ### Test tiers (by privilege)
-- **Unprivileged (mock backend):** the policy core, store, decision flow, and IPC
-  e2e — `cargo test`, CI-friendly, no root. Covers everything but the kernel hook.
-- **Kernel backends in a VM, without host root → virtme-ng.** The `fanotify`
-  (dev/test) backend needs `CAP_SYS_ADMIN`, and the `bpf-lsm` (boundary) backend
-  needs `CAP_BPF`+`CAP_MAC_ADMIN` plus `bpf` in the LSM list — we get both from a
-  **virtme-ng VM** (`packaging/test/run-in-vm.sh`, `run-bpf-lsm-vm.sh`) booting a
-  **pinned upstream kernel** (Ubuntu mainline, e.g. `v6.12`) as guest-root — needs
-  only `/dev/kvm` (group `kvm`), no
-  host root. The VM runs qemu **directly** (no container), and virtme-ng reuses
-  the host userspace, so there is no rootfs to build and no glibc mismatch. The
-  *same* harness + kernel run locally and in CI, so the kernel never diverges.
-  (`CORDON_VM_KERNEL` selects the pinned version; unset = the host kernel for fast
-  local iteration.) Rootless podman is *not* an option for the backend itself:
-  `FAN_OPEN_PERM` checks init-userns `CAP_SYS_ADMIN`; userns-root isn't enough.
-- **Why not libkrun/krunvm:** it was evaluated and proven to *boot* fanotify
-  (libkrunfw's kernel enables `FANOTIFY_ACCESS_PERMISSIONS`), but getting `krunvm`
-  onto a CI runner means nesting it *inside a container*, which stacks two user
-  namespaces (`buildah unshare`) under the libkrun VMM. That nesting fails
-  **differently per environment** (`gid_map: operation not permitted` locally vs
-  `memfd_create: EINVAL` on GitHub) — non-reproducible, so undebuggable across
-  environments. virtme-ng collapses the stack to a single `/dev/kvm` dependency.
-- The smoke tests prove owner-allow + scraper-deny (`EPERM`) through a real kernel
-  backend — green in the virtme-ng VM (host kernel + pinned `v6.12`):
-  `phase1-fanotify-smoke.sh` (fanotify) and `bpf-lsm-smoke.sh` (the `bpf-lsm`
-  boundary, booted `lsm=…,bpf`).
+- **Unprivileged (no kernel backend):** the policy parser + copy-down compiler and the
+  IPC types — `cargo test` (`--all-features` also builds and unit-tests the `bpf-lsm`
+  control plane, incl. event coalescing), CI-friendly, no root. Covers everything but
+  the in-kernel hook itself.
+- **The `bpf-lsm` boundary in a VM, without host root → virtme-ng.** Loading the LSM
+  program needs `CAP_BPF`+`CAP_MAC_ADMIN` plus `bpf` in the active LSM list — both come
+  from a **virtme-ng VM** (`packaging/test/run-bpf-lsm-vm.sh`) booting a **pinned
+  upstream kernel** (Ubuntu mainline, e.g. `v6.12`) as guest-root with `lsm=…,bpf`,
+  needing only `/dev/kvm` (group `kvm`), no host root. The VM runs qemu **directly** (no
+  container) and virtme-ng reuses the host userspace, so there is no rootfs to build and
+  no glibc mismatch — the *same* harness + kernel run locally and in CI, so the kernel
+  never diverges. (`CORDON_VM_KERNEL` selects the pinned version; unset = the host
+  kernel for fast local iteration.)
+- **Why not libkrun/krunvm:** evaluated and dropped — getting `krunvm` onto a CI runner
+  means nesting it *inside a container*, stacking two user namespaces (`buildah unshare`)
+  under the libkrun VMM, which fails **differently per environment** (`gid_map: operation
+  not permitted` locally vs `memfd_create: EINVAL` on GitHub) — non-reproducible.
+  virtme-ng collapses the stack to a single `/dev/kvm` dependency.
+- `bpf-lsm-smoke.sh` proves the rule model end-to-end (allow/deny, per-action, subject +
+  object groups, copy-down precedence, permissive, silence, runtime `policy apply`, event
+  coalescing) through a real kernel — green in the virtme-ng VM (host kernel + pinned
+  `v6.12`, booted `lsm=…,bpf`).
 
 ## 12. Phased plan
 - **Phase 0 — skeleton + user-mode daemon.** Rust workspace; SQLite store +
@@ -531,7 +529,9 @@ fires on a pre-existing unowned path and "approve permanently" persists.
   over IPC; daemon as `systemctl --user` with the `mock` backend — decision-flow,
   TOFU, and store unit-tested **without root**, CI-friendly. (Real fixtures run
   once an interception backend lands in Phase 1.)
-- **Phase 1 — Linux fanotify backend (root).** *Done + validated.*
+- **Phase 1 — Linux fanotify backend (root).** *Done + validated; the backend was
+  later **removed** in the §15 rule-model migration (`bpf-lsm` is the sole kernel
+  backend). Kept here as history.*
   `fanotify FAN_OPEN_PERM` backend (via `nix`, no hand-written `unsafe`) behind
   the same core: marks zone/subtree filesystems, resolves caller via `/proc`, runs
   the decision flow, answers ALLOW/DENY. **All of steps 1–5 enforced

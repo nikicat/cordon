@@ -22,11 +22,11 @@ jobs:
   # (The `fanotify-vm` job was removed: the fanotify backend was retired with the
   # owner model in M1 1f. `bpf-lsm` is the only kernel backend, validated below.)
 
-  # Privileged boundary: the bpf-lsm backend, in a virtme-ng VM booting the same
-  # pinned kernel with `bpf` added to the active LSM list (`lsm=…,bpf`). Mirrors
-  # fanotify-vm plus the eBPF toolchain — the pinned nightly (crates/bpf/
-  # rust-toolchain.toml, fetched on demand) and bpf-linker — to build the in-kernel
-  # object. The kernel needs CONFIG_BPF_LSM=y (set in the Ubuntu mainline build).
+  # Privileged boundary: the bpf-lsm backend, in a virtme-ng VM booting a pinned
+  # kernel with `bpf` added to the active LSM list (`lsm=…,bpf`). Adds the eBPF
+  # toolchain — the pinned nightly (crates/bpf/rust-toolchain.toml, fetched on demand)
+  # and bpf-linker — to build the in-kernel object. The kernel needs CONFIG_BPF_LSM=y
+  # (set in the Ubuntu mainline build).
   bpf-lsm-vm:
     runs-on: ubuntu-latest
     needs: test
