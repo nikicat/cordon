@@ -1,18 +1,16 @@
-//! The IPC protocol between the `cordon` CLI (and, later, the prompt agent) and
-//! the `cordond` daemon — the control/management plane, *not* the data path of a
-//! gated `open()`.
+//! The IPC protocol between the `cordon` CLI and the `cordond` daemon — the
+//! control/management plane, *not* the data path of a gated `open()` (that is
+//! returned in-kernel by the bpf-lsm program).
 //!
-//! Wire format: one JSON value per line (newline-delimited). Request/response is
-//! synchronous RPC today; the Phase-2 prompt push will add server-initiated
-//! messages on a long-lived connection. Types here are runtime-agnostic: the
-//! same `Request`/`Response` and `handle` logic work whether the daemon's accept
-//! loop is threads or async.
+//! Wire format: one JSON value per line (newline-delimited), synchronous RPC. Types
+//! here are runtime-agnostic so the same `Request`/`Response`/`handle` logic works
+//! whether the accept loop is threads or async.
+//!
+//! The flat **rule model** (DESIGN §15): policy is authored in a root-owned text file
+//! and pushed with `policy apply`; there are no per-object owner mutations on the wire.
 
-use crate::backend::BackendKind;
-use crate::config::Mode;
-use crate::event::Op;
-use crate::store::{OwnerDetail, Rule};
-use crate::{Count, Result, RuleId, Secs, UnixSecs};
+use crate::Result;
+use crate::policy::Diagnostic;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -21,108 +19,62 @@ use std::path::PathBuf;
 /// A command from a client to the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
-    /// Daemon + store summary.
+    /// Daemon summary (backend, mode, the effective policy's object count).
     Status,
-    /// List owner groups with their identities and owned subtrees.
-    Owners,
-    /// List explicit rules.
-    Rules,
-    /// Add an explicit allow/deny rule. `ttl_secs` = None for permanent.
-    AddRule {
-        identity: String,
-        path: String,
-        mode: String,
-        allow: bool,
-        ttl_secs: Option<Secs>,
-    },
-    /// Remove an explicit rule by id.
-    RemoveRule { id: RuleId },
-    /// Claim a pre-existing subtree for `identity` (subsumes the `adopt` flow).
-    Adopt { path: String, identity: String },
-    /// Add an identity to the owner group of an existing subtree.
-    Claim { subtree: String, add: String },
-    /// Drop ownership of a subtree.
-    Disown { subtree: String },
-    /// Register a new zone root (creates can TOFU-claim inside it).
-    AddZone { path: String },
-    /// Drive a synthetic access event through the engine and return the verdict.
-    /// This is how the `mock` backend, the test harness, and (later)
-    /// `cordon run` inject events — there is no kernel event source in Phase 0.
-    Submit {
-        path: String,
-        exe: String,
-        #[serde(default)]
-        ancestors: Vec<String>,
-        op: Op,
-        #[serde(default)]
-        pid: Option<i32>,
-    },
+    /// Compile + apply a text policy, atomically replacing the live one. The CLI
+    /// sends the **text** (not a path): the daemon compiles it with its own
+    /// mount-aware resolver and swaps the in-kernel maps.
+    PolicyApply { text: String },
+    /// The effective (currently-loaded) compiled policy.
+    PolicyShow,
 }
 
 /// A reply from the daemon to a client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
     Status(StatusInfo),
-    Owners(Vec<OwnerInfo>),
-    Rules(Vec<RuleInfo>),
-    Decision(crate::decision::Decision),
-    RuleAdded { id: RuleId },
-    Done { changed: bool },
-    Error { message: String },
+    /// Result of `PolicyApply`: the compile diagnostics and whether it was applied
+    /// (false ⇒ it had errors and the live policy is unchanged).
+    PolicyApplied {
+        applied: bool,
+        diagnostics: Vec<Diagnostic>,
+    },
+    /// The effective policy (`PolicyShow`), or `None` if none is loaded.
+    PolicyView(Option<PolicyView>),
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatusInfo {
-    pub backend: BackendKind,
-    pub mode: Mode,
-    pub store: PathBuf,
+    pub backend: crate::backend::BackendKind,
     pub socket: PathBuf,
-    pub zones: Vec<PathBuf>,
-    pub owners: Count,
-    pub subtrees: Count,
-    pub rules: Count,
+    /// The policy file the backend compiles at startup / `apply` re-reads.
+    pub policy: PathBuf,
+    /// The effective global mode (`enforce`/`permissive`/`off`), or `None` if no
+    /// policy is loaded yet.
+    pub mode: Option<String>,
+    /// How many protected objects the effective policy has (`None` if none loaded).
+    pub objects: Option<usize>,
 }
 
+/// A human-facing snapshot of the effective compiled policy, for `cordon policy show`.
+/// Subjects are rendered (the compiled form keys them by inode, not path), so this is
+/// a summary: the protected object paths, each with its rule count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OwnerInfo {
-    pub name: String,
-    /// Exe paths in the owner group.
-    pub identities: Vec<PathBuf>,
-    pub subtrees: Vec<PathBuf>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RuleInfo {
-    pub id: RuleId,
-    /// Owning identity (`*` = any) — a token, not necessarily a path.
-    pub identity: String,
-    pub path: PathBuf,
+pub struct PolicyView {
+    /// `enforce` | `permissive` | `off`.
     pub mode: String,
-    pub allow: bool,
-    pub expires_at: Option<UnixSecs>,
+    pub objects: Vec<ObjectView>,
+    /// Policy paths that don't exist yet (not enforced until created + re-applied).
+    pub pending: Vec<PathBuf>,
 }
 
-impl From<OwnerDetail> for OwnerInfo {
-    fn from(o: OwnerDetail) -> Self {
-        OwnerInfo {
-            name: o.name,
-            identities: o.identities,
-            subtrees: o.subtrees,
-        }
-    }
-}
-
-impl From<Rule> for RuleInfo {
-    fn from(r: Rule) -> Self {
-        RuleInfo {
-            id: r.id,
-            identity: r.identity_exe,
-            path: r.path_prefix,
-            mode: r.mode,
-            allow: r.allow,
-            expires_at: r.expires_at,
-        }
-    }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObjectView {
+    pub path: PathBuf,
+    pub rules: usize,
 }
 
 /// Write one newline-framed JSON message and flush.

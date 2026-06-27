@@ -3,7 +3,18 @@
 Working name: **cordon** (object-centric: you *cordon off* the secret dirs).
 Deliberately outside the `gate`/`Gatekeeper` namespace.
 
-Language: **Rust**. Store: **SQLite** (root-owned).
+Language: **Rust**. Policy: a **root-owned text file** compiled to in-kernel BPF maps (§15).
+
+> **Reading guide.** **§15 is the current architecture** — the flat *rule model*,
+> implemented in M1 (see [`PLAN-rule-model.md`](PLAN-rule-model.md) for the milestones).
+> §1–§14 are the foundational design and its evolution: the v1 **owner model** (owners /
+> TOFU / interactive prompts) and the **fanotify** backend they describe were **retired**
+> in the rule-model migration and no longer exist in the code. Those sections are kept for
+> the durable rationale they still carry (threat model, object-centric insight, identity
+> forgeability, prior art). Read §2–§4 and §15 for the live design. Wherever a section
+> still describes the owner model, TOFU, interactive prompts, or the fanotify backend, that
+> is **history** — carried under a *superseded by §15* note (most concentrated in §5, §6,
+> §8.2, §12).
 
 ---
 
@@ -42,39 +53,39 @@ Enabling simplification: we **never confine the adversary**. We protect the
    stay plaintext in place; the gater denies non-owner `open()`. Because nothing
    is moved or encrypted, **transparency is automatic**. Encryption/broker/shim
    are an optional later bundle (§7), not v1.
-5. **Identity is "exe + best-effort ancestry," not exe alone.** Shebang tools
-   exec as their interpreter (`python3`, not `aws`), and helpers/installers read
-   configs they didn't create. The parent chain disambiguates both — but it's
-   best-effort (evadable by double-fork), so it raises cost, it isn't a boundary.
+5. **Identity is a predicate set, not exe alone.** Shebang tools exec as their
+   interpreter (`python3`, not `aws`), and helpers/installers read configs they didn't
+   create. The subject is a *conjunction* of cheap predicates — exe, uid, cgroup, and
+   (opt-in) content hash / argv0 / ancestor — ANDed in-kernel (§15.4). The parent chain
+   disambiguates the interpreter case but is best-effort (evadable by double-fork), so it
+   raises cost, it isn't a boundary.
 
 ## 4. Architecture
 
-### Core (v1)
+### Core
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  GATER — object-centric authorizer daemon (root)              │
-│    decide each open() under a protected subtree via §6 flow.   │
-│    Linux:  fanotify FAN_OPEN_PERM (+ FAN_CREATE for TOFU,      │
-│            FAN_REPORT_PIDFD for race-free caller id)            │
-│    macOS:  Endpoint Security AUTH_OPEN (audit_token →          │
+│  GATER — object-centric authorizer, in-kernel (root)          │
+│    decide each open() against a flat per-object rule table     │
+│    (§15.6 precedence), the verdict returned IN THE KERNEL.     │
+│    Linux:  BPF-LSM file_open (policy in BPF maps)              │
+│    macOS:  Endpoint Security AUTH_OPEN (planned; audit_token → │
 │            SecCodeCheckValidity; native parent/responsible pid) │
 ├──────────────────────────────────────────────────────────────┤
-│  OWNERSHIP + RULES (SQLite, root-owned) — §5                  │
-│    explicit rules + TOFU auto-ownership + interactive grants   │
-├──────────────────────────────────────────────────────────────┤
-│  PROMPT AGENT (unprivileged, per user session) — §6           │
-│    daemon can't draw UI → delegates prompts here over IPC      │
+│  POLICY — a root-owned TEXT FILE (§15.8)                      │
+│    (who, where, action, policy) rules + groups; cordond        │
+│    compiles it → BPF maps on `cordon policy apply`.            │
 └──────────────────────────────────────────────────────────────┘
-Files stay in place, plaintext. Owner allowed → reads unmodified.
+Files stay in place, plaintext. A rule allows → reads unmodified.
 ```
 
 The gater is **not** an AppArmor analog — it's a programmable authorizer (cousin
-of `fanotify`/LSM-BPF). The AppArmor analog on macOS is Seatbelt/SBPL, unused.
+of LSM-BPF). The AppArmor analog on macOS is Seatbelt/SBPL, unused.
 
-**Fail-open when the daemon is down** (no one to ask). Accepted in scope: a
-one-shot interactive scraper runs while the daemon is up; killing the daemon
-needs root. (The **`bpf-lsm`** backend inverts this to **fail-safe** — pinned
-in-kernel programs keep enforcing if the daemon dies; see "BPF-LSM" below.)
+**Enforcement posture.** With `bpf-lsm` the verdict is in-kernel, so it does **not**
+depend on the daemon being up. Once the programs + maps are **bpffs-pinned** (the
+remaining hardening increment) enforcement is **fail-safe** — it survives daemon
+death; until then a daemon crash drops the program and fails open.
 
 ### Optional later bundle (only to cover un-gated reads — §7)
 Relocate + encrypt → needs a **key** → held by a resident **broker** → needs a
@@ -86,92 +97,51 @@ three or none.
 `credential_process`, docker, kube): hand back **short-lived** creds. Per-tool.
 
 ### Privilege model — pluggable backends
-The **policy core** (decision flow §6, ownership store §5, prompt routing,
-`cordon` CLI/IPC) is **privilege-agnostic**. Only the *enforcement backend* — the
-thing that feeds it open-events and carries out allow/deny — needs privilege.
-Backends sit behind one interface:
+The **policy core** (the §15 compiler, IPC, the `cordon` CLI) is
+**privilege-agnostic**. Only the *enforcement backend* — the thing that mediates opens
+and carries out allow/deny — needs privilege, and it sits behind one interface:
 
-| Backend | Privilege | Scope | Boundary? | Use |
+| Backend | Privilege | Scope | Boundary? | Status |
 |---|---|---|---|---|
-| `mock`/`replay` | user | synthetic events | no | unit/logic tests |
-| `seccomp-unotify` | user (`no_new_privs`) | descendants of `cordon run -- <tool>` | partial (launch-scoped) | dev; single-tool sandbox |
-| `fanotify` | **root** (CAP_SYS_ADMIN) | system-wide | **no** — fail-open + path-bypass | Linux **dev/test only** — NOT a security boundary |
-| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe) | Linux production — **the boundary** |
-| `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS production |
+| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe once pinned) | Linux production — **the boundary** |
+| `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS — planned (§12, Phase 4) |
+| `mock` / `fanotify` / `seccomp-unotify` | — | — | no | **removed / dropped** — see note |
 
-So the daemon runs **`systemctl --user`** in dev with the `mock` backend — no
-root, fast iteration, the whole policy engine testable — and swaps to the
-**`bpf-lsm`**/ES backend (system service) for the real guarantee.
+The build splits along this seam: the stock workspace compiles the core + CLI on stable
+with no kernel deps; the daemon is built `--features bpf-lsm` to link the aya loader and
+enforce. macOS will add an ES backend behind the same interface.
 
-**`fanotify` is a dev/test backend, not a security boundary.** It enforces while
-running, which made it a fast MVP and a good way to exercise the engine against a
-real kernel (unprivileged via a virtme-ng VM — §11), but it is **not** something to
-rely on for protection: it **fails open** (daemon down/slow ⇒ every open allowed),
-it decides in **userspace on the open-time path** (the rename-out-of-zone bypass
-below), and its identity is a best-effort `/proc` read. The production Linux
-boundary is **`bpf-lsm`** (in-kernel verdict, fail-safe); on kernels without it
-there is simply no hardened Linux boundary yet.
+> **Retired backends (history, kept as design contrast).** Earlier iterations shipped a
+> `mock` backend (synthetic events for logic tests) and a root **`fanotify`**
+> `FAN_OPEN_PERM` backend — a fast, portable MVP that enforced *while running* but was
+> **never a boundary**: it fails open (daemon down ⇒ every open allowed), decides in
+> userspace on the open-time path (the rename-out-of-zone bypass below), reads identity
+> best-effort from `/proc`, and needs `CAP_SYS_ADMIN` for its system-wide veto power (the
+> unprivileged `FAN_REPORT_FID` mode is notify-only — useless for gating). So **user-mode
+> cannot enforce system-wide** — that motivated the move in-kernel. A `seccomp-unotify`
+> `cordon run -- <tool>` sandbox was also evaluated and scoped out (subject-centric,
+> opt-in, real `unsafe`). All three were removed in the rule-model migration; **`bpf-lsm`
+> is the sole Linux backend.** The in-kernel LSM verdict (below) is the answer to
+> fanotify's wrong shape for per-object policy.
 
-**Why `fanotify` needs root:** permission events (`FAN_OPEN_PERM`) let you *block,
-deny, and surveil* `open()` for *any* process on the box — a system-wide
-interception/veto power (you could watch all I/O or deadlock the machine), so the
-kernel guards it behind `CAP_SYS_ADMIN` (≈root), as it does the broad
-`FAN_MARK_MOUNT`/`FAN_MARK_FILESYSTEM` marks. The unprivileged fanotify mode (≥5.1,
-`FAN_REPORT_FID`) is *notification-only* — no deny — so it's useless for gating.
-Hence user-mode **cannot enforce system-wide; it is a dev/debug harness, not a
-boundary** (its store is user-writable too). (Nicety: we need the capability, not
-uid 0 — a dedicated uid + systemd `AmbientCapabilities=CAP_SYS_ADMIN`.)
+### BPF-LSM — the hardened Linux boundary
+**BPF-LSM is the Linux mechanism that fits per-object policy**, and is cordon's sole Linux
+backend. eBPF programs attach to LSM hooks (`file_open`, `inode_create`/`inode_rename`/
+`inode_unlink`, `sb_mount`, `bprm_check_security`) and **return the verdict in-kernel**
+(`0` allow / `-EPERM` deny); policy lives in **BPF maps** the daemon fills from the compiled
+text policy — *no recompile/reload per rule.* Mediating the operation itself means there
+are no per-directory marks to keep race-free and no whole-filesystem funnel through
+userspace (the wrong-shape traps of a userspace open-notifier).
 
-**What `seccomp-unotify` is:** a seccomp filter verdict (`SECCOMP_RET_USER_NOTIF`)
-that, on a filtered syscall (e.g. `openat`), *suspends the calling thread* and
-hands a notification to a **supervisor** process holding a listener fd. The
-supervisor reads the syscall + args + target pid and responds: spoof a result
-(deny via errno), `CONTINUE` (proceed), or `ADDFD` (inject an fd so the open
-"succeeds" with a chosen file). It's **unprivileged** — installable without
-`CAP_SYS_ADMIN` if the process first sets `no_new_privs`; the listener fd is passed
-to a separate supervisor over a socket. Filters are inherited by descendants only,
-so it covers just processes you *launch* (`cordon run -- <tool>`: set
-`no_new_privs`, install filter, send fd to the daemon, exec the tool) — a
-per-invocation sandbox, not the system-wide guarantee. Footgun: path args point
-into the target's memory (racy with a hostile target → guard with
-`SECCOMP_IOCTL_NOTIF_ID_VALID`); harmless for our own fixtures. Linux-only; macOS
-unprivileged dev-mode is `mock` only (no seccomp equivalent; real interception
-needs ES/root).
-
-> **Re-evaluated (post-Phase-1): not planned.** `seccomp-unotify` had two jobs —
-> (a) an *unprivileged test/dev* path, and (b) a `cordon run -- <tool>`
-> single-tool sandbox. (a) is fully obsoleted: **virtme-ng** now runs the *real*
-> `fanotify` backend unprivileged (no root, only `/dev/kvm`) for local dev and
-> CI, and the `mock` backend covers pure logic. (b) is a genuine feature but
-> **subject-centric and opt-in** — you only confine tools you *launch*, so it
-> doesn't touch the threat model (an unknown scraper you didn't launch); it's a
-> firejail-style sandbox orthogonal to the object-centric gater, at the cost of
-> real `unsafe` (BPF + user-notif + the path-arg TOCTOU above). So it's **dropped
-> from the plan** and kept only as an *optional future* sandbox mode, not a
-> deliverable.
-
-### BPF-LSM — the hardened Linux boundary (in progress; supersedes `fanotify` for production)
-`fanotify` got us a correct, portable MVP fast, but it is the *wrong shape* for
-per-object policy — it was built for whole-volume AV/HSM scanning. It can only
-veto `open`/`access`/`exec` (no structural-op gating), and per-directory marks
-don't recurse and can't be kept race-free across `mkdir`/rename/mount, so
-recursive coverage forces a **whole-filesystem mark → every `open()` on the fs
-funnels through userspace**. **BPF-LSM is the Linux mechanism that actually
-fits.** eBPF programs attach to LSM hooks (`file_open`, `inode_create`/
-`inode_rename`/`inode_unlink`, `sb_mount`, `bprm_check_security`) and **return
-the verdict in-kernel** (`0` allow / `-EPERM` deny). Policy lives in **BPF maps**
-the daemon updates via the `bpf()` syscall — *no recompile/reload per rule.*
-
-Our **deny-and-learn-only** decision (no synchronous block-and-ask — §6) removes
-the *one* thing BPF-LSM can't do (it can't suspend a syscall pending a userspace
-answer), making the trade one-sided. Versus `fanotify`:
+cordon returns the verdict **in-kernel** (no synchronous block-and-ask), sidestepping the
+*one* thing BPF-LSM can't do (suspend a syscall pending a userspace answer). What the
+in-kernel LSM shape buys:
 - **No marking → no recursive-mark race.** Hooks fire on the operation; a freshly
   `mkdir`'d / `mv`'d-in / `mount`-ed-in subtree is covered the instant it exists.
-- **Structural ops are gateable** (`inode_rename`, `inode_create`, `sb_mount`…),
-  closing the `fanotify` **rename-out-of-zone bypass**: a same-uid tool renames a
-  secret out of a protected subtree, then opens it at an unprotected path —
-  `fanotify` decides on the open-time path and allows it; BPF-LSM vetoes the
-  rename (or keys identity on the inode, not the path).
+- **Structural ops are gateable** (`inode_rename`, `inode_create`, `sb_mount`…), closing
+  the **rename-out-of-zone bypass**: a same-uid tool can't rename a secret out of a
+  protected subtree and reopen it at an unprotected path — the rename itself is vetoed (and
+  identity is keyed on the inode, not the path).
 - **In-kernel matching → no funnel.** The program walks the opened file's dentry
   ancestors by **`(dev,inode)`** and allows non-zone opens *without leaving the
   kernel* — no whole-`/` funnel; the hot path never crosses into userspace. Path
@@ -190,64 +160,62 @@ answer), making the trade one-sided. Versus `fanotify`:
   path. (IMA *appraisal* + a keyring gets "verified-signed-by-key," the closest
   Linux analog to ES code-signing — enterprise setup, not free.)
 - **Fail-safe, not fail-open.** Pin the programs and their `bpf_link` to **bpffs**
-  (`/sys/fs/bpf/…`) and enforcement persists with **no holding process** — the
-  daemon can crash/restart with *zero* enforcement gap, inverting `fanotify`'s
-  posture (kill the daemon → marks drop → fail-open).
+  (`/sys/fs/bpf/…`) and enforcement persists with **no holding process** — the daemon can
+  crash/restart with *zero* enforcement gap.
 
-**Implemented so far (increment 1 — validated in a VM, see STATUS):** the
-`file_open` verdict (subtree `(dev,inode)` ancestor walk + exe-`(dev,inode)`
-identity), map-sync from the store on every ownership change, and the ring-buffer
-learn path. The **structural-op gating** (closing the rename bypass), **content-
-digest identity**, and **fail-safe pinning** described above are the design's next
-increments, not yet shipped — so today's `bpf-lsm` enforces reads like `fanotify`
-but in-kernel, and (until pinning) still fails open when the daemon dies.
+**Implemented (M1 — validated in a VM, see STATUS / [`PLAN-rule-model.md`](PLAN-rule-model.md)):**
+the `file_open` verdict over the **flat rule table** — deepest protected object via the
+`(dev,inode)` dentry walk, exe-`(dev,inode)` subject match, action from `f_mode`/`f_flags`
+(read/write/create), first-match on the copy-down-resolved bucket, default-deny, with the
+global `enforce`/`permissive`/`off` mode; the **text policy** compiled + seeded at startup
+and re-seeded by `cordon policy apply` via an **atomic double-buffer swap**; and the
+ring-buffer learn path with **in-kernel event coalescing**. The **structural-op gating**
+(closing the rename bypass), **content-digest identity** (§15.4), and **fail-safe pinning**
+described above are the next increments, not yet shipped — so today's `bpf-lsm` enforces
+open-time actions in-kernel and (until pinning) still fails open when the daemon dies.
 
-**Deny/learn delivery — decoupled from the verdict.** Unlike `fanotify` (where
-delivery to userspace *is* the decision), the in-kernel program has already
-decided; learning rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a deny
-/ would-deny (audit) the hook emits a record (pid, exe `(dev,inode)`, subtree
-`(dev,inode)`, decision) and the daemon drains it asynchronously. It does
-**not** block the syscall. Lossy under flood = you drop *observability records*,
-never *enforcement* (a discard counter bumps).
+**Deny/learn delivery — decoupled from the verdict.** The in-kernel program has already
+decided; observability rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a
+deny / would-deny (audit) the hook emits a record (pid, exe `(dev,inode)`, object
+`(dev,inode)`, action, decision), **coalesced by an in-kernel suppressor**, and the daemon
+drains it asynchronously. It does **not** block the syscall. Lossy under flood = you drop
+*observability records*, never *enforcement* (a discard counter bumps).
 
 **Control plane vs data plane** — the daemon leaves the hot path entirely:
-> **Data plane = in-kernel BPF** — every open, every verdict, the TOFU map-write
-> — *always on, daemon-independent.*
-> **Control plane = SQLite (durable source of truth) + a thin, restartable
-> daemon** that (a) loads+pins the programs and seeds maps from the store at boot,
-> (b) applies `cordon` CLI policy changes as map updates, and (c) **drains the
-> ring buffer to the journal/log and persists learned ownership to SQLite.** Off
-> the hot path; its absence costs durability/observability, **never** enforcement.
-> *The daemon is still required* — at minimum to ship ring-buffer events to the
-> journal and to persist learning.
+> **Data plane = in-kernel BPF** — every open, every verdict — *always on,
+> daemon-independent.*
+> **Control plane = the root-owned text policy (durable source of truth) + a thin,
+> restartable daemon** that (a) compiles the policy and seeds the maps at startup and on
+> `cordon policy apply`, and (b) **drains the ring buffer to the journal.** Off the hot
+> path; its absence costs observability, **never** enforcement (and, once pinned, not even
+> across a restart). *The daemon is still required* — to ship ring-buffer events to the
+> journal and to apply policy changes.
 
 **Map concurrency** is handled by map semantics + RCU, not hand-rolled locks: a
-single-element `bpf_map_update_elem` is atomic (a reader sees old-or-new, never
-torn; element lifetime is RCU); multi-field values are swapped whole; an atomic
-*multi-entry* policy snapshot uses a **generation-counter / double-buffer** (fill
-the inactive version, flip the active-gen key in one update — RCU-style);
-`bpf_spin_lock` is available if a value genuinely needs in-program
-read-modify-write.
+single-element `bpf_map_update_elem` is atomic (a reader sees old-or-new, never torn;
+element lifetime is RCU). The atomic *multi-entry* policy swap on `apply` uses exactly the
+**generation-counter / double-buffer** this called for — **now implemented** (§15.8): the
+three rule maps are banked, and the daemon fills the inactive bank then flips
+`Settings.active_bank` in one update, RCU-style. `bpf_spin_lock` is available if a value
+ever needs in-program read-modify-write.
 
-**Durability caveat.** BPF maps are ephemeral (lost on reboot / program reload),
-so SQLite remains the backing and the ring-buffer drainer keeps them in sync. A
-TOFU claim written in-kernel but not yet persisted is *enforced live* but *lost on
-reboot* (re-learned on next create) — acceptable for creator-owns.
+**Durability.** BPF maps are ephemeral (lost on reboot / program reload), but the **text
+policy is the durable source of truth** — the daemon recompiles and re-seeds it at startup,
+so nothing is lost. (The owner model's hazard of an in-kernel TOFU claim not yet persisted
+is gone with TOFU itself; autolearn (§15.9) keeps its *proposals* in a separate db, never
+the enforced source.)
 
 **Requirements / cost.** `CONFIG_BPF_LSM=y` **and** `bpf` in the active LSM list
 (`CONFIG_LSM=` / `lsm=` boot param — common but not universal); kernel ≥ 5.7 (the
-content-hash helpers are ≥ 5.11 / 6.x); `CAP_BPF` + `CAP_MAC_ADMIN`. Heavier to
-ship than `fanotify` (a verifier-friendly program, and — since rustc can't emit
-CO-RE relocations, <https://github.com/rust-lang/rust/issues/158412> — a userspace
-shim that reads the running kernel's BTF and injects field offsets into the program's
-`.rodata`, so one object runs on any kernel). **Additive** to existing LSMs — it can
-only
-*further* restrict, never loosen (a SELinux/AppArmor deny still denies). So
-`bpf-lsm` is the hardened production boundary where available; on older kernels (or
-with `bpf` absent from the LSM list) there is **no hardened Linux boundary** — the
-`fanotify` backend remains only as a **dev/test** harness, not a fallback to rely
-on (it fails open and is path-bypassable). Real precedent for exactly this
-allow/deny use: **KubeArmor**, **Tetragon**, **bpflock** (§13).
+content-hash helpers are ≥ 5.11 / 6.x); `CAP_BPF` + `CAP_MAC_ADMIN`. The program is
+verifier-friendly, and — since rustc can't emit CO-RE relocations,
+<https://github.com/rust-lang/rust/issues/158412> — a userspace shim reads the running
+kernel's BTF and injects field offsets into the program's `.rodata`, so one object runs on
+any kernel. **Additive** to existing LSMs — it can only *further* restrict, never loosen
+(a SELinux/AppArmor deny still denies). So `bpf-lsm` is the hardened production boundary
+where available; on older kernels (or with `bpf` absent from the LSM list) there is **no
+hardened Linux boundary**. Real precedent for exactly this allow/deny use: **KubeArmor**,
+**Tetragon**, **bpflock** (§13).
 
 **Lineage is subsumed here (cancels the standalone cache, §8.2/§12).** Because the
 backend already runs in-kernel, the §8.2 ancestry hardening is *folded in*, not a
@@ -258,21 +226,28 @@ into a BPF map *within this backend*. Ceiling unchanged: a real `exec` of a
 blessed binary (the **construction** attack, §8.1) is still faithfully recorded,
 so ancestry stays best-effort, never the boundary.
 
-Locations: dev `--user` → socket `$XDG_RUNTIME_DIR/cordon.sock`, store
-`$XDG_STATE_HOME/cordon/`; prod system → `/run/cordon.sock`, `/var/lib/cordon/`
-(root-owned). The `cordon` CLI auto-detects.
+Locations: the root system service listens on `/run/cordon.sock` and compiles
+`/etc/cordon/policy.toml` (both root-owned). A user-session dev daemon can override these
+to `$XDG_RUNTIME_DIR`/`$XDG_CONFIG_HOME` (the `cordon` CLI auto-detects), but it is **not**
+a boundary — only the root service enforces.
 
-**Operational config** is an optional TOML file (`mode`, `backend`, `socket`/
-`store`, the initial `zones` seed), with `${ENV}` interpolation and precedence
-CLI > file > default; dynamic policy (owners/rules/zones) stays in the store.
-**Mode** is `enforce` (block) or `audit` (run the flow, log would-be denials,
-allow) — the latter previews an ownership decision's blast radius before it
-bites, mirroring the fail-open posture. See `packaging/cordon.example.toml`.
+**Operational config** is an optional TOML file (`backend`, `socket`, the eBPF-object /
+policy-file paths), `${ENV}`-interpolated, precedence CLI > file > default. The
+*enforcement policy* — the rules — is **not** here: it lives in the root-owned text policy
+(§15.8), applied with `cordon policy apply`. There is no global mode; observe-vs-enforce is
+the per-rule `audit`/`deny` choice (§15.6). See `packaging/cordon.example.toml` +
+`cordon.example.policy.toml`.
 
 Terminology: this daemon is the **gater**. The **broker** (§7) is the separate,
 deferred key-holder.
 
 ## 5. Coverage & ownership model
+
+> **Superseded by §15 — historical.** This section describes the v1 *owner* model as
+> shipped in Phases 0–1. The flat **rule model** in §15 (shipped in M1) replaces it,
+> subsuming owners, explicit rules, and TOFU into one concept (§15.1 explains why). The
+> owner model — owners, the SQLite store, TOFU, interactive prompts — was **removed** in
+> the migration; what follows is the record of what those phases did, not current behavior.
 
 Two rule sources; explicit wins over auto.
 
@@ -311,6 +286,14 @@ SQLite **owned by the daemon (root), not user-writable** — else a scraper writ
 itself in as owner. Mutated only via the privileged `cordon` CLI → daemon IPC.
 
 ## 6. Decision flow & interactive mode
+
+> **Superseded by §15.6 — historical.** The owner-model decision flow and interactive
+> deny-and-learn below were **removed** with the owner model. The live decision flow is
+> §15.6: most-specific protected object → first-match on the copy-down bucket →
+> default-deny, under a global `enforce`/`permissive`/`off` mode, with the verdict returned
+> **in-kernel** (so there is no synchronous prompt). TOFU's successor is **autolearn**
+> (§15.9) — an explicit, reviewed training mode, not a per-open prompt (the deadline-safety
+> problem below is exactly why). Kept for that rationale and the prompt-UX design.
 
 ### Decision flow (evaluated per gated open)
 1. Path not under any protected subtree → **allow** (unmediated).
@@ -371,6 +354,14 @@ only exist if we later encrypt: a master key the broker holds in RAM, unlocked
 once per session.
 
 ## 8. Caller identity (mechanics)
+
+> **Mechanics updated by §15.4.** In the in-kernel backend the caller's identity is its
+> exe `(dev,inode)` read straight from `task->mm->exe_file` — race-free, no `/proc`
+> readlink, no `FAN_REPORT_PIDFD` — plus the other predicates in §15.4 (uid, cgroup, opt-in
+> hash/argv0/ancestor). The fanotify pidfd / `/proc` mechanics below are the retired
+> userspace path; the **forgeability analysis in §8.1 is model-agnostic and still
+> load-bearing** — §15.4's argv0/ancestor predicates rest on it.
+
 - **Race-free id:** Linux `FAN_REPORT_PIDFD` → pidfd → exe; macOS per-connection
   audit token → code requirement. Don't re-`readlink` `/proc/pid/exe` after the
   fact (PID may have exec'd).
@@ -432,153 +423,118 @@ destroyed information. Stronger sources, weakest→strongest:
   sources (`auditd` is async, log-only), not `/proc/.../children` (wrong
   direction), not cgroup/session grouping (CLI tools share the shell's cgroup).
 
-> **Superseded as a standalone deliverable.** With the **BPF-LSM backend (§4)**
-> this is *folded into the backend*, not a separate proc-connector subsystem: the
-> same `sched_process_{fork,exec}` hooks live there (writing `(pid, starttime)`→
-> parent into a BPF map), and a live `task->real_parent` walk is free at decision
-> time. So the once-planned event-sourced **proc-connector lineage cache is
-> dropped** — the `fanotify` backend keeps its best-effort `/proc/<pid>/stat`
-> snapshot (ancestry is never the boundary, §8.1), and the durable version arrives
-> for free with `bpf-lsm`. Note the in-kernel walk is *also* best-effort: a parent
-> that already exited is already reparented, so only fork-time recording (cache or
-> BPF map) defeats **removal** — the **construction** ceiling stands regardless.
+> **Superseded as a standalone deliverable.** With the **BPF-LSM backend (§4)** this is
+> *folded into the backend*, not a separate proc-connector subsystem: a live
+> `task->real_parent` walk is free at decision time, and durable-across-exit lineage is
+> just `sched_process_{fork,exec}` hooks writing `(pid, starttime)`→parent into a BPF map
+> there (a later increment; ancestry is one of §15.4's opt-in predicates, never the
+> boundary, §8.1). So the once-planned event-sourced **proc-connector lineage cache is
+> dropped.** The in-kernel walk is *also* best-effort: a parent that already exited is
+> already reparented, so only fork-time recording defeats **removal** — the
+> **construction** ceiling stands regardless.
 
 ## 9. Cross-platform primitive map
 
 | Need | Linux | macOS |
 |---|---|---|
-| Object-centric open authorizer | `fanotify FAN_OPEN_PERM` / LSM-BPF | **Endpoint Security** `AUTH_OPEN` |
-| Unprivileged dev/testing | `mock` + **virtme-ng VM** (runs real `fanotify`, no root) | `mock` only (no unpriv intercept) |
-| Caller id (race-free) | `pidfd` (`FAN_REPORT_PIDFD`, ≥5.15) | per-conn audit token → code req |
-| Parent chain | `/proc/<pid>/stat` walk + start-time | ES process struct (parent + responsible pid) |
-| TOFU create signal | `FAN_CREATE` (FID/DFID) | ES create/exec events |
-| Prompt channel | per-session agent + dbus/libnotify | per-session agent + UserNotifications |
+| Object-centric open authorizer | **BPF-LSM** `file_open` (in-kernel verdict) | **Endpoint Security** `AUTH_OPEN` |
+| Testing without host root | **virtme-ng VM** runs the real `bpf-lsm` backend; `cargo test` covers the compiler/control plane | `mock` only (no unpriv intercept) |
+| Caller id (race-free) | exe `(dev,inode)` from `task->mm->exe_file` (in-kernel) | per-conn audit token → code req |
+| Parent chain | `task->real_parent` walk (in-kernel) + start-time | ES process struct (parent + responsible pid) |
+| Create signal (autolearn / mutation) | `inode_create` hook (§15, M3) | ES create/exec events |
+| Prompt channel (deferred — no interactive mode in the rule model) | per-session agent + dbus/libnotify | per-session agent + UserNotifications |
 | Key custody (only if encrypting) | kernel keyring / Secret Service | Keychain / Secure Enclave |
 | Declarative MAC we're *not* using | AppArmor / SELinux | Seatbelt / SBPL |
 
-Same shape both OSes: root authorizer daemon + shared SQLite store + per-session
-prompt agent + `cordon` CLI. Per-tool cost = a row, not a profile.
+Same shape both OSes: a root **in-kernel authorizer** + a **root-owned text policy** +
+the `cordon` CLI. Per-protected-dir cost = a rule, not a per-tool profile.
 
 ## 10. Honest limitations
-- **`fanotify` is not a security boundary — dev/test only** (§4): it fails open
-  (daemon down ⇒ allowed), decides in userspace on the open-time path (rename-out-
-  of-zone bypass), and reads identity best-effort from `/proc`. The Linux boundary
-  is **`bpf-lsm`** (in-kernel, fail-safe once pinned); on kernels without it there
-  is no hardened Linux boundary yet.
-- Fail-open when the daemon is down — the `bpf-lsm` backend *will* fail *safe* once
-  its programs are bpffs-pinned (§4); until that increment lands it, too, fails open.
-- Parent chain is best-effort — double-fork launders ancestry; argv untrusted.
-- Interpreted tools surface as their interpreter → need ancestry or explicit rule.
-- Interactive mode: first-access denial friction; prompt-fatigue/habituation risk
-  (mitigate: prompt only on protected subtrees, first touch, rich context).
-- Confused-deputy: gating ≠ stopping a tool's own export surface (out of scope).
-- `bpf-lsm` needs `CAP_BPF` + `CAP_MAC_ADMIN`; `fanotify` needs `CAP_SYS_ADMIN`; ES
-  needs a restricted entitlement (SIP relaxation for personal use). All run as root.
-- **Neither user-mode nor `fanotify` is a boundary** — the `--user` dev daemon
-  (`mock`) and the root `fanotify` backend are both development/test only; real
-  protection needs the root `bpf-lsm`/ES backend.
-- **macOS backend shares ES's ceiling** — open()-time mediation only (no
-  `read(2)` event), symlinks not followed, ES "default mute set" binaries
-  unmediated. Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
+- **Fail-open until pinned.** The verdict is in-kernel, but the daemon loads the program —
+  until the programs + maps are **bpffs-pinned** (§4), a daemon crash drops enforcement
+  (fail-open). Pinning makes it fail-safe; it is the remaining hardening increment. On
+  kernels without BPF-LSM (`CONFIG_BPF_LSM` off, or `bpf` not in the LSM list) there is no
+  hardened Linux boundary at all.
+- **Open-time only (so far).** M1 mediates `file_open` (read/write/create); the structural
+  ops (unlink/rename/… — closing the rename-out-of-zone bypass) and `execute` are later
+  hooks (§15.5). Until then a same-uid tool can rename a secret out of a protected subtree
+  and open it at an unprotected path.
+- **Identity is best-effort beyond exe.** The exe `(dev,inode)` is race-free, but the
+  parent chain is laundered by double-fork and argv is untrusted; interpreted tools surface
+  as their interpreter (`python3`), needing the opt-in argv0/ancestor or hash predicates
+  (§15.4). Ancestry raises cost, never the boundary (§8.1).
+- **First-access friction.** A tool with no matching rule hitting a protected object is
+  default-denied; granting access means editing the root-owned policy + `cordon policy
+  apply` (autolearn, §15.9, is the assisted path). There is no interactive per-open prompt.
+- **Confused-deputy:** gating ≠ stopping a tool's own export surface (out of scope).
+- **Only the root `bpf-lsm` backend is a boundary** — a user-session dev daemon is for
+  iteration, not protection; the boundary runs as a root service with `CAP_BPF` +
+  `CAP_MAC_ADMIN` (macOS ES needs a restricted entitlement).
+- **macOS backend (planned) shares ES's ceiling** — open()-time mediation only (no
+  `read(2)` event), symlinks not followed, ES "default mute set" binaries unmediated.
+  Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
 
 ## 11. Testing strategy — internal fixtures
-Hermetic, throwaway `$HOME` as the only zone root. Distinct exe paths to
-exercise *identity* gating:
-- `testtool-oldstyle` → `$HOME/.ctest-old/secret` (dotfile; zone = home)
-- `testtool-xdg` → `$HOME/.config/ctest-xdg/secret` (XDG; zone = `~/.config`)
-- `testscraper` → walks & tries to read both; must be denied.
-- (later) an interpreted fixture (`python testtool.py`) to exercise the chain.
+The kernel-backed smoke (`bpf-lsm-smoke.sh`) drives the rule model end-to-end with
+distinct-inode exes (copies of `bash`, so each is its own subject) reading/writing secrets
+under a protected subtree, against a policy file:
+- an **owner** exe allowed to read its secret; a **scraper** with no matching rule →
+  default-deny (`EPERM`), reported on the ring buffer with the object inode + action;
+- per-action (read allowed, write default-denied on the same object), subject + object
+  **groups**, **deny > allow** ties, **copy-down** precedence (subtree allow + a
+  file-specific deny for one subject, the sibling still readable), **permissive** (logged,
+  not blocked), **silence** (denied, not logged), runtime **`policy apply`**, and **event
+  coalescing**.
 
-Asserts: each tool reads its own secret across runs (TOFU); scraper denied on
-both; store shows expected owners; cross-owner read denied; (Phase 2) prompt
-fires on a pre-existing unowned path and "approve permanently" persists.
+Asserts: the right subject reads, the wrong one is denied **in-kernel**, precedence
+resolves as §15.6 says, and a tight open-loop collapses to a few records — all on a real
+kernel (the unprivileged `cargo test` tier covers the parser + copy-down compiler).
 
 ### Test tiers (by privilege)
-- **Unprivileged (mock backend):** the policy core, store, decision flow, and IPC
-  e2e — `cargo test`, CI-friendly, no root. Covers everything but the kernel hook.
-- **Kernel backends in a VM, without host root → virtme-ng.** The `fanotify`
-  (dev/test) backend needs `CAP_SYS_ADMIN`, and the `bpf-lsm` (boundary) backend
-  needs `CAP_BPF`+`CAP_MAC_ADMIN` plus `bpf` in the LSM list — we get both from a
-  **virtme-ng VM** (`packaging/test/run-in-vm.sh`, `run-bpf-lsm-vm.sh`) booting a
-  **pinned upstream kernel** (Ubuntu mainline, e.g. `v6.12`) as guest-root — needs
-  only `/dev/kvm` (group `kvm`), no
-  host root. The VM runs qemu **directly** (no container), and virtme-ng reuses
-  the host userspace, so there is no rootfs to build and no glibc mismatch. The
-  *same* harness + kernel run locally and in CI, so the kernel never diverges.
-  (`CORDON_VM_KERNEL` selects the pinned version; unset = the host kernel for fast
-  local iteration.) Rootless podman is *not* an option for the backend itself:
-  `FAN_OPEN_PERM` checks init-userns `CAP_SYS_ADMIN`; userns-root isn't enough.
-- **Why not libkrun/krunvm:** it was evaluated and proven to *boot* fanotify
-  (libkrunfw's kernel enables `FANOTIFY_ACCESS_PERMISSIONS`), but getting `krunvm`
-  onto a CI runner means nesting it *inside a container*, which stacks two user
-  namespaces (`buildah unshare`) under the libkrun VMM. That nesting fails
-  **differently per environment** (`gid_map: operation not permitted` locally vs
-  `memfd_create: EINVAL` on GitHub) — non-reproducible, so undebuggable across
-  environments. virtme-ng collapses the stack to a single `/dev/kvm` dependency.
-- The smoke tests prove owner-allow + scraper-deny (`EPERM`) through a real kernel
-  backend — green in the virtme-ng VM (host kernel + pinned `v6.12`):
-  `phase1-fanotify-smoke.sh` (fanotify) and `bpf-lsm-smoke.sh` (the `bpf-lsm`
-  boundary, booted `lsm=…,bpf`).
+- **Unprivileged (no kernel backend):** the policy parser + copy-down compiler and the
+  IPC types — `cargo test` (`--all-features` also builds and unit-tests the `bpf-lsm`
+  control plane, incl. event coalescing), CI-friendly, no root. Covers everything but
+  the in-kernel hook itself.
+- **The `bpf-lsm` boundary in a VM, without host root → virtme-ng.** Loading the LSM
+  program needs `CAP_BPF`+`CAP_MAC_ADMIN` plus `bpf` in the active LSM list — both come
+  from a **virtme-ng VM** (`packaging/test/run-bpf-lsm-vm.sh`) booting a **pinned
+  upstream kernel** (Ubuntu mainline, e.g. `v6.12`) as guest-root with `lsm=…,bpf`,
+  needing only `/dev/kvm` (group `kvm`), no host root. The VM runs qemu **directly** (no
+  container) and virtme-ng reuses the host userspace, so there is no rootfs to build and
+  no glibc mismatch — the *same* harness + kernel run locally and in CI, so the kernel
+  never diverges. (`CORDON_VM_KERNEL` selects the pinned version; unset = the host
+  kernel for fast local iteration.)
+- **Why not libkrun/krunvm:** evaluated and dropped — getting `krunvm` onto a CI runner
+  means nesting it *inside a container*, stacking two user namespaces (`buildah unshare`)
+  under the libkrun VMM, which fails **differently per environment** (`gid_map: operation
+  not permitted` locally vs `memfd_create: EINVAL` on GitHub) — non-reproducible.
+  virtme-ng collapses the stack to a single `/dev/kvm` dependency.
+- `bpf-lsm-smoke.sh` proves the rule model end-to-end (allow/deny, per-action, subject +
+  object groups, copy-down precedence, permissive, silence, runtime `policy apply`, event
+  coalescing) through a real kernel — green in the virtme-ng VM (host kernel + pinned
+  `v6.12`, booted `lsm=…,bpf`).
 
 ## 12. Phased plan
-- **Phase 0 — skeleton + user-mode daemon.** Rust workspace; SQLite store +
-  rules/ownership schema; `cordon` CLI (`add/rm/status/owners/adopt/claim/disown`)
-  over IPC; daemon as `systemctl --user` with the `mock` backend — decision-flow,
-  TOFU, and store unit-tested **without root**, CI-friendly. (Real fixtures run
-  once an interception backend lands in Phase 1.)
-- **Phase 1 — Linux fanotify backend (root).** *Done + validated.*
-  `fanotify FAN_OPEN_PERM` backend (via `nix`, no hand-written `unsafe`) behind
-  the same core: marks zone/subtree filesystems, resolves caller via `/proc`, runs
-  the decision flow, answers ALLOW/DENY. **All of steps 1–5 enforced
-  system-wide**, incl. **TOFU-on-create (step 4)**: rather than the FID-based
-  `FAN_CREATE` group (racy/`unsafe`), the backend reads the suspended caller's
-  in-flight open flags from `/proc/<pid>/syscall` — safe, register-based,
-  race-free for `open`/`openat`/`creat` (`openat2` logs a warning + falls back to
-  `Read`). Proven owner-allow + scraper-deny (`EPERM`) for both `adopt` and TOFU
-  in a virtme-ng VM (§11). Ancestry is the best-effort `/proc/<pid>/stat` snapshot
-  (upgraded in Phase 2). (The once-planned `seccomp-unotify` dev extra is
-  **dropped** — virtme-ng obsoleted the unprivileged-testing rationale; see the §4
-  re-evaluation.)
-- **Phase 2 — interactive + ancestry hardening.** (Basic parent-chain
-  owner-match — step 3 — already landed in Phase 1: `proc::ancestry` + the
-  engine's chain check. Phase 2 makes it *interactive* and *robust*.)
-  - **Interactive deny-and-learn (step 5) — the headline.** A per-session,
-    unprivileged **prompt agent** (polkit-style) that the root daemon routes
-    prompts to; the AUTH path stays synchronous-with-deadline (Santa's
-    deadline-safety dispatch, `docs/SANTA.md`) and **denies-then-learns** —
-    persist the user's choice, honor it next time. Prompt outcomes → rules:
-    deny-once / deny-perm / allow-once / allow-for-X-min (TTL) / allow-perm; the
-    last **subsumes `adopt`**. *Protocol work:* the IPC gains a **server-initiated
-    push channel** (today it's request/response only) so the daemon can deliver
-    prompts on the agent's long-lived connection; authenticate the agent via
-    `SO_PEERCRED`.
-  - **Ancestry hardening — folded into the `bpf-lsm` backend, not a standalone
-    cache.** The once-planned event-sourced **proc-connector lineage cache is
-    cancelled**: the `bpf-lsm` backend (Phase 3, §4) has in-kernel access, so
-    durable lineage is just `sched_process_{fork,exec}` → a BPF map *inside that
-    backend*, and a live `task->real_parent` walk is free at decision time. Until
-    then the `fanotify` backend keeps its best-effort `/proc/<pid>/stat` snapshot
-    (Phase 1) — ancestry is never the boundary (§8.1), so there's no urgency.
-    (Ceiling unchanged: the **construction** attack survives any lineage source.)
-  - **Carry-over hardening from Phase 1:** `FAN_REPORT_TID` so op/identity
-    attribution reads the *triggering thread* (today `/proc/<tgid>/syscall` can
-    miss a non-main-thread create → falls back to `Read`); optional `openat2`
-    flag decode. The interpreter fixture (`python testtool.py`) lands here to
-    exercise the chain end-to-end.
-- **Phase 3 — `bpf-lsm` backend (the hardened Linux boundary) + full ownership.**
-  The production Linux backend that supersedes `fanotify` (kept as the portable
-  fallback): in-kernel verdicts on LSM hooks, policy in BPF maps, a ring-buffer
-  learn path, **fail-safe** pinned enforcement, in-kernel zone filtering, and
-  structural-op gating (closes the rename-out-of-zone bypass) — full design in §4.
-  This also realizes **full ownership**: identity granularity (path / `path+inode`
-  / `signature`) keyed on an in-kernel **content digest** (`bpf_ima_file_hash` /
-  `bpf_get_fsverity_digest`), tool-groups, and the override CLI fully wired; and
-  **subsumes** the §8.2 lineage hardening (fork/exec → BPF map). Ancestry stays
-  best-effort (construction attack).
+
+> **Superseded by [`PLAN-rule-model.md`](PLAN-rule-model.md) + §15.11 — historical.** The
+> phases below are the *owner-model* roadmap. They shipped through Phase 1, after which the
+> owner model + fanotify were **removed**; the **current** roadmap is the rule-model
+> milestones M1–M5 (M1 done) in PLAN-rule-model.md, summarized in §15.11. Kept for the
+> design history and the macOS/ES notes (Phase 4), which still apply.
+
+- **Phases 0–3 (owner model — shipped, then retired).** Phase 0 built the
+  privilege-agnostic core + a SQLite store + the `cordon` CLI on a `mock` backend; Phase 1
+  added the root **`fanotify`** `FAN_OPEN_PERM` backend (TOFU-on-create read from
+  `/proc/<pid>/syscall`, ancestry from `/proc`), VM-validated; Phase 3 moved the verdict
+  **in-kernel** (the bpf-lsm backend, then keyed on `subtrees` + `owner_identities`). Phase
+  2 (interactive deny-and-learn + ancestry hardening) was specced, not built. The
+  rule-model migration (§15) replaced this whole line — detail in git history; the
+  interactive/prompt design survives as the §6 record and **autolearn** (§15.9), the
+  ancestry analysis as §8.1/§8.2.
 - **Phase 4 — macOS gater.** Bespoke ES `AUTH_OPEN` client — **decided**: Santa's
-  FAA can't do dynamic TOFU / interactive prompts (`docs/SANTA.md`). Reuse Santa's
+  FAA can't do dynamic, reviewable policy + autolearn (`docs/SANTA.md`). Reuse Santa's
   Apache-2.0 source as a reference (deadline-safety dispatch, multi-ES-client
-  layout, identity matching). Same store/CLI/agent abstraction.
+  layout, identity matching). Same policy + CLI abstraction behind the backend interface.
 - **Phase 5 — (optional) at-rest bundle; capability brokering; canaries.**
 
 ## 13. Related work / prior art
@@ -647,6 +603,33 @@ secret config dirs — transparently, cross-platform, zero per-tool policy."
   backend — but it's container/k8s-oriented and heavyweight to drive as a
   per-user desktop secret gate.
 
+### aya-ecosystem peers (our toolchain — pure-Rust eBPF via aya)
+The eBPF enforcers above (Tetragon/Falco/KubeArmor/bpflock) are the **mechanism**
+precedent but all **Go/libbpf**. The projects that share cordon's actual *toolchain*
+— a `no_std` `aya-ebpf` kernel crate + an `aya` userspace loader, maps/ring-buffers,
+and the same CO-RE/BTF offset problem (rustc can't emit CO-RE relocations,
+<https://github.com/rust-lang/rust/issues/158412>) — live in
+[`aya-rs/awesome-aya`](https://github.com/aya-rs/awesome-aya), and **every security
+one is subject-centric, most observe-only**. None is an object-centric file
+authorizer for a personal box, so cordon shares their plumbing, not their shape:
+- **lockc** — eBPF **LSM-MAC** for *containers* (Docker/k8s), Rust/aya. Closest
+  cousin by mechanism (LSM hooks → MAC), but **container/profile-centric** and
+  audit-framed/experimental — it restricts the confined workload, not an *object*
+  the way we protect a subtree.
+- **suidsnoop** — aya **LSM programs**, the only peer that actually **denies**
+  (audit-or-enforce) — but scoped to **suid `execve`** and keyed on **uid**
+  (subject-centric); a research demo, not a file-read gate.
+- **bombini** — aya **LSM-BPF**, but **observe-only**: modular "detectors"
+  (exec / connect / file-access) emit JSON, no veto. Subject-centric, k8s runtime-sec.
+- **kunai** — aya, kprobes/tracepoints (not LSM enforcement); **observe-only** host
+  threat-hunting (Sysmon-for-Linux). The most mature of the set and the **least**
+  like cordon — it logs events, it doesn't gate opens.
+
+So in the aya world cordon's niche is empty: object-centric, enforcing,
+personal-desktop, TOFU + interactive. The precedent for the *use* (allow/deny on LSM
+hooks) is the Go tools above; the precedent for the *stack* is these — and they all
+answer "what may this subject do?", never "who may touch this resource?"
+
 ### Authorization-agent architecture
 - **polkit** — privileged daemon + **unprivileged per-session agent** that draws
   the prompt. Exactly our daemon/agent split (§6). But polkit authorizes D-Bus
@@ -654,3 +637,167 @@ secret config dirs — transparently, cross-platform, zero per-tool policy."
 
 ## 14. Open decisions
 See `STATUS.md`.
+
+## 15. The rule model — current architecture (supersedes §1–§14)
+
+The flat **rule model** — `(who, where, action, policy)`, in the SELinux/AppArmor lineage
+— is cordon's architecture, **shipped in M1**. It subsumes the v1 owner model's owners,
+explicit rules, and TOFU (§5) into one concept, enforced uniformly in-kernel. This section
+is the design; milestone-by-milestone status is in
+[`PLAN-rule-model.md`](PLAN-rule-model.md) (M1 done; M2–M5 ahead).
+
+### 15.1 Why
+The owner entity is reducible to allow-rules: `owner_match` ≡ "an allow rule exists for
+(caller-exe, subtree)." Owner groups bought grouping / dedup / naming — but a general
+**group** mechanism (§15.7) gives that for *all* axes, symmetrically, so a dedicated
+owner table was incidental complexity. Collapsing it also closed a real gap: the
+owner-model bpf-lsm backend enforced only `subtrees` + `owner_identities`, **not** the
+`rules` table, so `cordon add` allow/deny and TOFU were silently unenforced in-kernel.
+One model, now enforced uniformly.
+
+### 15.2 The rule
+`(who, where, action, policy)`:
+- **who** — subject: a *conjunction of predicates*, not just an exe (§15.4).
+- **where** — object: a file, directory, or **subtree** (recursive). Matched in-kernel
+  by the dentry ancestor walk (most-specific wins).
+- **action** — `read | write | create | execute | listdir | unlink | mkdir | rmdir |
+  rename` (extensible). Each maps to an LSM hook (§15.5).
+- **policy** — `allow | deny | audit | silence` = `{allow,deny} × {log,silent}`:
+  allow=allow+silent, audit=allow+log, deny=deny+log, silence=deny+silent.
+
+### 15.3 The compile principle (load-bearing)
+**Groups, nesting, defaults, and precedence are resolved entirely in userspace at
+compile time; the kernel evaluates a flat, pre-resolved decision table.** cordond
+parses the text policy → expands groups → resolves paths→`(dev,ino)` → flattens to a
+per-object rule table → loads BPF maps. Like SELinux's `checkpolicy`: expressive
+source, dumb-fast binary form. The eBPF program never sees a group or a nested ref,
+so it stays small and verifier-friendly no matter how expressive authoring gets.
+
+### 15.4 Subject = predicate set (the identity frontier)
+`who` is a conjunction of cheap-to-check predicates, ANDed:
+- `exe` — path/inode (cheap)
+- `uid` / `gid` — cheap (`bpf_get_current_uid_gid`)
+- `cgroup` / unit — cheap (`bpf_get_current_cgroup_id`); names a systemd service
+- `exe-hash` — content identity via **IMA/fsverity** (kernel-measured), *not* hashed in
+  BPF; survives upgrades, resists binary swap
+- `argv0` / `ancestor-exe` — moderate cost; the only real fix for the **interpreter
+  problem** (`~/.aws` is opened by `python3`, not `aws` — match "python3 whose
+  argv0/ancestor is aws", not all python)
+
+v1 ships `exe`+`uid`+`cgroup`; hash/argv/ancestor are opt-in later. No rule grammar
+fixes identity granularity — this axis is where the security actually lives.
+
+### 15.5 Action ↔ hook map (actions are not uniform)
+| action | LSM hook | notes |
+|---|---|---|
+| read / write / create | `file_open` | one program; `f_flags`/`f_mode` already encode RDONLY/WRONLY/RDWR/`O_CREAT` — three actions free at open time |
+| execute | `bprm_check_security` | exec of a binary |
+| unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | second program; fire on mutation (cheap) |
+| listdir | `file_open` of a directory (coarse) | no clean per-`getdents` hook; finer needs the hot `file_permission` |
+
+`file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
+is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewhere), so
+**identity is inode across all hooks** (the dentry walk), never path.
+
+### 15.6 Precedence (pin it explicitly)
+The kernel takes the **first matching rule** in the most-specific protected object's
+bucket; the compiler pre-sorts each bucket so first-match = most-specific-wins:
+1. Most-specific **where** — object depth (exact file > deeper subtree > ancestor).
+2. Most-specific **who** — a concrete subject (an `exe`; later, more predicates) beats
+   `who="*"`, so a specific `allow`/`deny` overrides a broad catch-all on the same object.
+3. **deny > allow** — fail-safe, but only as the tie-break among rules of *equal*
+   object+subject specificity (`allow X` vs `deny X` → deny; `allow *` vs `deny *` → deny).
+
+A protected object with no matching rule → **default-deny** (logged with a distinct
+`default-deny` cause, so it reads apart from an explicit `deny`). "Protected" = appears
+in/under some rule; everything else is unmediated **allow** (you cannot default-deny the
+whole filesystem).
+
+**No global mode — the per-rule `policy` *is* the enforcement level.** `audit` (allow+log)
+*observes* an object; `deny` (block+log) *enforces* it — so observe-vs-enforce is
+per-object, flipped by editing that object's catch-all rule, not a system-wide switch. This
+deliberately drops SELinux's `enforce|permissive|off`: cordon's user is their *own* policy
+admin iterating live on one box, not an admin staging policy for a fleet, so a global
+"permissive" preview + "enforce" cutover is just the **audit→deny** progression (§15.10).
+"Off" is an empty policy (or a stopped daemon). *(M1 shipped a global enforce/permissive/off
+mode; its removal — and the subject-specificity key in (2) — are tracked in
+[`PLAN-rule-model.md`](PLAN-rule-model.md).)*
+
+### 15.7 Groups
+Named, nestable, **symmetric across all three axes** (subject / object / action),
+cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Example
+(TOML):
+```toml
+[group.subject.ssh-tools]  members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/git"]
+[group.object.cloud-creds] members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
+[group.action.ro]          members = ["read", "listdir"]
+
+[[rule]]  who = "@ssh-tools"  where = "~/.ssh"        action = "@ro"             policy = "allow"
+[[rule]]  who = "*"           where = "@cloud-creds"  action = ["read", "write"] policy = "audit"
+```
+
+### 15.8 Storage
+- **Authoritative policy = a root-owned text file** (TOML v1; a compact DSL later if
+  TOML gets noisy). Not user-writable, else a scraper writes itself in. Git-versionable,
+  reviewable, diffable — policy as code.
+- **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
+  swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
+  only on an explicit apply, so an edit-in-progress is never half-enforced.
+- **`cordon policy check`** — linter/compiler: unknown exes, group cycles, shadowed /
+  unreachable rules, missing paths, deny-shadowed-by-allow.
+- **Atomic swap** in-kernel — **implemented** as a generation-counter **double-buffer**:
+  the rule maps are banked, the daemon fills the inactive bank and flips `active_bank` in
+  one write (RCU-style), so an `apply` has no visible window.
+- **Learned rules** live in a *separate* SQLite db (high-churn, machine-managed),
+  **lower precedence**, never overriding a hand-written deny; promoted into the text
+  file on review (§15.9).
+
+### 15.9 Autolearn (the zones layer)
+TOFU generalized: a bounded **training mode** (AppArmor complain-mode / fapolicyd
+trust-DB lineage). `zones` = the scope where autolearn may propose rules.
+- Explicit activation (`cordon learn`), bounded window; **the trust window is the whole
+  vulnerability** (anything malicious running during learning gets blessed) — so never
+  auto-enforce, review before promote.
+- Generalize (collapse per-file opens into a subtree rule) + confidence (seen N times)
+  + dedup, or you drown in candidates.
+- Record the *rich* subject (argv0 / ancestor / hash) so promoted rules are tight, not
+  just `exe=python3`.
+- `cordon learn review` → diff of proposed rules → promote into the text file. The
+  learned db is throwaway; the text file is durable.
+
+### 15.10 Authoring flows
+Both flows are just *edit the root-owned text policy → `cordon policy apply`*. There is no
+global mode and no daemon-side wizard; the journal (`audit`/`deny`/`default-deny`, each with
+the matched `exe`/`object`/`action`/`policy`) is the whole feedback loop.
+
+**A. Protect a known dir — observe → bless → enforce.**
+1. *Observe.* Add the dir with a `who="*" … policy="audit"` catch-all. Every access logs as
+   `audit`, nothing blocks — the blast-radius preview.
+2. *Bless.* For each legit `(exe → dir)` the log shows, add `who=<exe> … policy="allow"`.
+   Subject-specificity (§15.6) makes the specific allow win over the `*` catch-all, so a
+   blessed exe goes silent and the catch-all keeps logging only the not-yet-blessed.
+3. *Enforce.* When the audit stream is quiet, flip the catch-all `policy="audit"` →
+   `"deny"`: blessed exes stay silent, everything else is blocked **and logged** (`deny`),
+   so a tool you broke surfaces and you add an allow. Per dir, on your own schedule.
+
+**B. Discover where an app hides secrets — a "smart `strace -efile`".**
+Audit one exe across your home: `who=<app> where="~" action="*" policy="audit"`. Two wins
+over `strace`: the `where="~"` scope leaves `/usr/lib/*.so`, `/dev`, `/proc` *unprotected*
+→ never logged (only home-subtree access surfaces), and coalescing prevents the flood. The
+discovered paths then graduate into `@secrets` under flow A. *Requires leaf-path
+reconstruction — the kernel reports the matched protected root, not the leaf file (PLAN);
+the same mechanism M4 autolearn needs to collapse per-file opens into a subtree rule.*
+
+### 15.11 Phasing (M1–M5; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
+1. **Rule core** — **done.** Text policy + compiler (groups/precedence resolved in
+   userspace) → flat maps; open-time read/write/create via `f_flags`/`f_mode`; global
+   `enforce`/`permissive`/`off` mode; explicit `policy apply` via an atomic double-buffer
+   swap; in-kernel event coalescing. Replaced the owner model and closed the
+   in-kernel-rules gap.
+2. **Subject predicates** beyond exe — uid, cgroup; then IMA/fsverity hash; then
+   argv0/ancestor.
+3. **Mutation + exec hooks** — unlink/mkdir/rmdir/rename + `bprm_check_security` as a
+   second program (closes the rename-out-of-zone bypass).
+4. **Autolearn** (separate sqlite db) + review/promote, scoped to zones.
+5. **Fail-safe pinning** (orthogonal, already parked) so the compiled policy keeps
+   enforcing across daemon restarts (must ship with a singleton guard — see the plan).

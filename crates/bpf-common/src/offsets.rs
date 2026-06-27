@@ -33,6 +33,10 @@ pub struct Offsets {
     pub file_f_path_dentry: u32,
     /// `file -> f_inode` (the opened inode; the caller-exe identity path).
     pub file_f_inode: u32,
+    /// `file -> f_mode` (`fmode_t`: `FMODE_READ`/`FMODE_WRITE` → the read/write action).
+    pub file_f_mode: u32,
+    /// `file -> f_flags` (`O_CREAT` → the create action).
+    pub file_f_flags: u32,
     /// `dentry -> d_inode`.
     pub dentry_d_inode: u32,
     /// `dentry -> d_sb` (super_block, for the device number).
@@ -59,6 +63,8 @@ impl Offsets {
     pub const POISON: Offsets = Offsets {
         file_f_path_dentry: u32::MAX,
         file_f_inode: u32::MAX,
+        file_f_mode: u32::MAX,
+        file_f_flags: u32::MAX,
         dentry_d_inode: u32::MAX,
         dentry_d_sb: u32::MAX,
         dentry_d_parent: u32::MAX,

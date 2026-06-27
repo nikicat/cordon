@@ -19,8 +19,6 @@ bpf-lsm = ["dep:aya", "dep:cordon-bpf-common"]
 
 [dependencies]
 cordon-core = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -30,12 +28,6 @@ aya = { version = "0.14", optional = true }
 cordon-bpf-common = { path = "../bpf-common", features = ["user"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# fanotify permission events + write_response (most fanotify crates are
-# notification-only); nix wraps the unsafe syscalls in a safe, tested API. The
-# bpf-lsm backend also reuses nix `poll` to drive the ring-buffer reader.
-nix = { version = "0.31.3", features = ["fanotify", "poll", "process"] }
-
-[dev-dependencies]
-tempfile = "3"
-toml = { workspace = true }
-serde = { workspace = true }
+# nix `poll` drives the bpf-lsm ring-buffer reader; its safe wrappers avoid
+# hand-rolled `unsafe`. (Unused without the `bpf-lsm` feature.)
+nix = { version = "0.31.3", features = ["poll"] }

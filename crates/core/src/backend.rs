@@ -1,29 +1,27 @@
 //! The enforcement-backend seam.
 //!
-//! A backend is the only privileged part of the system: it sources open-events
-//! and carries out the engine's verdicts. Everything behind this trait (engine,
-//! store, IPC) is privilege-agnostic. Phase 0 ships only [`MockBackend`]; Phase 1
-//! adds a root `fanotify` backend implementing the same trait.
+//! A backend sources the verdict mechanism (in-kernel, for `bpf-lsm`) and is fed the
+//! compiled policy by the control plane. Everything behind this trait — the policy
+//! compiler, the IPC — is privilege-agnostic; only the backend needs root.
+//!
+//! Under the rule model the only backend is `bpf-lsm` (the hardened Linux boundary),
+//! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
+//! backends were retired with the rule-model migration (DESIGN §15).
 
-use crate::engine::Engine;
-use crate::{Error, Result};
+use crate::policy::Diagnostic;
+use crate::proto::PolicyView;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Which enforcement backend to run. The concrete implementations live where
-/// their privilege/OS lands (`MockBackend` here; `fanotify` in the daemon crate;
-/// macOS Endpoint Security in Phase 4) — this enum is just the selector that
-/// flows from config/CLI to the daemon's backend factory.
+/// Which enforcement backend to run — the selector that flows from config to the
+/// daemon's backend factory. Only `bpf-lsm` remains under the rule model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
-    /// Unprivileged dev/CI backend; events injected over IPC. Not a boundary.
+    /// Linux BPF-LSM (root, CAP_BPF + CAP_MAC_ADMIN). In-kernel verdicts from BPF
+    /// maps the daemon seeds from the compiled policy (DESIGN §4, §15). Built into the
+    /// daemon only with the `bpf-lsm` cargo feature.
     #[default]
-    Mock,
-    /// Linux `fanotify FAN_OPEN_PERM` (root). The portable boundary (fail-open).
-    Fanotify,
-    /// Linux BPF-LSM (root, CAP_BPF + CAP_MAC_ADMIN). The hardened boundary:
-    /// in-kernel verdicts, fail-safe via pinned programs (DESIGN §4). Built into
-    /// the daemon only with the `bpf-lsm` cargo feature.
     #[serde(rename = "bpf-lsm")]
     BpfLsm,
 }
@@ -31,8 +29,6 @@ pub enum BackendKind {
 impl BackendKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            BackendKind::Mock => "mock",
-            BackendKind::Fanotify => "fanotify",
             BackendKind::BpfLsm => "bpf-lsm",
         }
     }
@@ -45,21 +41,18 @@ impl std::fmt::Display for BackendKind {
 }
 
 impl std::str::FromStr for BackendKind {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<BackendKind> {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> crate::Result<BackendKind> {
         match s {
-            "mock" => Ok(BackendKind::Mock),
-            "fanotify" => Ok(BackendKind::Fanotify),
             "bpf-lsm" => Ok(BackendKind::BpfLsm),
-            other => Err(Error::msg(format!(
-                "unknown backend '{other}' (expected 'mock', 'fanotify', or 'bpf-lsm')"
+            other => Err(crate::Error::msg(format!(
+                "unknown backend '{other}' (the only backend is 'bpf-lsm')"
             ))),
         }
     }
 }
 
-/// A cooperative shutdown signal shared between the daemon and its backend
-/// thread. A backend's run loop parks on / polls this and returns when tripped.
+/// A cooperative shutdown signal shared between the daemon and its backend thread.
 #[derive(Default)]
 pub struct Shutdown {
     state: Mutex<bool>,
@@ -90,30 +83,54 @@ impl Shutdown {
     }
 }
 
-/// A source of open-events and the actuator of verdicts.
-pub trait Backend: Send {
-    /// Short stable name shown in `cordon status` (e.g. `mock`, `fanotify`).
-    fn name(&self) -> &str;
-
-    /// Run the event loop until `shutdown` is tripped. The mock backend has no
-    /// kernel event source — events arrive via IPC `Submit` and are evaluated on
-    /// the IPC threads — so its loop simply parks. A real backend reads native
-    /// events, calls `engine.lock().evaluate(..)`, and writes the verdict back to
-    /// the kernel.
-    fn run(self: Box<Self>, engine: Arc<Mutex<Engine>>, shutdown: Arc<Shutdown>) -> Result<()>;
+/// The control-plane handle the daemon hands the backend thread: a channel of
+/// `cordon policy apply` requests to honor, and a slot to publish the effective
+/// policy into for `cordon policy show`. The IPC side holds the matching
+/// [`ControlSender`].
+pub struct PolicyControl {
+    pub apply_rx: Receiver<ApplyRequest>,
+    pub current: Arc<Mutex<Option<PolicyView>>>,
 }
 
-/// The unprivileged development backend: no interception, events injected over
-/// IPC. **Not a boundary** (DESIGN §4) — for logic/CI and local iteration.
-pub struct MockBackend;
+/// The IPC side of [`PolicyControl`]: send applies, read the current policy.
+#[derive(Clone)]
+pub struct ControlSender {
+    pub apply_tx: Sender<ApplyRequest>,
+    pub current: Arc<Mutex<Option<PolicyView>>>,
+}
 
-impl Backend for MockBackend {
-    fn name(&self) -> &str {
-        "mock"
-    }
+/// Create a connected [`PolicyControl`] / [`ControlSender`] pair.
+pub fn control() -> (PolicyControl, ControlSender) {
+    let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+    let current = Arc::new(Mutex::new(None));
+    (
+        PolicyControl {
+            apply_rx,
+            current: Arc::clone(&current),
+        },
+        ControlSender { apply_tx, current },
+    )
+}
 
-    fn run(self: Box<Self>, _engine: Arc<Mutex<Engine>>, shutdown: Arc<Shutdown>) -> Result<()> {
-        shutdown.wait();
-        Ok(())
-    }
+/// One `policy apply`: the policy text + a one-shot reply channel for the outcome.
+pub struct ApplyRequest {
+    pub text: String,
+    pub reply: Sender<ApplyOutcome>,
+}
+
+/// The result of an apply: the compile diagnostics and whether the live policy was
+/// replaced (false ⇒ it had errors and was left unchanged).
+pub struct ApplyOutcome {
+    pub applied: bool,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A source of verdicts and the actuator of compiled policy.
+pub trait Backend: Send {
+    /// Short stable name shown in `cordon status` (e.g. `bpf-lsm`).
+    fn name(&self) -> &str;
+
+    /// Load + seed the compiled policy, then run until `shutdown` trips: drain the
+    /// ring buffer to the journal and honor `policy apply` requests off `control`.
+    fn run(self: Box<Self>, control: PolicyControl, shutdown: Arc<Shutdown>) -> crate::Result<()>;
 }

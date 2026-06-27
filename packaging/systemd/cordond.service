@@ -1,30 +1,30 @@
-# cordon gater — DEVELOPMENT user-mode unit (Phase 0).
+# cordon gater — system unit (the hardened bpf-lsm boundary).
 #
-# Run with:   systemctl --user start cordond
-# Install:    cp to ~/.config/systemd/user/ && systemctl --user daemon-reload
+# Install:  cp to /etc/systemd/system/ && systemctl daemon-reload && systemctl
+#           enable --now cordond
 #
-# This is the `--user` dev daemon with the `mock` backend. It is NOT a security
-# boundary (DESIGN §4/§10): it performs no kernel interception and its store is
-# user-writable. It exists for logic/CI iteration and to drive synthetic events
-# over IPC (`cordon submit ...`). Real enforcement is the root `fanotify`/ES
-# backend shipped as a system unit in a later phase.
-#
-# The daemon creates its own socket ($XDG_RUNTIME_DIR/cordon.sock) and store
-# ($XDG_STATE_HOME/cordon/cordon.db), so no RuntimeDirectory=/StateDirectory= is
-# needed here.
+# Requires root with CAP_BPF + CAP_MAC_ADMIN, a kernel with CONFIG_BPF_LSM=y and
+# `bpf` in the active LSM list (`lsm=…,bpf` on the kernel cmdline), the daemon built
+# `--features bpf-lsm`, and the eBPF object installed (default
+# /usr/lib/cordon/cordon.bpf.o). The daemon compiles the text policy
+# (/etc/cordon/policy.toml) at startup and seeds the in-kernel maps; `cordon policy
+# apply` re-seeds at runtime. Operational settings come from /etc/cordon/config.toml
+# (see packaging/cordon.example.toml).
 
 [Unit]
-Description=cordon gater (dev, user-mode, mock backend — NOT a security boundary)
+Description=cordon gater (bpf-lsm in-kernel boundary)
+# The verdict is in-kernel; start early so coverage begins before user sessions.
+DefaultDependencies=no
+After=local-fs.target
+Before=basic.target
 
 [Service]
 Type=simple
-# Resolve `cordond` from PATH (e.g. ~/.cargo/bin after `cargo install --path crates/daemon`).
-# Settings come from the config file (see packaging/cordon.example.toml); --backend
-# here just forces the dev mock backend regardless of the file.
-ExecStart=cordond --backend mock
+ExecStart=/usr/bin/cordond
 Restart=on-failure
 RestartSec=1
-NoNewPrivileges=true
+# CAP_BPF loads the program + maps; CAP_MAC_ADMIN is required to load an LSM program.
+AmbientCapabilities=CAP_BPF CAP_MAC_ADMIN
 
 [Install]
-WantedBy=default.target
+WantedBy=basic.target

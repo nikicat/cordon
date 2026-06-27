@@ -1,10 +1,9 @@
 //! `cordond` — the gater daemon.
 //!
-//! Wires the privilege-agnostic policy core to an enforcement backend and serves
-//! the IPC control plane over a Unix socket (thread-per-connection). It holds the
-//! engine behind a `Mutex` so the backend thread and IPC threads share one store.
-//! Dev runs the `mock` backend (`systemctl --user`); the real Linux boundary is
-//! the root `fanotify` backend.
+//! Wires the rule-model enforcement backend (`bpf-lsm`) to the IPC control plane over
+//! a Unix socket (thread-per-connection). The backend runs on its own thread; the IPC
+//! threads reach it through a [`ControlSender`] (apply a policy, read the effective
+//! one). There is no store/engine — policy is the compiled text file (DESIGN §15).
 
 mod backend;
 #[cfg(feature = "bpf-lsm")]
@@ -14,20 +13,21 @@ mod ipc;
 mod proc;
 
 use clap::Parser;
-use cordon_core::backend::{BackendKind, Shutdown};
-use cordon_core::{Config, Engine, Mode, Store, config};
+use cordon_core::backend::{BackendKind, ControlSender, Shutdown, control};
+use cordon_core::{Config, config};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::process::ExitCode;
+use std::sync::Arc;
 use tracing::{error, info};
 
-/// Shared daemon state + the IPC server behavior over it (see `ipc.rs` for the
-/// `impl`). Held as `Arc<Ctx>`; each connection thread gets a clone.
+/// Shared daemon state + the IPC server behavior over it (the `impl` lives in
+/// `ipc.rs`). Held as `Arc<Ctx>`; each connection thread gets a clone.
 pub struct Ctx {
-    pub engine: Arc<Mutex<Engine>>,
+    /// Talk to the backend thread: apply a policy, read the effective one.
+    pub control: ControlSender,
     pub backend: BackendKind,
-    pub mode: Mode,
-    pub store: PathBuf,
     pub socket: PathBuf,
+    pub policy: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -39,84 +39,73 @@ struct Args {
     /// IPC socket path (overrides the config file).
     #[arg(long)]
     socket: Option<PathBuf>,
-    /// SQLite store path (overrides the config file).
-    #[arg(long)]
-    store: Option<PathBuf>,
-    /// Enforcement backend: `mock` (dev) or `fanotify` (Linux, root).
+    /// Enforcement backend (only `bpf-lsm`).
     #[arg(long)]
     backend: Option<String>,
-    /// Enforcement mode: `enforce` (block) or `audit` (log would-deny, allow).
+    /// Text policy file to compile + seed (overrides the config file).
     #[arg(long)]
-    mode: Option<String>,
+    policy: Option<PathBuf>,
 }
 
-fn main() -> std::process::ExitCode {
+fn main() -> ExitCode {
     init_tracing();
     match run(Args::parse()) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error = %e, "fatal");
-            std::process::ExitCode::FAILURE
+            ExitCode::FAILURE
         }
     }
 }
 
-/// Logs to stderr; level via `RUST_LOG` (default `info`). ANSI styling only when
-/// stderr is a terminal, so a redirected log or journald capture stays free of
-/// escape codes (the default `fmt` colors unconditionally).
+/// Logs to stderr; level via `RUST_LOG` (default `info`). Drops the module-path target
+/// (`cordond::backend::…` — noise in an audit line, not signal). On a terminal keep ANSI
+/// + timestamps; under systemd/journald drop both (journald colours and timestamps).
 fn init_tracing() {
     use std::io::IsTerminal;
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
+    let terminal = std::io::stderr().is_terminal();
+    let builder = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+        .with_target(false)
+        .with_ansi(terminal);
+    if terminal {
+        builder.init();
+    } else {
+        builder.without_time().init();
+    }
 }
 
 fn run(args: Args) -> cordon_core::Result<()> {
-    // Config file (with ${ENV} interpolation) + built-in defaults, then CLI
-    // overrides on top.
     let mut cfg = Config::load(args.config.as_deref())?;
     if let Some(s) = args.socket {
         cfg.socket = s;
     }
-    if let Some(s) = args.store {
-        cfg.store = s;
-    }
     if let Some(b) = args.backend {
         cfg.backend = b.parse()?;
     }
-    if let Some(m) = args.mode {
-        cfg.mode = m.parse()?;
+    if let Some(p) = args.policy {
+        cfg.policy = p;
     }
-
-    let store = Store::open(&cfg.store)?;
-    if store.seed_zones(&cfg.zones)? {
-        info!("seeded zones");
-    }
-    let engine = Arc::new(Mutex::new(Engine::new(store)?));
 
     let backend = backend::select(&cfg)?;
-
     info!(
         backend = backend.name(),
-        mode = cfg.mode.as_str(),
-        store = %cfg.store.display(),
         socket = %cfg.socket.display(),
+        policy = %cfg.policy.display(),
         privilege = if config::is_root() { "root" } else { "user (NOT a boundary)" },
         "cordond started",
     );
 
     let shutdown = Shutdown::new();
-    let backend_engine = Arc::clone(&engine);
+    let (policy_control, control_sender) = control();
     let backend_shutdown = Arc::clone(&shutdown);
-    // Log a backend failure the moment `run` returns, not at join — an
-    // un-graceful signal-kill never reaches the join below, and a backend that
-    // fails to load/attach (e.g. a BPF verifier rejection) must be visible.
+    // Log a backend failure the moment `run` returns (a signal-kill never reaches the
+    // join below, and a load/attach/verifier failure must be visible).
     let backend_thread = std::thread::spawn(move || {
-        let result = backend.run(backend_engine, backend_shutdown);
+        let result = backend.run(policy_control, backend_shutdown);
         if let Err(e) = &result {
             error!(error = %e, "backend exited with error");
         }
@@ -124,17 +113,13 @@ fn run(args: Args) -> cordon_core::Result<()> {
     });
 
     let ctx = Arc::new(Ctx {
-        engine,
+        control: control_sender,
         backend: cfg.backend,
-        mode: cfg.mode,
-        store: cfg.store,
         socket: cfg.socket,
+        policy: cfg.policy,
     });
 
-    // Serve until the listener fails (or the process is signalled). On the next
-    // start a stale socket is unlinked, so an un-graceful exit is harmless.
     let serve_result = ctx.serve();
-
     shutdown.trigger();
     let _ = backend_thread.join();
     serve_result

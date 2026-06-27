@@ -9,10 +9,9 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-rusqlite = { workspace = true }
-rusqlite_migration = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"
+# The flat rule-model POD types (the compiler's output contract). Default features
+# only — NO `user`, so the stock build pulls in no aya/eBPF deps; the daemon enables
+# `user` for the loader.
+cordon-bpf-common = { path = "../bpf-common" }

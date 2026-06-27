@@ -19,42 +19,14 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # Privileged boundary: the real fanotify backend, run in a virtme-ng VM booting
-  # a PINNED upstream kernel (Ubuntu mainline v6.12) as guest-root. The VM runs
-  # directly on the runner via qemu+KVM — no container/userns nesting — so it is
-  # reproducible: the same harness + kernel run locally (packaging/test/run-in-vm.sh)
-  # and here. Needs only /dev/kvm (present on GitHub Ubuntu runners), made
-  # group-accessible to the unprivileged runner user by the udev rule below.
-  fanotify-vm:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Enable KVM for the runner user
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Install qemu + virtme-ng
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
-          pipx install virtme-ng
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Build
-        run: cargo build
-      - name: Fanotify smoke test in a virtme-ng VM (pinned kernel v6.12)
-        env:
-          CORDON_VM_KERNEL: v6.12
-        run: packaging/test/run-in-vm.sh
+  # (The `fanotify-vm` job was removed: the fanotify backend was retired with the
+  # owner model in M1 1f. `bpf-lsm` is the only kernel backend, validated below.)
 
-  # Privileged boundary: the bpf-lsm backend, in a virtme-ng VM booting the same
-  # pinned kernel with `bpf` added to the active LSM list (`lsm=…,bpf`). Mirrors
-  # fanotify-vm plus the eBPF toolchain — the pinned nightly (crates/bpf/
-  # rust-toolchain.toml, fetched on demand) and bpf-linker — to build the in-kernel
-  # object. The kernel needs CONFIG_BPF_LSM=y (set in the Ubuntu mainline build).
+  # Privileged boundary: the bpf-lsm backend, in a virtme-ng VM booting a pinned
+  # kernel with `bpf` added to the active LSM list (`lsm=…,bpf`). Adds the eBPF
+  # toolchain — the pinned nightly (crates/bpf/rust-toolchain.toml, fetched on demand)
+  # and bpf-linker — to build the in-kernel object. The kernel needs CONFIG_BPF_LSM=y
+  # (set in the Ubuntu mainline build).
   bpf-lsm-vm:
     runs-on: ubuntu-latest
     needs: test

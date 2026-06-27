@@ -1,42 +1,31 @@
 # cordon daemon configuration (operational settings).
 #
 # All keys are optional; an absent file or key falls back to a built-in default.
-# Precedence: CLI flag  >  this file  >  default.
-# String values may interpolate ${ENV} from the environment.
+# Precedence: CLI flag  >  this file  >  default. String values may interpolate
+# ${ENV} from the environment.
 #
-# Dynamic policy (owners, rules, and zones after the first-run seed) is NOT here —
-# it lives in the SQLite store and is managed at runtime via the `cordon` CLI.
+# The *enforcement* policy — the rules and the global enforce/permissive/off mode —
+# is NOT here: it lives in the root-owned text policy file (see `policy` below and
+# cordon.example.policy.toml), applied with `cordon policy apply`.
 #
 # Default location: /etc/cordon/config.toml (root) or
 # $XDG_CONFIG_HOME/cordon/config.toml (user). Override with --config / $CORDON_CONFIG.
 
-# Enforcement backend:
-#   "mock"     — dev/CI, NOT a boundary (events injected over IPC).
-#   "fanotify" — Linux, root. DEV/TEST ONLY, not a security boundary: it fails
-#                OPEN if the daemon dies and decides on the open-time path
-#                (rename-out-of-zone bypass). Use bpf-lsm for real protection.
-#   "bpf-lsm"  — Linux, root (CAP_BPF + CAP_MAC_ADMIN). Hardened boundary: the
-#                verdict is returned in-kernel from BPF maps. Needs a kernel with
-#                CONFIG_BPF_LSM=y and `bpf` in the active LSM list (`lsm=…,bpf` on
-#                the kernel cmdline), the daemon built `--features bpf-lsm`, and the
-#                eBPF object built via `just build-ebpf`. See bpf_object below.
-backend = "fanotify"
+# Enforcement backend — only "bpf-lsm" (Linux, root: CAP_BPF + CAP_MAC_ADMIN). The
+# hardened boundary: the verdict is returned in-kernel from BPF maps. Needs a kernel
+# with CONFIG_BPF_LSM=y and `bpf` in the active LSM list (`lsm=…,bpf` on the kernel
+# cmdline), the daemon built `--features bpf-lsm`, and the eBPF object built via
+# `just build-ebpf` (see bpf_object below).
+backend = "bpf-lsm"
 
-# "enforce" blocks non-owner opens; "audit" only logs would-be denials and allows
-# them — use it to preview the blast radius of an ownership decision before it
-# bites, then switch back to "enforce".
-mode = "enforce"
-
-# IPC socket + SQLite store. Defaults: /run/cordon.sock + /var/lib/cordon/cordon.db
-# as root; under $XDG_RUNTIME_DIR / $XDG_STATE_HOME for a user daemon.
+# IPC socket. Default: /run/cordon.sock (root); $XDG_RUNTIME_DIR/cordon.sock (user).
 # socket = "${XDG_RUNTIME_DIR}/cordon.sock"
-# store  = "${XDG_STATE_HOME}/cordon/cordon.db"
 
-# Zone roots seeded into a fresh store on first run (thereafter: `cordon zone add`).
-# The first subtree level inside each is claimable (TOFU); the root never is.
-zones = ["${HOME}", "${HOME}/.config", "${HOME}/.local/share", "${HOME}/.cache"]
+# Reserved for autolearn (M4): the roots where learning may propose rules. Accepted
+# but unused by M1 enforcement.
+# zones = ["${HOME}", "${HOME}/.config"]
 
-# --- bpf-lsm backend only (ignored by mock/fanotify) -------------------------
+# --- bpf-lsm backend ---------------------------------------------------------
 # The compiled eBPF object the daemon loads at runtime. Default:
 # /usr/lib/cordon/cordon.bpf.o (where packaging installs it). In a dev tree, point
 # it at the `just build-ebpf` output:
@@ -45,3 +34,8 @@ zones = ["${HOME}", "${HOME}/.config", "${HOME}/.local/share", "${HOME}/.cache"]
 # bpffs directory the program + maps are pinned under for fail-safe enforcement
 # (planned; see DESIGN §4). Default: /sys/fs/bpf/cordon.
 # bpf_pin_dir = "/sys/fs/bpf/cordon"
+#
+# The root-owned text policy (the flat rule model — see cordon.example.policy.toml)
+# the bpf-lsm backend compiles at startup and seeds the maps from. Default:
+# /etc/cordon/policy.toml. In a dev tree:
+# policy = "${PWD}/packaging/cordon.example.policy.toml"

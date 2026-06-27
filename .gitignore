@@ -6,3 +6,6 @@
 *.db
 *.db-wal
 *.db-shm
+/cordon-audit.toml
+/cordon-audit.policy.toml
+/cordond.service
