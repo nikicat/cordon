@@ -58,16 +58,24 @@ fn main() -> ExitCode {
     }
 }
 
-/// Logs to stderr; level via `RUST_LOG` (default `info`). ANSI only on a terminal.
+/// Logs to stderr; level via `RUST_LOG` (default `info`). Drops the module-path target
+/// (`cordond::backend::…` — noise in an audit line, not signal). On a terminal keep ANSI
+/// + timestamps; under systemd/journald drop both (journald colours and timestamps).
 fn init_tracing() {
     use std::io::IsTerminal;
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
+    let terminal = std::io::stderr().is_terminal();
+    let builder = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+        .with_target(false)
+        .with_ansi(terminal);
+    if terminal {
+        builder.init();
+    } else {
+        builder.without_time().init();
+    }
 }
 
 fn run(args: Args) -> cordon_core::Result<()> {
