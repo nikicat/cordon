@@ -93,9 +93,16 @@ whole model end-to-end and closes the in-kernel-rules gap.
 - **Remove** `adopt`/`claim`/`disown`/`add`/`rm` (replaced by editing the text file +
   `apply`). `zones` config moves to autolearn scope (M4).
 
-### 1g. Event coalescing (from audit findings)
+### 1g. Event coalescing (from audit findings) — ✅ done (VM-validated)
 Tools re-open the same file hundreds of times per run, so raw 1-event-per-open floods the
 ring buffer (lossy under enforce) and the learn path (duplicate candidates).
+
+> **Implemented:** in-kernel suppressor as a `BPF_MAP_TYPE_LRU_HASH` keyed by `(exe,
+> ObjId, action)` (1s window; LRU so a full map evicts the coldest key rather than refusing
+> a new hot one), folding suppressed repeats into a `suppressed` count carried on the next
+> `DecisionEvent`; daemon-side `coalesce()` collapses each drain batch to one journal line
+> per `(exe, object, action)` summing `count`/`suppressed`. Smoke scenario 11 proves a
+> 41-open burst → ~2 records with the count carried.
 - **In-kernel suppressor**: a small `HashMap<(exe FileId, ObjId, action), u64 last_ns>` (or
   an LRU) — emit a `LearnEvent` only if `now - last > window` (e.g. 1s); bump a per-key
   `suppressed` counter otherwise. Keeps the ring quiet without losing the *first* occurrence.
@@ -137,7 +144,9 @@ ring buffer (lossy under enforce) and the learn path (duplicate candidates).
 4. **Map encoding → packed per-object array** (not `HashMap<(ObjId, idx)>`): one base + index
    scan, cache-friendly, cheaper per-iteration now that copy-down can lengthen buckets.
 5. **Atomic swap → recompile whole table + double-buffer swap** on apply (copy-down makes a
-   single edit touch many buckets, so incremental in-place patching is out).
+   single edit touch many buckets, so incremental in-place patching is out). **✅ done:** the
+   three rule maps are banked (`BankedFile`/`BankedObj`/`rule_slot`, `NUM_BANKS = 2`);
+   `seed_policy` fills the inactive bank and flips `Settings.active_bank` in one write.
 
 `MAX_RULES_PER_OBJ = 32` to start (raise toward 64 if the verifier log demands; `cordon policy
 check` errors if a compiled bucket exceeds it).
@@ -178,6 +187,12 @@ check` errors if a compiled bucket exceeds it).
 ## Milestone 5 — Fail-safe pinning (orthogonal, already parked)
 - Pin program + maps + link to bpffs so the compiled policy keeps enforcing across daemon
   restarts; adopt-existing-pins on startup; explicit teardown. (DESIGN §4.)
+- **Singleton guard (required with pinning).** Today two daemons can't corrupt the rule
+  table — each `EbpfLoader::load_file` creates *private* maps, and the single backend
+  thread owns the only `&mut Ebpf`, so there is exactly one writer. Pinning shares maps
+  across processes, which reintroduces a cross-process write/write race (one daemon's bank
+  fill interleaving another's flip → a torn table). So adopting shared pins must take a
+  singleton lock first (flock on the pin dir, or refuse-to-start when live pins exist).
 
 ---
 

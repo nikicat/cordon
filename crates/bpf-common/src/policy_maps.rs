@@ -8,29 +8,44 @@
 //! program only ever does: most-specific protected object → **first matching** rule
 //! in its one bucket (DESIGN §15.3 — "expressive source, dumb-fast binary form").
 //!
-//! This module is the contract for that binary form. It supersedes the v1 owner
-//! schema in [`crate::maps`] (`SUBTREES`/`OWNER_IDS`), which the eBPF program and
-//! loader still use until the rule-model backend lands; the two coexist during the
-//! migration.
+//! This module is the contract for that binary form — and the only enforcement schema
+//! now that the v1 owner model (`SUBTREES`/`OWNER_IDS`) has been retired. The three
+//! rule maps are **double-buffered** (see the map-name section): each holds two
+//! generations, and `Settings.active_bank` picks the live one, so `cordon policy apply`
+//! publishes a whole new table with one atomic flip (DESIGN §15.8).
 
-use crate::ids::{Dev, Ino};
+use crate::ids::{Bank, Dev, Ino};
 use crate::maps::FileId;
 use bitflags::bitflags;
 
 // ---- map names ------------------------------------------------------------
 // The eBPF program defines these maps; the loader resolves them by name. Constants
 // so a rename can't silently desync the two crates.
+//
+// ## Double-buffer (atomic apply)
+// All three rule maps are **banked**: each holds two independent generations (banks
+// `0` and `1`), and `Settings.active_bank` selects which the kernel reads. A
+// `cordon policy apply` fills the *inactive* bank, then flips `active_bank` in one
+// atomic `SETTINGS` write — an RCU-style generation flip (DESIGN §15.8). The kernel
+// reads the active bank only; the inactive one is the next apply's scratch space, so
+// a re-seed is never half-visible (no clear-then-insert window).
 
-/// `HashMap<FileId, ObjId>` — every protected object's `(dev,ino)` → its object id.
-/// The deepest match in the dentry ancestor walk is the most-specific object.
+/// `HashMap<BankedFile, ObjId>` — every protected object's `(bank, dev, ino)` → its
+/// object id. The deepest match in the dentry ancestor walk (keyed with the active
+/// bank) is the most-specific object.
 pub const MAP_PROTECTED: &str = "PROTECTED";
-/// The packed per-object rule table: object `o`'s rules occupy the contiguous slot
-/// `[o * MAX_RULES_PER_OBJ .. o * MAX_RULES_PER_OBJ + RULE_COUNT[o]]`. A single base
-/// + index scan (cache-friendly) rather than a per-rule hash lookup.
+/// The packed per-(bank,object) rule table: bank `b`, object `o`'s rules occupy the
+/// contiguous slot at [`rule_slot`]`(b, o, 0..RULE_COUNT[(b,o)])`. A single base +
+/// index scan (cache-friendly) rather than a per-rule hash lookup.
 pub const MAP_RULES: &str = "RULES";
-/// `HashMap<ObjId, u32>` — how many rules object `o` actually has in [`MAP_RULES`]
-/// (its slot is otherwise zero-padded to `MAX_RULES_PER_OBJ`).
+/// `HashMap<BankedObj, u32>` — how many rules bank `b`, object `o` actually has in
+/// [`MAP_RULES`] (its slot is otherwise zero-padded to `MAX_RULES_PER_OBJ`).
 pub const MAP_RULE_COUNT: &str = "RULE_COUNT";
+
+/// The number of rule-table generations the maps hold for the atomic double-buffer
+/// swap. Two: one active (the kernel reads it), one inactive (an apply fills it, then
+/// flips). Sizes the banked [`MAP_RULES`] array and the `bank` dimension of every key.
+pub const NUM_BANKS: usize = 2;
 
 /// Per-object rule-list cap. Bounds the kernel's first-match scan and the verifier
 /// loop, and fixes the [`MAP_RULES`] slot stride. Copy-down can lengthen a bucket
@@ -52,6 +67,58 @@ pub const MAX_OBJECTS: usize = 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ObjId(pub u32);
 
+/// A [`MAP_PROTECTED`] key: a protected object's inode identity within one bank. The
+/// explicit `_pad` is **load-bearing**: `FileId` is 8-aligned, so [`Bank`] (a `u32`)
+/// at offset 16 would leave 4 trailing *implicit* padding bytes — and a BPF `HashMap`
+/// hashes the whole key, padding included (uninitialized padding → mismatched
+/// lookups). Making the gap an explicit, always-zeroed field keeps the 24-byte key
+/// padding-free.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BankedFile {
+    pub file: FileId,
+    pub bank: Bank,
+    pub _pad: [u8; 4],
+}
+
+impl BankedFile {
+    pub const fn new(bank: Bank, file: FileId) -> Self {
+        BankedFile {
+            file,
+            bank,
+            _pad: [0; 4],
+        }
+    }
+}
+
+/// A [`MAP_RULE_COUNT`] key: an object id within one bank. `ObjId` + [`Bank`]
+/// (`u32 + u32`) is naturally padding-free.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BankedObj {
+    pub obj: ObjId,
+    pub bank: Bank,
+}
+
+impl BankedObj {
+    pub const fn new(bank: Bank, obj: ObjId) -> Self {
+        BankedObj { obj, bank }
+    }
+}
+
+/// The flat index of bank `bank`, object `obj`'s rule `i` in the banked [`MAP_RULES`]
+/// array (sized `NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ`). The **one** definition
+/// both sides use — the kernel to scan, the loader to fill — so the stride can't
+/// desync. [`Bank::index`] masks the bank to `0`/`1` and `wrapping_*` keeps the math
+/// total, so valid inputs (`obj < MAX_OBJECTS`, `i < MAX_RULES_PER_OBJ`) stay in range
+/// (and `Array::get` bounds-checks regardless).
+pub const fn rule_slot(bank: Bank, obj: ObjId, i: u32) -> u32 {
+    (bank.index().wrapping_mul(MAX_OBJECTS as u32))
+        .wrapping_add(obj.0)
+        .wrapping_mul(MAX_RULES_PER_OBJ as u32)
+        .wrapping_add(i)
+}
+
 bitflags! {
     /// The set of actions a rule covers, as a bitset — one bit per LSM-mediated
     /// operation (DESIGN §15.5). A rule carries a *mask* (not one action) so e.g.
@@ -67,7 +134,7 @@ bitflags! {
     /// 2.x permits unknown bits, so every bit pattern is valid → the `aya::Pod` impl
     /// below is sound.
     #[repr(transparent)]
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct Action: u32 {
         const READ    = 1 << 0;
         const WRITE   = 1 << 1;
@@ -220,6 +287,8 @@ mod user {
     // the existing `Mode`/`Decision`; that's a memory-safety statement, not a claim
     // every value is semantically meaningful.)
     unsafe impl aya::Pod for ObjId {}
+    unsafe impl aya::Pod for BankedFile {}
+    unsafe impl aya::Pod for BankedObj {}
     unsafe impl aya::Pod for Action {}
     unsafe impl aya::Pod for Policy {}
     unsafe impl aya::Pod for SubjectMatch {}
@@ -270,5 +339,38 @@ mod tests {
         assert_eq!(core::mem::size_of::<SubjectMatch>(), 32);
         assert_eq!(core::mem::size_of::<CompiledRule>(), 40);
         assert_eq!(core::mem::align_of::<CompiledRule>(), 8);
+    }
+
+    #[test]
+    fn banked_keys_are_padding_free() {
+        // BPF hashes the whole key, padding included — these must have no implicit
+        // padding bytes. BankedFile: 16 (FileId) + 4 (Bank) + 4 (explicit pad) = 24.
+        assert_eq!(core::mem::size_of::<BankedFile>(), 24);
+        assert_eq!(core::mem::align_of::<BankedFile>(), 8);
+        // BankedObj: 4 (ObjId) + 4 (Bank) = 8, no padding.
+        assert_eq!(core::mem::size_of::<BankedObj>(), 8);
+        assert_eq!(core::mem::align_of::<BankedObj>(), 4);
+    }
+
+    #[test]
+    fn rule_slot_banks_dont_overlap() {
+        // Each bank occupies a disjoint MAX_OBJECTS*MAX_RULES_PER_OBJ window, and every
+        // valid slot stays inside the NUM_BANKS-sized array.
+        let span = (MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32;
+        assert_eq!(rule_slot(Bank(0), ObjId(0), 0), 0);
+        assert_eq!(rule_slot(Bank(1), ObjId(0), 0), span);
+        assert_eq!(
+            rule_slot(
+                Bank(1),
+                ObjId(MAX_OBJECTS as u32 - 1),
+                MAX_RULES_PER_OBJ as u32 - 1
+            ),
+            (NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32 - 1
+        );
+        // A garbage bank is masked back into range, never out the top of the array.
+        assert!(
+            rule_slot(Bank(u32::MAX), ObjId(0), 0)
+                < (NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32
+        );
     }
 }

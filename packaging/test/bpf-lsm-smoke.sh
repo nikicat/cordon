@@ -26,11 +26,13 @@
 #                       would-be denial is logged.
 #   9. silence        — a `silence` policy denies (EPERM) *without* a log record (vs a
 #                       `deny`, which logs).
-#  10. apply + show    — `cordon policy apply` re-seeds the live maps at runtime (a
-#                       previously-unprotected dir becomes protected), and `policy show`
-#                       reflects it.
-#
-# Coalescing (collapsing a tight open-loop into one record) is M1 §1g — not yet here.
+#  10. apply + show    — `cordon policy apply` re-seeds the live maps at runtime via the
+#                       atomic double-buffer swap (a previously-unprotected dir becomes
+#                       protected with no restart), and `policy show` reflects it.
+#  11. coalescing      — a tight loop of identical denied opens collapses to a handful of
+#                       ring records (the in-kernel 1s suppressor), and the folded
+#                       `suppressed` count is carried into a record so volume stays
+#                       visible (M1 §1g).
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -123,6 +125,8 @@ wait_active() {
 
 # grep the daemon log with ANSI styling stripped (tracing colorizes key=value).
 log_has() { sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -qE "$1"; }
+# count matching daemon-log lines (ANSI stripped) — for the coalescing assertion.
+log_count() { sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -cE "$1"; }
 
 # Poll for a log line that the async ring drain produces (e.g. a deny record).
 wait_log() { for _ in $(seq 1 30); do log_has "$1" && return 0; sleep 0.1; done; return 1; }
@@ -386,6 +390,44 @@ EOF
     return $fail
 }
 
+# --- scenario 11: event coalescing (in-kernel suppressor + folded count) -----
+scenario_coalesce() {
+    echo "### scenario: coalescing (a repeat-open burst collapses to a few records + a count)"
+    ws_new
+    write_policy enforce <<EOF
+[[rule]]
+who = "$SCRAPER"
+where = "$VAULT"
+action = "read"
+policy = "deny"
+EOF
+    daemon_start; started || return 1
+    local fail=0 n=40
+    # A tight loop of denied reads of the SAME (exe, object, action): the in-kernel
+    # suppressor (1s window) emits the first and folds the rest, so the ring sees a
+    # handful of records, not `n`.
+    for _ in $(seq 1 "$n"); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; done
+    # Cross the window, then one more open flushes the held-back count.
+    sleep 1.2
+    read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1
+    sleep 0.8   # > one poll interval, so the final drain lands before we count
+
+    local recs; recs=$(log_count 'deny pid=[0-9]+ .*action=read')
+    if [ "$recs" -ge 1 ] && [ "$recs" -le 15 ]; then
+        echo "  OK: $((n + 1)) denied opens collapsed to $recs ring record(s)"
+    else
+        echo "  FAIL: $recs deny records for $((n + 1)) opens — coalescing off (or nothing logged)"
+        sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    # At least one record must carry a nonzero suppressed count (volume stays visible).
+    if log_has 'deny .*suppressed=[1-9][0-9]*'; then
+        echo "  OK: a suppressed>0 count was carried into a record"
+    else
+        echo "  FAIL: no record reported a folded suppressed count"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    daemon_stop; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -398,6 +440,7 @@ scenario_copydown          || rc=1
 scenario_permissive        || rc=1
 scenario_silence           || rc=1
 scenario_apply             || rc=1
+scenario_coalesce          || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

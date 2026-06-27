@@ -8,11 +8,13 @@ bypass); the real Linux boundary is **`bpf-lsm`**, which Phase 3 adds — in-ker
 verdicts, validated end-to-end in a VM (owner allowed, non-owner `EPERM`). This file
 is the resume point.
 
-## Rule model (target architecture, DESIGN §15) — M1 in progress
-The owner model (Phase 3 below) is being replaced by the flat **rule model**
+## Rule model (target architecture, DESIGN §15) — M1 core complete
+The owner model (Phase 3 below) has been replaced by the flat **rule model**
 (`(who, where, action, policy)`), per [`docs/PLAN-rule-model.md`]. M1 decisions are
 locked there (copy-down object precedence, `MAX_RULES_PER_OBJ = 32`, packed-array rule
-encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed).
+encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed). All of
+M1 1a–1h plus 1g coalescing and the atomic double-buffer swap are implemented and
+VM-validated; only fail-safe bpffs pinning (M5) remains as deferred hardening.
 
 **Landed (M1 1a + 1b — userspace core, pure + unit-tested, no kernel changes yet):**
 - **`crates/bpf-common/src/policy_maps.rs`** — the compiled-form contract shared with
@@ -31,12 +33,13 @@ encoding, recompile + double-buffer swap, default-deny, owner CLI verbs removed)
 
 **Landed (M1 1c + 1d + 1e + 1f + 1h — the in-kernel enforcement path + authoring CLI,
 VM-validated):** The rule-model `file_open` boundary is proven end-to-end in a
-virtme-ng VM (`lsm=capability,bpf`, host kernel) — all 10 `bpf-lsm-smoke.sh` scenarios
+virtme-ng VM (`lsm=capability,bpf`, host kernel) — all 11 `bpf-lsm-smoke.sh` scenarios
 green: allow + default-deny + learn record, self-test-negative abort, per-action (read
 allowed / write default-denied), subject group, object group, deny>allow, **copy-down**
 (subtree allow + a file-specific deny for one subject; the sibling stays readable),
-permissive (logged, not blocked), silence (denied, not logged), and **runtime `policy
-apply` + `show`** (a previously-unprotected dir becomes protected without a restart).
+permissive (logged, not blocked), silence (denied, not logged), **runtime `policy
+apply` + `show`** (a previously-unprotected dir becomes protected without a restart), and
+**coalescing** (a 41-open burst collapses to ~2 records with the folded count carried).
 - **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
   intent at open); the global `Mode` is now `enforce`/`permissive`/`off`; the ring-buffer
   record is reshaped + renamed `LearnEvent` → **`DecisionEvent`** (it records a decision
@@ -56,24 +59,42 @@ apply` + `show`** (a previously-unprotected dir becomes protected without a rest
   on error diagnostics; self-test adapted to a deny-all rule. `config.policy` path added.
 
 - **1f CLI + owner-model retirement** — `cordon policy check` (local lint, daemon-free),
-  `policy apply` (send text → daemon recompiles with the mount-aware resolver →
-  clear-then-insert re-seed → reply with diagnostics), `policy show` / `status` (read the
-  effective policy via a `PolicyControl` shared between IPC and the backend thread). The
-  owner model was **retired**: removed the `engine`, the SQLite `store` (+ `rusqlite`),
+  `policy apply` (send text → daemon recompiles with the mount-aware resolver → re-seed →
+  reply with diagnostics), `policy show` / `status` (read the effective policy via a
+  `PolicyControl` shared between IPC and the backend thread). The owner model was
+  **retired**: removed the `engine`, the SQLite `store` (+ `rusqlite`),
   `event`/`identity`/`decision`, the `mock` + `fanotify` backends, the owner CLI/IPC verbs
   + `Submit`, and `config.mode`/`store`. `bpf-lsm` is now the only backend (so a stock,
-  no-feature build compiles but the daemon needs `--features bpf-lsm` to run). `apply`
-  uses clear-then-insert (a brief non-atomic window); the **double-buffer swap** is next.
+  no-feature build compiles but the daemon needs `--features bpf-lsm` to run).
 - **1h validation** — `packaging/test/bpf-lsm-smoke.sh` rewritten for the rule model
   (policy-file driven, no runtime adopt) + `packaging/cordon.example.policy.toml` (a
   documented example, regression-tested through parse→resolve in `cargo test`). The
   smoke caught + fixed a real bug: the self-test seeded a `DENY` (logging) probe rule,
   spamming a spurious deny record on every startup → now `SILENCE` (block, no log).
 
-**Next (M1 remainder):** 1g event coalescing — an in-kernel suppressor + daemon-side
-collapse so a tool re-opening the same file hundreds of times yields one record + a
-count (in `events.rs`), plus a coalescing smoke scenario. Then the deferred hardening:
-the atomic **double-buffer swap** for `apply` (`seed.rs`) and fail-safe **bpffs pinning**.
+**Landed (M1 1g event coalescing + atomic double-buffer swap — VM-validated, 11/11
+smoke scenarios green):**
+- **1g coalescing** — the audit found tools re-open one config hundreds of times per run
+  (helm: 464× `~/.kube/config`). Two layers now collapse that: an **in-kernel suppressor**
+  (`SUPPRESS`, a `BPF_MAP_TYPE_LRU_HASH` keyed by `(exe, ObjId, action)`) emits at most one
+  `DecisionEvent` per key per 1s window and folds the rest into a `suppressed` count carried
+  on the next emit (LRU so a full map evicts the coldest key, never refuses a hot one); and
+  **daemon-side batch coalescing** (`events.rs::coalesce`) collapses each drain to one
+  journal line per `(exe, object, action)` with the summed `count`/`suppressed`. The smoke
+  proves a 41-open burst collapses to ~2 records with the count carried.
+- **Atomic double-buffer swap** — the three rule maps (`PROTECTED`/`RULES`/`RULE_COUNT`) are
+  **banked**: each holds two generations, keyed/indexed by a `Bank` (via `BankedFile`/
+  `BankedObj`/`rule_slot`), with `Settings.active_bank` selecting the live one. `seed_policy`
+  fills the inactive bank then flips `active_bank` in one `SETTINGS` write (RCU-style), so a
+  `policy apply` re-seed is never half-visible — replacing the old clear-then-insert window.
+  Single-writer by construction (the `&mut Ebpf` lives on one backend thread; CLI applies
+  serialize through one channel).
+
+**Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
++ maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
+**Pinning must ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active):
+today two daemons can't corrupt each other (each loads private maps), but two daemons sharing
+*pinned* maps would reintroduce a cross-process writer race.
 
 The Phase-3 section below is **historical** — it describes the now-retired owner model.
 

@@ -69,6 +69,40 @@ impl Decision {
     pub const AUDIT: Decision = Decision(2);
 }
 
+/// Which generation of the double-buffered rule table is live (DESIGN §15.8). The
+/// kernel reads `Settings.active_bank`; a `cordon policy apply` fills the other bank
+/// and [`flip`](Bank::flip)s to it in one atomic `SETTINGS` write. Only `0`/`1` are
+/// valid; same `repr(transparent)`-not-enum rationale as [`Mode`] (it's read out of
+/// map memory, so every bit pattern must be a sound value — [`index`](Bank::index)
+/// masks a garbage read back into range).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Bank(pub u32);
+
+impl Bank {
+    /// The generation a fresh fill targets first (startup's initial active bank, with
+    /// `SETTINGS` zero-initialized).
+    pub const ZERO: Bank = Bank(0);
+
+    /// The *other* generation: an `apply` fills this, then flips the active bank to it.
+    pub const fn flip(self) -> Bank {
+        Bank(self.index() ^ 1)
+    }
+
+    /// The bank as an array index, masked to a valid generation (`0`/`1`) so a stray
+    /// value read from map memory can't push a [`crate::rule_slot`] index out of range.
+    pub const fn index(self) -> u32 {
+        self.0 & 1
+    }
+
+    /// This value normalized to a valid generation (`0`/`1`) — what the kernel keys the
+    /// banked maps with, so a torn/garbage `active_bank` read degrades to an empty
+    /// bucket (fail-open allow) rather than a wild lookup.
+    pub const fn masked(self) -> Bank {
+        Bank(self.index())
+    }
+}
+
 // ---- userspace-only: usable as aya map keys/values ------------------------
 
 #[cfg(feature = "user")]
@@ -82,4 +116,5 @@ mod user {
     unsafe impl aya::Pod for Pid {}
     unsafe impl aya::Pod for Mode {}
     unsafe impl aya::Pod for Decision {}
+    unsafe impl aya::Pod for Bank {}
 }

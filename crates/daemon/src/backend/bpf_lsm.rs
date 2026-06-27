@@ -9,9 +9,9 @@
 //!     the ring buffer of logged decisions into the journal ([`events`]). The daemon is
 //!     still required (for logging) but the verdict no longer depends on it.
 //!
-//! This root holds the lifecycle (load → attach → self-test → seed → drain). The two
-//! growth areas live in submodules: [`seed`] (map writes — atomic double-buffer swap +
-//! pinning land there) and [`events`] (ring drain — coalescing lands there).
+//! This root holds the lifecycle (load → attach → self-test → seed → drain). The work
+//! lives in submodules: [`seed`] (map writes — the atomic double-buffer swap; fail-safe
+//! pinning lands there next) and [`events`] (ring drain + event coalescing).
 //!
 //! Requires **root** with `CAP_BPF` + `CAP_MAC_ADMIN`, `CONFIG_BPF_LSM=y`, **and**
 //! `bpf` in the active LSM list (`lsm=…,bpf`).
@@ -19,9 +19,9 @@
 //! ## Scope (M1)
 //! Open-time actions (`read`/`write`/`create`): deepest protected object → first
 //! matching rule in its copy-down bucket → allow/deny/audit, with the global
-//! `enforce`/`permissive`/`off` mode. The policy is compiled + seeded **once at
-//! startup**; live `cordon policy apply` (atomic re-seed) and fail-safe **pinning** are
-//! the next increments.
+//! `enforce`/`permissive`/`off` mode. The policy is compiled + seeded at startup and
+//! re-seeded by `cordon policy apply` via an **atomic double-buffer swap** ([`seed`]).
+//! Fail-safe **pinning** (enforcement surviving daemon death) is the next increment.
 
 mod events;
 mod seed;
@@ -32,7 +32,8 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, CompiledRule, Mode as BpfMode, ObjId, Offsets, Pid, Policy, SubjectMatch,
+    Action, Bank, CompiledRule, Mode as BpfMode, ObjId, Offsets, Pid, Policy, SubjectMatch,
+    rule_slot,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, CompiledPolicy, Diagnostic, Mode as PolicyMode, Severity};
@@ -275,24 +276,27 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     let id = proc::file_id(probe)
         .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve probe FileId"))?;
     let obj = ObjId(0);
+    // Seed bank 0 and point `active_bank` at it (the zero-initialized default), so the
+    // probe is live; the real `seed_policy` then fills bank 1 and flips away from this.
+    let bank = Bank::ZERO;
     // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX
     // pid so we are *not* fast-allowed; enforce so the deny actually blocks. SILENCE
     // (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
     // logged probe-deny would spam a spurious record into the ring on every startup.
-    seed::set_settings(ebpf, Pid(u32::MAX), BpfMode::ENFORCE)?;
-    seed::protected_insert(ebpf, id, obj)?;
+    seed::set_settings(ebpf, Pid(u32::MAX), BpfMode::ENFORCE, bank)?;
+    seed::protected_insert(ebpf, bank, id, obj)?;
     seed::rules_set(
         ebpf,
-        seed::rule_index(obj, 0),
+        rule_slot(bank, obj, 0),
         CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
     )?;
-    seed::rule_count_insert(ebpf, obj, 1)?;
+    seed::rule_count_insert(ebpf, bank, obj, 1)?;
 
     let opened = std::fs::File::open(probe);
 
     // Clean up the probe entries (the real seed also clears, but don't rely on it).
-    let _ = seed::protected_remove(ebpf, id);
-    let _ = seed::rule_count_remove(ebpf, obj);
+    let _ = seed::protected_remove(ebpf, bank, id);
+    let _ = seed::rule_count_remove(ebpf, bank, obj);
 
     match opened {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
