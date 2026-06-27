@@ -197,15 +197,36 @@ impl Policy {
     pub const DENY: Policy = Policy(2);
     /// Deny, silently (no learn record).
     pub const SILENCE: Policy = Policy(3);
+    /// Synthetic effect the kernel applies when **no rule matched** (the default-deny,
+    /// DESIGN §15.6.3). Never authored or stored in a [`CompiledRule`] — it exists only as
+    /// the *cause* carried on a [`crate::DecisionEvent`], so the journal can tell a
+    /// default-deny ("you have no rule for this") apart from an explicit `deny` rule ("you
+    /// chose to block this"). Blocks + logs exactly like [`DENY`](Policy::DENY).
+    pub const DEFAULT_DENY: Policy = Policy(4);
 
-    /// Whether this policy blocks the access (`DENY` or `SILENCE`).
+    /// Whether this policy blocks the access (the `deny` half of `{allow,deny}×{log,silent}`).
     pub const fn denies(self) -> bool {
-        matches!(self.0, 2 | 3)
+        matches!(self, Policy::DENY | Policy::SILENCE | Policy::DEFAULT_DENY)
     }
-    /// Whether a decision under this policy emits a learn record (`AUDIT` or `DENY`)
-    /// rather than staying silent (`ALLOW` or `SILENCE`).
+    /// Whether a decision under this policy emits a record (the `log` half) rather than
+    /// staying silent.
     pub const fn logs(self) -> bool {
-        matches!(self.0, 1 | 2)
+        matches!(self, Policy::AUDIT | Policy::DENY | Policy::DEFAULT_DENY)
+    }
+}
+
+/// The canonical human form (`allow`/`audit`/`deny`/`silence`/`default-deny`) — the policy
+/// authoring vocabulary plus the synthetic default-deny cause. `no_std`: `core::fmt`.
+impl core::fmt::Display for Policy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match *self {
+            Policy::ALLOW => "allow",
+            Policy::AUDIT => "audit",
+            Policy::DENY => "deny",
+            Policy::SILENCE => "silence",
+            Policy::DEFAULT_DENY => "default-deny",
+            _ => "unknown",
+        })
     }
 }
 
@@ -320,6 +341,8 @@ mod tests {
         assert!(!Policy::AUDIT.denies() && Policy::AUDIT.logs());
         assert!(Policy::DENY.denies() && Policy::DENY.logs());
         assert!(Policy::SILENCE.denies() && !Policy::SILENCE.logs());
+        // The synthetic default-deny blocks and logs, like DENY.
+        assert!(Policy::DEFAULT_DENY.denies() && Policy::DEFAULT_DENY.logs());
     }
 
     #[test]

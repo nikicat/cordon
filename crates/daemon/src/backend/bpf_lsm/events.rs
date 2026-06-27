@@ -12,7 +12,7 @@
 use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
-use cordon_bpf_common::{Action, Decision, DecisionEvent, FileId, MAP_EVENTS, Pid};
+use cordon_bpf_common::{Action, Decision, DecisionEvent, FileId, MAP_EVENTS, Pid, Policy};
 use cordon_core::backend::{ApplyOutcome, PolicyControl, Shutdown};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -34,6 +34,7 @@ pub(super) fn serve(
     ebpf: &mut Ebpf,
     control: &PolicyControl,
     shutdown: &Arc<Shutdown>,
+    mut object_paths: HashMap<FileId, PathBuf>,
 ) -> Result<()> {
     let mut ring = RingBuf::try_from(
         ebpf.take_map(MAP_EVENTS)
@@ -62,7 +63,7 @@ pub(super) fn serve(
                     }
                 }
                 for record in coalesce(&batch) {
-                    record.log();
+                    record.log(&object_paths);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -70,7 +71,7 @@ pub(super) fn serve(
         }
         // Service any `policy apply` requests that arrived since the last tick.
         while let Ok(req) = control.apply_rx.try_recv() {
-            apply(ebpf, control, &req.text, &req.reply);
+            apply(ebpf, control, &req.text, &req.reply, &mut object_paths);
         }
     }
     Ok(())
@@ -85,6 +86,7 @@ fn apply(
     control: &PolicyControl,
     text: &str,
     reply: &std::sync::mpsc::Sender<ApplyOutcome>,
+    object_paths: &mut HashMap<FileId, PathBuf>,
 ) {
     let compiled = super::compile_text(text);
     let applied = if compiled.has_errors() {
@@ -93,6 +95,7 @@ fn apply(
         match super::seed::seed_policy(ebpf, &compiled, super::bpf_mode(compiled.mode)) {
             Ok(()) => {
                 *control.current.lock().unwrap() = Some(super::build_view(&compiled));
+                *object_paths = super::object_paths(&compiled);
                 info!(objects = compiled.objects.len(), "policy applied");
                 true
             }
@@ -117,9 +120,12 @@ struct Coalesced {
     exe: FileId,
     object: FileId,
     action: Action,
-    /// Representative decision/pid (the first occurrence; identical across the group in
-    /// practice — policy + mode are fixed within a single drain batch).
+    /// Representative decision/policy/pid (the first occurrence; identical across the group
+    /// in practice — policy + mode are fixed within a single drain batch).
     decision: Decision,
+    /// The matched policy — `audit`/`deny`, or `default-deny` (no rule matched). Lets the
+    /// journal distinguish a default-deny from an explicit `deny` (DESIGN §15.6).
+    policy: Policy,
     pid: Pid,
     events: u32,
     suppressed: u64,
@@ -132,22 +138,25 @@ impl Coalesced {
         self.events as u64 + self.suppressed
     }
 
-    /// Journal it at the level its decision warrants. The fields are typed (`object` /
-    /// `action` via their own `Display`, `exe` via [`CallerExe`]); `tracing` renders
-    /// them lazily — no eager `String`s.
-    fn log(&self) {
+    /// Journal it at the level its decision warrants. The fields are typed (`object` via
+    /// [`ObjectName`], `action` via its own `Display`, `exe` via [`CallerExe`]); `tracing`
+    /// renders them lazily — no eager `String`s.
+    fn log(&self, object_paths: &HashMap<FileId, PathBuf>) {
         let exe = CallerExe::resolve(self.pid, self.exe);
-        let object = self.object;
+        let object = ObjectName::resolve(self.object, object_paths);
         let action = self.action;
+        let policy = self.policy;
         let (count, suppressed) = (self.count(), self.suppressed);
         match self.decision {
             Decision::DENY => {
-                info!(pid = self.pid.0, %exe, %object, %action, count, suppressed, "deny")
+                info!(pid = self.pid.0, %exe, %object, %action, %policy, count, suppressed, "deny")
             }
             Decision::WOULD_DENY => {
-                warn!(pid = self.pid.0, %exe, %object, %action, count, suppressed, "would deny (permissive)")
+                warn!(pid = self.pid.0, %exe, %object, %action, %policy, count, suppressed, "would deny (permissive)")
             }
-            _ => info!(pid = self.pid.0, %exe, %object, %action, count, suppressed, "audit"),
+            _ => {
+                info!(pid = self.pid.0, %exe, %object, %action, %policy, count, suppressed, "audit")
+            }
         }
     }
 }
@@ -172,6 +181,7 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
                     object: e.object,
                     action: e.action,
                     decision: e.decision,
+                    policy: e.policy,
                     pid: e.pid,
                     events: 1,
                     suppressed: e.suppressed as u64,
@@ -209,6 +219,33 @@ impl fmt::Display for CallerExe {
         match self {
             CallerExe::Resolved(p) => write!(f, "{}", p.display()),
             CallerExe::Inode(id) => write!(f, "{id}"),
+        }
+    }
+}
+
+/// The protected object in the journal: its policy **path** when the daemon knows the
+/// inode (it seeded the object from that path), else the raw inode. Same "path *or* inode,
+/// kept distinct" modelling as [`CallerExe`] — there's no path at the `file_open` hook, so
+/// the kernel only ever hands us the `FileId`.
+enum ObjectName {
+    Path(PathBuf),
+    Inode(FileId),
+}
+
+impl ObjectName {
+    fn resolve(object: FileId, object_paths: &HashMap<FileId, PathBuf>) -> ObjectName {
+        match object_paths.get(&object) {
+            Some(p) => ObjectName::Path(p.clone()),
+            None => ObjectName::Inode(object),
+        }
+    }
+}
+
+impl fmt::Display for ObjectName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ObjectName::Path(p) => write!(f, "{}", p.display()),
+            ObjectName::Inode(id) => write!(f, "{id}"),
         }
     }
 }

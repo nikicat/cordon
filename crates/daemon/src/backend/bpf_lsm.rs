@@ -32,13 +32,14 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, Bank, CompiledRule, Mode as BpfMode, ObjId, Offsets, Pid, Policy, SubjectMatch,
+    Action, Bank, CompiledRule, FileId, Mode as BpfMode, ObjId, Offsets, Pid, Policy, SubjectMatch,
     rule_slot,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, CompiledPolicy, Diagnostic, Mode as PolicyMode, Severity};
 use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -128,8 +129,10 @@ impl Backend for BpfLsmBackend {
             "bpf-lsm active on the file_open hook (self-test passed)",
         );
 
-        // Drain the ring buffer + honor `policy apply` requests until shutdown.
-        events::serve(&mut ebpf, &control, &shutdown)
+        // Drain the ring buffer + honor `policy apply` requests until shutdown. The
+        // object→path map lets the journal name the protected object (`object=~/.aws`)
+        // instead of its raw inode; the apply path refreshes it on each re-seed.
+        events::serve(&mut ebpf, &control, &shutdown, object_paths(&compiled))
     }
 }
 
@@ -207,6 +210,15 @@ pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
             .collect(),
         pending: c.pending.clone(),
     }
+}
+
+/// The protected objects' `inode → path` map, for naming objects in the journal. The
+/// kernel can't resolve paths at `file_open` (`bpf_d_path` is disallowed there), so a
+/// `DecisionEvent` carries the object's `FileId`; this is the reverse of the path→inode
+/// resolution the daemon did at seed time. Rebuilt on every apply (inodes are stable, but
+/// the *set* of protected objects changes).
+pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
+    c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
 }
 
 /// Map the policy's global mode to the kernel `Settings` mode.

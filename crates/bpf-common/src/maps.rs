@@ -109,7 +109,8 @@ pub struct DecisionEvent {
     /// occurrence; nonzero means a repeat burst was collapsed — the daemon adds it to
     /// the coalesced record so the true volume is visible.
     pub suppressed: u32,
-    /// The matched policy (or `DENY` for a default-deny) — the cause, for the log.
+    /// The matched policy — the cause, for the log: an authored `audit`/`deny`, or the
+    /// synthetic `DEFAULT_DENY` when no rule matched (vs an explicit `deny`).
     pub policy: crate::policy_maps::Policy,
     pub _pad: [u8; 3],
 }

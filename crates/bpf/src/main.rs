@@ -131,9 +131,10 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
         return Some(Verdict::Allow);
     }
 
-    // (4)/(5) caller exe → first matching rule, else default-deny.
+    // (4)/(5) caller exe → first matching rule, else default-deny (a distinct cause from
+    // an explicit `deny`, so the journal can tell "no rule" apart from "you blocked it").
     let exe = kernel::caller_exe()?;
-    let policy = match_rule(matched.obj, requested, exe, bank).unwrap_or(Policy::DENY);
+    let policy = match_rule(matched.obj, requested, exe, bank).unwrap_or(Policy::DEFAULT_DENY);
 
     let blocked = policy.denies() && settings.mode.enforces();
     // Emit only when the policy logs *and* the suppressor lets this one through (a tight
