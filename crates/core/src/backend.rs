@@ -5,8 +5,8 @@
 //! compiler, the IPC — is privilege-agnostic; only the backend needs root.
 //!
 //! Under the rule model the only backend is `bpf-lsm` (the hardened Linux boundary),
-//! built into the daemon with the `bpf-lsm` cargo feature. The owner-model `mock`/
-//! `fanotify` backends were retired with the rule-model migration (DESIGN §15).
+//! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
+//! backends were retired with the rule-model migration (DESIGN §15).
 
 use crate::policy::Diagnostic;
 use crate::proto::PolicyView;

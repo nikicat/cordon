@@ -1,8 +1,8 @@
 //! Backend selection. Under the rule model the only backend is `bpf-lsm` (the
-//! hardened Linux boundary), compiled in with the `bpf-lsm` cargo feature. The
-//! owner-model `mock`/`fanotify` backends were retired with the rule-model migration
-//! (DESIGN §15), so a stock build (without the feature) has no functional backend —
-//! `select` returns a clear error pointing at `--features bpf-lsm`.
+//! hardened Linux boundary), compiled in with the `bpf-lsm` cargo feature. The earlier
+//! owner-model backends were retired with the rule-model migration (DESIGN §15), so a
+//! stock build (without the feature) has no functional backend — `select` returns a
+//! clear error pointing at `--features bpf-lsm`.
 
 use cordon_core::Result;
 use cordon_core::backend::{Backend, BackendKind};
