@@ -6,10 +6,10 @@
 # Requires root with CAP_BPF + CAP_MAC_ADMIN, a kernel with CONFIG_BPF_LSM=y and
 # `bpf` in the active LSM list (`lsm=…,bpf` on the kernel cmdline), the daemon built
 # `--features bpf-lsm`, and the eBPF object installed (default
-# /usr/lib/cordon/cordon.bpf.o). The daemon compiles the text policy
-# (/etc/cordon/policy.toml) at startup and seeds the in-kernel maps; `cordon policy
-# apply` re-seeds at runtime. Operational settings come from /etc/cordon/config.toml
-# (see packaging/cordon.example.toml).
+# /usr/lib/cordon/cordon.bpf.o). The daemon compiles the text policy at startup
+# (/etc/cordon/policy.toml, or a /etc/cordon/conf.d/ directory of *.toml fragments) and
+# seeds the in-kernel maps; `cordon policy apply` re-seeds at runtime. Operational
+# settings come from /etc/cordon/config.toml (see packaging/cordon.example.toml).
 
 [Unit]
 Description=cordon gater (bpf-lsm in-kernel boundary)
