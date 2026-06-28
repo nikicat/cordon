@@ -218,6 +218,59 @@ impl PolicyName {
     }
 }
 
+/// The account named by a policy's `user =` header — whose home directory `~` expands
+/// against. A newtype over the raw login name so it can't be mixed up with the other
+/// strings in the policy layer (paths, group/action names, tokens); deserialized
+/// transparently from the TOML string.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct UserName(String);
+
+impl UserName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for UserName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Resolve which home directory `~` expands against for a policy: the home of its
+/// `user =` header (looked up in `/etc/passwd`), or `fallback` (the daemon/CLI `$HOME`)
+/// when the policy names no user. Errors if the named account has no `/etc/passwd`
+/// entry — a root-owned policy naming a missing user is a misconfiguration, not a
+/// silent fall-through to the wrong home.
+pub fn home_for(user: Option<&UserName>, fallback: &std::path::Path) -> Result<std::path::PathBuf> {
+    let Some(user) = user else {
+        return Ok(fallback.to_path_buf());
+    };
+    let passwd = std::fs::read_to_string("/etc/passwd")
+        .map_err(|e| crate::Error::msg(format!("read /etc/passwd: {e}")))?;
+    home_in_passwd(&passwd, user.as_str()).ok_or_else(|| {
+        crate::Error::msg(format!(
+            "policy user {:?} not found in /etc/passwd",
+            user.as_str()
+        ))
+    })
+}
+
+/// The home field (index 5) of the `/etc/passwd` line whose login name (index 0)
+/// matches `user`. Split from [`home_for`] so it unit-tests without the real file.
+fn home_in_passwd(passwd: &str, user: &str) -> Option<std::path::PathBuf> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some(user) {
+            return None;
+        }
+        // name(0):passwd(1):uid(2):gid(3):gecos(4):home(5):shell(6) — name consumed,
+        // skip passwd..gecos, take home.
+        fields.nth(4).map(std::path::PathBuf::from)
+    })
+}
+
 /// Expand a leading `~` to `home`, then lexically normalize. Errors if the result is
 /// neither absolute nor `~`-relative — policy paths must be unambiguous (no
 /// cwd-relative surprises in a reviewable, root-owned file; DESIGN §15.8).
@@ -271,6 +324,21 @@ mod tests {
             std::path::PathBuf::from("/etc/ssh")
         );
         assert!(expand_path("relative/path", home).is_err());
+    }
+
+    #[test]
+    fn home_in_passwd_finds_the_home_field() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      alice:x:1000:1000:Alice,,,:/home/alice:/usr/bin/fish\n";
+        assert_eq!(home_in_passwd(passwd, "alice"), Some("/home/alice".into()));
+        assert_eq!(home_in_passwd(passwd, "root"), Some("/root".into()));
+        assert_eq!(home_in_passwd(passwd, "ghost"), None);
+    }
+
+    #[test]
+    fn home_for_without_user_uses_fallback() {
+        let fallback = std::path::Path::new("/root");
+        assert_eq!(home_for(None, fallback).unwrap(), fallback);
     }
 
     #[test]

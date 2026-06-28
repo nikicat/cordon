@@ -24,6 +24,14 @@
 # `[[rule]]` example — see cordon.example.policy.toml. There is no `mode` key; use
 # `audit` to observe an object and `deny` to enforce it.
 #
+# For a root-owned, per-user policy, declare whose home `~` expands against (looked up
+# in /etc/passwd) so you can write `~/.ssh` instead of `/home/<name>/.ssh`:
+#
+#     user = "alice"
+#
+# Without it, `~` expands against the daemon's own $HOME (a root daemon → /root), so a
+# system-wide policy uses absolute paths. Like `rules`, `user` is a top-level key.
+#
 # NOTE: the `rules` block is a top-level key, so it must precede any `[group.*]` header
 # (a bare top-level key binds to the last table otherwise). Rules first, groups below.
 

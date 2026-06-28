@@ -164,7 +164,12 @@ pub(super) fn compile_text(text: &str) -> CompiledPolicy {
         Ok(p) => p,
         Err(e) => return error_policy(e),
     };
-    let resolved = match policy::resolve(&parsed, &policy_home()) {
+    // `~` expands against the policy's `user =` header (if any), else the daemon `$HOME`.
+    let home = match policy::home_for(parsed.user(), &policy_home()) {
+        Ok(h) => h,
+        Err(e) => return error_policy(e),
+    };
+    let resolved = match policy::resolve(&parsed, &home) {
         Ok(r) => r,
         Err(e) => return error_policy(e),
     };

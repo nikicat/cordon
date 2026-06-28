@@ -151,7 +151,15 @@ fn policy_check(file: Option<&Path>, cli: &Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let resolved = match policy::resolve(&parsed, &home()) {
+    // `~` expands against the policy's `user =` header (if any), else the CLI `$HOME`.
+    let home = match policy::home_for(parsed.user(), &home()) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let resolved = match policy::resolve(&parsed, &home) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}: {e}", path.display());

@@ -6,7 +6,7 @@
 //! point a diagnostic at the offending source line. Semantic validation — `@ref`
 //! resolution, cycles, paths — is [`super::resolve`]'s job.
 
-use super::{LineIndex, PolicyName, Pos};
+use super::{LineIndex, PolicyName, Pos, UserName};
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -24,6 +24,18 @@ pub struct ParsedPolicy {
     pub(crate) groups: Groups,
     pub(crate) rules: Vec<ParsedRule>,
     pub(crate) lines: LineIndex,
+    /// The optional `user = "name"` header: whose home `~` expands against. `None` ⇒
+    /// the caller's fallback (the daemon/CLI `$HOME`). Lets a root-owned, per-user
+    /// policy file use `~` instead of spelling out `/home/<name>` (DESIGN §15.8); the
+    /// caller resolves it to a home via [`super::home_for`].
+    pub(crate) user: Option<UserName>,
+}
+
+impl ParsedPolicy {
+    /// The `user =` header, if the policy declared one.
+    pub fn user(&self) -> Option<&UserName> {
+        self.user.as_ref()
+    }
 }
 
 /// One rule, normalized from either authoring surface: each axis lexed to its
@@ -45,6 +57,10 @@ pub(crate) struct ParsedRule {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
+    /// `user = "name"` — whose home `~` expands against (DESIGN §15.8). Like `rules`,
+    /// a top-level key, so it must precede any `[group.*]` header.
+    #[serde(default)]
+    user: Option<UserName>,
     #[serde(default)]
     group: Groups,
     #[serde(default, rename = "rule")]
@@ -189,6 +205,7 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
         groups: raw.group,
         rules,
         lines,
+        user: raw.user,
     })
 }
 
@@ -249,6 +266,19 @@ mod tests {
                 Token::Leaf("~/.config/gcloud".into()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_user_header() {
+        let p = parse(
+            "user = \"alice\"\n[[rule]]\nwho = \"*\"\nwhere = \"/x\"\naction = \"read\"\npolicy = \"deny\"\n",
+        )
+        .unwrap();
+        assert_eq!(p.user().map(|u| u.as_str()), Some("alice"));
+        // absent ⇒ None (the caller falls back to its own `$HOME`).
+        let p2 = parse("[[rule]]\nwho = \"*\"\nwhere = \"/x\"\naction = \"read\"\npolicy = \"deny\"\n")
+            .unwrap();
+        assert!(p2.user().is_none());
     }
 
     #[test]
