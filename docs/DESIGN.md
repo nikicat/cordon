@@ -229,10 +229,11 @@ into a BPF map *within this backend*. Ceiling unchanged: a real `exec` of a
 blessed binary (the **construction** attack, §8.1) is still faithfully recorded,
 so ancestry stays best-effort, never the boundary.
 
-Locations: the root system service listens on `/run/cordon.sock` and compiles
-`/etc/cordon/policy.toml` (both root-owned). A user-session dev daemon can override these
-to `$XDG_RUNTIME_DIR`/`$XDG_CONFIG_HOME` (the `cordon` CLI auto-detects), but it is **not**
-a boundary — only the root service enforces.
+Locations: the root system service listens on `/run/cordon.sock` and compiles its policy
+(`/etc/cordon/policy.toml`, or a `/etc/cordon/conf.d/` directory of per-user fragments —
+§15.8; both root-owned), with operational settings in `/etc/cordon/config.toml`. A
+user-session dev daemon can override these to `$XDG_RUNTIME_DIR`/`$XDG_CONFIG_HOME` (the
+`cordon` CLI auto-detects), but it is **not** a boundary — only the root service enforces.
 
 **Operational config** is an optional TOML file (`backend`, `socket`, the eBPF-object /
 policy-file paths), `${ENV}`-interpolated, precedence CLI > file > default. The

@@ -31,14 +31,18 @@ hardening.
 
 **Landed (M1 1c + 1d + 1e + 1f + 1h — the in-kernel enforcement path + authoring CLI,
 VM-validated):** The rule-model `file_open` boundary is proven end-to-end in a
-virtme-ng VM (`lsm=capability,bpf`, host kernel) — all 11 `bpf-lsm-smoke.sh` scenarios
+virtme-ng VM (`lsm=capability,bpf`) on both the host kernel and the CI-pinned **v6.12** —
+all 13 `bpf-lsm-smoke.sh` scenarios
 green: allow + default-deny + learn record, self-test-negative abort, per-action (read
-allowed / write default-denied), subject group, object group, deny>allow, **copy-down**
+allowed / write default-denied), subject group, object group, deny>allow,
+**subject-specificity** (a concrete allow outranks a `who="*"` deny), **copy-down**
 (subtree allow + a file-specific deny for one subject; the sibling stays readable),
 audit→deny (observe with a `who="*"` catch-all, then enforce by flipping that one rule —
 no global mode), silence (denied, not logged), **runtime `policy
-apply` + `show`** (a previously-unprotected dir becomes protected without a restart), and
-**coalescing** (a 41-open burst collapses to ~2 records with the folded count carried).
+apply` + `show`** (a previously-unprotected dir becomes protected without a restart),
+**coalescing** (a 41-open burst collapses to ~2 records with the folded count carried),
+and **leaf-path reconstruction** (distinct files under one audited root surface with
+their real paths).
 - **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
   intent at open); the ring-buffer record is reshaped + renamed `LearnEvent` →
   **`DecisionEvent`** (it records a decision for the journal; autolearn is a later M4
@@ -70,7 +74,7 @@ apply` + `show`** (a previously-unprotected dir becomes protected without a rest
   smoke caught + fixed a real bug: the self-test seeded a `DENY` (logging) probe rule,
   spamming a spurious deny record on every startup → now `SILENCE` (block, no log).
 
-**Landed (M1 1g event coalescing + atomic double-buffer swap — VM-validated, 11/11
+**Landed (M1 1g event coalescing + atomic double-buffer swap — VM-validated, 13/13
 smoke scenarios green):**
 - **1g coalescing** — the audit found tools re-open one config hundreds of times per run
   (helm: 464× `~/.kube/config`). Two layers now collapse that: an **in-kernel suppressor**

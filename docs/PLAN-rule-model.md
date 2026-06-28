@@ -101,7 +101,7 @@ ring buffer (lossy under enforce) and the learn path (duplicate candidates).
 > ObjId, action)` (1s window; LRU so a full map evicts the coldest key rather than refusing
 > a new hot one), folding suppressed repeats into a `suppressed` count carried on the next
 > `DecisionEvent`; daemon-side `coalesce()` collapses each drain batch to one journal line
-> per `(exe, object, action)` summing `count`/`suppressed`. Smoke scenario 11 proves a
+> per `(exe, object, action)` summing `count`/`suppressed`. Smoke scenario 12 proves a
 > 41-open burst → ~2 records with the count carried.
 - **In-kernel suppressor**: a small `HashMap<(exe FileId, ObjId, action), u64 last_ns>` (or
   an LRU) — emit a `LearnEvent` only if `now - last > window` (e.g. 1s); bump a per-key
