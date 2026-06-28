@@ -36,8 +36,8 @@ use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
-    Action, Bank, BankedFile, BankedObj, CompiledRule, Decision, FileId, MAX_OBJECTS,
-    MAX_RULES_PER_OBJ, NUM_BANKS, ObjId, Policy, Settings, SubjectMatch, rule_slot,
+    rule_slot, Action, Bank, BankedFile, BankedObj, CompiledRule, Decision, FileId, ObjId, Policy,
+    Settings, SubjectMatch, MAX_OBJECTS, MAX_RULES_PER_OBJ, NUM_BANKS,
 };
 
 /// The hook's verdict. The kernel wants a raw return (`0` allow / negative errno
@@ -105,7 +105,20 @@ struct Match {
 #[lsm(hook = "file_open")]
 pub fn file_open(ctx: LsmContext) -> i32 {
     // `None` anywhere in the flow ⇒ couldn't decide ⇒ fail open.
-    decide(&ctx).unwrap_or(Verdict::Allow).to_lsm()
+    let ret = decide(&ctx).unwrap_or(Verdict::Allow).to_lsm();
+    // An LSM hook must return a value in `[-4095, 0]`, and the verifier requires the
+    // exit register to be *provably* in range. `to_lsm()` only ever yields `0` or
+    // `-EPERM`, but codegen leaves R0 an untracked scalar that the stricter v6.12
+    // verifier rejects ("R0 has unknown scalar value should have been in [-4095, 0]")
+    // though the laxer host kernel accepts it. `black_box` stops LLVM from proving the
+    // bound redundant and eliding it (it knows `ret ∈ {0,-1}`), so the clamp survives in
+    // the object and gives the verifier the range it needs.
+    let ret = core::hint::black_box(ret);
+    if ret < -4095 || ret > 0 {
+        0
+    } else {
+        ret
+    }
 }
 
 fn decide(ctx: &LsmContext) -> Option<Verdict> {
@@ -171,7 +184,11 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
             );
         }
     }
-    Some(if blocked { Verdict::Deny } else { Verdict::Allow })
+    Some(if blocked {
+        Verdict::Deny
+    } else {
+        Verdict::Allow
+    })
 }
 
 /// Walk the opened file's dentry ancestors; return the first (deepest, hence
@@ -188,7 +205,10 @@ fn find_object(file: kernel::File, bank: Bank) -> Option<Match> {
             let leaf = if dentry == leaf_dentry {
                 id
             } else {
-                FileId::new(leaf_dentry.super_block()?.dev()?, leaf_dentry.inode()?.ino()?)
+                FileId::new(
+                    leaf_dentry.super_block()?.dev()?,
+                    leaf_dentry.inode()?.ino()?,
+                )
             };
             return Some(Match {
                 obj,
