@@ -25,6 +25,7 @@
 mod compile;
 mod parse;
 mod resolve;
+mod ruleline;
 
 pub use compile::{CompiledObject, CompiledPolicy, compile, stat_resolver};
 pub use parse::{ParsedPolicy, parse};
@@ -191,6 +192,20 @@ pub enum PolicyName {
 }
 
 impl PolicyName {
+    /// Parse one policy keyword (the leading field of a DSL rule line). `None` if
+    /// unknown — the caller turns that into a diagnostic naming the offending token.
+    /// The names match the `#[serde(rename_all = "snake_case")]` the `[[rule]]` form
+    /// deserializes, so both authoring surfaces accept exactly the same four words.
+    pub fn parse(token: &str) -> Option<PolicyName> {
+        Some(match token {
+            "allow" => PolicyName::Allow,
+            "deny" => PolicyName::Deny,
+            "audit" => PolicyName::Audit,
+            "silence" => PolicyName::Silence,
+            _ => return None,
+        })
+    }
+
     /// Lower to the kernel's POD [`bpf::Policy`].
     pub fn lower(self) -> bpf::Policy {
         use bpf::Policy;
@@ -276,6 +291,18 @@ mod tests {
         let parsed = parse(text).expect("example policy parses");
         let resolved =
             resolve(&parsed, std::path::Path::new("/home/u")).expect("example policy resolves");
+        assert!(!resolved.rules.is_empty());
+    }
+
+    /// The DSL-form example must parse + resolve too — guards
+    /// `packaging/cordon.example.dsl.policy.toml` (the `rules = '''…'''` surface) against
+    /// drift, the same way the `[[rule]]` example is guarded above.
+    #[test]
+    fn shipped_dsl_example_policy_resolves() {
+        let text = include_str!("../../../../packaging/cordon.example.dsl.policy.toml");
+        let parsed = parse(text).expect("dsl example policy parses");
+        let resolved =
+            resolve(&parsed, std::path::Path::new("/home/u")).expect("dsl example policy resolves");
         assert!(!resolved.rules.is_empty());
     }
 }

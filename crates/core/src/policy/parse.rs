@@ -6,23 +6,40 @@
 //! point a diagnostic at the offending source line. Semantic validation — `@ref`
 //! resolution, cycles, paths — is [`super::resolve`]'s job.
 
-use super::{LineIndex, PolicyName};
+use super::{LineIndex, PolicyName, Pos};
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use toml::Spanned;
 
-/// A parsed-but-unresolved policy: serde-validated structure with retained spans, plus
-/// a line index for turning those spans into [`super::Pos`]. Consumed by
-/// [`super::resolve`].
+/// A parsed-but-unresolved policy: every rule normalized to a [`ParsedRule`] (its
+/// fields lexed to [`Token`]s, its source [`Pos`] already resolved), plus a line index
+/// the resolver still needs for *group* positions. Consumed by [`super::resolve`].
+///
+/// Both authoring surfaces land here: the verbose `[[rule]]` tables and the compact
+/// `rules = '''…'''` DSL block ([`super::ruleline`]) are normalized to the same
+/// `ParsedRule`, so everything downstream of parse is syntax-agnostic.
 #[derive(Debug)]
 pub struct ParsedPolicy {
     pub(crate) groups: Groups,
-    pub(crate) rules: Vec<Spanned<RuleDef>>,
+    pub(crate) rules: Vec<ParsedRule>,
     pub(crate) lines: LineIndex,
 }
 
-/// The top-level TOML shape. `[[rule]]` tables collect into `rules`;
+/// One rule, normalized from either authoring surface: each axis lexed to its
+/// [`Token`] list, the effect as a [`PolicyName`], and the source [`Pos`] of the rule
+/// (the `[[rule]]` header, or the first field of a DSL line) for diagnostics.
+#[derive(Debug)]
+pub(crate) struct ParsedRule {
+    pub(crate) who: Vec<Token>,
+    pub(crate) where_: Vec<Token>,
+    pub(crate) action: Vec<Token>,
+    pub(crate) policy: PolicyName,
+    pub(crate) pos: Pos,
+}
+
+/// The top-level TOML shape. `[[rule]]` tables collect into `blocks`; the optional
+/// `rules = '''…'''` literal block into `rules` (the DSL, [`super::ruleline`]);
 /// `[group.{subject,object,action}.NAME]` into `group`. There is no top-level `mode`
 /// key — the per-rule `policy` is the only enforcement level (DESIGN §15.6).
 #[derive(Deserialize)]
@@ -31,7 +48,13 @@ struct RawPolicy {
     #[serde(default)]
     group: Groups,
     #[serde(default, rename = "rule")]
-    rules: Vec<Spanned<RuleDef>>,
+    blocks: Vec<Spanned<RuleDef>>,
+    /// The compact rule DSL. A TOML *literal* (`'''…'''`) string so paths keep their
+    /// backslashes and our own `"…"` quoting is free of TOML escape processing — one
+    /// rule per line, `POLICY SUBJECT ACTION OBJECT`. Must precede any `[group.*]`
+    /// header (a bare top-level key binds to the last table otherwise).
+    #[serde(default)]
+    rules: Option<Spanned<String>>,
 }
 
 /// The three group namespaces (DESIGN §15.7), each `name → members`.
@@ -132,16 +155,61 @@ impl Token {
     }
 }
 
-/// Parse policy text. Fails only on a structural problem (TOML syntax, unknown key,
-/// bad enum value); `toml`'s error renders the location and a source snippet.
+/// Parse policy text. Fails on a structural TOML problem (syntax, unknown key, bad
+/// enum value — `toml`'s own error, with location), or on a malformed DSL rule line
+/// (arity, unknown policy keyword, unterminated quote — a `line:col`-prefixed error
+/// pointing into the `rules` block). Both rule surfaces normalize to [`ParsedRule`].
 pub fn parse(text: &str) -> Result<ParsedPolicy> {
     let raw: RawPolicy =
         toml::from_str(text).map_err(|e| Error::msg(format!("policy parse error: {e}")))?;
+    let lines = LineIndex::new(text);
+
+    let mut rules = Vec::with_capacity(raw.blocks.len());
+    // `[[rule]]` tables → normalized rules (pos = the table header).
+    for spanned in &raw.blocks {
+        let rd = spanned.get_ref();
+        rules.push(ParsedRule {
+            who: rd.who.classified(),
+            where_: rd.where_.classified(),
+            action: rd.action.classified(),
+            policy: rd.policy,
+            pos: lines.pos(spanned.span().start),
+        });
+    }
+    // `rules = '''…'''` DSL block → normalized rules. The literal-string content is a
+    // verbatim slice of the source starting at `content_start`, so byte offsets inside
+    // it map straight back to real file positions via `lines`.
+    if let Some(block) = &raw.rules {
+        let content = block.get_ref();
+        let content_start = block_content_start(text, block.span().start);
+        rules.extend(super::ruleline::parse_block(content, content_start, &lines)?);
+    }
+
     Ok(ParsedPolicy {
         groups: raw.group,
-        rules: raw.rules,
-        lines: LineIndex::new(text),
+        rules,
+        lines,
     })
+}
+
+/// The absolute byte offset where a multiline literal/basic string's *content* begins:
+/// past the opening `'''`/`"""` delimiter and the single newline TOML trims right after
+/// it (CRLF counts as one). For the literal (`'''`) form the content is then a verbatim
+/// slice of the source from here, so DSL offsets translate to exact source positions.
+fn block_content_start(text: &str, span_start: usize) -> usize {
+    let after = &text[span_start..];
+    let Some(rest) = after.strip_prefix("'''").or_else(|| after.strip_prefix("\"\"\"")) else {
+        // A single-line string value: content begins just past one quote char.
+        return span_start + after.chars().next().map_or(0, |c| c.len_utf8());
+    };
+    let trimmed = if rest.starts_with("\r\n") {
+        2
+    } else if rest.starts_with('\n') || rest.starts_with('\r') {
+        1
+    } else {
+        0
+    };
+    span_start + 3 + trimmed
 }
 
 #[cfg(test)]
@@ -173,13 +241,13 @@ mod tests {
         assert_eq!(p.groups.subject.len(), 1);
         assert_eq!(p.groups.action.len(), 1);
         assert_eq!(p.rules.len(), 2);
+        assert_eq!(p.rules[0].who, vec![Token::Group("ssh-tools".into())]);
         assert_eq!(
-            p.rules[0].get_ref().who.tokens(),
-            &["@ssh-tools".to_string()]
-        );
-        assert_eq!(
-            p.rules[1].get_ref().where_.tokens(),
-            &["~/.aws".to_string(), "~/.config/gcloud".to_string()]
+            p.rules[1].where_,
+            vec![
+                Token::Leaf("~/.aws".into()),
+                Token::Leaf("~/.config/gcloud".into()),
+            ]
         );
     }
 
