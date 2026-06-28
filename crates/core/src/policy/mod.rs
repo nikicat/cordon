@@ -442,13 +442,16 @@ mod tests {
             src("a.toml", "rules = '''\nallow /usr/bin/ssh read /a\n'''\n"),
             src("b.toml", "rules = '''\naudit * read /b\n'''\n"),
             // 5 fields → an arity error, attributed to this fragment.
-            src("bad.toml", "rules = '''\nallow /usr/bin/x read /c oops\n'''\n"),
+            src(
+                "bad.toml",
+                "rules = '''\nallow /usr/bin/x read /c oops\n'''\n",
+            ),
         ];
         let c = compile_fragments(&frags, Path::new("/home/u"), resolver);
 
         // Rules from the two good fragments merged into one table…
-        assert!(c.objects.iter().any(|o| o.path == PathBuf::from("/a")));
-        assert!(c.objects.iter().any(|o| o.path == PathBuf::from("/b")));
+        assert!(c.objects.iter().any(|o| o.path == Path::new("/a")));
+        assert!(c.objects.iter().any(|o| o.path == Path::new("/b")));
         // …and the bad fragment surfaced as an error diagnostic naming it.
         assert!(c.has_errors());
         assert!(

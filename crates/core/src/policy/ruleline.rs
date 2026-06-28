@@ -47,7 +47,8 @@ pub(crate) fn parse_block(
         line = line.strip_suffix('\r').unwrap_or(line);
         let body = strip_comment(line);
 
-        let fields = split_quoted(body, Sep::Whitespace).map_err(|(c, m)| at(lines, base + c, m))?;
+        let fields =
+            split_quoted(body, Sep::Whitespace).map_err(|(c, m)| at(lines, base + c, m))?;
         if fields.is_empty() {
             continue; // blank or comment-only line
         }
@@ -162,7 +163,10 @@ fn split_quoted(s: &str, sep: Sep) -> std::result::Result<Vec<(usize, &str)>, (u
         }
     }
     if in_quote {
-        return Err((quote_at, "unterminated quote (missing closing `\"`)".to_string()));
+        return Err((
+            quote_at,
+            "unterminated quote (missing closing `\"`)".to_string(),
+        ));
     }
     if let Some(st) = start.take() {
         segs.push((st, &s[st..]));
@@ -309,7 +313,10 @@ mod tests {
 
     #[test]
     fn unknown_policy_keyword_is_an_error() {
-        let err = format!("{}", block("allowe /usr/bin/ssh read ~/.ssh\n").unwrap_err());
+        let err = format!(
+            "{}",
+            block("allowe /usr/bin/ssh read ~/.ssh\n").unwrap_err()
+        );
         assert!(err.contains("unknown policy"), "got: {err}");
         assert!(err.starts_with("1:1"), "points at the policy field: {err}");
     }

@@ -198,7 +198,11 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
     if let Some(block) = &raw.rules {
         let content = block.get_ref();
         let content_start = block_content_start(text, block.span().start);
-        rules.extend(super::ruleline::parse_block(content, content_start, &lines)?);
+        rules.extend(super::ruleline::parse_block(
+            content,
+            content_start,
+            &lines,
+        )?);
     }
 
     Ok(ParsedPolicy {
@@ -215,7 +219,10 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
 /// slice of the source from here, so DSL offsets translate to exact source positions.
 fn block_content_start(text: &str, span_start: usize) -> usize {
     let after = &text[span_start..];
-    let Some(rest) = after.strip_prefix("'''").or_else(|| after.strip_prefix("\"\"\"")) else {
+    let Some(rest) = after
+        .strip_prefix("'''")
+        .or_else(|| after.strip_prefix("\"\"\""))
+    else {
         // A single-line string value: content begins just past one quote char.
         return span_start + after.chars().next().map_or(0, |c| c.len_utf8());
     };
@@ -276,8 +283,9 @@ mod tests {
         .unwrap();
         assert_eq!(p.user().map(|u| u.as_str()), Some("alice"));
         // absent ⇒ None (the caller falls back to its own `$HOME`).
-        let p2 = parse("[[rule]]\nwho = \"*\"\nwhere = \"/x\"\naction = \"read\"\npolicy = \"deny\"\n")
-            .unwrap();
+        let p2 =
+            parse("[[rule]]\nwho = \"*\"\nwhere = \"/x\"\naction = \"read\"\npolicy = \"deny\"\n")
+                .unwrap();
         assert!(p2.user().is_none());
     }
 
