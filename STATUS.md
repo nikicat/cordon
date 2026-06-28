@@ -122,8 +122,15 @@ smoke scenarios green):**
 - **(5) Per-user `~` via `user =` header — ✅ done.** A `user = "name"` header expands `~`
   against that account's `/etc/passwd` home, so a root-owned per-user file uses `~/.ssh`
   (the root daemon's `$HOME` is `/root`). New `UserName` newtype + `policy::home_for`, wired
-  into `compile_text` (startup + apply) and CLI `check`. **conf.d multi-file merge is the
-  next increment** (needs an `apply`-path redesign — `apply` ships one file's text today).
+  into the resolve choke point (`compile_sources` for startup + apply; CLI `check`).
+- **(6) conf.d split — ✅ done.** A policy path may be a single file or a directory of
+  `*.toml` fragments (name-sorted), each parsed/resolved independently (file-local groups,
+  own `user =` home) then **merged** before compile via `policy::compile_fragments`; a bad
+  fragment fails the apply, named. `apply` now ships the read fragments to the daemon
+  (`Request::PolicyApply { sources: Vec<PolicySource> }` replaced the single `text`), which
+  resolves homes + merges; `read_sources` does the file-or-dir read for both daemon startup
+  and CLI `check`/`apply`. *Known gap:* compile-stage diagnostics (e.g. pending-path
+  warnings) carry `line:col` but not yet the fragment name (parse/resolve errors do).
 
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
 + maps + link so enforcement survives daemon death (until then it fails open on daemon exit).

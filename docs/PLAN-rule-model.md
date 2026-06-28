@@ -250,13 +250,19 @@ decision table cost ~5 lines/rule, and a root daemon can't use `~`. Both address
    audit policy: 129→76 lines, **proven** to compile to the identical per-object table.
 5. **Per-user `~` via `user =` header — ✅ done.** `user = "name"` expands `~` against that
    account's `/etc/passwd` home (the root daemon's `$HOME` is `/root`). New `UserName`
-   newtype + `policy::home_for(user, fallback)`, wired into the one resolve choke point
-   (`compile_text` for startup + `apply`; CLI `check`). A named-but-missing account is a hard
-   error. **Next:** the conf.d split — a *directory* of per-user fragments, each with its own
-   `user`, merged before compile. Deferred because `apply` ships a single file's text today,
-   so the apply path (and `policy show`) need a multi-source redesign; precedence stays
-   source-order-independent (specificity + deny>allow), so a flat merge is safe (all
-   fragments root-owned), with system-beats-user *tiers* an open question for a baseline deny.
+   newtype + `policy::home_for(user, fallback)`, wired into the resolve choke point. A
+   named-but-missing account is a hard error.
+6. **conf.d split — ✅ done.** A policy path is a single file *or* a directory of `*.toml`
+   fragments (`policy::read_sources`, name-sorted). Each parses/resolves independently
+   (file-local groups, own `user =` home); `policy::compile_fragments` **merges** the
+   resolved rules and compiles them as one table — precedence is source-order-independent
+   (specificity + deny>allow), so a flat merge is safe (all fragments root-owned), with
+   system-beats-user *tiers* an open question only for an unoverridable baseline deny. A bad
+   fragment becomes an error diagnostic naming it, failing the whole apply (no silent partial
+   load). The apply path was redesigned: `Request::PolicyApply` now ships the read fragments
+   (`Vec<PolicySource>`) instead of one `text`; the daemon resolves their homes + merges
+   (`compile_sources`). *Open:* compile-stage diagnostics don't yet carry the fragment name
+   (only parse/resolve errors do); a future `Pos` could gain a source id.
 
 ## Appendix A — policy TOML (proposed)
 ```toml

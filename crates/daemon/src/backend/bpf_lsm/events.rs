@@ -16,6 +16,7 @@ use cordon_bpf_common::{
     Action, Decision, DecisionEvent, FileId, MAP_EVENTS, PATH_MAX_DEPTH, PathComp, Pid, Policy,
 };
 use cordon_core::backend::{ApplyOutcome, PolicyControl, Shutdown};
+use cordon_core::policy::PolicySource;
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::HashMap;
@@ -75,7 +76,7 @@ pub(super) fn serve(
         }
         // Service any `policy apply` requests that arrived since the last tick.
         while let Ok(req) = control.apply_rx.try_recv() {
-            apply(ebpf, control, &req.text, &req.reply, &mut object_paths);
+            apply(ebpf, control, &req.sources, &req.reply, &mut object_paths);
         }
     }
     Ok(())
@@ -88,11 +89,11 @@ pub(super) fn serve(
 fn apply(
     ebpf: &mut Ebpf,
     control: &PolicyControl,
-    text: &str,
+    sources: &[PolicySource],
     reply: &std::sync::mpsc::Sender<ApplyOutcome>,
     object_paths: &mut HashMap<FileId, PathBuf>,
 ) {
-    let compiled = super::compile_text(text);
+    let compiled = super::compile_sources(sources);
     let applied = if compiled.has_errors() {
         false
     } else {

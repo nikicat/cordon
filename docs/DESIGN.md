@@ -756,8 +756,17 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
 - **Per-user `~` (✅ 2026-06-28).** An optional `user = "name"` header expands `~`
   against that account's home (via `/etc/passwd`), so a root-owned per-user file writes
   `~/.ssh` not `/home/<name>/.ssh` — the daemon runs as root, so absent the header `~`
-  would be `/root`. The conf.d split that turns this into a *directory* of per-user
-  fragments (each with its own `user`) is the next increment.
+  would be `/root`.
+- **conf.d split (✅ 2026-06-28).** A policy path is a single file *or* a directory of
+  `*.toml` fragments (loaded in name order). Each fragment parses/resolves independently
+  — **file-local groups**, its own `user =` home — then the resolved rules are **merged**
+  into one table and compiled together. Precedence (object/subject specificity, then
+  deny>allow) is source-order-independent, so fragment load order can't change a verdict;
+  a flat merge is safe because every fragment is root-owned (system-beats-user *tiers*
+  remain an open question, only needed if a system baseline-deny must be unoverridable). A
+  bad fragment fails the whole apply, named in the diagnostic — never a silent partial
+  load. `apply` ships the read fragments (`Vec<PolicySource>`) to the daemon, which
+  resolves their homes and merges.
 - **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
   swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
   only on an explicit apply, so an edit-in-progress is never half-enforced.

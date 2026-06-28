@@ -117,9 +117,10 @@ fn build_request(cli: &Cli) -> Result<Request> {
             PolicyCmd::Show => Ok(Request::PolicyShow),
             PolicyCmd::Apply { file } => {
                 let path = policy_path(file.as_deref(), cli)?;
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| Error::msg(format!("read {}: {e}", path.display())))?;
-                Ok(Request::PolicyApply { text })
+                // Read the policy source (a file, or a conf.d dir of fragments) and ship
+                // the fragments; the daemon resolves per-fragment homes + merges.
+                let sources = policy::read_sources(&path)?;
+                Ok(Request::PolicyApply { sources })
             }
             PolicyCmd::Check { .. } => unreachable!("check is handled locally"),
         },
@@ -136,37 +137,17 @@ fn policy_check(file: Option<&Path>, cli: &Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
+    // A file → one fragment; a conf.d dir → every `*.toml`. Each resolves with its own
+    // `user =` home (else the CLI `$HOME`); per-fragment errors are folded into the
+    // compile diagnostics, naming the fragment.
+    let sources = match policy::read_sources(&path) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("cordon: read {}: {e}", path.display());
+            eprintln!("cordon: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // parse/resolve errors are fatal + structural (the message carries `line:col`).
-    let parsed = match policy::parse(&text) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}: {e}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    // `~` expands against the policy's `user =` header (if any), else the CLI `$HOME`.
-    let home = match policy::home_for(parsed.user(), &home()) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("{}: {e}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let resolved = match policy::resolve(&parsed, &home) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{}: {e}", path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let compiled = policy::compile(&resolved, policy::stat_resolver);
+    let compiled = policy::compile_fragments(&sources, &home(), policy::stat_resolver);
     for d in &compiled.diagnostics {
         eprintln!("{}:{d}", path.display());
     }

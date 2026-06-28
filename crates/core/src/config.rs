@@ -29,7 +29,8 @@ pub struct Config {
     /// `bpf-lsm` backend: the bpffs directory to pin the program + maps under, so
     /// enforcement survives the daemon dying (fail-safe, DESIGN §4).
     pub bpf_pin_dir: PathBuf,
-    /// The root-owned text policy file (the flat rule model, DESIGN §15.8). The
+    /// The root-owned text policy (the flat rule model, DESIGN §15.8) — a single file,
+    /// or a **conf.d directory** of `*.toml` fragments merged in name order. The
     /// `bpf-lsm` backend compiles it at startup and seeds the maps from it.
     pub policy: PathBuf,
 }

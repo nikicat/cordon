@@ -35,6 +35,7 @@ use crate::Result;
 use cordon_bpf_common as bpf;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// A 1-based line/column into the policy source. Column is a byte offset within the
 /// line (fine for the ASCII paths/names a policy holds; not grapheme-aware).
@@ -243,7 +244,7 @@ impl fmt::Display for UserName {
 /// when the policy names no user. Errors if the named account has no `/etc/passwd`
 /// entry — a root-owned policy naming a missing user is a misconfiguration, not a
 /// silent fall-through to the wrong home.
-pub fn home_for(user: Option<&UserName>, fallback: &std::path::Path) -> Result<std::path::PathBuf> {
+pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     let Some(user) = user else {
         return Ok(fallback.to_path_buf());
     };
@@ -259,7 +260,7 @@ pub fn home_for(user: Option<&UserName>, fallback: &std::path::Path) -> Result<s
 
 /// The home field (index 5) of the `/etc/passwd` line whose login name (index 0)
 /// matches `user`. Split from [`home_for`] so it unit-tests without the real file.
-fn home_in_passwd(passwd: &str, user: &str) -> Option<std::path::PathBuf> {
+fn home_in_passwd(passwd: &str, user: &str) -> Option<PathBuf> {
     passwd.lines().find_map(|line| {
         let mut fields = line.split(':');
         if fields.next() != Some(user) {
@@ -267,16 +268,99 @@ fn home_in_passwd(passwd: &str, user: &str) -> Option<std::path::PathBuf> {
         }
         // name(0):passwd(1):uid(2):gid(3):gecos(4):home(5):shell(6) — name consumed,
         // skip passwd..gecos, take home.
-        fields.nth(4).map(std::path::PathBuf::from)
+        fields.nth(4).map(PathBuf::from)
     })
+}
+
+/// One named policy fragment: a source name (a file path, for diagnostics) and its
+/// text. The unit of the **conf.d split** (DESIGN §15.8) — a directory of these, each
+/// parsed/resolved independently (groups are file-local; `~` uses the fragment's own
+/// `user =` header), then merged into one compiled table. Sent over IPC on `apply`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolicySource {
+    pub name: String,
+    pub text: String,
+}
+
+/// Read a policy path into [`PolicySource`]s: a single file → one fragment; a directory
+/// → every `*.toml` inside it, **sorted by name** for deterministic load order (the
+/// conf.d split, DESIGN §15.8). Errors on I/O or an empty directory — a policy that
+/// resolves to no fragments is a misconfiguration, not an empty allow-all.
+pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| crate::Error::msg(format!("policy {}: {e}", path.display())))?;
+    if !meta.is_dir() {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| crate::Error::msg(format!("read policy {}: {e}", path.display())))?;
+        return Ok(vec![PolicySource {
+            name: path.display().to_string(),
+            text,
+        }]);
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+        .map_err(|e| crate::Error::msg(format!("read policy dir {}: {e}", path.display())))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(crate::Error::msg(format!(
+            "policy dir {} has no *.toml fragments",
+            path.display()
+        )));
+    }
+    files
+        .into_iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(&p)
+                .map_err(|e| crate::Error::msg(format!("read policy {}: {e}", p.display())))?;
+            Ok(PolicySource {
+                name: p.display().to_string(),
+                text,
+            })
+        })
+        .collect()
+}
+
+/// Parse → resolve → **merge** → compile a set of fragments into one decision table.
+/// Each fragment resolves independently — its `@`-groups are file-local and its `~`
+/// expands against its own `user =` header (else `fallback_home`) — then the resolved
+/// rules are concatenated and compiled together, so precedence (object/subject
+/// specificity then deny>allow, all source-order-independent) applies across the whole
+/// set. A fragment's parse/resolve failure becomes an error diagnostic naming it, so one
+/// bad fragment fails the apply via [`CompiledPolicy::has_errors`] rather than silently
+/// dropping its rules.
+pub fn compile_fragments<R>(
+    sources: &[PolicySource],
+    fallback_home: &Path,
+    resolve_fileid: R,
+) -> CompiledPolicy
+where
+    R: FnMut(&Path) -> Option<bpf::FileId>,
+{
+    let mut rules = Vec::new();
+    let mut errors = Vec::new();
+    for src in sources {
+        let resolved = parse(&src.text).and_then(|parsed| {
+            let home = home_for(parsed.user(), fallback_home)?;
+            resolve(&parsed, &home)
+        });
+        match resolved {
+            Ok(r) => rules.extend(r.rules),
+            Err(e) => errors.push(Diagnostic::error(None, format!("{}: {e}", src.name))),
+        }
+    }
+    let mut compiled = compile(&ResolvedPolicy { rules }, resolve_fileid);
+    // Surface per-fragment parse/resolve errors ahead of the compile diagnostics.
+    compiled.diagnostics.splice(0..0, errors);
+    compiled
 }
 
 /// Expand a leading `~` to `home`, then lexically normalize. Errors if the result is
 /// neither absolute nor `~`-relative — policy paths must be unambiguous (no
 /// cwd-relative surprises in a reviewable, root-owned file; DESIGN §15.8).
-pub(crate) fn expand_path(raw: &str, home: &std::path::Path) -> Result<std::path::PathBuf> {
+pub(crate) fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     use crate::paths::normalize;
-    use std::path::{Path, PathBuf};
 
     let expanded: PathBuf = if raw == "~" {
         home.to_path_buf()
@@ -339,6 +423,41 @@ mod tests {
     fn home_for_without_user_uses_fallback() {
         let fallback = std::path::Path::new("/root");
         assert_eq!(home_for(None, fallback).unwrap(), fallback);
+    }
+
+    #[test]
+    fn compile_fragments_merges_and_names_bad_fragment() {
+        use cordon_bpf_common::{Dev, FileId, Ino};
+        // Deterministic stub resolver: a distinct fake inode per path (so /a ≠ /b),
+        // no filesystem dependency.
+        let resolver = |p: &Path| {
+            let ino: u64 = p.to_string_lossy().bytes().map(u64::from).sum();
+            Some(FileId::new(Dev(1), Ino(ino)))
+        };
+        let src = |name: &str, text: &str| PolicySource {
+            name: name.into(),
+            text: text.into(),
+        };
+        let frags = [
+            src("a.toml", "rules = '''\nallow /usr/bin/ssh read /a\n'''\n"),
+            src("b.toml", "rules = '''\naudit * read /b\n'''\n"),
+            // 5 fields → an arity error, attributed to this fragment.
+            src("bad.toml", "rules = '''\nallow /usr/bin/x read /c oops\n'''\n"),
+        ];
+        let c = compile_fragments(&frags, Path::new("/home/u"), resolver);
+
+        // Rules from the two good fragments merged into one table…
+        assert!(c.objects.iter().any(|o| o.path == PathBuf::from("/a")));
+        assert!(c.objects.iter().any(|o| o.path == PathBuf::from("/b")));
+        // …and the bad fragment surfaced as an error diagnostic naming it.
+        assert!(c.has_errors());
+        assert!(
+            c.diagnostics
+                .iter()
+                .any(|d| d.message.contains("bad.toml") && d.message.contains("4 fields")),
+            "expected a bad.toml arity error, got: {:?}",
+            c.diagnostics
+        );
     }
 
     #[test]

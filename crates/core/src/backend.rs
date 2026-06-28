@@ -8,7 +8,7 @@
 //! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
 //! backends were retired with the rule-model migration (DESIGN §15).
 
-use crate::policy::Diagnostic;
+use crate::policy::{Diagnostic, PolicySource};
 use crate::proto::PolicyView;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -112,9 +112,10 @@ pub fn control() -> (PolicyControl, ControlSender) {
     )
 }
 
-/// One `policy apply`: the policy text + a one-shot reply channel for the outcome.
+/// One `policy apply`: the policy fragments to compile + a one-shot reply channel for
+/// the outcome.
 pub struct ApplyRequest {
-    pub text: String,
+    pub sources: Vec<PolicySource>,
     pub reply: Sender<ApplyOutcome>,
 }
 
