@@ -21,10 +21,13 @@ use std::path::PathBuf;
 pub enum Request {
     /// Daemon summary (backend, the effective policy's object count).
     Status,
-    /// Compile + apply a text policy, atomically replacing the live one. The CLI
-    /// sends the **text** (not a path): the daemon compiles it with its own
-    /// mount-aware resolver and swaps the in-kernel maps.
-    PolicyApply { text: String },
+    /// Compile + apply a policy, atomically replacing the live one. The CLI sends the
+    /// **fragments** it read from the policy path (one for a file, many for a conf.d
+    /// directory): the daemon resolves each fragment's `user =` home, merges, compiles
+    /// with its own mount-aware resolver, and swaps the in-kernel maps.
+    PolicyApply {
+        sources: Vec<crate::policy::PolicySource>,
+    },
     /// The effective (currently-loaded) compiled policy.
     PolicyShow,
 }

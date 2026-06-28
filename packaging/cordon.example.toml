@@ -37,6 +37,9 @@ backend = "bpf-lsm"
 # bpf_pin_dir = "/sys/fs/bpf/cordon"
 #
 # The root-owned text policy (the flat rule model — see cordon.example.policy.toml)
-# the bpf-lsm backend compiles at startup and seeds the maps from. Default:
-# /etc/cordon/policy.toml. In a dev tree:
-# policy = "${PWD}/packaging/cordon.example.policy.toml"
+# the bpf-lsm backend compiles at startup and seeds the maps from. May be a single
+# file or a conf.d *directory* of *.toml fragments merged in name order (each may carry
+# a `user = "name"` header so `~` resolves under the root daemon). Default:
+# /etc/cordon/policy.toml. Typical layouts:
+# policy = "/etc/cordon/conf.d"                          # a directory of fragments
+# policy = "${PWD}/packaging/cordon.example.policy.toml" # a single file, in a dev tree

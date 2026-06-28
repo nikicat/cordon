@@ -110,6 +110,28 @@ smoke scenarios green):**
   Enables flow B (discovery) + M4 autolearn's per-file→subtree generalization. VM-validated
   (smoke scenario 13: siblings + a depth-2 nested file each surface with their real path).
 
+**Authoring ergonomics (2026-06-28) — from rewriting the real-system audit policy by hand:**
+- **(4) Compact rule DSL — ✅ done.** A `rules = '''…'''` literal block, one rule per line
+  (`POLICY SUBJECT ACTION OBJECT`), accepted *alongside* `[[rule]]` tables and normalized to
+  the same `ParsedRule` — only surface syntax, so resolve/compile/kernel are untouched. New
+  `crates/core/src/policy/ruleline.rs` (a quote-aware lexer with `Item`/`Sep` types); `parse`
+  normalizes both surfaces; `PolicyName::parse` added; literal-string content is a verbatim
+  source slice so diagnostics give exact `line:col`. 11 unit tests + a regression-tested
+  `packaging/cordon.example.dsl.policy.toml`. The hand audit policy went 129→76 lines, proven
+  to compile to the identical table.
+- **(5) Per-user `~` via `user =` header — ✅ done.** A `user = "name"` header expands `~`
+  against that account's `/etc/passwd` home, so a root-owned per-user file uses `~/.ssh`
+  (the root daemon's `$HOME` is `/root`). New `UserName` newtype + `policy::home_for`, wired
+  into the resolve choke point (`compile_sources` for startup + apply; CLI `check`).
+- **(6) conf.d split — ✅ done.** A policy path may be a single file or a directory of
+  `*.toml` fragments (name-sorted), each parsed/resolved independently (file-local groups,
+  own `user =` home) then **merged** before compile via `policy::compile_fragments`; a bad
+  fragment fails the apply, named. `apply` now ships the read fragments to the daemon
+  (`Request::PolicyApply { sources: Vec<PolicySource> }` replaced the single `text`), which
+  resolves homes + merges; `read_sources` does the file-or-dir read for both daemon startup
+  and CLI `check`/`apply`. *Known gap:* compile-stage diagnostics (e.g. pending-path
+  warnings) carry `line:col` but not yet the fragment name (parse/resolve errors do).
+
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
 + maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
 **Pinning must ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active):

@@ -50,13 +50,12 @@ pub struct ResolvedPolicy {
 /// structurally unusable until fixed.
 pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
     let mut rules = Vec::with_capacity(parsed.rules.len());
-    for spanned in &parsed.rules {
-        let pos = parsed.lines.pos(spanned.span().start);
-        let rule = spanned.get_ref();
+    for rule in &parsed.rules {
+        let pos = rule.pos;
 
-        let subjects = resolve_subjects(&rule.who.classified(), parsed, home, pos)?;
-        let objects = resolve_objects(&rule.where_.classified(), parsed, home, pos)?;
-        let actions = resolve_actions(&rule.action.classified(), parsed, pos)?;
+        let subjects = resolve_subjects(&rule.who, parsed, home, pos)?;
+        let objects = resolve_objects(&rule.where_, parsed, home, pos)?;
+        let actions = resolve_actions(&rule.action, parsed, pos)?;
 
         if subjects.is_empty() {
             return Err(at(pos, "rule `who` resolves to nothing"));

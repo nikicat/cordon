@@ -87,15 +87,15 @@ impl Ctx {
                 self.control.current.lock().unwrap().clone(),
             )),
 
-            Request::PolicyApply { text } => {
-                // Hand the text to the backend thread (which owns the BPF maps) and
-                // block on its reply. The backend compiles with its mount-aware
-                // resolver and re-seeds the maps.
+            Request::PolicyApply { sources } => {
+                // Hand the fragments to the backend thread (which owns the BPF maps)
+                // and block on its reply. The backend resolves per-fragment homes,
+                // merges, compiles with its mount-aware resolver, and re-seeds the maps.
                 let (reply_tx, reply_rx) = mpsc::channel();
                 self.control
                     .apply_tx
                     .send(ApplyRequest {
-                        text,
+                        sources,
                         reply: reply_tx,
                     })
                     .map_err(|_| {

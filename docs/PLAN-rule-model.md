@@ -234,6 +234,36 @@ DESIGN documents them as the target. **All three (1)–(3) are now done.**
    Enables §15.10 flow B (per-app discovery) and M4 autolearn's per-file→subtree
    generalization. VM-validated (smoke scenario 13: siblings + a depth-2 nested file).
 
+## Authoring ergonomics (2026-06-28)
+From rewriting the real-system audit policy by hand — TOML's `[[rule]]` tables make a
+decision table cost ~5 lines/rule, and a root daemon can't use `~`. Both addressed (DESIGN
+§15.8); neither touches the compiler IR or the kernel.
+
+4. **Compact rule DSL — ✅ done.** A `rules = '''…'''` **literal** block, one rule per
+   line — `POLICY SUBJECT ACTION OBJECT`, whitespace-aligned columns, comma lists, `"…"`
+   quoting (spaces; and `*`/`@` forced literal — which also lets an object path start with
+   those sigils), `#` comments. Accepted *alongside* `[[rule]]` and normalized to the same
+   `ParsedRule`, so it is **surface syntax only**. New `policy/ruleline.rs` (quote-aware
+   lexer, `Item`/`Sep` types), `PolicyName::parse`; the literal content is a verbatim source
+   slice so a diagnostic carries exact `line:col` (better than `[[rule]]`, which points at
+   the table header). 11 units + a regression-tested `cordon.example.dsl.policy.toml`. Hand
+   audit policy: 129→76 lines, **proven** to compile to the identical per-object table.
+5. **Per-user `~` via `user =` header — ✅ done.** `user = "name"` expands `~` against that
+   account's `/etc/passwd` home (the root daemon's `$HOME` is `/root`). New `UserName`
+   newtype + `policy::home_for(user, fallback)`, wired into the resolve choke point. A
+   named-but-missing account is a hard error.
+6. **conf.d split — ✅ done.** A policy path is a single file *or* a directory of `*.toml`
+   fragments (`policy::read_sources`, name-sorted). Each parses/resolves independently
+   (file-local groups, own `user =` home); `policy::compile_fragments` **merges** the
+   resolved rules and compiles them as one table — precedence is source-order-independent
+   (specificity + deny>allow), so a flat merge is safe (all fragments root-owned), with
+   system-beats-user *tiers* an open question only for an unoverridable baseline deny. A bad
+   fragment becomes an error diagnostic naming it, failing the whole apply (no silent partial
+   load). The apply path was redesigned: `Request::PolicyApply` now ships the read fragments
+   (`Vec<PolicySource>`) instead of one `text`; the daemon resolves their homes + merges
+   (`compile_sources`). *Open:* compile-stage diagnostics don't yet carry the fragment name
+   (only parse/resolve errors do); a future `Pos` could gain a source id.
+
 ## Appendix A — policy TOML (proposed)
 ```toml
 # No global mode: the per-rule `policy` is the only enforcement level (use `audit` to
@@ -250,6 +280,19 @@ DESIGN documents them as the target. **All three (1)–(3) are now done.**
 [[rule]]  who = "@aws-cli"    where = "~/.aws"        action = ["read","write"]  policy = "allow"
 [[rule]]  who = "*"           where = "@cloud-creds"  action = "read"            policy = "audit"
 [[rule]]  who = "/tmp/sketchy" where = "~/.aws"       action = "*"               policy = "deny"
+```
+
+The same rules in the DSL surface (✅ shipped — `POLICY SUBJECT ACTION OBJECT`; `user =`
+expands `~`; the block precedes the `[group.*]` tables as a top-level key):
+```toml
+user = "alice"
+rules = '''
+allow  @ssh-tools    @ro          ~/.ssh
+allow  @aws-cli      read,write   ~/.aws
+audit  *             read         @cloud-creds
+deny   /tmp/sketchy  *            ~/.aws
+'''
+# …[group.*] tables follow, as above.
 ```
 
 ## Appendix B — compiled shapes (proposed; refine during impl)

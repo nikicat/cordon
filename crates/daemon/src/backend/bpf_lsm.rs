@@ -36,7 +36,7 @@ use cordon_bpf_common::{
     Action, Bank, CompiledRule, FileId, ObjId, Offsets, Pid, Policy, SubjectMatch, rule_slot,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
-use cordon_core::policy::{self, CompiledPolicy, Diagnostic, Severity};
+use cordon_core::policy::{self, CompiledPolicy, PolicySource, Severity};
 use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
 use std::collections::HashMap;
@@ -135,16 +135,12 @@ impl Backend for BpfLsmBackend {
 }
 
 impl BpfLsmBackend {
-    /// Startup: read + compile the policy file. Returns an error (refusing to seed) if
-    /// it has any error-severity finding — a bad startup policy must not silently run.
+    /// Startup: read + compile the policy source (a file, or a conf.d directory of
+    /// fragments). Returns an error (refusing to seed) if it has any error-severity
+    /// finding — a bad startup policy must not silently run.
     fn compile_policy(&self) -> Result<CompiledPolicy> {
-        let text = std::fs::read_to_string(&self.policy).map_err(|e| {
-            Error::msg(format!(
-                "bpf-lsm: read policy {}: {e}",
-                self.policy.display()
-            ))
-        })?;
-        let compiled = compile_text(&text);
+        let sources = policy::read_sources(&self.policy)?;
+        let compiled = compile_sources(&sources);
         if compiled.has_errors() {
             return Err(Error::msg(format!(
                 "bpf-lsm: policy {} has errors; refusing to seed",
@@ -155,20 +151,13 @@ impl BpfLsmBackend {
     }
 }
 
-/// Parse → resolve → compile policy text, logging diagnostics. Always returns a
-/// `CompiledPolicy`: a structural parse/resolve failure becomes a single error
-/// diagnostic (so `policy apply` can report it instead of the daemon crashing). The
-/// caller decides whether to seed via [`CompiledPolicy::has_errors`].
-pub(super) fn compile_text(text: &str) -> CompiledPolicy {
-    let parsed = match policy::parse(text) {
-        Ok(p) => p,
-        Err(e) => return error_policy(e),
-    };
-    let resolved = match policy::resolve(&parsed, &policy_home()) {
-        Ok(r) => r,
-        Err(e) => return error_policy(e),
-    };
-    let compiled = policy::compile(&resolved, proc::file_id);
+/// Resolve (each fragment's own `user =` home, else the daemon `$HOME`) → merge →
+/// compile a set of policy fragments, logging diagnostics. Always returns a
+/// `CompiledPolicy`: a per-fragment parse/resolve failure is folded in as an error
+/// diagnostic naming the fragment (so `policy apply` reports it instead of the daemon
+/// crashing). The caller decides whether to seed via [`CompiledPolicy::has_errors`].
+pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
+    let compiled = policy::compile_fragments(sources, &policy_home(), proc::file_id);
     for d in &compiled.diagnostics {
         match d.severity {
             Severity::Error => error!("policy: {d}"),
@@ -176,21 +165,6 @@ pub(super) fn compile_text(text: &str) -> CompiledPolicy {
         }
     }
     compiled
-}
-
-/// Wrap a structural parse/resolve error as an otherwise-empty compiled policy
-/// carrying it as one error diagnostic (its message already includes `line:col`).
-fn error_policy(e: Error) -> CompiledPolicy {
-    error!("policy: {e}");
-    CompiledPolicy {
-        objects: Vec::new(),
-        pending: Vec::new(),
-        diagnostics: vec![Diagnostic {
-            severity: Severity::Error,
-            message: e.to_string(),
-            pos: None,
-        }],
-    }
 }
 
 /// A human-facing view of a compiled policy for `cordon policy show`.

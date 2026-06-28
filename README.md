@@ -45,7 +45,10 @@ silence, and runtime `policy apply` — runs in a virtme-ng VM with no host root
 packaging/test/run-bpf-lsm-vm.sh
 ```
 
-The authoritative policy is a text file (see
-[`packaging/cordon.example.policy.toml`](packaging/cordon.example.policy.toml));
-`cordon policy apply` compiles it and atomically re-seeds the in-kernel maps.
+The authoritative policy is a text file — either the verbose `[[rule]]` form (see
+[`packaging/cordon.example.policy.toml`](packaging/cordon.example.policy.toml)) or the
+compact one-rule-per-line DSL
+([`packaging/cordon.example.dsl.policy.toml`](packaging/cordon.example.dsl.policy.toml)),
+which compile identically. `cordon policy apply` compiles it and atomically re-seeds the
+in-kernel maps.
 

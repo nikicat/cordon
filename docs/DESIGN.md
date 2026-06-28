@@ -742,9 +742,31 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
 ```
 
 ### 15.8 Storage
-- **Authoritative policy = a root-owned text file** (TOML v1; a compact DSL later if
-  TOML gets noisy). Not user-writable, else a scraper writes itself in. Git-versionable,
-  reviewable, diffable — policy as code.
+- **Authoritative policy = a root-owned text file.** Not user-writable, else a scraper
+  writes itself in. Git-versionable, reviewable, diffable — policy as code.
+- **Two authoring surfaces, one model (✅ 2026-06-28).** Each rule is either a verbose
+  `[[rule]]` TOML table or a line in a compact `rules = '''…'''` **DSL** block —
+  `POLICY SUBJECT ACTION OBJECT`, one rule per line, columns whitespace-aligned, list
+  items comma-separated, `"…"` quoting a token with spaces (and forcing `*`/`@` literal),
+  `#` comments. A *literal* TOML string so paths keep backslashes and the DSL owns `"`/`\`;
+  its content is a verbatim source slice, so diagnostics map to exact `line:col`. Both
+  surfaces normalize to the same parsed rule and may be mixed in one file — the DSL is
+  *only* surface syntax (the kernel is unaffected), the natural form for the decision
+  table a policy actually is.
+- **Per-user `~` (✅ 2026-06-28).** An optional `user = "name"` header expands `~`
+  against that account's home (via `/etc/passwd`), so a root-owned per-user file writes
+  `~/.ssh` not `/home/<name>/.ssh` — the daemon runs as root, so absent the header `~`
+  would be `/root`.
+- **conf.d split (✅ 2026-06-28).** A policy path is a single file *or* a directory of
+  `*.toml` fragments (loaded in name order). Each fragment parses/resolves independently
+  — **file-local groups**, its own `user =` home — then the resolved rules are **merged**
+  into one table and compiled together. Precedence (object/subject specificity, then
+  deny>allow) is source-order-independent, so fragment load order can't change a verdict;
+  a flat merge is safe because every fragment is root-owned (system-beats-user *tiers*
+  remain an open question, only needed if a system baseline-deny must be unoverridable). A
+  bad fragment fails the whole apply, named in the diagnostic — never a silent partial
+  load. `apply` ships the read fragments (`Vec<PolicySource>`) to the daemon, which
+  resolves their homes and merges.
 - **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
   swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
   only on an explicit apply, so an edit-in-progress is never half-enforced.

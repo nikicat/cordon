@@ -1,0 +1,63 @@
+# cordon policy — the flat rule model (DESIGN §15), authored in the compact rule DSL.
+# Same model as cordon.example.policy.toml (the verbose `[[rule]]` form); this file
+# shows the line-oriented alternative. Both surfaces may be mixed in one file and
+# compile identically.
+#
+# The rule block is one rule per line:
+#
+#     POLICY  SUBJECT[,SUBJECT…]  ACTION[,ACTION…]  OBJECT[,OBJECT…]
+#
+#   POLICY  — allow (allow, silent) | audit (allow, log) | deny (deny, log) |
+#             silence (deny, silent).
+#   SUBJECT — an exe path, `*` (any), or `@subject-group`.
+#   ACTION  — read | write | create (M1, at open); a single value, a comma list, `*`
+#             (all), or `@action-group`.
+#   OBJECT  — a file or directory (matched recursively as a subtree), or `@object-group`.
+#             `*` is NOT allowed — the whole filesystem can't be default-denied.
+#
+# Fields are whitespace-separated (align the columns however you like); list items use
+# commas with no spaces; `"…"` quotes a token that contains spaces, and inside the
+# quotes `*`/`@` are literal (the way to name a path that starts with those). `#` starts
+# a comment; blank lines are ignored.
+#
+# Precedence, enforcement levels, and the no-global-mode rule are exactly as in the
+# `[[rule]]` example — see cordon.example.policy.toml. There is no `mode` key; use
+# `audit` to observe an object and `deny` to enforce it.
+#
+# For a root-owned, per-user policy, declare whose home `~` expands against (looked up
+# in /etc/passwd) so you can write `~/.ssh` instead of `/home/<name>/.ssh`:
+#
+#     user = "alice"
+#
+# Without it, `~` expands against the daemon's own $HOME (a root daemon → /root), so a
+# system-wide policy uses absolute paths. Like `rules`, `user` is a top-level key.
+#
+# NOTE: the `rules` block is a top-level key, so it must precede any `[group.*]` header
+# (a bare top-level key binds to the last table otherwise). Rules first, groups below.
+
+rules = '''
+# ssh tooling may read ~/.ssh; every other opener there is default-denied.
+allow    @ssh-tools     @ro          ~/.ssh
+
+# the aws cli reads + writes its own creds.
+allow    /usr/bin/aws   read,write   ~/.aws
+
+# log (but allow) every *other* reader of the cloud-credential dirs — preview who
+# touches them before tightening to a deny.
+audit    *              read         @cloud-creds
+
+# copy-down exception: aws may read ~/.aws (above), but never this one stashed token,
+# and silently (deny + no log line). More-specific object wins over the subtree allow,
+# but only for this file and only for aws.
+silence  /usr/bin/aws   *            ~/.aws/.danger-token
+'''
+
+# --- groups: named, nestable, symmetric across all three axes ----------------
+[group.subject.ssh-tools]
+members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
+
+[group.object.cloud-creds]
+members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
+
+[group.action.ro]
+members = ["read", "listdir"]
