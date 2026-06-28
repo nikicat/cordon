@@ -4,6 +4,11 @@
 # backend. Default location: /etc/cordon/policy.toml (override via the daemon's
 # `policy = …` config key).
 #
+# This file uses the verbose `[[rule]]` form. The same model can be written far more
+# compactly in the line-oriented DSL — see cordon.example.dsl.policy.toml — and a
+# `user = "name"` header lets `~` resolve for a root daemon. The two surfaces compile
+# identically and may be mixed.
+#
 # A rule is `(who, where, action, policy)`:
 #   who    — subject: an exe path, `*` (any), or `@subject-group`. (uid/cgroup/argv0
 #            predicates arrive in M2.)
