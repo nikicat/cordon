@@ -4,8 +4,13 @@
 # (the host kernel usually omits `bpf` from `lsm=`). Needs only /dev/kvm + virtme-ng
 # + qemu, plus the eBPF toolchain to build the object (nightly + bpf-linker).
 #
-#   packaging/test/run-bpf-lsm-vm.sh                          # host kernel (local dev)
-#   CORDON_VM_KERNEL=v6.12 packaging/test/run-bpf-lsm-vm.sh   # pinned kernel (CI)
+#   packaging/test/run-bpf-lsm-vm.sh                          # pinned kernel v6.12 (== CI)
+#   CORDON_VM_KERNEL=host packaging/test/run-bpf-lsm-vm.sh    # host kernel (fast iteration)
+#   CORDON_VM_KERNEL=v6.6 packaging/test/run-bpf-lsm-vm.sh    # another pinned kernel
+#
+# Default = the CI-pinned kernel, NOT the host: the host verifier is laxer and once
+# masked a v6.12 LSM return-bound rejection that only CI caught. So local runs match CI
+# by default; opt into the host kernel explicitly for fast iteration.
 #
 # The host userspace + host-built binaries are exposed read-only in the guest, so
 # there is no rootfs to build.
@@ -25,8 +30,10 @@ just build-ebpf
 # `capability` is the base every kernel needs.
 LSM="${CORDON_VM_LSM:-capability,bpf}"
 
-if [ -n "${CORDON_VM_KERNEL:-}" ]; then
-    exec vng --run "$CORDON_VM_KERNEL" -a "lsm=$LSM" -- bash packaging/test/bpf-lsm-smoke.sh
-else
+# Default to the CI-pinned kernel; `host` selects the running kernel for fast iteration.
+KERNEL="${CORDON_VM_KERNEL:-v6.12}"
+if [ "$KERNEL" = host ]; then
     exec vng --run -a "lsm=$LSM" -- bash packaging/test/bpf-lsm-smoke.sh
+else
+    exec vng --run "$KERNEL" -a "lsm=$LSM" -- bash packaging/test/bpf-lsm-smoke.sh
 fi

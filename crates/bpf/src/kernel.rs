@@ -26,8 +26,8 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{LruHashMap, PerCpuArray, RingBuf};
 use cordon_bpf_common::{
-    Action, Decision, DecisionEvent, Dev, FileId, Ino, ObjId, Offsets, PATH_MAX_DEPTH,
-    PATH_NAME_MAX, PathComp, Pid, Policy, SuppressKey, SuppressVal,
+    Action, Decision, DecisionEvent, Dev, FileId, Ino, ObjId, Offsets, PathComp, Pid, Policy,
+    SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
 };
 
 /// Running-kernel field offsets, injected into `.rodata` by the daemon
