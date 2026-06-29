@@ -75,7 +75,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CORDOND="$ROOT_DIR/target/debug/cordond"
 CORDON="$ROOT_DIR/target/debug/cordon"
 OBJ="$ROOT_DIR/target/bpf/cordon.bpf.o"
-[ -x "$CORDOND" ] || { echo "missing $CORDOND — cargo build -p cordon-daemon --features bpf-lsm" >&2; exit 1; }
+[ -x "$CORDOND" ] || { echo "missing $CORDOND — cargo build -p cordon-daemon" >&2; exit 1; }
 [ -x "$CORDON" ]  || { echo "missing $CORDON — cargo build -p cordon-cli" >&2; exit 1; }
 [ -e "$OBJ" ]     || { echo "missing $OBJ — just build-ebpf" >&2; exit 1; }
 

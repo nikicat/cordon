@@ -107,9 +107,9 @@ and carries out allow/deny — needs privilege, and it sits behind one interface
 | `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS — planned (§12, Phase 4) |
 | `mock` / `fanotify` / `seccomp-unotify` | — | — | no | **removed / dropped** — see note |
 
-The build splits along this seam: the stock workspace compiles the core + CLI on stable
-with no kernel deps; the daemon is built `--features bpf-lsm` to link the aya loader and
-enforce. macOS will add an ES backend behind the same interface.
+The build splits along this seam: the core + CLI compile on stable with no kernel deps;
+the daemon's `bpf-lsm` feature (on by default, Linux-only) links the aya loader and
+enforces. macOS will add an ES backend behind the same interface.
 
 > **Retired backends (history, kept as design contrast).** Earlier iterations shipped a
 > `mock` backend (synthetic events for logic tests) and a root **`fanotify`**
