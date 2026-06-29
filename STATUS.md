@@ -102,7 +102,7 @@ smoke scenarios green):**
 - **(2) Subject-specificity in precedence — ✅ done.** `sort_bucket` now ranks by object
   depth → **subject specificity** (count of non-wildcard predicates, via the `Specificity`
   newtype) → deny>allow (`Polarity`), so `allow exe=X` beats an `audit`/`deny` `who="*"`
-  catch-all on the same object — the basis of the audit→bless→enforce flow A. VM-validated
+  catch-all on the same object — the basis of the audit→admit→enforce flow A. VM-validated
   (smoke scenario 7: a concrete `allow` outranks a `who="*"` deny).
 - **(3) Leaf-path reconstruction — ✅ done.** On an emitted record the kernel walks
   `d_name` from the opened file up to the matched protected object (`bpf_d_path` is
@@ -172,7 +172,7 @@ smoke scenarios green):**
   expressible in the single first-match bucket and only matters once user files are
   user-owned, so it's sequenced with the home-migration (below). Files are root-owned under
   `/etc` for now; **roadmap:** move them to `~user/.config/cordon/` and have cordon *cordon*
-  its own user-policy file (a protected object only a blessed editor may write) — that
+  its own user-policy file (a protected object only an authorized editor may write) — that
   self-protection is the future "edit without sudo".
 
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
@@ -180,6 +180,20 @@ smoke scenarios green):**
 **Pinning must ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active):
 today two daemons can't corrupt each other (each loads private maps), but two daemons sharing
 *pinned* maps would reintroduce a cross-process writer race.
+
+## Designed, not built — blessing (`cordon bless`)
+The runtime, PAM-authenticated access grant is **specced but unimplemented**: [`DESIGN.md`
+§16](docs/DESIGN.md) (design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (milestones B1–B2).
+It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
+(`blessing = "<class>"`), so a blessing rule is an ordinary rule — its action, **object scope**,
+and precedence all reuse the §15 model (scope = the rule's object column; **fully customizable
+in policy**, not blanket). The runtime pieces are a per-invocation **root-owned cgroup** carrier
+(the membership boundary is DAC on `cgroup.procs` — only the root daemon places a task in it,
+after PAM), a tiny unbanked `BLESSED: cgroup_id → ClassId` indirection map, and a
+`cordon bless --class NAME -- <cmd>` CLI. No grace window (every mint authenticates). B1 (the
+boundary) ships the whole scoped feature. (Authoring flow A was renamed observe → **admit** →
+enforce to reserve "bless" for this; the §8.1 threat-model "blessed binary" is unrelated
+generic usage.)
 
 ## Pre-rule-model history (retired)
 Phases 0–3 built an **owner model** — explicit rules + TOFU creator-owns, a root-owned
