@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod passwd;
 pub mod paths;
 pub mod policy;
 pub mod proto;

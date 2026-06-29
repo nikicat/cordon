@@ -856,7 +856,10 @@ trust-DB lineage). `zones` = the scope where autolearn may propose rules.
 Both flows are just *edit the root-owned text policy → `cordon policy apply`* — or, in one
 safe step, `cordon policy edit` (§15.8: edit-as-you → validate → apply → save). There is no
 global mode and no daemon-side wizard; the journal (`audit`/`deny`/`default-deny`, each with
-the matched `exe`/`object`/`action`/`policy`) is the whole feedback loop.
+the caller's `user` and the matched `exe`/`object`/`action`/`policy`) is the whole feedback
+loop. The `user` is the caller's real uid resolved to a login name (captured in-kernel); for
+a *regular* user (§15.8) the `object=`/`path=` print with that user's home collapsed to `~`,
+so a `deny` line copy-pastes straight into their user-tier policy.
 
 **A. Protect a known dir — observe → bless → enforce.**
 1. *Observe.* Add the dir with a `who="*" … policy="audit"` catch-all. Every access logs as

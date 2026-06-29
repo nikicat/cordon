@@ -20,14 +20,14 @@
 //! ([`FileId`]).
 
 use aya_ebpf::helpers::{
-    bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
-    bpf_probe_read_kernel_str_bytes,
+    bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{LruHashMap, PerCpuArray, RingBuf};
 use cordon_bpf_common::{
-    Action, Decision, DecisionEvent, Dev, FileId, Ino, ObjId, Offsets, PathComp, Pid, Policy,
-    SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
+    Action, Decision, DecisionEvent, Dev, FileId, Ino, Nanos, ObjId, Offsets, PathComp, Pid,
+    Policy, Suppressed, Uid, SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
 };
 
 /// Running-kernel field offsets, injected into `.rodata` by the daemon
@@ -64,6 +64,12 @@ fn ptr_at(base: *const u8, off: u32) -> Option<*const u8> {
 /// The thread-group id (userspace pid) of the current task.
 pub fn current_pid() -> Pid {
     Pid((bpf_get_current_pid_tgid() >> 32) as u32)
+}
+
+/// The real uid of the current task (the low 32 bits of `bpf_get_current_uid_gid`; the
+/// high 32 are the gid). The daemon names the user from it on the audit line.
+pub fn current_uid() -> Uid {
+    Uid(bpf_get_current_uid_gid() as u32)
 }
 
 /// A `struct file *`.
@@ -173,6 +179,7 @@ static SCRATCH: PerCpuArray<DecisionEvent> = PerCpuArray::with_max_entries(1, 0)
 #[allow(clippy::too_many_arguments)]
 pub fn emit(
     pid: Pid,
+    uid: Uid,
     exe: FileId,
     object: FileId,
     leaf: FileId,
@@ -180,7 +187,7 @@ pub fn emit(
     action: Action,
     decision: Decision,
     policy: Policy,
-    suppressed: u32,
+    suppressed: Suppressed,
     file: File,
     object_dentry: Dentry,
 ) {
@@ -197,6 +204,7 @@ pub fn emit(
         (*ev).obj = obj;
         (*ev).action = action;
         (*ev).pid = pid;
+        (*ev).uid = uid;
         (*ev).decision = decision;
         (*ev).suppressed = suppressed;
         (*ev).policy = policy;
@@ -264,7 +272,7 @@ fn fill_comps(
 /// many nanoseconds (1s). The audit found tools re-open the same config hundreds of
 /// times per run; a 1s window collapses each such burst to its first occurrence + a
 /// count, keeping the ring (and the learn path) quiet without losing the event.
-const SUPPRESS_WINDOW_NS: u64 = 1_000_000_000;
+const SUPPRESS_WINDOW_NS: Nanos = Nanos(1_000_000_000);
 
 /// The in-kernel event suppressor (M1 §1g): the hottest decision keys and when each
 /// last emitted. **LRU** so a full map evicts the coldest key rather than refusing a
@@ -279,7 +287,7 @@ static SUPPRESS: LruHashMap<SuppressKey, SuppressVal> = LruHashMap::with_max_ent
 /// the protected object, so distinct files under one audited root each surface (DESIGN
 /// §15.10 flow B). Best-effort: a failed map write just means a slightly off count, never
 /// a missed *first* occurrence.
-pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<u32> {
+pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed> {
     let now = now_ns();
     let key = SuppressKey::new(exe, leaf, action);
     match suppress_get(&key) {
@@ -287,20 +295,20 @@ pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<u32> {
         Some(prev) if now.wrapping_sub(prev.last_ns) < SUPPRESS_WINDOW_NS => {
             let _ = SUPPRESS.insert(
                 &key,
-                &SuppressVal::new(prev.last_ns, prev.suppressed.saturating_add(1)),
+                &SuppressVal::new(prev.last_ns, Suppressed(prev.suppressed.0.saturating_add(1))),
                 0,
             );
             None
         }
         // Window elapsed → emit, reporting the burst we held back, and reset.
         Some(prev) => {
-            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, 0), 0);
+            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed(0)), 0);
             Some(prev.suppressed)
         }
         // First occurrence → emit immediately, start tracking.
         None => {
-            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, 0), 0);
-            Some(0)
+            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed(0)), 0);
+            Some(Suppressed(0))
         }
     }
 }
@@ -312,8 +320,8 @@ fn suppress_get(key: &SuppressKey) -> Option<SuppressVal> {
 }
 
 /// Monotonic nanoseconds since boot (`bpf_ktime_get_ns`), the suppressor's clock.
-fn now_ns() -> u64 {
-    unsafe { bpf_ktime_get_ns() }
+fn now_ns() -> Nanos {
+    Nanos(unsafe { bpf_ktime_get_ns() })
 }
 
 /// The current task's `mm->exe_file`, if any (kernel threads have no `mm`).
