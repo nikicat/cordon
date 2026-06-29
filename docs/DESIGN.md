@@ -480,6 +480,17 @@ the `cordon` CLI. Per-protected-dir cost = a rule, not a per-tool profile.
   Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
 
 ## 11. Testing strategy — internal fixtures
+
+> **Definition of done — every change is VM-validated locally before it's complete.** Run
+> `packaging/test/run-bpf-lsm-vm.sh` (default = the CI-pinned kernel, currently `v6.12`) and
+> confirm **all** `bpf-lsm-smoke.sh` scenarios pass — *including for userspace-only changes*
+> (policy compiler, CLI, daemon control plane): the VM is the one tier that exercises the
+> real kernel boundary end-to-end, and a userspace change can still break seeding, the IPC
+> apply path, or a policy shape. `cargo test` (the unprivileged tier) is necessary but **not
+> sufficient**. When a change adds or alters enforcement behavior, add or extend a scenario
+> so the suite still covers it. The same harness + pinned kernel run locally and in CI, so a
+> green local VM run is the gate, not a courtesy.
+
 The kernel-backed smoke (`bpf-lsm-smoke.sh`) drives the rule model end-to-end with
 distinct-inode exes (copies of `bash`, so each is its own subject) reading/writing secrets
 under a protected subtree, against a policy file:
@@ -763,16 +774,64 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
   — **file-local groups**, its own `user =` home — then the resolved rules are **merged**
   into one table and compiled together. Precedence (object/subject specificity, then
   deny>allow) is source-order-independent, so fragment load order can't change a verdict;
-  a flat merge is safe because every fragment is root-owned (system-beats-user *tiers*
-  remain an open question, only needed if a system baseline-deny must be unoverridable). A
+  a flat merge is safe because every fragment is root-owned. A
   bad fragment fails the whole apply, named in the diagnostic — never a silent partial
   load. `apply` ships the read fragments (`Vec<PolicySource>`) to the daemon, which
   resolves their homes and merges.
+- **System / user tiers (✅ 2026-06-29).** The effective policy is **system tier ⊕ user
+  tier**. A *system* fragment can pull in a *user-tier* file with an `[[include]]` directive
+  naming the owning user; that file's rules are **confined to that user's home** (every
+  object path must resolve under `~user`, enforced at compile — a user can't write rules
+  about `/etc` or another home). The binding lives system-side (an admin opt-in), so a user
+  file can't self-declare its own scope, and a user-tier file may not itself `[[include]]`.
+  Each `PolicySource` now carries its [`SourceOrigin`] tier; `load_policy` does the include
+  expansion (CLI on `apply`, daemon at startup). **Precedence between tiers is deferred:**
+  the intended semantics is *system-is-a-floor* (a user may tighten — add denies — but not
+  loosen a system deny), which needs the kernel to evaluate the two tiers' buckets
+  separately and combine deny-wins — **not expressible in the single first-match bucket**
+  today. It only becomes a security boundary once user files move into user-owned homes, so
+  it lands with that migration; for now the tiers merge flat (both are root-owned ⇒ equally
+  trusted), and the tier only drives `~` resolution and the home-scope lint.
+  ```toml
+  # /etc/cordon/conf.d/00-users.toml  (system tier, root-authored)
+  [[include]]
+  user = "alice"
+  path = "/etc/cordon/users/alice.toml"   # later: ~alice/.config/cordon/policy.toml
+
+  # /etc/cordon/users/alice.toml  (user tier — every object must be under ~alice)
+  rules = '''
+  allow  /usr/bin/ssh  read  ~/.ssh
+  deny   *             read  ~/.config/my-secret
+  '''
+  ```
+  Author it with `cordon policy edit --user alice`.
+  > **Migration roadmap.** User files are root-owned under `/etc` for now (so `sudo` gates
+  > every edit). The target is to move them into `~user/.config/cordon/`, at which point
+  > **cordon must cordon its own user-policy file** — make it a protected object only a
+  > blessed editor may write — so a same-uid scraper can't author policy. That self-protection
+  > *is* the "edit without sudo" mechanism, and it's why the file belongs in the home.
 - **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
   swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
   only on an explicit apply, so an edit-in-progress is never half-enforced.
 - **`cordon policy check`** — linter/compiler: unknown exes, group cycles, shadowed /
   unreachable rules, missing paths, deny-shadowed-by-allow.
+- **`cordon policy edit`** — the **sudoedit analog** (✅ 2026-06-29). `sudo cordon policy
+  edit` copies the root-owned file to a private temp, runs `$EDITOR` **as the invoking
+  user** (never root — `sudo $EDITOR policy.toml` would run the editor as root, and a
+  same-uid scraper (§2) that wrote your `.vimrc`/plugins gets root: a self-inflicted
+  escalation in cordon's own threat model), then *validates → applies → saves* in one step.
+  visudo-style: a policy that won't compile is rejected with diagnostics and re-prompts
+  rather than persisting a broken file. It writes the file **only after** the daemon accepts
+  the policy, so on-disk == live (daemon down ⇒ saved, warned "not applied"). Self-privileged
+  (the CLI stays root in the parent, drops only in the editor child); reuses `PolicyApply`,
+  no new IPC. `cordon policy edit FILE` edits a system file (a bare name → that conf.d
+  fragment); `cordon policy edit --user NAME` edits the user-tier file a system `[[include]]`
+  binds to `NAME` (home-scope-validated). When **no** include exists yet, `--user` is
+  self-bootstrapping: it opens the file at the convention path (`…/users/NAME.toml`) and, only
+  **after** the edit validates and saves, registers the `[[include]]` in `…/conf.d/00-users.toml`
+  — so a cancelled or rejected edit never leaves a stale binding. *(Who may run it — the socket
+  has no peer-cred gate yet — is the open authorization question, deferred; today it inherits
+  root via `sudo`.)*
 - **Atomic swap** in-kernel — **implemented** as a generation-counter **double-buffer**:
   the rule maps are banked, the daemon fills the inactive bank and flips `active_bank` in
   one write (RCU-style), so an `apply` has no visible window.
@@ -794,7 +853,8 @@ trust-DB lineage). `zones` = the scope where autolearn may propose rules.
   learned db is throwaway; the text file is durable.
 
 ### 15.10 Authoring flows
-Both flows are just *edit the root-owned text policy → `cordon policy apply`*. There is no
+Both flows are just *edit the root-owned text policy → `cordon policy apply`* — or, in one
+safe step, `cordon policy edit` (§15.8: edit-as-you → validate → apply → save). There is no
 global mode and no daemon-side wizard; the journal (`audit`/`deny`/`default-deny`, each with
 the matched `exe`/`object`/`action`/`policy`) is the whole feedback loop.
 

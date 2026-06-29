@@ -181,6 +181,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "cordon-core",
+ "nix",
  "serde",
  "serde_json",
 ]

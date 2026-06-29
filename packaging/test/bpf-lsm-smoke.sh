@@ -45,6 +45,12 @@
 #                       §15.10 flow B), incl. a depth-2 nested file. The kernel walks
 #                       d_name (no bpf_d_path at file_open); the suppressor keys on the
 #                       opened file, so siblings don't coalesce away.
+#  14. user tier      — a system fragment `[[include]]`s a user-tier file scoped to a
+#                       user's home (DESIGN §15.8); BOTH a system-tier rule and the
+#                       included user-tier rule enforce in-kernel, proving the tier
+#                       assembly (load_policy include-expansion → merged maps) wires all
+#                       the way through. Home-scope *validation* is a userspace compile
+#                       check (unit-tested); this proves the enforcement path.
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -533,6 +539,63 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario 14: system + user tiers (an [[include]]d user rule enforces) ---
+# A system fragment carries a system-tier rule AND an `[[include]]` pulling in a user-tier
+# file scoped to root's home (~root = /root, always in passwd). The included rule must
+# enforce in-kernel exactly like a system rule — proving the tier assembly
+# (load_policy → include expansion → tier-aware compile → merged maps) reaches the kernel.
+# The user vault sits under /root so it passes the home-scope check; the system vault is
+# under $TMP (system tier has no scope limit). Exes/subjects are unscoped either way.
+scenario_user_tier() {
+    echo "### scenario: system + user tiers (a system rule and an [[include]]d user rule both enforce)"
+    ws_new   # exes (OWNER/OWNER_B/SCRAPER), TMP, SOCK, LOG
+    local sysvault="$TMP/sysvault"; mkdir -p "$sysvault"; echo SYS > "$sysvault/secret"
+    local usrvault="/root/cordon-tier-$$"; mkdir -p "$usrvault"; echo USR > "$usrvault/secret"
+    mkdir -p "$TMP/conf.d" "$TMP/users"
+    # System fragment: a system-tier allow + the include binding root's user-tier file.
+    cat > "$TMP/conf.d/00-system.toml" <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$sysvault"
+action = "read"
+policy = "allow"
+
+[[include]]
+user = "root"
+path = "$TMP/users/root.toml"
+EOF
+    # User-tier file (objects must be under ~root): only OWNER_B may read the user vault.
+    cat > "$TMP/users/root.toml" <<EOF
+[[rule]]
+who = "$OWNER_B"
+where = "$usrvault"
+action = "read"
+policy = "allow"
+EOF
+    cat > "$TMP/config.toml" <<EOF
+backend = "bpf-lsm"
+socket = "$SOCK"
+bpf_object = "$OBJ"
+policy = "$TMP/conf.d"
+EOF
+    export CORDON_CONFIG="$TMP/config.toml"
+
+    daemon_start
+    if ! wait_active; then
+        echo "  FAIL: daemon did not become active"; sed 's/^/  daemon| /' "$LOG"
+        daemon_stop; rm -rf "$usrvault"; return 1
+    fi
+    local fail=0
+    expect_allow "system-tier rule: OWNER reads the system vault"        read_as "$OWNER"   "$sysvault/secret" || fail=1
+    expect_allow "user-tier (included) rule: OWNER_B reads the ~root vault" read_as "$OWNER_B" "$usrvault/secret" || fail=1
+    expect_deny  "scraper denied the system vault (default-deny)"         read_as "$SCRAPER" "$sysvault/secret" || fail=1
+    expect_deny  "scraper denied the ~root user vault (default-deny)"     read_as "$SCRAPER" "$usrvault/secret" || fail=1
+    expect_deny  "OWNER denied the user vault (only OWNER_B is allowed there)" read_as "$OWNER" "$usrvault/secret" || fail=1
+    daemon_stop
+    rm -rf "$usrvault"
+    return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -548,6 +611,7 @@ scenario_silence           || rc=1
 scenario_apply             || rc=1
 scenario_coalesce          || rc=1
 scenario_leaf_path         || rc=1
+scenario_user_tier         || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then
