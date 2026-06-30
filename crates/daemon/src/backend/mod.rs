@@ -1,8 +1,8 @@
-//! Backend selection. Under the rule model the only backend is `bpf-lsm` (the
-//! hardened Linux boundary), compiled in with the `bpf-lsm` cargo feature. The earlier
-//! owner-model backends were retired with the rule-model migration (DESIGN §15), so a
-//! stock build (without the feature) has no functional backend — `select` returns a
-//! clear error pointing at `--features bpf-lsm`.
+//! Backend selection. Under the rule model the only backend is `bpf-lsm` (the hardened
+//! Linux boundary), in the `bpf-lsm` cargo feature — **on by default**, so a stock Linux
+//! build has it. The earlier owner-model backends were retired with the rule-model
+//! migration (DESIGN §15). The feature is Linux-only, so `select` only hits the
+//! no-backend error on a non-Linux target or a `--no-default-features` build.
 
 use cordon_core::Result;
 use cordon_core::backend::{Backend, BackendKind};
@@ -26,9 +26,10 @@ pub fn select(cfg: &Config) -> Result<Box<dyn Backend>> {
             #[cfg(not(all(target_os = "linux", feature = "bpf-lsm")))]
             {
                 Err(cordon_core::Error::msg(
-                    "the 'bpf-lsm' backend requires Linux and the `bpf-lsm` build \
-                     feature — rebuild with `cargo build -p cordon-daemon --features bpf-lsm` \
-                     (or `just build-bpf-daemon`)",
+                    "this build has no 'bpf-lsm' backend — it is Linux-only and on by \
+                     default, so this is a non-Linux target or a `--no-default-features` \
+                     build. Rebuild on Linux with default features (`cargo build -p \
+                     cordon-daemon`, or `just build-bpf-daemon`)",
                 ))
             }
         }

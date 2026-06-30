@@ -45,6 +45,17 @@
 #                       §15.10 flow B), incl. a depth-2 nested file. The kernel walks
 #                       d_name (no bpf_d_path at file_open); the suppressor keys on the
 #                       opened file, so siblings don't coalesce away.
+#  14. user tier      — a system fragment `[[include]]`s a user-tier file scoped to a
+#                       user's home (DESIGN §15.8); BOTH a system-tier rule and the
+#                       included user-tier rule enforce in-kernel, proving the tier
+#                       assembly (load_policy include-expansion → merged maps) wires all
+#                       the way through. Home-scope *validation* is a userspace compile
+#                       check (unit-tested); this proves the enforcement path.
+#  15. audit ~ collapse — the audit line names the caller's user (kernel-captured uid →
+#                       passwd) and, for a *regular* user, renders object=/path= with their
+#                       home collapsed to `~` (DESIGN §15.10) — so a logged access is
+#                       copy-pasteable into that user's policy. Reads a vault as a
+#                       synthesized regular uid and asserts the ~-collapsed line.
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -64,7 +75,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CORDOND="$ROOT_DIR/target/debug/cordond"
 CORDON="$ROOT_DIR/target/debug/cordon"
 OBJ="$ROOT_DIR/target/bpf/cordon.bpf.o"
-[ -x "$CORDOND" ] || { echo "missing $CORDOND — cargo build -p cordon-daemon --features bpf-lsm" >&2; exit 1; }
+[ -x "$CORDOND" ] || { echo "missing $CORDOND — cargo build -p cordon-daemon" >&2; exit 1; }
 [ -x "$CORDON" ]  || { echo "missing $CORDON — cargo build -p cordon-cli" >&2; exit 1; }
 [ -e "$OBJ" ]     || { echo "missing $OBJ — just build-ebpf" >&2; exit 1; }
 
@@ -80,6 +91,9 @@ mk_exe() { local p="$TMP/$1"; cp "$(command -v bash)" "$p"; echo "$p"; }
 # sees *its* inode as the caller.
 read_as()  { "$1" -c 'exec 3<"$1"' bash "$2" 2>/dev/null; }   # $1 exe  $2 file
 write_as() { "$1" -c 'exec 3>"$1"' bash "$2" 2>/dev/null; }   # opens O_WRONLY|O_CREAT|O_TRUNC
+# Read FILE as EXE *dropped to UID* (real uid the kernel records) — for the audit-log
+# user/`~` scenario. setpriv sheds root before exec so the open is attributed to UID.
+read_as_uid() { setpriv --reuid "$1" --regid "$1" --clear-groups "$2" -c 'exec 3<"$1"' bash "$3" 2>/dev/null; } # $1 uid $2 exe $3 file
 
 # Fresh workspace: a vault with a secret + a sibling, and three distinct exes.
 ws_new() {
@@ -166,10 +180,13 @@ EOF
     local fail=0
     expect_allow "owner reads its secret"  read_as "$OWNER"   "$SECRET" || fail=1
     expect_deny  "scraper reads the secret" read_as "$SCRAPER" "$SECRET" || fail=1
-    if wait_log 'deny pid=[0-9]+ exe=.* object=.*vault path=.*/vault/secret action=read policy=default-deny'; then
-        echo "  OK: denial reported on the ring buffer (object + opened path + action, default-deny)"
+    # root runs the readers, so the caller resolves to user=root (uid 0 → passwd), proving
+    # the kernel-captured uid reaches the journal; root is not a regular user, so paths stay
+    # absolute (no `~` collapse — that's exercised by the daemon's unit tests).
+    if wait_log 'deny pid=[0-9]+ user=root exe=.* object=.*vault path=.*/vault/secret action=read policy=default-deny'; then
+        echo "  OK: denial reported on the ring buffer (user + object + opened path + action, default-deny)"
     else
-        echo "  FAIL: no deny record with the object, opened path, and action"; sed 's/^/  daemon| /' "$LOG"; fail=1
+        echo "  FAIL: no deny record with the user, object, opened path, and action"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
     daemon_stop; return $fail
 }
@@ -352,7 +369,7 @@ EOF
     daemon_start; started || return 1
     local fail=0
     expect_allow "scraper reads under audit (observe, not enforce)" read_as "$SCRAPER" "$SECRET" || fail=1
-    if wait_log 'audit pid=[0-9]+ exe=.* object=.* action=read'; then
+    if wait_log 'audit pid=[0-9]+ user=root exe=.* object=.* action=read'; then
         echo "  OK: the audit catch-all logged the read (allowed)"
     else
         echo "  FAIL: no audit record for the observed read"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -374,8 +391,8 @@ EOF
     fi
     expect_deny "scraper denied after the flip to deny" read_as "$SCRAPER" "$SECRET" || fail=1
     # Drive reads to cross the in-kernel suppressor's 1s window, then assert a deny record.
-    for _ in $(seq 1 40); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; log_has 'deny pid=[0-9]+ exe=.* action=read' && break; sleep 0.1; done
-    if log_has 'deny pid=[0-9]+ exe=.* object=.* action=read'; then
+    for _ in $(seq 1 40); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; log_has 'deny pid=[0-9]+ user=root exe=.* action=read' && break; sleep 0.1; done
+    if log_has 'deny pid=[0-9]+ user=root exe=.* object=.* action=read'; then
         echo "  OK: the same access now logs as deny (enforced)"
     else
         echo "  FAIL: no deny record after the flip to deny"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -533,6 +550,112 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario 14: system + user tiers (an [[include]]d user rule enforces) ---
+# A system fragment carries a system-tier rule AND an `[[include]]` pulling in a user-tier
+# file scoped to root's home (~root = /root, always in passwd). The included rule must
+# enforce in-kernel exactly like a system rule — proving the tier assembly
+# (load_policy → include expansion → tier-aware compile → merged maps) reaches the kernel.
+# The user vault sits under /root so it passes the home-scope check; the system vault is
+# under $TMP (system tier has no scope limit). Exes/subjects are unscoped either way.
+scenario_user_tier() {
+    echo "### scenario: system + user tiers (a system rule and an [[include]]d user rule both enforce)"
+    ws_new   # exes (OWNER/OWNER_B/SCRAPER), TMP, SOCK, LOG
+    local sysvault="$TMP/sysvault"; mkdir -p "$sysvault"; echo SYS > "$sysvault/secret"
+    local usrvault="/root/cordon-tier-$$"; mkdir -p "$usrvault"; echo USR > "$usrvault/secret"
+    mkdir -p "$TMP/conf.d" "$TMP/users"
+    # System fragment: a system-tier allow + the include binding root's user-tier file.
+    cat > "$TMP/conf.d/00-system.toml" <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$sysvault"
+action = "read"
+policy = "allow"
+
+[[include]]
+user = "root"
+path = "$TMP/users/root.toml"
+EOF
+    # User-tier file (objects must be under ~root): only OWNER_B may read the user vault.
+    cat > "$TMP/users/root.toml" <<EOF
+[[rule]]
+who = "$OWNER_B"
+where = "$usrvault"
+action = "read"
+policy = "allow"
+EOF
+    cat > "$TMP/config.toml" <<EOF
+backend = "bpf-lsm"
+socket = "$SOCK"
+bpf_object = "$OBJ"
+policy = "$TMP/conf.d"
+EOF
+    export CORDON_CONFIG="$TMP/config.toml"
+
+    daemon_start
+    if ! wait_active; then
+        echo "  FAIL: daemon did not become active"; sed 's/^/  daemon| /' "$LOG"
+        daemon_stop; rm -rf "$usrvault"; return 1
+    fi
+    local fail=0
+    expect_allow "system-tier rule: OWNER reads the system vault"        read_as "$OWNER"   "$sysvault/secret" || fail=1
+    expect_allow "user-tier (included) rule: OWNER_B reads the ~root vault" read_as "$OWNER_B" "$usrvault/secret" || fail=1
+    expect_deny  "scraper denied the system vault (default-deny)"         read_as "$SCRAPER" "$sysvault/secret" || fail=1
+    expect_deny  "scraper denied the ~root user vault (default-deny)"     read_as "$SCRAPER" "$usrvault/secret" || fail=1
+    expect_deny  "OWNER denied the user vault (only OWNER_B is allowed there)" read_as "$OWNER" "$usrvault/secret" || fail=1
+    daemon_stop
+    rm -rf "$usrvault"
+    return $fail
+}
+
+# --- scenario 15: audit-log ~ collapse for a regular user --------------------
+# The headline of the audit-log change (DESIGN §15.10): for a *regular* user the journal
+# renders object=/path= with that user's home collapsed to ~, so a deny/audit line drops
+# straight into the user's policy. We synthesize a throwaway regular user (uid in the
+# [1000,60000] window) with a writable home under /tmp, audit a vault inside it, and read it
+# *as* that user — the kernel records the uid, the daemon resolves it via /etc/passwd (its
+# mtime-keyed cache picks up the appended line) and renders ~. The collapse is caller-driven,
+# not tier-driven, so a plain system policy suffices. (Skips if the guest can't drop uid or
+# edit /etc/passwd.)
+scenario_user_home_tilde() {
+    echo "### scenario: audit-log ~ collapse (a regular user's home renders as ~)"
+    ws_new
+    if ! command -v setpriv >/dev/null; then
+        echo "  SKIP: setpriv unavailable — cannot run the reader as a non-root uid"; daemon_stop; return 0
+    fi
+    local tuser="cordontilde$$" tuid=4242
+    local thome="$TMP/home" tvault tsecret
+    tvault="$thome/.creds"; tsecret="$tvault/key"
+    mkdir -p "$tvault"; echo SECRET > "$tsecret"
+    chown -R "$tuid:$tuid" "$thome"
+    chmod 755 "$TMP"   # let $tuid traverse the workspace to its home and the exe
+    # Register the synthetic user so the daemon's passwd lookup resolves uid → name + home.
+    if ! printf '%s:x:%s:%s:Cordon Tilde:%s:/bin/sh\n' "$tuser" "$tuid" "$tuid" "$thome" >> /etc/passwd 2>/dev/null; then
+        echo "  SKIP: /etc/passwd not writable in this guest — cannot synthesize a regular user"; daemon_stop; return 0
+    fi
+    write_policy <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$tvault"
+action = "read"
+policy = "audit"
+EOF
+    daemon_start
+    if ! started; then sed -i "/^$tuser:/d" /etc/passwd 2>/dev/null; return 1; fi
+    local fail=0
+    expect_allow "regular user reads its cred (audit)" read_as_uid "$tuid" "$OWNER" "$tsecret" || fail=1
+    # The audit line names the user and collapses ~ on BOTH object= (the rule's dir) and
+    # path= (the opened file): object=~/.creds, path=~/.creds/key — copy-pasteable into the
+    # user's policy verbatim.
+    if wait_log "audit pid=[0-9]+ user=$tuser exe=.* object=~/\.creds path=~/\.creds/key action=read"; then
+        echo "  OK: audit line shows user=$tuser with ~-collapsed object and path"
+    else
+        echo "  FAIL: no audit line with user=$tuser and ~-collapsed paths"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    daemon_stop
+    sed -i "/^$tuser:/d" /etc/passwd 2>/dev/null   # undo the synthetic passwd entry (ephemeral VM)
+    return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -548,6 +671,8 @@ scenario_silence           || rc=1
 scenario_apply             || rc=1
 scenario_coalesce          || rc=1
 scenario_leaf_path         || rc=1
+scenario_user_tier         || rc=1
+scenario_user_home_tilde   || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

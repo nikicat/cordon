@@ -5,7 +5,11 @@
 //! the in-kernel maps; `policy show` and `status` read the effective policy. There are
 //! no per-object owner mutations — the owner model was retired with the rule model.
 
+mod edit;
+mod sys;
+
 use clap::{Parser, Subcommand};
+use cordon_core::policy::UserName;
 use cordon_core::proto::{Request, Response, read_msg, write_msg};
 use cordon_core::{Config, Error, Result, policy};
 use std::io::{BufReader, BufWriter};
@@ -59,6 +63,24 @@ enum PolicyCmd {
         /// Policy file (default: the configured `policy` path).
         file: Option<PathBuf>,
     },
+    /// Edit the policy in `$EDITOR`, then validate + apply + save in one step — the
+    /// sudoedit analog. The editor runs as the invoking user (never root); the result is
+    /// compiled and pushed to the daemon, and the root-owned file is written only once the
+    /// daemon accepts it. Run via `sudo` for a root-owned policy.
+    Edit {
+        /// Policy file to edit (default: the configured `policy` path; for a conf.d
+        /// directory, name a fragment, e.g. `local` → `…/conf.d/local.toml`).
+        file: Option<PathBuf>,
+        /// Edit the user-tier policy a system `[[include]]` binds to this user (its rules
+        /// are confined to that user's home). Mutually exclusive with FILE.
+        #[arg(long, conflicts_with = "file")]
+        user: Option<UserName>,
+        /// Launch the editor as root when there is no unprivileged invoker (e.g. a root
+        /// login without sudo). Off by default — running an editor as root re-opens the
+        /// same-uid escalation this command exists to avoid.
+        #[arg(long)]
+        allow_root_editor: bool,
+    },
     /// Show the effective (currently-loaded) compiled policy.
     Show,
 }
@@ -72,6 +94,30 @@ fn main() -> ExitCode {
     } = &cli.cmd
     {
         return policy_check(file.as_deref(), &cli);
+    }
+
+    // `policy edit` drives its own flow (editor → validate → apply → save), reaching the
+    // daemon only via the shared `PolicyApply` path, so it routes here rather than through
+    // the single-request round-trip below.
+    if let Cmd::Policy {
+        cmd:
+            PolicyCmd::Edit {
+                file,
+                user,
+                allow_root_editor,
+            },
+    } = &cli.cmd
+    {
+        // `--user` and FILE are mutually exclusive (clap-enforced), so one selects the target.
+        let target = match user {
+            Some(u) => edit::EditTarget::User(u.clone()),
+            None => edit::EditTarget::File(file.clone()),
+        };
+        return edit::run(
+            target,
+            edit::RootEditor::from_flag(*allow_root_editor),
+            &cli,
+        );
     }
 
     let socket = match resolve_socket(&cli) {
@@ -117,12 +163,14 @@ fn build_request(cli: &Cli) -> Result<Request> {
             PolicyCmd::Show => Ok(Request::PolicyShow),
             PolicyCmd::Apply { file } => {
                 let path = policy_path(file.as_deref(), cli)?;
-                // Read the policy source (a file, or a conf.d dir of fragments) and ship
-                // the fragments; the daemon resolves per-fragment homes + merges.
-                let sources = policy::read_sources(&path)?;
+                // Read the policy source (a file, or a conf.d dir of fragments) and expand
+                // any `[[include]]` user-tier files; ship the lot. The daemon resolves
+                // per-fragment homes, merges, and compiles.
+                let sources = policy::load_policy(&path)?;
                 Ok(Request::PolicyApply { sources })
             }
             PolicyCmd::Check { .. } => unreachable!("check is handled locally"),
+            PolicyCmd::Edit { .. } => unreachable!("edit is handled locally"),
         },
     }
 }
@@ -137,10 +185,10 @@ fn policy_check(file: Option<&Path>, cli: &Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A file → one fragment; a conf.d dir → every `*.toml`. Each resolves with its own
-    // `user =` home (else the CLI `$HOME`); per-fragment errors are folded into the
-    // compile diagnostics, naming the fragment.
-    let sources = match policy::read_sources(&path) {
+    // A file → one fragment; a conf.d dir → every `*.toml`; plus any `[[include]]`
+    // user-tier files. Each resolves with its own home (the owning user's, else the CLI
+    // `$HOME`); per-fragment errors fold into the compile diagnostics, naming the fragment.
+    let sources = match policy::load_policy(&path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cordon: {e}");

@@ -139,7 +139,7 @@ impl BpfLsmBackend {
     /// fragments). Returns an error (refusing to seed) if it has any error-severity
     /// finding — a bad startup policy must not silently run.
     fn compile_policy(&self) -> Result<CompiledPolicy> {
-        let sources = policy::read_sources(&self.policy)?;
+        let sources = policy::load_policy(&self.policy)?;
         let compiled = compile_sources(&sources);
         if compiled.has_errors() {
             return Err(Error::msg(format!(

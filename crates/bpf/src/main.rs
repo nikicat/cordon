@@ -169,8 +169,11 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
             // `emit` assembles the record off-stack (per-CPU scratch) and reconstructs the
             // opened file's path relative to the protected object (DESIGN §15.10 flow B) —
             // no `bpf_d_path` here, so it walks `d_name` from the leaf to `object_dentry`.
+            // The uid is read only on the logged path, so the unprotected majority pays
+            // nothing for it.
             kernel::emit(
                 pid,
+                kernel::current_uid(),
                 exe,
                 matched.object,
                 matched.leaf,

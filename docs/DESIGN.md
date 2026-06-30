@@ -7,6 +7,8 @@ Language: **Rust**. Policy: a **root-owned text file** compiled to in-kernel BPF
 
 > **Reading guide.** **§15 is the current architecture** — the flat *rule model*,
 > implemented in M1 (see [`PLAN-rule-model.md`](PLAN-rule-model.md) for the milestones).
+> **§16 specifies *blessing*** — the planned runtime, PAM-authenticated access grant
+> (`cordon bless`), milestones in [`PLAN-bless.md`](PLAN-bless.md).
 > §1–§14 are the foundational design and its evolution: the v1 **owner model** (owners /
 > TOFU / interactive prompts) and the **fanotify** backend they describe were **retired**
 > in the rule-model migration and no longer exist in the code. Those sections are kept for
@@ -107,9 +109,9 @@ and carries out allow/deny — needs privilege, and it sits behind one interface
 | `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS — planned (§12, Phase 4) |
 | `mock` / `fanotify` / `seccomp-unotify` | — | — | no | **removed / dropped** — see note |
 
-The build splits along this seam: the stock workspace compiles the core + CLI on stable
-with no kernel deps; the daemon is built `--features bpf-lsm` to link the aya loader and
-enforce. macOS will add an ES backend behind the same interface.
+The build splits along this seam: the core + CLI compile on stable with no kernel deps;
+the daemon's `bpf-lsm` feature (on by default, Linux-only) links the aya loader and
+enforces. macOS will add an ES backend behind the same interface.
 
 > **Retired backends (history, kept as design contrast).** Earlier iterations shipped a
 > `mock` backend (synthetic events for logic tests) and a root **`fanotify`**
@@ -480,6 +482,17 @@ the `cordon` CLI. Per-protected-dir cost = a rule, not a per-tool profile.
   Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
 
 ## 11. Testing strategy — internal fixtures
+
+> **Definition of done — every change is VM-validated locally before it's complete.** Run
+> `packaging/test/run-bpf-lsm-vm.sh` (default = the CI-pinned kernel, currently `v6.12`) and
+> confirm **all** `bpf-lsm-smoke.sh` scenarios pass — *including for userspace-only changes*
+> (policy compiler, CLI, daemon control plane): the VM is the one tier that exercises the
+> real kernel boundary end-to-end, and a userspace change can still break seeding, the IPC
+> apply path, or a policy shape. `cargo test` (the unprivileged tier) is necessary but **not
+> sufficient**. When a change adds or alters enforcement behavior, add or extend a scenario
+> so the suite still covers it. The same harness + pinned kernel run locally and in CI, so a
+> green local VM run is the gate, not a courtesy.
+
 The kernel-backed smoke (`bpf-lsm-smoke.sh`) drives the rule model end-to-end with
 distinct-inode exes (copies of `bash`, so each is its own subject) reading/writing secrets
 under a protected subtree, against a policy file:
@@ -763,16 +776,64 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
   — **file-local groups**, its own `user =` home — then the resolved rules are **merged**
   into one table and compiled together. Precedence (object/subject specificity, then
   deny>allow) is source-order-independent, so fragment load order can't change a verdict;
-  a flat merge is safe because every fragment is root-owned (system-beats-user *tiers*
-  remain an open question, only needed if a system baseline-deny must be unoverridable). A
+  a flat merge is safe because every fragment is root-owned. A
   bad fragment fails the whole apply, named in the diagnostic — never a silent partial
   load. `apply` ships the read fragments (`Vec<PolicySource>`) to the daemon, which
   resolves their homes and merges.
+- **System / user tiers (✅ 2026-06-29).** The effective policy is **system tier ⊕ user
+  tier**. A *system* fragment can pull in a *user-tier* file with an `[[include]]` directive
+  naming the owning user; that file's rules are **confined to that user's home** (every
+  object path must resolve under `~user`, enforced at compile — a user can't write rules
+  about `/etc` or another home). The binding lives system-side (an admin opt-in), so a user
+  file can't self-declare its own scope, and a user-tier file may not itself `[[include]]`.
+  Each `PolicySource` now carries its [`SourceOrigin`] tier; `load_policy` does the include
+  expansion (CLI on `apply`, daemon at startup). **Precedence between tiers is deferred:**
+  the intended semantics is *system-is-a-floor* (a user may tighten — add denies — but not
+  loosen a system deny), which needs the kernel to evaluate the two tiers' buckets
+  separately and combine deny-wins — **not expressible in the single first-match bucket**
+  today. It only becomes a security boundary once user files move into user-owned homes, so
+  it lands with that migration; for now the tiers merge flat (both are root-owned ⇒ equally
+  trusted), and the tier only drives `~` resolution and the home-scope lint.
+  ```toml
+  # /etc/cordon/conf.d/00-users.toml  (system tier, root-authored)
+  [[include]]
+  user = "alice"
+  path = "/etc/cordon/users/alice.toml"   # later: ~alice/.config/cordon/policy.toml
+
+  # /etc/cordon/users/alice.toml  (user tier — every object must be under ~alice)
+  rules = '''
+  allow  /usr/bin/ssh  read  ~/.ssh
+  deny   *             read  ~/.config/my-secret
+  '''
+  ```
+  Author it with `cordon policy edit --user alice`.
+  > **Migration roadmap.** User files are root-owned under `/etc` for now (so `sudo` gates
+  > every edit). The target is to move them into `~user/.config/cordon/`, at which point
+  > **cordon must cordon its own user-policy file** — make it a protected object only an
+  > authorized editor may write — so a same-uid scraper can't author policy. That self-protection
+  > *is* the "edit without sudo" mechanism, and it's why the file belongs in the home.
 - **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
   swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
   only on an explicit apply, so an edit-in-progress is never half-enforced.
 - **`cordon policy check`** — linter/compiler: unknown exes, group cycles, shadowed /
   unreachable rules, missing paths, deny-shadowed-by-allow.
+- **`cordon policy edit`** — the **sudoedit analog** (✅ 2026-06-29). `sudo cordon policy
+  edit` copies the root-owned file to a private temp, runs `$EDITOR` **as the invoking
+  user** (never root — `sudo $EDITOR policy.toml` would run the editor as root, and a
+  same-uid scraper (§2) that wrote your `.vimrc`/plugins gets root: a self-inflicted
+  escalation in cordon's own threat model), then *validates → applies → saves* in one step.
+  visudo-style: a policy that won't compile is rejected with diagnostics and re-prompts
+  rather than persisting a broken file. It writes the file **only after** the daemon accepts
+  the policy, so on-disk == live (daemon down ⇒ saved, warned "not applied"). Self-privileged
+  (the CLI stays root in the parent, drops only in the editor child); reuses `PolicyApply`,
+  no new IPC. `cordon policy edit FILE` edits a system file (a bare name → that conf.d
+  fragment); `cordon policy edit --user NAME` edits the user-tier file a system `[[include]]`
+  binds to `NAME` (home-scope-validated). When **no** include exists yet, `--user` is
+  self-bootstrapping: it opens the file at the convention path (`…/users/NAME.toml`) and, only
+  **after** the edit validates and saves, registers the `[[include]]` in `…/conf.d/00-users.toml`
+  — so a cancelled or rejected edit never leaves a stale binding. *(Who may run it — the socket
+  has no peer-cred gate yet — is the open authorization question, deferred; today it inherits
+  root via `sudo`.)*
 - **Atomic swap** in-kernel — **implemented** as a generation-counter **double-buffer**:
   the rule maps are banked, the daemon fills the inactive bank and flips `active_bank` in
   one write (RCU-style), so an `apply` has no visible window.
@@ -784,7 +845,7 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
 TOFU generalized: a bounded **training mode** (AppArmor complain-mode / fapolicyd
 trust-DB lineage). `zones` = the scope where autolearn may propose rules.
 - Explicit activation (`cordon learn`), bounded window; **the trust window is the whole
-  vulnerability** (anything malicious running during learning gets blessed) — so never
+  vulnerability** (anything malicious running during learning gets trusted) — so never
   auto-enforce, review before promote.
 - Generalize (collapse per-file opens into a subtree rule) + confidence (seen N times)
   + dedup, or you drown in candidates.
@@ -794,18 +855,24 @@ trust-DB lineage). `zones` = the scope where autolearn may propose rules.
   learned db is throwaway; the text file is durable.
 
 ### 15.10 Authoring flows
-Both flows are just *edit the root-owned text policy → `cordon policy apply`*. There is no
+Both flows are just *edit the root-owned text policy → `cordon policy apply`* — or, in one
+safe step, `cordon policy edit` (§15.8: edit-as-you → validate → apply → save). There is no
 global mode and no daemon-side wizard; the journal (`audit`/`deny`/`default-deny`, each with
-the matched `exe`/`object`/`action`/`policy`) is the whole feedback loop.
+the caller's `user` and the matched `exe`/`object`/`action`/`policy`) is the whole feedback
+loop. The `user` is the caller's real uid resolved to a login name (captured in-kernel); for
+a *regular* user (§15.8) the `object=`/`path=` print with that user's home collapsed to `~`,
+so a `deny` line copy-pastes straight into their user-tier policy.
 
-**A. Protect a known dir — observe → bless → enforce.**
+**A. Protect a known dir — observe → admit → enforce.** *(The middle step adds static
+`allow` rules; it is unrelated to the runtime `cordon bless` grant — §16 — which is why it
+is "admit", not "bless".)*
 1. *Observe.* Add the dir with a `who="*" … policy="audit"` catch-all. Every access logs as
    `audit`, nothing blocks — the blast-radius preview.
-2. *Bless.* For each legit `(exe → dir)` the log shows, add `who=<exe> … policy="allow"`.
-   Subject-specificity (§15.6) makes the specific allow win over the `*` catch-all, so a
-   blessed exe goes silent and the catch-all keeps logging only the not-yet-blessed.
+2. *Admit.* For each legit `(exe → dir)` the log shows, add `who=<exe> … policy="allow"`.
+   Subject-specificity (§15.6) makes the specific allow win over the `*` catch-all, so an
+   admitted exe goes silent and the catch-all keeps logging only the not-yet-admitted.
 3. *Enforce.* When the audit stream is quiet, flip the catch-all `policy="audit"` →
-   `"deny"`: blessed exes stay silent, everything else is blocked **and logged** (`deny`),
+   `"deny"`: admitted exes stay silent, everything else is blocked **and logged** (`deny`),
    so a tool you broke surfaces and you add an allow. Per dir, on your own schedule.
 
 **B. Discover where an app hides secrets — a "smart `strace -efile`".**
@@ -830,3 +897,238 @@ the same mechanism M4 autolearn needs to collapse per-file opens into a subtree 
 4. **Autolearn** (separate sqlite db) + review/promote, scoped to zones.
 5. **Fail-safe pinning** (orthogonal, already parked) so the compiled policy keeps
    enforcing across daemon restarts (must ship with a singleton guard — see the plan).
+
+## 16. Blessing — runtime, authenticated access grants
+
+**Status: design only (not implemented).** Milestones in [`PLAN-bless.md`](PLAN-bless.md).
+
+### 16.1 The gap it fills
+The rule model (§15) keys the subject on `exe` (plus the §15.4 predicates). That is exactly
+wrong for the tools you reach for *interactively over secrets* — `cat`, `find`, `du`, `ls`,
+a shell. You can't write `allow /usr/bin/cat read @secrets`: it would admit **every** `cat`,
+including the one a scraper `exec`s. Generic-interpreter exes are too coarse a subject, and
+no static predicate fixes it — what you actually want to express is *"the `cat` **I** just
+launched, now,"* i.e. **provenance: a human at the keyboard chose to run this."**
+
+**Blessing is sudo for file reads.** `cordon bless --class <name> -- <cmd> <args>` runs `<cmd>`
+with a runtime, human-authenticated grant that lets it (and its descendants) cross the
+cordon, per a class defined *in policy* (no hardcode; class names like `ro`/`rw` are policy
+conventions, not built-ins). It is the inverse of the project's
+"never confine the adversary" stance (§2): here we **elevate the ally**. It complements, and
+does not replace, static rules and autolearn (§15.9) — those admit *known* exes durably;
+bless covers the *ad-hoc, interactive* long tail a static rule can't name.
+
+> **Terminology.** "Blessing" / `cordon bless` is **this** runtime grant. Elsewhere the docs
+> use *blessed* adjectivally in the threat model (§8.1: a "blessed binary/ancestor" = one a
+> *static* rule trusts) — that is generic English, not this feature. Authoring flow A
+> (§15.10) was renamed observe → **admit** → enforce precisely to free the word.
+
+### 16.2 Why it must authenticate a human (threat-model fit)
+A blessing is carried by something descendants inherit, so by the construction attack (§8.1)
+it is **forgeable** unless *minting* it requires something the in-scope adversary (§2:
+one-shot, non-interactive, same-uid, not root, no persistence, no targeted RE) cannot
+produce. Enumerate what that adversary lacks:
+
+| Candidate distinguisher | Gates the scraper? |
+|---|---|
+| A secret in a file | ✗ same-uid reads it too (and it's circular) |
+| An agent/keyring holding a secret | ✗ same-uid client → can't tell you from the scraper without prompting a human |
+| Best-effort ancestry ("my shell launched it") | ✗ §8.1 — the scraper is also your descendant; constructible |
+| Controlling TTY + foreground pgrp | ~ kills the canonical `curl\|sh` (no tty); not a boundary |
+| **A human at the keyboard** (PAM: password / fingerprint / token) | ✓ the one-shot automated scraper has no one to answer |
+
+Everything that isn't "a human acts" collapses under same-uid — the same wall that forced
+the object-centric model (§3.1). So **the blessing's strength is exactly the human-presence
+check at mint time, and nothing else.**
+
+This is why an *unauthenticated* bless is rejected even though §2 concedes targeted RE:
+`cordon bless --` is a 13-character prefix from the README, not reverse-engineering — a
+*generic* bypass, on the wrong side of the threat-model line. PAM puts it back on the right
+side, and the alignment is exact:
+- **one-shot scraper** (in scope): no human ⇒ can't mint ⇒ **defeated**;
+- **resident adversary that acts against a *live* blessed process** (ptrace it, or use its
+  open fds — §16.7) (out of scope, §2): not defeated — but already conceded (the
+  ptrace / already-open-fd class), and bounded by the blessed process's lifetime.
+
+So PAM defeats *exactly* the in-scope adversary and concedes *exactly* the out-of-scope one —
+the strongest honest claim available. **There is no auth-cache / grace window** (every mint
+authenticates): the answer to "I need repeated access" is to `bless` a shell and work in it,
+not to cache the credential. Dropping the cache also removes the one window a resident
+adversary could otherwise ride — the only residual is acting against an *already-live* blessed
+process (§16.7), which short-lived blesses bound.
+
+### 16.3 Mechanism — blessing is a subject predicate
+Mechanism and authorization are orthogonal; only authorization (§16.2) is hard. The carrier
+must be **kernel-readable at `file_open`, inherited across fork/exec, and policy-matchable** —
+that is **cgroup id** (`bpf_get_current_cgroup_id`; the §15.4 / M2 `cgroup` predicate reads the
+same value). The key design choice: **a blessing is not a separate grant table — it is one
+more `SubjectMatch` predicate (§15.4), `blessing = "<class>"`, ANDed with the rest.** That
+makes grants **fully policy-customizable and scoped** with zero new precedence machinery: a
+blessing rule is an ordinary rule, so its action, its object scope, its conjunction with other
+predicates, and its precedence all come from the existing rule model.
+
+- **Class = a named subject predicate, defined in policy.** `[group.subject.blessed-ro]
+  blessing = "ro"` declares a class; ordinary rules referencing it (`allow @blessed-ro read
+  ~/.aws`) say *exactly* what it may do and **where**. Scope is just the rule's object column —
+  not blanket. Because the predicate composes, you can also write `who = {exe = "/usr/bin/cat",
+  blessing = "ro"}` — "`cat`, but only when blessed" — which is the precise fix for the
+  coarse-exe problem (§16.1) without granting all `cat`s.
+- **Cgroup = carrier lifetime, per-invocation.** Each `cordon bless` gets a **fresh,
+  root-owned** cgroup (`cordon-bless-<id>.scope`), tagged with its class — per-invocation (not
+  one shared cgroup per class) buys automatic teardown, a per-bless audit/revoke handle, and a
+  smaller standing surface (§16.6). Orthogonal axes: the *class* is static (a policy name), the
+  *cgroup* is per-invocation.
+- **`BLESSED` map = a tiny cgroup→class indirection.** A new BPF map `HashMap<cgroup_id u64,
+  ClassId>`, written by the daemon at mint (and cleared at GC). It is **not** part of the
+  banked compiled rule table (§15.8): the static `@blessed-*` rules compile into the per-object
+  buckets like any rule and only change on `policy apply`; the per-bless churn is confined to
+  this one small, unbanked, single-writer map. So a bless never recompiles policy, and policy
+  apply never disturbs a live bless.
+- **Compiler:** assigns a dense `ClassId` to each named blessing class, stamps it into the
+  `SubjectMatch` of every rule that references the class (clearing the predicate's wildcard
+  flag), and emits a `class-name → ClassId` registry on the compiled output (the daemon/CLI use
+  it to validate `--class` and to write `BLESSED` at mint). No hardcode: `ro`/`rw` are just
+  whatever names the policy declares.
+
+**`decide()` integration (§15 kernel flow).** No separate fast-path and no deny→allow flip —
+blessing folds into the existing first-match scan. `subject_matches` gains: resolve the
+caller's class once (`BLESSED[current_cgroup_id]`, or a "not blessed" sentinel), and a rule's
+`blessing` predicate matches iff it is wildcard or equals that class. Everything else is
+unchanged: copy-down resolves object precedence, and **subject-specificity already ranks a
+concrete `blessing` rule above a `who="*"` catch-all** (§15.6), so a blessing `allow` outranks
+the catch-all `deny` that protects the object — no special casing. Because it is a real rule,
+a blessing can also be `audit` (observe a blessed class) and is **logged like any decision**
+(extend `DecisionEvent` with the matched class so the journal shows bless-mediated access —
+bless is loud).
+
+> **Precedence note.** A `blessing` predicate counts as **one** unit of subject specificity,
+> like `exe`. So a *targeted* `deny <exe> …` and an `allow @blessed-ro …` on the same object
+> are equal-specificity → `deny>allow` wins: an explicit deny of a known-bad binary beats a
+> blessing (you can deny-list even inside blessed sessions). Conjunctions raise specificity the
+> usual way (`{exe, blessing}` = 2 beats a bare `blessing` = 1).
+
+### 16.4 The membership boundary — what forbids other processes from joining (critical)
+Unlike exe/ancestry identity, this is a **real boundary, not best-effort**: plain DAC on a
+root-owned kernfs file, backed by cgroup-v2's delegation rule.
+
+1. The blessed cgroup is **created and owned by root** (the daemon, or a systemd transient
+   scope under a root `cordon.slice`). Its `cgroup.procs` is `root:root`, **not
+   user-writable**.
+2. cgroup v2 moves a task by **writing its PID to the destination `cgroup.procs`**. A
+   non-root, same-uid scraper **cannot open that file for write** (VFS permission) →
+   `EACCES`; the migration never begins.
+3. Defense in depth: even with a writable fd, v2's **"common ancestor" rule** additionally
+   requires an unprivileged writer to hold `MAY_WRITE` on the common ancestor's
+   `cgroup.procs`. We never delegate the subtree to the user — second closed door.
+4. `clone3(CLONE_INTO_CGROUP)` (birth a child directly into a cgroup) runs the **same**
+   write-permission check on the target — so the scraper can't sidestep by spawning into it.
+5. The cgroup **id** is kernel-assigned and unique per directory; the scraper can't forge a
+   cgroup whose id collides with a blessed one, and only daemon-created ids are in `BLESSED`.
+6. The **only** legitimate entry is the root daemon placing the command in **at spawn** —
+   use `clone3(CLONE_INTO_CGROUP)` so the child is *born* inside (zero window where it runs
+   unblessed) — and only **after PAM succeeds**. Inheritance to children is automatic and is
+   the intended `bless -- bash` behavior.
+
+The entire lock is: **root owns `cgroup.procs`; root writes it only post-auth.** That makes
+cgroup membership the *strongest* subject identity in the system — a same-uid process cannot
+forge it the way it forges ancestry.
+
+> **Mechanism wrinkle.** systemd owns the unified hierarchy (single-writer; no procs in
+> inner nodes). The clean placement is a **systemd transient scope** via the daemon, or a
+> subtree **delegated** to the (root) daemon (`Delegate=yes`); a hand-rolled cgroup outside
+> systemd's knowledge invites conflicts. Either way the per-bless cgroup is root-owned.
+
+### 16.5 Authentication (PAM)
+- **PAM, in the daemon.** Auth runs against a `cordon` PAM service (`/etc/pam.d/cordon`), so
+  the *admin's stack* picks the method — `pam_unix` (password), `pam_fprintd` (fingerprint),
+  `pam_u2f` (security key) all work with **zero cordon code**. PAM must run in the **root
+  daemon** (it needs `/etc/shadow`); the client only relays I/O.
+- **Conversation proxied to the tty; verdict computed in the daemon.** The PAM *conversation
+  function* in the daemon sends prompt/info messages over the control socket to the
+  `cordon bless` front-end, which renders them on the tty (echo-off for a password, "swipe
+  now" info for fingerprint) and returns input. A malicious front-end (a scraper hitting the
+  socket) controls only the **I/O channel**, never the **verdict** — real PAM modules in the
+  daemon verify, so a wrong/absent answer simply fails. The daemon learns *who* is asking
+  from `SO_PEERCRED` (the open socket-authorization question in §15.8 / `STATUS.md`), not
+  from anything the client asserts, and authenticates *that* user.
+  - *Deployment note:* a method needing the user's session bus (some `pam_fprintd` setups)
+    is a deployment consideration, since the daemon is a system service.
+- **No grace / auth-cache window.** Every mint authenticates — there is no sudo-style cached
+  timestamp. Repeat access is `bless`-a-shell, not a credential cache (§16.2), which keeps the
+  resident adversary off any auth window.
+- **Environment.** The blessed command inherits the **invoking shell's full environment** (and
+  cwd): the front-end ships its `environ` with the request and the daemon spawns the child with
+  exactly that. No sudo-style env scrubbing is needed because the child runs **as the invoking
+  user** (no uid elevation) — the env is already entirely under that user's control; the only
+  thing the grant adds is the cgroup membership.
+
+### 16.6 Lifecycle
+1. `cordon bless --class NAME -- <cmd>` connects to the daemon (`SO_PEERCRED` → caller uid).
+   (A policy may designate a default class so `--class` can be omitted.)
+2. Daemon runs PAM for that user (conversation proxied to the tty); on failure, abort.
+3. Daemon validates `NAME` against the compiled class registry, creates a fresh root-owned
+   cgroup (transient scope), registers `BLESSED[cgroup_id] = ClassId(NAME)`, and
+   `clone3(CLONE_INTO_CGROUP)`-spawns `<cmd>` **as the invoking user** (drop privileges like
+   `cordon policy edit`, §15.8), **with the caller's full environment and cwd** (§16.5), inside
+   it.
+4. Descendants inherit the cgroup ⇒ inherit the blessing (`bless -- bash` blesses the
+   subtree).
+5. **GC on exit.** The daemon watches the cgroup's `cgroup.events` `populated` flag; when the
+   tree drains (`populated 0`) it removes the cgroup and drops the `BLESSED` entry — the grant
+   **evaporates with the process tree**. No standing always-armed cgroup.
+6. `cordon bless --class NAME ...` (canonical) / `cordon bless list` / `cordon bless revoke
+   <id>` — list and revoke enumerate and tear down live blessings (the per-invocation cgroup
+   *is* the handle).
+
+### 16.7 Blast radius and limits (honest)
+- **`bless -- bash` trusts the whole subtree.** A scraper you run *inside* a blessed shell
+  inherits the blessing. That is the grant working as designed, not a bypass — but it means
+  bless is for tools/shells you trust *in that moment*. Prefer per-command blesses; treat a
+  blessed shell as a deliberate, loud, ideally short-lived "vault session."
+- **ptrace.** A long-lived blessed process is a fat target for the conceded resident
+  adversary (§2): same-uid ptrace → make it read the secret. Default yama `ptrace_scope ≥ 1`
+  restricts ptrace to descendants, so a *non-descendant* scraper can't touch it — recommend
+  it as a deployment note. Argues again for short-lived per-command blesses.
+- **Already-open fds (§10).** cordon gates `open()`, not `read()`. A blessed process that
+  opens a secret and passes the fd (SCM_RIGHTS, or a non-CLOEXEC leak across exec) hands the
+  content to a non-blessed process. Inherent; the blessed process is trusted not to.
+- **Every bless is journaled** (§16.3 — the matched class on `DecisionEvent`), so even the
+  conceded cases leave an audit trail.
+
+### 16.8 Policy surface (authoring)
+A class is an ordinary **subject group** with a `blessing` predicate — symmetric with the
+§15.7 group model, no new top-level concept. **Blessings are fully policy-customizable:** their
+action, object scope, polarity, and conjunction with other predicates are all just ordinary
+rules, so the policy author declares as many classes as they like and says precisely what each
+reaches.
+```toml
+[group.subject.blessed-ro]   blessing = "ro"
+[group.subject.blessed-rw]   blessing = "rw"
+[group.subject.aws-rw]       blessing = "aws"          # a narrow, single-target class
+[group.object.secrets]       members = ["~/.aws", "~/.ssh", "~/.config/gcloud"]
+
+# Ordinary rules — the object column IS the scope (no blanket grant):
+rules = '''
+allow  @blessed-ro   read,listdir   @secrets       # broad read across all secrets
+allow  @blessed-rw   read,write      @secrets       # …and write
+allow  @aws-rw       read,write      ~/.aws         # scoped to one dir only
+'''
+```
+`cordon bless --class aws -- terraform apply` runs `terraform` in an `aws`-class cgroup; the
+kernel matches the `blessing="aws"` predicate on those rules, so it can read/write `~/.aws`
+**and nothing else protected** — scope is exactly the rule's object column. Because the
+predicate composes, `who = {exe = "/usr/bin/cat", blessing = "ro"}` admits *only* `cat` *only*
+when blessed; and a class may even be `audit` to observe a blessed cohort. Subject-specificity
+(§15.6) makes any concrete `blessing` rule outrank a `who="*"` catch-all on the same object,
+and the §16.3 precedence note covers the targeted-deny tie.
+
+### 16.9 Relationship to the rest of cordon
+- **vs. flow A "admit" (§15.10):** admit adds a *durable static* `allow` for a *known* exe;
+  bless is a *runtime, authenticated* grant for an *ad-hoc* invocation. Different lifetimes,
+  different trust basis.
+- **vs. autolearn (§15.9):** autolearn *observes* to *propose* durable rules; bless *grants*
+  immediately under human auth. Orthogonal.
+- **vs. `cordon policy edit` (§15.8):** both are privileged, authenticated mutations of *what
+  is allowed* — edit mutates the durable policy under `sudo`; bless mints a transient grant
+  under PAM. Same family; bless reuses the privilege-drop discipline (run the child as the
+  invoking user, never root).

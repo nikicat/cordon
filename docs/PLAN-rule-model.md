@@ -263,6 +263,32 @@ decision table cost ~5 lines/rule, and a root daemon can't use `~`. Both address
    (`Vec<PolicySource>`) instead of one `text`; the daemon resolves their homes + merges
    (`compile_sources`). *Open:* compile-stage diagnostics don't yet carry the fragment name
    (only parse/resolve errors do); a future `Pos` could gain a source id.
+7. **`cordon policy edit` (sudoedit analog) — ✅ done (2026-06-29).** `sudo cordon policy
+   edit [FILE]` copies the root-owned policy to a private temp, runs `$EDITOR`
+   (`$CORDON_EDITOR`→`$VISUAL`→`$EDITOR`→`vi`) **as the invoking user** (privilege model A:
+   the CLI stays root in the parent and drops only in the editor child, so the editor — a
+   same-uid scraper's `.vimrc`/plugin surface, DESIGN §2 — never runs as root), then
+   *validates → applies → saves* in one step, visudo-style (a non-compiling policy is
+   rejected and re-prompts rather than persisting). No IR/kernel changes and **no new IPC**:
+   read is direct, validation is the in-process compiler (`compile_fragments`, the `check`
+   path), commit reuses `Request::PolicyApply`; the file is written only after the daemon
+   accepts it (daemon down ⇒ locally validated, saved, warned "not applied"). The editor gets
+   the invoking user's own `$HOME`/`$USER` (not root's, left by `sudo`). New
+   `crates/cli/src/edit.rs` + `crates/cli/src/sys.rs` (privileged ops as safe `nix` wrappers
+   over typed `Uid`/`Gid`: `chown` + passwd lookup + `setgroups`/`setgid`/`setuid`; the lone
+   `unsafe` is the `Command::pre_exec` registration). *Open:* caller authorization —
+   the control socket has no peer-cred gate, so `edit`/`apply` are gated only by who can
+   reach it; `edit` takes root via `sudo` for now, pending a CLI-authorization pass.
+8. **System / user policy tiers — ✅ done (2026-06-29).** Effective policy = system ⊕ user
+   tier (DESIGN §15.8). A system fragment `[[include]]`s a user-tier file (naming the owning
+   user); the file loads `SourceOrigin::User` and is **home-scoped** at compile (objects must
+   be under `~user`; no nested includes). New `policy::{load_policy, user_include_path}`,
+   `PolicySource.origin` (IPC), tier-aware `compile_fragments`, `edit --user NAME`. Wired into
+   CLI `check`/`apply`/`edit` + daemon startup. **Floor precedence deferred** — *system is a
+   floor* (user tightens, not loosens) isn't expressible in one first-match bucket and only
+   bites once user files are user-owned, so it lands with the home-migration. Files root-owned
+   under `/etc` now (sudo-gated); roadmap: move to `~user/.config/cordon/` with cordon
+   protecting its own user-policy file (the future sudo-less path).
 
 ## Appendix A — policy TOML (proposed)
 ```toml

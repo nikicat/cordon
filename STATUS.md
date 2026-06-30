@@ -32,7 +32,7 @@ hardening.
 **Landed (M1 1c + 1d + 1e + 1f + 1h — the in-kernel enforcement path + authoring CLI,
 VM-validated):** The rule-model `file_open` boundary is proven end-to-end in a
 virtme-ng VM (`lsm=capability,bpf`) on both the host kernel and the CI-pinned **v6.12** —
-all 13 `bpf-lsm-smoke.sh` scenarios
+all 13 M1 `bpf-lsm-smoke.sh` scenarios
 green: allow + default-deny + learn record, self-test-negative abort, per-action (read
 allowed / write default-denied), subject group, object group, deny>allow,
 **subject-specificity** (a concrete allow outranks a `who="*"` deny), **copy-down**
@@ -102,7 +102,7 @@ smoke scenarios green):**
 - **(2) Subject-specificity in precedence — ✅ done.** `sort_bucket` now ranks by object
   depth → **subject specificity** (count of non-wildcard predicates, via the `Specificity`
   newtype) → deny>allow (`Polarity`), so `allow exe=X` beats an `audit`/`deny` `who="*"`
-  catch-all on the same object — the basis of the audit→bless→enforce flow A. VM-validated
+  catch-all on the same object — the basis of the audit→admit→enforce flow A. VM-validated
   (smoke scenario 7: a concrete `allow` outranks a `who="*"` deny).
 - **(3) Leaf-path reconstruction — ✅ done.** On an emitted record the kernel walks
   `d_name` from the opened file up to the matched protected object (`bpf_d_path` is
@@ -135,12 +135,65 @@ smoke scenarios green):**
   resolves homes + merges; `read_sources` does the file-or-dir read for both daemon startup
   and CLI `check`/`apply`. *Known gap:* compile-stage diagnostics (e.g. pending-path
   warnings) carry `line:col` but not yet the fragment name (parse/resolve errors do).
+- **(7) `cordon policy edit` — ✅ done (2026-06-29).** The sudoedit analog for the
+  root-owned policy: `sudo cordon policy edit [FILE]` copies the file to a private temp,
+  runs `$EDITOR` (`$CORDON_EDITOR`→`$VISUAL`→`$EDITOR`→`vi`) **as the invoking user** —
+  closing the `sudo $EDITOR` same-uid escalation (DESIGN §2: the scraper can write your
+  `.vimrc`) — then validates and, on success, applies *and* saves in one step. visudo-style:
+  a broken policy is rejected with diagnostics and re-prompts `[e]dit again / [Q]uit`. No new
+  IPC — the read is direct, validation is the in-process compiler (the `check` path), the
+  commit reuses `PolicyApply`; the file is written **only after** the daemon accepts it, so
+  on-disk == live with no rollback (daemon down ⇒ saved + warned "not applied"). New
+  `crates/cli/src/edit.rs` (privilege model **A**, self-privileged) + `crates/cli/src/sys.rs`
+  (the privileged ops as safe `nix` wrappers over typed `Uid`/`Gid` — `chown` the temp to the
+  invoker, passwd lookup for their `$HOME`/`$USER`, `setgroups`+`setgid`+`setuid` drop in the
+  editor child; the crate's lone `unsafe` is the `pre_exec` registration). The editor runs
+  with the **invoking user's** own `$HOME`/`$USER` (not root's, which `sudo` leaves as
+  `/root` — else e.g. nvim can't write its state). *Authorization is still open* (the socket
+  has no peer-cred check yet — whoever can reach it can `apply`); `edit` inherits root via
+  `sudo` for now, deferred to a later CLI-authorization pass.
+
+- **(8) System / user policy tiers — ✅ done (2026-06-29).** The effective policy is now
+  **system ⊕ user tier** (DESIGN §15.8). A system fragment pulls in a user-tier file via an
+  `[[include]] user = "…" path = "…"` directive; the included file is loaded
+  `SourceOrigin::User` and **home-scoped** — every object path must resolve under that user's
+  `~` (compile error otherwise, so a user can't write rules about `/etc` or another home),
+  and it may not itself `[[include]]`. New `policy::{load_policy, user_include_path}` (include
+  expansion at read time; CLI on `apply`/`check`, daemon at startup), `PolicySource.origin`
+  (over IPC), tier-aware `compile_fragments`, and `cordon policy edit --user NAME` (edits the
+  bound file; `UserName` parsed straight from the flag via `FromStr`). `--user` is
+  **self-bootstrapping**: with no include yet it opens `…/users/NAME.toml` and registers the
+  `[[include]]` in `…/conf.d/00-users.toml` *only after* the edit validates + saves — a
+  cancelled/rejected edit writes neither the file nor the include (no stale binding). VM
+  coverage: a 14th `bpf-lsm-smoke.sh` scenario (`user_tier`) proves a system-tier rule and an
+  `[[include]]`d user-tier rule both enforce in-kernel (the tier assembly reaches the maps).
+  **Precedence is flat
+  for now** — the *system-is-a-floor* semantics (user tightens, never loosens) isn't
+  expressible in the single first-match bucket and only matters once user files are
+  user-owned, so it's sequenced with the home-migration (below). Files are root-owned under
+  `/etc` for now; **roadmap:** move them to `~user/.config/cordon/` and have cordon *cordon*
+  its own user-policy file (a protected object only an authorized editor may write) — that
+  self-protection is the future "edit without sudo".
 
 **Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
 + maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
 **Pinning must ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active):
 today two daemons can't corrupt each other (each loads private maps), but two daemons sharing
 *pinned* maps would reintroduce a cross-process writer race.
+
+## Designed, not built — blessing (`cordon bless`)
+The runtime, PAM-authenticated access grant is **specced but unimplemented**: [`DESIGN.md`
+§16](docs/DESIGN.md) (design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (milestones B1–B2).
+It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
+(`blessing = "<class>"`), so a blessing rule is an ordinary rule — its action, **object scope**,
+and precedence all reuse the §15 model (scope = the rule's object column; **fully customizable
+in policy**, not blanket). The runtime pieces are a per-invocation **root-owned cgroup** carrier
+(the membership boundary is DAC on `cgroup.procs` — only the root daemon places a task in it,
+after PAM), a tiny unbanked `BLESSED: cgroup_id → ClassId` indirection map, and a
+`cordon bless --class NAME -- <cmd>` CLI. No grace window (every mint authenticates). B1 (the
+boundary) ships the whole scoped feature. (Authoring flow A was renamed observe → **admit** →
+enforce to reserve "bless" for this; the §8.1 threat-model "blessed binary" is unrelated
+generic usage.)
 
 ## Pre-rule-model history (retired)
 Phases 0–3 built an **owner model** — explicit rules + TOFU creator-owns, a root-owned

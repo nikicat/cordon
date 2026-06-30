@@ -29,12 +29,41 @@ pub struct ParsedPolicy {
     /// policy file use `~` instead of spelling out `/home/<name>` (DESIGN §15.8); the
     /// caller resolves it to a home via [`super::home_for`].
     pub(crate) user: Option<UserName>,
+    /// `[[include]]` directives: user-tier files this (system) fragment pulls in
+    /// (DESIGN §15.8). Resolved by [`super::load_policy`] at read time, not here.
+    pub(crate) includes: Vec<Include>,
 }
 
 impl ParsedPolicy {
     /// The `user =` header, if the policy declared one.
     pub fn user(&self) -> Option<&UserName> {
         self.user.as_ref()
+    }
+
+    /// The `[[include]]` directives this fragment declares (empty for most fragments).
+    pub fn includes(&self) -> &[Include] {
+        &self.includes
+    }
+}
+
+/// One `[[include]]` directive — a system fragment pulling in a user-tier policy file
+/// (DESIGN §15.8): the owning `user` (whose home scopes the included rules and which `~`
+/// expands against) and the `path` to read. The directive lives in a *system* fragment;
+/// the file it names is loaded as [`super::SourceOrigin::User`].
+#[derive(Debug)]
+pub struct Include {
+    user: UserName,
+    path: String,
+    #[allow(dead_code)] // carried for future fragment-named diagnostics
+    pos: Pos,
+}
+
+impl Include {
+    pub fn user(&self) -> &UserName {
+        &self.user
+    }
+    pub fn path(&self) -> &str {
+        &self.path
     }
 }
 
@@ -71,6 +100,17 @@ struct RawPolicy {
     /// header (a bare top-level key binds to the last table otherwise).
     #[serde(default)]
     rules: Option<Spanned<String>>,
+    /// `[[include]]` tables — user-tier files this system fragment pulls in (DESIGN §15.8).
+    #[serde(default, rename = "include")]
+    includes: Vec<Spanned<IncludeDef>>,
+}
+
+/// One `[[include]] user = "name" path = "…"` table.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct IncludeDef {
+    user: UserName,
+    path: String,
 }
 
 /// The three group namespaces (DESIGN §15.7), each `name → members`.
@@ -205,11 +245,25 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
         )?);
     }
 
+    let includes = raw
+        .includes
+        .iter()
+        .map(|spanned| {
+            let def = spanned.get_ref();
+            Include {
+                user: def.user.clone(),
+                path: def.path.clone(),
+                pos: lines.pos(spanned.span().start),
+            }
+        })
+        .collect();
+
     Ok(ParsedPolicy {
         groups: raw.group,
         rules,
         lines,
         user: raw.user,
+        includes,
     })
 }
 
@@ -287,6 +341,26 @@ mod tests {
             parse("[[rule]]\nwho = \"*\"\nwhere = \"/x\"\naction = \"read\"\npolicy = \"deny\"\n")
                 .unwrap();
         assert!(p2.user().is_none());
+    }
+
+    #[test]
+    fn parses_includes() {
+        let p = parse(
+            "[[include]]\nuser = \"nb\"\npath = \"/etc/cordon/users/nb.toml\"\n\
+             [[include]]\nuser = \"al\"\npath = \"/etc/cordon/users/al.toml\"\n",
+        )
+        .unwrap();
+        assert_eq!(p.includes().len(), 2);
+        assert_eq!(p.includes()[0].user().as_str(), "nb");
+        assert_eq!(p.includes()[0].path(), "/etc/cordon/users/nb.toml");
+        assert_eq!(p.includes()[1].user().as_str(), "al");
+        // a policy with no include directive has an empty list.
+        assert!(
+            parse("rules = '''\nallow /b read /x\n'''\n")
+                .unwrap()
+                .includes()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -13,10 +13,12 @@ use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
 use cordon_bpf_common::{
-    Action, Decision, DecisionEvent, FileId, MAP_EVENTS, PATH_MAX_DEPTH, PathComp, Pid, Policy,
+    Action, Decision, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp, Pid,
+    Policy, SuppressedTotal, Uid,
 };
 use cordon_core::backend::{ApplyOutcome, PolicyControl, Shutdown};
-use cordon_core::policy::PolicySource;
+use cordon_core::passwd::Passwd;
+use cordon_core::policy::{PolicySource, UserName};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::HashMap;
@@ -47,6 +49,8 @@ pub(super) fn serve(
     )
     .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_EVENTS}: {e}")))?;
     let raw = ring.as_raw_fd();
+    // Names callers on the audit line; reloaded only when /etc/passwd changes (per drain).
+    let mut passwd = Passwd::new();
 
     while !shutdown.is_triggered() {
         // SAFETY: `raw` is the ring buffer's fd, owned by `ring` for this scope.
@@ -67,8 +71,11 @@ pub(super) fn serve(
                         ),
                     }
                 }
+                // Refresh once per drain (cheap unless /etc/passwd changed), then name each
+                // record's caller from the cache.
+                passwd.refresh();
                 for record in coalesce(&batch) {
-                    record.log(&object_paths);
+                    record.log(&object_paths, &passwd);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -133,38 +140,45 @@ struct Coalesced {
     /// journal distinguish a default-deny from an explicit `deny` (DESIGN §15.6).
     policy: Policy,
     pid: Pid,
+    /// The caller's real uid (representative, like `pid` — the in-kernel suppressor keys on
+    /// `(exe, leaf, action)` regardless of uid, so a group can only carry one).
+    uid: Uid,
     /// The opened file's path components (leaf-first) + how many are valid + truncation,
     /// for the `path=` field. Carried verbatim from the representative event.
     comps: [PathComp; PATH_MAX_DEPTH],
     depth: u8,
     trunc: u8,
     events: u32,
-    suppressed: u64,
+    suppressed: SuppressedTotal,
 }
 
 impl Coalesced {
     /// Total opens this record stands for: the ring records folded plus the opens the
     /// in-kernel suppressor held back.
-    fn count(&self) -> u64 {
-        self.events as u64 + self.suppressed
+    fn count(&self) -> Opens {
+        Opens(u64::from(self.events) + u64::from(self.suppressed))
     }
 
-    /// Journal it at the level its decision warrants. The fields are typed (`object` via
-    /// [`ObjectName`], `path` via [`OpenedPath`], `action` via its own `Display`, `exe` via
-    /// [`CallerExe`]); `tracing` renders them lazily — no eager `String`s.
-    fn log(&self, object_paths: &HashMap<FileId, PathBuf>) {
+    /// Journal it at the level its decision warrants. The fields are typed (`user` via
+    /// [`CallerUser`], `object`/`path` via [`AuditPath`], `action`/`exe` via their own
+    /// `Display`); `tracing` renders them lazily — no eager `String`s. For a regular user
+    /// (DESIGN §15.8) a path under their home renders as `~/…`, so a `deny` line drops
+    /// straight into that user's policy.
+    fn log(&self, object_paths: &HashMap<FileId, PathBuf>, passwd: &Passwd) {
+        let user = CallerUser::resolve(self.uid, passwd);
+        let home = user.home();
         let exe = CallerExe::resolve(self.pid, self.exe);
-        let object = ObjectName::resolve(self.object, object_paths);
-        let path = OpenedPath::resolve(self, object_paths);
+        let object = ObjectName::resolve(self.object, object_paths).into_audit(home);
+        let path = OpenedPath::resolve(self, object_paths).into_audit(home);
         let action = self.action;
         let policy = self.policy;
         let (count, suppressed) = (self.count(), self.suppressed);
         match self.decision {
             Decision::DENY => {
-                info!(pid = self.pid.0, %exe, %object, %path, %action, %policy, count, suppressed, "deny")
+                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "deny")
             }
             _ => {
-                info!(pid = self.pid.0, %exe, %object, %path, %action, %policy, count, suppressed, "audit")
+                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "audit")
             }
         }
     }
@@ -183,7 +197,7 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
         match index.get(&(e.exe, e.leaf, e.action)) {
             Some(&i) => {
                 records[i].events += 1;
-                records[i].suppressed += e.suppressed as u64;
+                records[i].suppressed += e.suppressed;
             }
             None => {
                 index.insert((e.exe, e.leaf, e.action), records.len());
@@ -194,16 +208,59 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
                     decision: e.decision,
                     policy: e.policy,
                     pid: e.pid,
+                    uid: e.uid,
                     comps: e.comps,
                     depth: e.depth,
                     trunc: e.trunc,
                     events: 1,
-                    suppressed: e.suppressed as u64,
+                    suppressed: e.suppressed.into(),
                 });
             }
         }
     }
     records
+}
+
+/// The caller's user in the journal: the login name resolved from the kernel-captured uid
+/// (via the [`Passwd`] cache), plus — when it's a *regular* account (DESIGN §15.8) — that
+/// user's home, so a path under it collapses to `~` and the line drops into the user's
+/// policy. Falls back to the bare uid when passwd has no entry (a deleted or NSS-only
+/// account). Borrows the cache, so naming a caller costs no allocation.
+enum CallerUser<'a> {
+    Named {
+        name: &'a UserName,
+        home: Option<&'a Path>,
+    },
+    Uid(Uid),
+}
+
+impl<'a> CallerUser<'a> {
+    fn resolve(uid: Uid, passwd: &'a Passwd) -> CallerUser<'a> {
+        match passwd.lookup(uid) {
+            Some(id) => CallerUser::Named {
+                name: id.name,
+                home: id.home,
+            },
+            None => CallerUser::Uid(uid),
+        }
+    }
+
+    /// The home whose prefix collapses to `~` on this caller's audit paths, if any.
+    fn home(&self) -> Option<&Path> {
+        match self {
+            CallerUser::Named { home, .. } => *home,
+            CallerUser::Uid(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for CallerUser<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CallerUser::Named { name, .. } => write!(f, "{name}"),
+            CallerUser::Uid(uid) => write!(f, "{}", uid.0),
+        }
+    }
 }
 
 /// The caller's executable in the journal: a resolved path when `/proc/<pid>/exe` still
@@ -253,13 +310,12 @@ impl ObjectName {
             None => ObjectName::Inode(object),
         }
     }
-}
 
-impl fmt::Display for ObjectName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// Lower to the journal renderer, collapsing `home` (if a regular user's) to `~`.
+    fn into_audit(self, home: Option<&Path>) -> AuditPath<'_> {
         match self {
-            ObjectName::Path(p) => write!(f, "{}", p.display()),
-            ObjectName::Inode(id) => write!(f, "{id}"),
+            ObjectName::Path(path) => AuditPath::Path { path, home },
+            ObjectName::Inode(id) => AuditPath::Inode(id),
         }
     }
 }
@@ -285,13 +341,41 @@ impl OpenedPath {
             (None, None) => OpenedPath::Inode(c.object),
         }
     }
+
+    /// Lower to the journal renderer, collapsing `home` (if a regular user's) to `~`.
+    fn into_audit(self, home: Option<&Path>) -> AuditPath<'_> {
+        match self {
+            OpenedPath::Path(path) => AuditPath::Path { path, home },
+            OpenedPath::Inode(id) => AuditPath::Inode(id),
+        }
+    }
 }
 
-impl fmt::Display for OpenedPath {
+/// A resolved audit path as it prints in the journal, with a *regular* user's home
+/// collapsed to `~` (DESIGN §15.8) so `object=`/`path=` read exactly as that user's policy
+/// would author them — copy-paste from a `deny` line straight into the user's policy.
+/// Both [`ObjectName`] and [`OpenedPath`] lower to this, so the two fields collapse
+/// identically; the inode fallback (no known path) passes through. `home` is `None` for
+/// root/system callers and unresolvable uids, leaving their paths absolute.
+enum AuditPath<'a> {
+    Path {
+        path: PathBuf,
+        home: Option<&'a Path>,
+    },
+    Inode(FileId),
+}
+
+impl fmt::Display for AuditPath<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OpenedPath::Path(p) => write!(f, "{}", p.display()),
-            OpenedPath::Inode(id) => write!(f, "{id}"),
+            // `strip_prefix` is component-wise, so `/home/alice` never matches a peer like
+            // `/home/alicia` — only a true home prefix collapses.
+            AuditPath::Path { path, home } => match home.and_then(|h| path.strip_prefix(h).ok()) {
+                Some(rest) if rest.as_os_str().is_empty() => f.write_str("~"),
+                Some(rest) => write!(f, "~/{}", rest.display()),
+                None => write!(f, "{}", path.display()),
+            },
+            AuditPath::Inode(id) => write!(f, "{id}"),
         }
     }
 }
@@ -328,19 +412,20 @@ fn parse_event(bytes: &[u8]) -> Option<DecisionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordon_bpf_common::{Dev, Ino, ObjId, Policy};
+    use cordon_bpf_common::{Dev, Ino, ObjId, Policy, Suppressed, SuppressedTotal};
 
     /// A protected root shared by the test events (the `object`); `leaf` is what varies.
     const OBJECT: FileId = FileId::new(Dev(1), Ino(100));
 
     /// A `DecisionEvent` for the given exe + **opened file (leaf)** inodes, action, and
     /// in-kernel suppressed count — the coalesce key is `(exe, leaf, action)`.
-    fn ev(exe_ino: u64, leaf_ino: u64, action: Action, suppressed: u32) -> DecisionEvent {
+    fn ev(exe: Ino, leaf: Ino, action: Action, suppressed: Suppressed) -> DecisionEvent {
         DecisionEvent::new(
             Pid(1),
-            FileId::new(Dev(1), Ino(exe_ino)),
+            Uid(1000),
+            FileId::new(Dev(1), exe),
             OBJECT,
-            FileId::new(Dev(1), Ino(leaf_ino)),
+            FileId::new(Dev(1), leaf),
             ObjId(0),
             action,
             Decision::DENY,
@@ -359,32 +444,40 @@ mod tests {
     #[test]
     fn folds_identical_events_summing_counts() {
         let batch = vec![
-            ev(10, 20, Action::READ, 0),
-            ev(10, 20, Action::READ, 5),
-            ev(10, 20, Action::READ, 3),
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)),
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(5)),
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(3)),
         ];
         let out = coalesce(&batch);
         assert_eq!(out.len(), 1, "one (exe,leaf,action) → one record");
         assert_eq!(out[0].events, 3, "three ring records folded");
-        assert_eq!(out[0].suppressed, 8, "in-kernel suppressed counts summed");
-        assert_eq!(out[0].count(), 11, "total opens = events + suppressed");
+        assert_eq!(
+            out[0].suppressed,
+            SuppressedTotal(8),
+            "in-kernel suppressed counts summed"
+        );
+        assert_eq!(
+            out[0].count(),
+            Opens(11),
+            "total opens = events + suppressed"
+        );
     }
 
     #[test]
     fn distinct_keys_stay_separate() {
         let batch = vec![
-            ev(10, 20, Action::READ, 0),
-            ev(11, 20, Action::READ, 0),  // different exe
-            ev(10, 21, Action::READ, 0),  // different leaf (a different opened file)
-            ev(10, 20, Action::WRITE, 0), // different action
-            ev(10, 20, Action::READ, 2),  // dup of the first → folds in
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)),
+            ev(Ino(11), Ino(20), Action::READ, Suppressed(0)), // different exe
+            ev(Ino(10), Ino(21), Action::READ, Suppressed(0)), // different leaf (a different opened file)
+            ev(Ino(10), Ino(20), Action::WRITE, Suppressed(0)), // different action
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(2)), // dup of the first → folds in
         ];
         let out = coalesce(&batch);
         assert_eq!(out.len(), 4, "four distinct identities");
         // Insertion order preserved; the first key folded the trailing dup.
         assert_eq!(out[0].action, Action::READ);
         assert_eq!(out[0].events, 2);
-        assert_eq!(out[0].suppressed, 2);
+        assert_eq!(out[0].suppressed, SuppressedTotal(2));
     }
 
     /// The discovery property (DESIGN §15.10 flow B): two files under the *same* protected
@@ -392,8 +485,8 @@ mod tests {
     #[test]
     fn distinct_leaves_under_one_object_stay_separate() {
         let batch = vec![
-            ev(10, 20, Action::READ, 0),
-            ev(10, 21, Action::READ, 0), // same exe + object, different opened file
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)),
+            ev(Ino(10), Ino(21), Action::READ, Suppressed(0)), // same exe + object, different opened file
         ];
         assert_eq!(coalesce(&batch).len(), 2);
     }
@@ -425,7 +518,7 @@ mod tests {
     fn opened_path_joins_object_base() {
         let mut object_paths = HashMap::new();
         object_paths.insert(OBJECT, PathBuf::from("/home/u"));
-        let mut e = ev(10, 20, Action::READ, 0);
+        let mut e = ev(Ino(10), Ino(20), Action::READ, Suppressed(0));
         e.comps[0] = comp("config");
         e.comps[1] = comp(".aws");
         e.depth = 2;
@@ -434,5 +527,63 @@ mod tests {
             OpenedPath::Path(p) => assert_eq!(p, PathBuf::from("/home/u/.aws/config")),
             OpenedPath::Inode(_) => panic!("expected a joined path"),
         }
+    }
+
+    #[test]
+    fn audit_path_collapses_regular_home_to_tilde() {
+        let home = PathBuf::from("/home/alice");
+        let render = |p: &str| {
+            AuditPath::Path {
+                path: PathBuf::from(p),
+                home: Some(&home),
+            }
+            .to_string()
+        };
+        // A child of the home → `~/rest`; the home itself → `~`.
+        assert_eq!(render("/home/alice/.aws/config"), "~/.aws/config");
+        assert_eq!(render("/home/alice"), "~");
+        // Outside the home → absolute, untouched.
+        assert_eq!(render("/etc/passwd"), "/etc/passwd");
+        // A peer that only shares a textual prefix must NOT collapse (component-wise strip).
+        assert_eq!(render("/home/alicia/.aws"), "/home/alicia/.aws");
+        // No home (root/system/unresolved caller) → absolute, untouched.
+        assert_eq!(
+            AuditPath::Path {
+                path: PathBuf::from("/home/alice/.aws"),
+                home: None,
+            }
+            .to_string(),
+            "/home/alice/.aws"
+        );
+        // The inode fallback prints the raw identity regardless of home.
+        assert_eq!(
+            AuditPath::Inode(FileId::new(Dev(1), Ino(7))).to_string(),
+            "dev=1 ino=7"
+        );
+    }
+
+    #[test]
+    fn caller_user_renders_name_or_bare_uid() {
+        // A regular user: name shown, home kept for `~` collapse. (`CallerUser` borrows the
+        // cache, so the owned name/home outlive it here.)
+        let (alice, alice_home) = (UserName::new("alice"), PathBuf::from("/home/alice"));
+        let u = CallerUser::Named {
+            name: &alice,
+            home: Some(&alice_home),
+        };
+        assert_eq!(u.to_string(), "alice");
+        assert_eq!(u.home(), Some(Path::new("/home/alice")));
+        // Resolved but not regular (root/system): name shown, no home → paths stay absolute.
+        let root = UserName::new("root");
+        let u = CallerUser::Named {
+            name: &root,
+            home: None,
+        };
+        assert_eq!(u.to_string(), "root");
+        assert_eq!(u.home(), None);
+        // No passwd entry → the bare uid, no home.
+        let u = CallerUser::Uid(Uid(4242));
+        assert_eq!(u.to_string(), "4242");
+        assert_eq!(u.home(), None);
     }
 }

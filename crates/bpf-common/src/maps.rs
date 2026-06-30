@@ -9,7 +9,7 @@
 //! paths to `(dev,inode)` via `stat(2)` + the mount table at seed time, and both the
 //! protected object and the caller's executable are matched by [`FileId`].
 
-use crate::ids::{Bank, Decision, Dev, Ino, Pid};
+use crate::ids::{Bank, Decision, Dev, Ino, Nanos, Pid, Suppressed, Uid};
 use crate::policy_maps::{Action, ObjId};
 
 // ---- map names ------------------------------------------------------------
@@ -154,13 +154,16 @@ pub struct DecisionEvent {
     pub action: Action,
     /// Thread-group id (userspace pid) of the caller.
     pub pid: Pid,
+    /// The caller's **real** uid — the daemon resolves it to a login name for the audit
+    /// line and, for a regular user, collapses a path under that user's home to `~`.
+    pub uid: Uid,
     /// How it was handled (`DENY` blocked / `AUDIT` allowed-and-logged).
     pub decision: Decision,
     /// How many identical decisions the in-kernel suppressor folded into this one since
     /// the previous emit for the same `(exe, leaf, action)` (M1 §1g). `0` on a first
     /// occurrence; nonzero means a repeat burst was collapsed — the daemon adds it to
     /// the coalesced record so the true volume is visible.
-    pub suppressed: u32,
+    pub suppressed: Suppressed,
     /// The matched policy — the cause, for the log: an authored `audit`/`deny`, or the
     /// synthetic `DEFAULT_DENY` when no rule matched (vs an explicit `deny`).
     pub policy: crate::policy_maps::Policy,
@@ -170,7 +173,9 @@ pub struct DecisionEvent {
     /// `1` if the path was truncated (deeper than [`PATH_MAX_DEPTH`] or a name longer than
     /// [`PATH_NAME_MAX`]) — the daemon renders a leading `…/` so it never reads as exact.
     pub trunc: u8,
-    pub _pad: [u8; 1],
+    /// Trailing pad so the record's size is a multiple of its 8-byte alignment (the `u64`
+    /// in [`FileId`]) with no implicit padding the kernel might leave uninitialized.
+    pub _pad: [u8; 5],
     /// Leaf-first path components ([`PathComp`]), `depth` of them valid.
     pub comps: [PathComp; PATH_MAX_DEPTH],
 }
@@ -182,6 +187,7 @@ impl DecisionEvent {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pid: Pid,
+        uid: Uid,
         exe: FileId,
         object: FileId,
         leaf: FileId,
@@ -189,7 +195,7 @@ impl DecisionEvent {
         action: Action,
         decision: Decision,
         policy: crate::policy_maps::Policy,
-        suppressed: u32,
+        suppressed: Suppressed,
     ) -> DecisionEvent {
         DecisionEvent {
             exe,
@@ -198,12 +204,13 @@ impl DecisionEvent {
             obj,
             action,
             pid,
+            uid,
             decision,
             suppressed,
             policy,
             depth: 0,
             trunc: 0,
-            _pad: [0; 1],
+            _pad: [0; 5],
             comps: [PathComp::EMPTY; PATH_MAX_DEPTH],
         }
     }
@@ -244,14 +251,14 @@ impl SuppressKey {
 #[derive(Clone, Copy, Debug)]
 pub struct SuppressVal {
     /// `bpf_ktime_get_ns()` at the last *emitted* decision for this key.
-    pub last_ns: u64,
+    pub last_ns: Nanos,
     /// Decisions suppressed since `last_ns` (carried into the next [`DecisionEvent`]).
-    pub suppressed: u32,
+    pub suppressed: Suppressed,
     pub _pad: [u8; 4],
 }
 
 impl SuppressVal {
-    pub const fn new(last_ns: u64, suppressed: u32) -> Self {
+    pub const fn new(last_ns: Nanos, suppressed: Suppressed) -> Self {
         SuppressVal {
             last_ns,
             suppressed,

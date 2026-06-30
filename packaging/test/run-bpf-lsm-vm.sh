@@ -19,9 +19,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-# Build the feature daemon + the `cordon` CLI (for the policy apply/show scenario) +
-# the eBPF object on the host (all reach the guest read-only).
-cargo build -p cordon-daemon --features bpf-lsm
+# Build the daemon (bpf-lsm backend on by default) + the `cordon` CLI (for the policy
+# apply/show scenario) + the eBPF object on the host (all reach the guest read-only).
+cargo build -p cordon-daemon
 cargo build -p cordon-cli
 just build-ebpf
 
