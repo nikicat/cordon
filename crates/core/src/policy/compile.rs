@@ -22,7 +22,9 @@
 
 use super::{Diagnostic, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
-use cordon_bpf_common::{CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectMatch};
+use cordon_bpf_common::{
+    CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectFlags, SubjectMatch,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -246,17 +248,22 @@ fn sort_bucket(bucket: &mut [ProvRule]) {
 /// The count of non-wildcard subject predicates (DESIGN §15.6 step 2); a higher count is
 /// more specific. A concrete subject (`exe=X`) outranks a `who="*"` catch-all on the same
 /// object, so a specific `allow`/`deny` wins over a broad `audit`/`deny` — the basis of
-/// the audit→bless→enforce flow (§15.10 flow A): a blessed `allow exe=X` goes silent while
-/// the `*` catch-all keeps observing the not-yet-blessed.
+/// the audit→admit→enforce flow (§15.10 flow A): an admitted `allow exe=X` goes silent while
+/// the `*` catch-all keeps observing the not-yet-admitted. A concrete `blessing` predicate
+/// (PLAN-bless B1) counts the same way, so a blessing `allow` likewise outranks the catch-all.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Specificity(u32);
 
-/// M1 fills only `exe`, so the count is 1 (concrete exe) or 0 (`*`); the popcount
-/// generalizes for free as M2 adds the uid/cgroup predicates.
+/// M1 fills only `exe`, so the count is 1 (concrete exe) or 0 (`*`); the popcount over the
+/// wildcard flags generalizes for free as the `uid`/`cgroup` (M2) and `blessing` (B1)
+/// predicates land — each concrete one clears its bit and adds a unit of specificity.
 fn subject_specificity(r: CompiledRule) -> Specificity {
-    const PREDICATES: u32 =
-        SubjectMatch::FLAG_EXE_ANY | SubjectMatch::FLAG_UID_ANY | SubjectMatch::FLAG_CGROUP_ANY;
-    Specificity(PREDICATES.count_ones() - (r.subject.flags & PREDICATES).count_ones())
+    // All subject predicates; a rule's specificity is how many are *not* wildcard.
+    let predicates = SubjectFlags::all();
+    Specificity(
+        predicates.bits().count_ones()
+            - r.subject.flags.intersection(predicates).bits().count_ones(),
+    )
 }
 
 /// Allow-vs-deny polarity — the fail-safe tie-break (§15.6 step 3). `Deny` is declared

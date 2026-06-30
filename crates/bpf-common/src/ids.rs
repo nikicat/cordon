@@ -34,6 +34,17 @@ pub struct Pid(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Uid(pub u32);
 
+/// A cgroup-v2 id, as returned by `bpf_get_current_cgroup_id()` — the kernel-assigned,
+/// per-directory unique handle for a cgroup. The `cgroup` subject predicate
+/// ([`crate::SubjectMatch::cgroup`], M2) matches it directly, and it is the key of
+/// [`crate::policy_maps::MAP_BLESSED`] (`cgroup → ClassId`, DESIGN §16.3): a
+/// **per-invocation** blessed cgroup's id resolves to the [`ClassId`](crate::ClassId) it
+/// was minted with. `u64` to match the helper's width; a newtype so it can't be confused
+/// with an [`Ino`]/[`Nanos`]/raw count.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CgroupId(pub u64);
+
 /// How many identical opens the in-kernel suppressor folded into one emit since the last
 /// ring record for a `(exe, leaf, action)` key (M1 §1g): `0` on a first occurrence,
 /// nonzero when a repeat burst was collapsed. Carried on the wire in
@@ -184,6 +195,7 @@ mod user {
     unsafe impl aya::Pod for Ino {}
     unsafe impl aya::Pod for Pid {}
     unsafe impl aya::Pod for Uid {}
+    unsafe impl aya::Pod for CgroupId {}
     unsafe impl aya::Pod for Suppressed {}
     unsafe impl aya::Pod for Nanos {}
     unsafe impl aya::Pod for Decision {}

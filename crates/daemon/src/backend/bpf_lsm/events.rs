@@ -412,7 +412,7 @@ fn parse_event(bytes: &[u8]) -> Option<DecisionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordon_bpf_common::{Dev, Ino, ObjId, Policy, Suppressed, SuppressedTotal};
+    use cordon_bpf_common::{ClassId, Dev, Ino, ObjId, Policy, Suppressed, SuppressedTotal};
 
     /// A protected root shared by the test events (the `object`); `leaf` is what varies.
     const OBJECT: FileId = FileId::new(Dev(1), Ino(100));
@@ -431,6 +431,7 @@ mod tests {
             Decision::DENY,
             Policy::DENY,
             suppressed,
+            ClassId::UNBLESSED,
         )
     }
 

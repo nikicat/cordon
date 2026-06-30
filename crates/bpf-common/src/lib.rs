@@ -18,18 +18,26 @@
 
 #![no_std]
 
+// Defines `padded_pod!`; `#[macro_use]` + declaration-before-use makes it visible to the
+// `maps`/`policy_maps` modules below (textual macro scoping).
+#[macro_use]
+mod layout;
+
 pub mod ids;
 pub mod maps;
 pub mod offsets;
 pub mod policy_maps;
 
-pub use ids::{Bank, Decision, Dev, Ino, Nanos, Opens, Pid, Suppressed, SuppressedTotal, Uid};
+pub use ids::{
+    Bank, CgroupId, Decision, Dev, Ino, Nanos, Opens, Pid, Suppressed, SuppressedTotal, Uid,
+};
 pub use maps::{
     DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, MAP_SUPPRESS, PATH_MAX_DEPTH, PATH_NAME_MAX,
     PathComp, Settings, SuppressKey, SuppressVal,
 };
 pub use offsets::Offsets;
 pub use policy_maps::{
-    Action, BankedFile, BankedObj, CompiledRule, MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES,
-    MAX_OBJECTS, MAX_RULES_PER_OBJ, NUM_BANKS, ObjId, Policy, SubjectMatch, rule_slot,
+    Action, BankedFile, BankedObj, ClassId, CompiledRule, MAP_BLESSED, MAP_PROTECTED,
+    MAP_RULE_COUNT, MAP_RULES, MAX_BLESSED, MAX_OBJECTS, MAX_RULES_PER_OBJ, NUM_BANKS, ObjId,
+    Policy, SubjectFlags, SubjectMatch, rule_slot,
 };
