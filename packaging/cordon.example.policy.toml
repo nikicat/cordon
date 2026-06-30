@@ -37,6 +37,14 @@
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
+# A blessing class (DESIGN §16): a subject group with a `blessing = "<name>"` predicate
+# instead of `members`. `cordon bless --class ro -- <cmd>` runs <cmd> in a cgroup tagged
+# `ro`; this rule lets such a blessed process read the cloud creds (and only those — the
+# object column is the scope). Subject-specificity makes the blessed `allow` outrank the
+# `*` audit catch-all below, so a blessed reader goes silent while unknown ones stay logged.
+[group.subject.blessed-ro]
+blessing = "ro"
+
 [group.object.cloud-creds]
 members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
 
@@ -49,6 +57,16 @@ members = ["read", "listdir"]
 [[rule]]
 who = "@ssh-tools"
 where = "~/.ssh"
+action = "@ro"
+policy = "allow"
+
+# a `cordon bless --class ro` process may read the cloud creds (runtime, PAM-authenticated
+# grant; see DESIGN §16). The blessed allow outranks the `*` audit catch-all below by
+# subject-specificity, so an interactive `cat ~/.aws/credentials` under a bless works
+# without widening the catch-all.
+[[rule]]
+who = "@blessed-ro"
+where = "@cloud-creds"
 action = "@ro"
 policy = "allow"
 

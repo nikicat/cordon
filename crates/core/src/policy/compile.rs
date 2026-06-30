@@ -20,12 +20,12 @@
 //! apply / `inode_create` in M3); an exe that doesn't resolve drops that one rule with
 //! a warning.
 
-use super::{Diagnostic, ResolvedPolicy, Severity, SubjectSpec};
+use super::{ClassName, Diagnostic, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
 use cordon_bpf_common::{
-    CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectFlags, SubjectMatch,
+    ClassId, CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectFlags, SubjectMatch,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The compiled policy: protected objects with their pre-merged, pre-sorted rule
@@ -39,6 +39,10 @@ pub struct CompiledPolicy {
     /// `cordon policy apply` (or when the path is created, M3).
     pub pending: Vec<PathBuf>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The blessing class registry (DESIGN §16.3): each declared class name → its dense
+    /// [`ClassId`], sorted by name. The daemon validates `cordon bless --class` against this
+    /// and writes the `BLESSED` map at mint; [`ClassId::UNBLESSED`] (0) is never assigned.
+    pub blessing_classes: Vec<(ClassName, ClassId)>,
 }
 
 /// One protected object and its flat rule bucket (sorted, copy-down-merged, deduped,
@@ -98,6 +102,17 @@ where
 {
     let mut diagnostics = Vec::new();
 
+    // 0. Blessing class registry (DESIGN §16.3): assign each declared class a dense ClassId
+    //    starting at 1 (ClassId(0) = the UNBLESSED sentinel). `resolved.blessing_classes` is
+    //    already sorted, so the ids are stable across compiles.
+    let blessing_classes: Vec<(ClassName, ClassId)> = resolved
+        .blessing_classes
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), ClassId(i as u32 + 1)))
+        .collect();
+    let class_ids: BTreeMap<ClassName, ClassId> = blessing_classes.iter().cloned().collect();
+
     // 1. Resolve the distinct object paths → objects (sorted for stable ObjIds) +
     //    pending. A `BTreeSet` gives a deterministic order so ObjIds don't churn
     //    across compiles of the same policy.
@@ -132,6 +147,7 @@ where
         let subjects = lower_subjects(
             &rule.subjects,
             &mut resolve_fileid,
+            &class_ids,
             rule.pos,
             &mut diagnostics,
         );
@@ -195,13 +211,16 @@ where
         objects: compiled,
         pending,
         diagnostics,
+        blessing_classes,
     }
 }
 
-/// Lower a rule's subjects to `SubjectMatch`es, resolving exe paths to inodes.
+/// Lower a rule's subjects to `SubjectMatch`es: resolve exe paths to inodes, and map a
+/// blessing class name to its dense [`ClassId`] via `class_ids` (DESIGN §16.3).
 fn lower_subjects<R>(
     subjects: &[SubjectSpec],
     resolve_fileid: &mut R,
+    class_ids: &BTreeMap<ClassName, ClassId>,
     pos: Option<super::Pos>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<SubjectMatch>
@@ -220,6 +239,15 @@ where
                         "exe {} does not exist; this rule is not enforced for it",
                         path.display()
                     ),
+                )),
+            },
+            // `resolve` only emits a `Blessed` for a *declared* class, so the lookup always
+            // hits; guard it as an internal error rather than panicking in the daemon.
+            SubjectSpec::Blessed(name) => match class_ids.get(name) {
+                Some(&id) => out.push(SubjectMatch::blessed(id)),
+                None => diagnostics.push(Diagnostic::error(
+                    pos,
+                    format!("internal: blessing class {name:?} is not in the registry"),
                 )),
             },
         }
@@ -532,5 +560,74 @@ mod tests {
         assert_eq!(d.rules[0].action_mask, Action::READ | Action::WRITE);
         assert_eq!(d.rules[0].policy, Policy::AUDIT);
         assert_eq!(d.rules[0].subject, SubjectMatch::ANY);
+    }
+
+    // ---- blessing (DESIGN §16.3 / PLAN-bless B1c) ----
+
+    /// A blessing rule lowers to `SubjectMatch::blessed(id)`: BLESSING_ANY cleared, the class
+    /// stamped in, and the registry maps the name → a dense id ≥ 1.
+    #[test]
+    fn blessing_rule_lowers_and_registry_is_assigned() {
+        let text = r#"
+            [group.subject.blessed-ro]
+            blessing = "ro"
+            [group.subject.blessed-rw]
+            blessing = "rw"
+            [[rule]]
+            who = "@blessed-ro"
+            where = "/d"
+            action = "read"
+            policy = "allow"
+        "#;
+        let p = compile_text(text, &[("/d", 10)]);
+        assert!(!p.has_errors(), "{:?}", p.diagnostics);
+
+        // Registry: both declared classes present, sorted by name, dense ids from 1
+        // (ClassId(0) reserved for UNBLESSED).
+        let reg: std::collections::BTreeMap<_, _> = p
+            .blessing_classes
+            .iter()
+            .map(|(n, id)| (n.as_str().to_string(), id.0))
+            .collect();
+        assert_eq!(reg["ro"], 1);
+        assert_eq!(reg["rw"], 2);
+
+        // The referencing rule's subject carries the stamped class id and clears BLESSING_ANY.
+        let d = object(&p, "/d");
+        assert_eq!(d.rules.len(), 1);
+        assert_eq!(d.rules[0].subject, SubjectMatch::blessed(ClassId(1)));
+        assert!(
+            !d.rules[0]
+                .subject
+                .flags
+                .contains(cordon_bpf_common::SubjectFlags::BLESSING_ANY)
+        );
+    }
+
+    /// A blessing predicate is one unit of subject specificity, so it outranks a `who="*"`
+    /// catch-all on the same object — the basis of a blessing `allow` beating a catch-all
+    /// `deny` (PLAN-bless B1 decision #5).
+    #[test]
+    fn blessed_allow_outranks_wildcard_deny() {
+        let text = r#"
+            [group.subject.blessed-ro]
+            blessing = "ro"
+            [[rule]]
+            who = "*"
+            where = "/d"
+            action = "read"
+            policy = "deny"
+            [[rule]]
+            who = "@blessed-ro"
+            where = "/d"
+            action = "read"
+            policy = "allow"
+        "#;
+        let p = compile_text(text, &[("/d", 10)]);
+        assert!(!p.has_errors());
+        // First-match = most-specific: the blessed allow beats the wildcard deny.
+        let d = object(&p, "/d");
+        assert_eq!(d.rules[0].policy, Policy::ALLOW, "{:?}", d.rules);
+        assert_eq!(d.rules[0].subject, SubjectMatch::blessed(ClassId(1)));
     }
 }
