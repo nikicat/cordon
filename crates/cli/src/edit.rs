@@ -677,12 +677,20 @@ impl TempEdit {
                 .open(&tmp.file)
                 .map_err(|e| Error::msg(format!("create temp file: {e}")))?;
             f.write_all(seed.as_bytes())?;
-        }
-        if let EditorAs::User { uid, gid, .. } = editor_as {
-            for p in [&tmp.dir, &tmp.file] {
-                sys::chown(p, *uid, *gid)
-                    .map_err(|e| Error::msg(format!("chown {}: {e}", p.display())))?;
+            // Hand the file to the invoking user via its **fd**, while the dir is still
+            // root-owned 0700 (so the fd is still the one we created). `fchown` acts on the
+            // open inode, not a name, so — unlike a path `chown` — a same-uid attacker can't
+            // redirect it through a symlink once the dir becomes theirs (arbitrary-chown TOCTOU).
+            if let EditorAs::User { uid, gid, .. } = editor_as {
+                sys::fchown(&f, *uid, *gid)
+                    .map_err(|e| Error::msg(format!("chown temp file: {e}")))?;
             }
+        }
+        // The dir last, by path — a root-created entry in the sticky tmpdir, so its own path
+        // can't be swapped — chowned so the dropped editor can enter it.
+        if let EditorAs::User { uid, gid, .. } = editor_as {
+            sys::chown(&tmp.dir, *uid, *gid)
+                .map_err(|e| Error::msg(format!("chown {}: {e}", tmp.dir.display())))?;
         }
         Ok(tmp)
     }
