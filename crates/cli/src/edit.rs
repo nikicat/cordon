@@ -27,7 +27,7 @@ use cordon_core::proto::{Request, Response};
 use cordon_core::{Error, Result, config};
 use nix::unistd::{Gid, Uid};
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
@@ -271,8 +271,7 @@ impl Session {
     fn edit_loop(self) -> Result<ExitCode> {
         loop {
             self.run_editor()?;
-            let edited = fs::read_to_string(&self.tmp.file)
-                .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+            let edited = read_edited(&self.tmp.file)?;
             // An unchanged buffer is a no-op — *unless* we still owe an include registration
             // (a `--user` bootstrap), where even an untouched-but-valid file should be
             // registered and applied.
@@ -744,6 +743,31 @@ fn write_staging(staging: &Path, text: &str, mode: u32) -> io::Result<()> {
     fs::set_permissions(staging, Permissions::from_mode(mode))
 }
 
+/// Read the edited temp copy back for validation, **without following a symlink**. The temp
+/// dir is owned by the invoking user while the editor runs, so a same-uid attacker could
+/// replace the file with a symlink to a root-only file (e.g. `/etc/shadow`) — this read runs
+/// as root, so following it would leak that file's contents (into the policy, or, on a parse
+/// failure, the diagnostics). `O_NOFOLLOW` makes a symlinked final component fail the open,
+/// and the regular-file check rejects a fifo/device swap; `O_NONBLOCK` keeps a fifo swap from
+/// stalling the open before that check. A legitimate editor's atomic save renames a *regular*
+/// file into place, which `O_NOFOLLOW` still accepts.
+fn read_edited(path: &Path) -> Result<String> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(Error::msg(
+            "edited file is not a regular file — refusing to read it back",
+        ));
+    }
+    let mut edited = String::new();
+    f.read_to_string(&mut edited)
+        .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+    Ok(edited)
+}
+
 /// Read the current policy file into a [`Seed`], or a template for a not-yet-existing one.
 fn read_seed(target: &Path) -> Result<Seed> {
     match fs::read_to_string(target) {
@@ -796,6 +820,47 @@ mod tests {
             PathBuf::from("/etc/cordon/users/nb.toml")
         );
         assert_eq!(include_fragment(file), file);
+    }
+
+    #[test]
+    fn read_edited_reads_a_regular_file() {
+        let dir = std::env::temp_dir().join(format!("cordon-re-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("policy.toml");
+        std::fs::write(&f, "rules = '''\n'''\n").unwrap();
+        assert_eq!(read_edited(&f).unwrap(), "rules = '''\n'''\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Vuln-2 regression: a same-uid attacker who owns the temp dir swaps the file for a
+    /// symlink to a root-only file. The privileged read-back must refuse to follow it, so the
+    /// target's contents never surface (into the policy or the diagnostics).
+    #[test]
+    fn read_edited_refuses_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("cordon-re-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "TOP-SECRET").unwrap();
+        let link = dir.join("policy.toml");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let err = read_edited(&link).unwrap_err();
+        assert!(
+            !format!("{err}").contains("TOP-SECRET"),
+            "symlinked file contents must not surface"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// …and a directory/fifo/device swapped in for the file is rejected by the regular-file
+    /// check rather than read.
+    #[test]
+    fn read_edited_refuses_a_non_regular_file() {
+        let dir = std::env::temp_dir().join(format!("cordon-re-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let notfile = dir.join("policy.toml");
+        std::fs::create_dir(&notfile).unwrap();
+        assert!(read_edited(&notfile).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

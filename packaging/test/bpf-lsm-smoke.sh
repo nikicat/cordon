@@ -56,6 +56,14 @@
 #                       home collapsed to `~` (DESIGN §15.10) — so a logged access is
 #                       copy-pasteable into that user's policy. Reads a vault as a
 #                       synthesized regular uid and asserts the ~-collapsed line.
+#  16. edit no-leak    — `cordon policy edit` (sudoedit analog, §15.8) drops to the invoking
+#                       user for the editor. A same-uid editor swaps the temp copy for a
+#                       symlink to a root-only file; the privileged read-back must refuse to
+#                       follow it (O_NOFOLLOW), so the file never leaks into the policy/output.
+#  17. edit no-chown   — a racing same-uid loop swaps the temp copy for a symlink while
+#                       `policy edit` runs; the fd-based (`fchown`) hand-off keeps a root-owned
+#                       sentinel from ever being chowned to the invoker (a path chown would
+#                       follow the symlink — an arbitrary-chown → local-root TOCTOU).
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -81,6 +89,8 @@ OBJ="$ROOT_DIR/target/bpf/cordon.bpf.o"
 
 # --- shared per-scenario state + helpers -----------------------------------
 TMP="" VAULT="" SECRET="" OWNER="" OWNER_B="" SCRAPER="" SOCK="" LOG="" DPID=""
+# policy-edit symlink scenarios (16/17): the synthetic editor user + the root-only sentinel.
+TUID="" TUSER="" SENTINEL="" EDITDIR=""
 
 # A throwaway exe with a distinct inode identity — a copy of `bash`, so we can drive
 # both reads (`exec 3<f`) and writes (`exec 3>f`) *as that subject*. Echoes its path.
@@ -656,6 +666,97 @@ EOF
     return $fail
 }
 
+# --- policy-edit symlink scenarios (16 + 17): shared setup ------------------
+# The sudoedit-style boundary (DESIGN §15.8) drops to the invoking user for the editor while
+# the root parent seeds/reads/writes the root-owned copy. Both scenarios exercise a same-uid
+# symlink attack (the in-scope threat, DESIGN §2) on the user-owned temp copy; no daemon is
+# needed — the attack is resolved before the apply.
+
+# Synthesize a throwaway regular user (the editor drops to it), a root-only sentinel, and a
+# config. Echoes SKIP + returns 1 when the guest can't support it; on success sets the
+# TUID/TUSER/SENTINEL/EDITDIR globals + CORDON_CONFIG.
+edit_env_setup() {
+    ws_new
+    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 1; }
+    TUID=4243; TUSER="cordonedit$$"
+    local thome="$TMP/ehome"; mkdir -p "$thome"; chown "$TUID:$TUID" "$thome"; chmod 755 "$TMP"
+    printf '%s:x:%s:%s:Cordon Edit:%s:/bin/sh\n' "$TUSER" "$TUID" "$TUID" "$thome" >> /etc/passwd 2>/dev/null \
+        || { echo "  SKIP: /etc/passwd not writable"; return 1; }
+    SENTINEL="$TMP/root-secret"; echo "SENTINEL-XYZZY" > "$SENTINEL"; chown 0:0 "$SENTINEL"; chmod 600 "$SENTINEL"
+    EDITDIR="${TMPDIR:-/tmp}"   # where cordon mints its per-edit temp dir
+    cat > "$TMP/config.toml" <<EOF
+backend = "bpf-lsm"
+socket = "$TMP/dead.sock"
+bpf_object = "$OBJ"
+policy = "$TMP/policy.toml"
+EOF
+    export CORDON_CONFIG="$TMP/config.toml"
+}
+
+# Undo edit_env_setup: drop the synthetic passwd line + free the workspace.
+edit_env_teardown() { sed -i "/^$TUSER:/d" /etc/passwd 2>/dev/null; daemon_stop; }
+
+# Run `cordon policy edit` as the synthetic user with EDITOR=$1; echoes its combined output.
+# stdin is /dev/null so a re-edit prompt (only reached if the read-back regresses and accepts
+# a bad buffer) gets EOF → Quit, failing fast instead of blocking the suite.
+run_policy_edit() { SUDO_UID="$TUID" SUDO_GID="$TUID" EDITOR="$1" "$CORDON" policy edit "$TMP/policy.toml" </dev/null 2>&1; }
+
+# --- scenario 16: read-back refuses a symlinked temp copy (no leak) ----------
+# The editor (running as the invoking user) swaps the temp copy for a symlink to a root-only
+# file; the privileged read-back must NOT follow it (O_NOFOLLOW), so its contents never
+# surface in the saved policy or the printed diagnostics.
+scenario_policy_edit_leak() {
+    echo "### scenario: policy edit read-back refuses a symlinked temp copy (no leak)"
+    edit_env_setup || { daemon_stop; return 0; }
+    cat > "$TMP/evil-editor.sh" <<EOF
+#!/bin/sh
+rm -f "\$1"; ln -s "$SENTINEL" "\$1"; exit 0
+EOF
+    chmod 755 "$TMP/evil-editor.sh"
+    local fail=0 out; out="$(run_policy_edit "$TMP/evil-editor.sh")"
+    if printf '%s' "$out" | grep -q "SENTINEL-XYZZY"; then
+        echo "  FAIL: read-back followed the symlink — leaked the root sentinel:"; printf '%s\n' "$out" | sed 's/^/  cli| /'; fail=1
+    elif [ -f "$TMP/policy.toml" ] && grep -q "SENTINEL-XYZZY" "$TMP/policy.toml"; then
+        echo "  FAIL: the root sentinel's contents were written into the policy"; fail=1
+    else
+        echo "  OK: read-back refused the symlink (no sentinel leak)"
+    fi
+    edit_env_teardown; return $fail
+}
+
+# --- scenario 17: fd-based chown resists a temp-copy symlink race ------------
+# A racing same-uid loop keeps swapping any cordon temp copy for a symlink to the sentinel
+# while `policy edit` runs. The fd-based (`fchown`) hand-off makes this structurally safe, so
+# across many runs the sentinel is never chowned to the invoker (a path `chown` would follow).
+scenario_policy_edit_chown() {
+    echo "### scenario: policy edit fd-based chown resists a temp-copy symlink race"
+    edit_env_setup || { daemon_stop; return 0; }
+    local flag="$TMP/race.on"; : > "$flag"
+    cat > "$TMP/racer.sh" <<'RACER'
+#!/bin/sh
+while [ -e "$FLAG" ]; do
+    for f in "$EDITDIR"/cordon-edit-*/policy.toml; do
+        [ -e "$f" ] && [ ! -L "$f" ] && ln -sf "$SENTINEL" "$f" 2>/dev/null
+    done
+done
+RACER
+    chmod 755 "$TMP/racer.sh"
+    FLAG="$flag" SENTINEL="$SENTINEL" EDITDIR="$EDITDIR" \
+        setpriv --reuid "$TUID" --regid "$TUID" --clear-groups "$TMP/racer.sh" &
+    local racer=$!
+    for _ in $(seq 1 20); do run_policy_edit /bin/true >/dev/null 2>&1; done
+    rm -f "$flag"; wait "$racer" 2>/dev/null
+    local fail=0 owner; owner="$(stat -c '%u:%g' "$SENTINEL")"
+    if [ "$owner" != "0:0" ]; then
+        echo "  FAIL: the root sentinel was chowned to $owner (arbitrary-chown TOCTOU)"; fail=1
+    elif [ "$(cat "$SENTINEL")" != "SENTINEL-XYZZY" ]; then
+        echo "  FAIL: the root sentinel's content changed"; fail=1
+    else
+        echo "  OK: the sentinel stayed root-owned + intact across the chown race"
+    fi
+    edit_env_teardown; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -673,6 +774,8 @@ scenario_coalesce          || rc=1
 scenario_leaf_path         || rc=1
 scenario_user_tier         || rc=1
 scenario_user_home_tilde   || rc=1
+scenario_policy_edit_leak  || rc=1
+scenario_policy_edit_chown || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then
