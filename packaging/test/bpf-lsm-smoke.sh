@@ -80,6 +80,18 @@
 #                       the blessed sleep dies, list + dirs drain.
 #  22. bless journal   — bless is loud: a blessed read under an `audit @blessed-ro` rule
 #                       journals with a trailing `blessing=ro` (class by NAME).
+#  23. bless drop      — the `sudo` shape: SUDO_UID/SUDO_GID is the ENTIRE interface sudo
+#                       gives the CLI, so setting them as root is byte-identical to a real
+#                       `sudo cordon bless` (same substitution 16/17 make for `policy
+#                       edit`). The blessed child is dropped to a non-root user and must
+#                       STILL read the secret — true only if the carrier join preceded the
+#                       drop. Also: the invoker's supplementary groups survive
+#                       (getgrouplist) and $HOME is theirs, not root's.
+#
+# The bless scenarios run the daemon in a NESTED cgroup, reproducing production's
+# `Delegate=yes` service cgroup without needing systemd (the carrier root is then a
+# non-root cgroup — the stricter case, since the cgroup2 root is exempt from the "no
+# internal processes" rule).
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -105,6 +117,9 @@ OBJ="$ROOT_DIR/target/bpf/cordon.bpf.o"
 
 # --- shared per-scenario state + helpers -----------------------------------
 TMP="" VAULT="" SECRET="" OWNER="" OWNER_B="" SCRAPER="" SOCK="" LOG="" DPID=""
+# When set (the bless scenarios), the daemon is started *inside* this cgroup instead of
+# the cgroup2 root — see `daemon_start`.
+DCGROUP=""
 # policy-edit symlink scenarios (16/17): the synthetic editor user + the root-only sentinel.
 TUID="" TUSER="" SENTINEL="" EDITDIR=""
 
@@ -148,8 +163,20 @@ EOF
     export CORDON_CONFIG="$TMP/config.toml"
 }
 
+# Start the daemon (env assignments as args). With `$DCGROUP` set, it is started *inside*
+# that cgroup — the production shape under `Delegate=yes`, where carriers are created in a
+# **nested** cgroup rather than the cgroup2 root. Worth reproducing precisely because the
+# root cgroup is *exempt* from cgroup-v2's "no internal processes" rule and a nested one is
+# not, so this is the stricter case. The daemon must already be in the cgroup when it
+# starts (it resolves its carrier root from /proc/self/cgroup), hence join-then-exec.
 daemon_start() {
-    RUST_LOG="${RUST_LOG:-info}" env "$@" "$CORDOND" >"$LOG" 2>&1 &
+    if [ -n "$DCGROUP" ]; then
+        mkdir -p "$DCGROUP"
+        RUST_LOG="${RUST_LOG:-info}" env "$@" \
+            sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$DCGROUP" "$CORDOND" >"$LOG" 2>&1 &
+    else
+        RUST_LOG="${RUST_LOG:-info}" env "$@" "$CORDOND" >"$LOG" 2>&1 &
+    fi
     DPID=$!
     for _ in $(seq 1 50); do
         [ -S "$SOCK" ] && break
@@ -161,6 +188,13 @@ daemon_start() {
 daemon_stop() {
     [ -n "$DPID" ] && { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
     DPID=""
+    if [ -n "$DCGROUP" ]; then
+        # Best-effort: the daemon's own cgroup is empty once it exits; a carrier that
+        # still has members is left for the next daemon's reconcile to adopt.
+        rmdir "$DCGROUP"/cordon-bless-* 2>/dev/null
+        rmdir "$DCGROUP" 2>/dev/null
+        DCGROUP=""
+    fi
     [ -n "$TMP" ] && rm -rf "$TMP"
 }
 
@@ -773,18 +807,30 @@ RACER
     edit_env_teardown; return $fail
 }
 
-# --- bless scenarios (18–22): shared helpers ---------------------------------
+# --- bless scenarios (18–23): shared helpers ---------------------------------
 # The smoke runs as root, so the CLI is invoked directly (peer uid 0 — the daemon's
-# SO_PEERCRED gate passes) and the blessed child stays root (no SUDO_UID to drop to).
+# SO_PEERCRED gate passes). Scenarios 18–22 leave the blessed child as root; scenario 23
+# covers the real `sudo` shape by setting SUDO_UID/SUDO_GID, which is the *entire*
+# interface between sudo and the CLI (crates/cli/src/bless.rs reads nothing else from it)
+# — the same substitution the policy-edit scenarios already make. All of them run the
+# daemon in a nested cgroup ($DCGROUP), reproducing `Delegate=yes` without systemd.
+
+# The daemon's cgroup for the bless scenarios — stands in for the systemd service cgroup.
+BLESS_DCGROUP="/sys/fs/cgroup/cordon-smoke.scope"
 
 # cgroup2 is required for the carrier cgroups; mount it if the guest hasn't (virtme
-# usually has). SKIP (like the setpriv guard) when it can't be made available.
+# usually has). SKIP (like the setpriv guard) when it can't be made available. Also arms
+# $DCGROUP so the daemon starts in a nested cgroup, as it does in production.
 cgroup2_ready() {
-    [ -f /sys/fs/cgroup/cgroup.controllers ] && return 0
-    mkdir -p /sys/fs/cgroup 2>/dev/null
-    mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null && return 0
-    echo "  SKIP: cgroup2 unavailable (cannot mount /sys/fs/cgroup)"
-    return 1
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        mkdir -p /sys/fs/cgroup 2>/dev/null
+        if ! mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; then
+            echo "  SKIP: cgroup2 unavailable (cannot mount /sys/fs/cgroup)"
+            return 1
+        fi
+    fi
+    DCGROUP="$BLESS_DCGROUP"
+    return 0
 }
 
 # The daemon's carrier root: its own cgroup dir (carriers are created under it).
@@ -853,6 +899,14 @@ policy = "deny"
 EOF
     daemon_start; started || return 1
     local fail=0
+    # Guard the harness itself: if the daemon ever fell back to the cgroup2 root, every
+    # bless scenario would silently stop covering the production (Delegate=yes) shape and
+    # still pass. Assert the carrier root is the nested cgroup we started it in.
+    if [ "$(bless_root)" = "$BLESS_DCGROUP" ]; then
+        echo "  OK: daemon runs in a nested cgroup ($BLESS_DCGROUP) — the Delegate=yes shape"
+    else
+        echo "  FAIL: carrier root is $(bless_root), expected the nested $BLESS_DCGROUP"; fail=1
+    fi
     # The blessed read must outrank the who="*" deny on the same object (B1 decision #5)
     # — this is also the end-to-end proof that the mkdir'd carrier's st_ino equals what
     # bpf_get_current_cgroup_id() sees.
@@ -1025,6 +1079,82 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario 23: bless drops to the invoking user (the sudo path) -----------
+# `sudo` hands the CLI exactly two things: SUDO_UID and SUDO_GID. Setting them as root is
+# therefore byte-identical to a real `sudo cordon bless` from the code's point of view —
+# the same substitution scenarios 16/17 already make for `policy edit`. This covers what
+# 18–22 structurally cannot: the child is dropped to a NON-ROOT user and must *still* be
+# blessed, which holds only if the carrier join happened **before** the privilege drop
+# (both in one pre_exec). It also exercises the invoker's supplementary groups
+# (getgrouplist, resolved pre-fork) and their $HOME replacing root's.
+scenario_bless_drop_to_invoker() {
+    echo "### scenario: bless drops to the invoking user (SUDO_UID + groups + still blessed)"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    local buid=4244 bgid=4244 sgid=4245
+    local buser="cordonbless$$" bgroup="cordonextra$$"
+    local bhome="$TMP/bhome"; mkdir -p "$bhome"; chown "$buid:$bgid" "$bhome"
+    chmod 755 "$TMP"   # the dropped child must traverse to its exe + the secret
+    if ! printf '%s:x:%s:%s:Cordon Bless:%s:/bin/sh\n' "$buser" "$buid" "$bgid" "$bhome" >> /etc/passwd 2>/dev/null; then
+        echo "  SKIP: /etc/passwd not writable in this guest"; daemon_stop; return 0
+    fi
+    # A supplementary group the invoker belongs to — getgrouplist must carry it through
+    # the drop (the editor drop deliberately clears groups; the bless drop must not).
+    printf '%s:x:%s:%s\n' "$bgroup" "$sgid" "$buser" >> /etc/group 2>/dev/null
+    local out="$TMP/blessed.id"; : > "$out"; chmod 666 "$out"
+    # Reports its identity, then does the blessed read (a denied read fails the script).
+    cat > "$TMP/blessed-id.sh" <<EOF
+#!/bin/bash
+{ id -u; id -G; echo "\$HOME"; } > "$out"
+exec 3< "$SECRET"
+EOF
+    chmod 755 "$TMP/blessed-id.sh"
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = "read"
+policy = "deny"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    bless_drop_cleanup() { sed -i "/^$buser:/d" /etc/passwd 2>/dev/null; sed -i "/^$bgroup:/d" /etc/group 2>/dev/null; }
+    daemon_start
+    if ! started; then bless_drop_cleanup; return 1; fi
+    local fail=0
+    if SUDO_UID="$buid" SUDO_GID="$bgid" "$CORDON" bless --class ro -- "$TMP/blessed-id.sh" 2>/dev/null; then
+        echo "  OK: a NON-ROOT blessed child read the secret (join happened before the drop)"
+    else
+        echo "  FAIL: the dropped child was denied — join-before-drop regression?"
+        sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    local got_uid got_groups got_home
+    got_uid="$(sed -n 1p "$out")"; got_groups="$(sed -n 2p "$out")"; got_home="$(sed -n 3p "$out")"
+    if [ "$got_uid" = "$buid" ]; then
+        echo "  OK: child ran as uid $buid (dropped from root via SUDO_UID)"
+    else
+        echo "  FAIL: child uid=${got_uid:-<none>}, expected $buid"; fail=1
+    fi
+    if printf '%s' "$got_groups" | tr ' ' '\n' | grep -qx "$sgid"; then
+        echo "  OK: the invoker's supplementary group $sgid survived the drop (getgrouplist)"
+    else
+        echo "  FAIL: supplementary group $sgid missing (groups=${got_groups:-<none>})"; fail=1
+    fi
+    if [ "$got_home" = "$bhome" ]; then
+        echo "  OK: \$HOME is the invoker's, not root's"
+    else
+        echo "  FAIL: HOME=${got_home:-<none>}, expected $bhome"; fail=1
+    fi
+    daemon_stop; bless_drop_cleanup; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -1049,6 +1179,7 @@ scenario_bless_boundary    || rc=1
 scenario_bless_inherit_gc  || rc=1
 scenario_bless_revoke      || rc=1
 scenario_bless_journal     || rc=1
+scenario_bless_drop_to_invoker || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then
