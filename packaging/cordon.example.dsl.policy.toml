@@ -39,9 +39,9 @@ rules = '''
 # ssh tooling may read ~/.ssh; every other opener there is default-denied.
 allow    @ssh-tools     @ro          ~/.ssh
 
-# a `cordon bless --class ro` process may read the cloud creds (runtime, PAM-authenticated
-# grant; DESIGN §16). The blessed allow outranks the `*` audit catch-all by subject-
-# specificity, so an interactive reader under a bless works without widening the catch-all.
+# a `sudo cordon bless --class ro` process may read the cloud creds (runtime grant, human-
+# authenticated by sudo; DESIGN §16). The blessed allow outranks the `*` audit catch-all by
+# subject-specificity, so an interactive reader under a bless works without widening the catch-all.
 allow    @blessed-ro    @ro          @cloud-creds
 
 # the aws cli reads + writes its own creds.
@@ -62,7 +62,7 @@ silence  /usr/bin/aws   *            ~/.aws/.danger-token
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
 # A blessing class (DESIGN §16): a subject group with a `blessing = "<name>"` predicate
-# instead of `members`. `cordon bless --class ro -- <cmd>` tags its cgroup `ro`; the rule
+# instead of `members`. `sudo cordon bless --class ro -- <cmd>` tags its cgroup `ro`; the rule
 # above grants such a process read access to the cloud creds (and only those).
 [group.subject.blessed-ro]
 blessing = "ro"

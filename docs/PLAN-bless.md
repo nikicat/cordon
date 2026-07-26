@@ -1,18 +1,25 @@
 # Implementation plan — blessing (`cordon bless`)
 
-Concrete, reviewable plan for [`DESIGN.md` §16](DESIGN.md) — the runtime, PAM-authenticated
+Concrete, reviewable plan for [`DESIGN.md` §16](DESIGN.md) — the runtime, human-authenticated
 access grant. A blessing lets an *ad-hoc, interactive* invocation (`cat`/`find`/`du`/a shell)
 and its descendants cross the cordon, under a class defined in policy. It is **additive** to
 the §15 rule model and reuses it as much as possible: **a blessing is one more `SubjectMatch`
 predicate** (`blessing = "<class>"`, §16.3), so a blessing rule is an ordinary rule —
 action, object scope, conjunction, and precedence all come from the existing model. The only
 new pieces are a carrier (a per-invocation root-owned cgroup), a tiny runtime indirection map
-(`BLESSED: cgroup_id → ClassId`), a PAM mint path in the daemon, and the `cordon bless` CLI.
+(`BLESSED: cgroup_id → ClassId`), a root-gated mint path in the daemon, and the `cordon bless`
+CLI.
+
+> **Status: B1 is done (2026-07-26), sudo-gated.** B1a–B1f all shipped and are VM-validated
+> (22/22 smoke scenarios). One design change during implementation: **`sudo` authenticates
+> instead of PAM-in-the-daemon**, and the CLI (root via sudo) spawns the target instead of the
+> daemon — see the B1d note and DESIGN §16.5 for the rationale and the accepted deltas. PAM
+> mint moves to **B3** below.
 
 Guiding constraints (from §16):
 - **Authorization is the whole feature.** The carrier is forgeable (§8.1); security rests
-  entirely on (a) PAM at mint and (b) root-owned `cgroup.procs` so only the daemon places a
-  task in a blessed cgroup. Build and test those two first.
+  entirely on (a) a human authenticating at mint and (b) root-owned `cgroup.procs` so only a
+  root process places a task in a blessed cgroup. Build and test those two first.
 - **Blessing is an ordinary rule.** The `blessing` predicate composes with the rest of
   `SubjectMatch`; scope is the rule's object column, precedence is §15.6 specificity. No
   bespoke grant table, no deny→allow flip — just first-match over the compiled buckets.
@@ -24,18 +31,20 @@ Guiding constraints (from §16):
   blessings are enumerable and revocable.
 - **No hardcode.** Classes are declared in policy (`blessing` predicate); class names (`ro`,
   `rw`, …) are conventions, not built-ins.
-- **No grace window.** Every mint authenticates; repeat access is `bless`-a-shell.
+- **No grace window.** Every mint authenticates; repeat access is `bless`-a-shell. *(As
+  shipped, sudo's timestamp cache is a grace window — see decision #8 and the sudoers note.)*
 
 Milestones are sequenced so each is shippable and VM-validated on its own. **B1 is the
-boundary** and ships the whole feature (scoped, fully customizable); B2 is ergonomics.
+boundary** and ships the whole feature (scoped, fully customizable); B2 is ergonomics; B3 is
+the PAM authenticator upgrade.
 
 ---
 
-## Milestone B1 — Core grant path (the boundary), scoped
-Text policy gains the `blessing` subject predicate; `cordon bless` authenticates via PAM,
-spawns the command into a fresh root-owned cgroup tagged with its class, and the kernel matches
-the blessing predicate during its normal bucket scan. Delivers the whole feature end-to-end,
-**scoped to the rule's object column** (no blanket), **no grace window**.
+## Milestone B1 — Core grant path (the boundary), scoped ✅ *done 2026-07-26*
+Text policy gains the `blessing` subject predicate; `sudo cordon bless` authenticates the
+human, spawns the command into a fresh root-owned cgroup tagged with its class, and the kernel
+matches the blessing predicate during its normal bucket scan. Delivers the whole feature
+end-to-end, **scoped to the rule's object column** (no blanket).
 
 ### B1a. Shared types — `crates/bpf-common`
 - **`SubjectMatch` gains a `blessing` predicate:** `blessing: ClassId (u32)` + a
@@ -71,68 +80,103 @@ the blessing predicate during its normal bucket scan. Delivers the whole feature
 - Lint: unknown class named by `cordon bless` (checked against the registry), a declared class
   no rule references (unreachable), a `blessing` predicate naming an undeclared class.
 
-### B1d. Daemon — `crates/daemon`
-- **IPC** (`proto.rs`/`ipc.rs`): `Request::Bless { class, argv, cwd, env }` (the front-end
-  ships its full `environ`; the child inherits it — safe, no uid elevation), plus PAM
-  **conversation** frames (daemon→client prompt/info, client→daemon response) and a terminal
-  result. `Request::BlessList` / `Request::BlessRevoke { id }`. Caller identity from
-  **`SO_PEERCRED`**, never the request body.
-- **PAM** (new dep): authenticate the peer uid's user against a `cordon` PAM service, with a
-  conversation function that proxies prompts to the client over the socket (§16.5). Runs in the
-  root daemon (needs `/etc/shadow`).
-- **Carrier:** validate `class` against the compiled registry; create a fresh root-owned cgroup
-  — **primary: a systemd transient scope** (`cordon-bless-<id>.scope` under a `cordon.slice`);
-  **alt:** a subtree delegated to the daemon. Register `BLESSED[cgroup_id] = ClassId`.
-- **Spawn:** `clone3(CLONE_INTO_CGROUP)` so the child is *born* in the cgroup (zero unblessed
-  window), running **as the invoking user** — reuse the privilege-drop discipline from
-  `crates/cli/src/sys.rs` (setgroups/setgid/setuid, the user's `$HOME`/`$USER`) — with the
-  **caller's full environment + cwd** (no scrubbing; same-uid, no elevation).
-- **GC:** watch the cgroup's `cgroup.events` `populated` flag; on `0`, remove the cgroup and
-  drop the `BLESSED` entry (the grant evaporates with the tree).
-- **Reconciliation:** on startup, adopt any pre-existing `cordon-bless-*` scopes, rebuild
-  `BLESSED`, resume GC — so a daemon restart doesn't strand live blessings or leak entries.
+### B1d. Daemon — `crates/daemon` ✅ *(shipped; sudo-gated, see the note below)*
+> **Shipped design change (user-approved).** The authenticator is **sudo**, not PAM in the
+> daemon, and the **CLI** (root, via sudo) is the spawner. Rationale + accepted deltas: DESIGN
+> §16.5. Exploration found PAM-in-daemon much heavier than specced (conversation proxying as
+> multi-frame IPC, stdio fd passing, degraded job control for daemon-spawned children), and
+> the systemd-less smoke VM cannot test transient scopes. PAM mint is deferred to B3 below;
+> the mint verb is authenticator-agnostic, so conversation frames slot in without reshaping
+> IPC. What follows is what actually shipped.
+- **IPC** (`proto.rs`/`ipc.rs`): `Request::{BlessMint { class }, BlessList, BlessRevoke { id }}`
+  → `Response::{BlessMinted(BlessingView), Blessings(Vec<BlessingView>), BlessRevoked { id }}`.
+  No `argv`/`cwd`/`env` on the wire — the CLI spawns, so nothing about the target crosses the
+  socket. Peer creds read once per connection; a pure `authorize(req, peer_uid)` gate requires
+  **uid 0** for mint/revoke (`BlessList` open, parity with `PolicyShow`).
+- **Channel:** the backend thread's one control channel widens to
+  `ControlMsg { Apply, Bless(BlessOp) }` — *one* channel, so applies and bless ops are strictly
+  ordered and the apply-time remap can't race a mint.
+- **Carrier:** validate `class` against the compiled registry (omitted `--class` → the sole
+  declared class), create a fresh root-owned `cordon-bless-<id>.<class>` **under the daemon's
+  own cgroup** (`Delegate=yes` in both units; identical code path with or without systemd, so
+  the VM exercises the real thing). Register `BLESSED[st_ino] = ClassId` — on cgroup2, the
+  directory's inode *is* the id `bpf_get_current_cgroup_id()` returns.
+- **GC** (every 500ms tick): reap on `populated 0` **and** meaningful emptiness — it had
+  members and they exited, it was revoked, or a **30s mint grace** expired (a fresh carrier is
+  legitimately empty until the CLI's `pre_exec` join lands; the grace also cleans up after a
+  CLI that died before joining).
+- **Revoke:** write `cgroup.kill` (the whole tree dies), let the same GC finish the teardown.
+- **Apply-time remap (the correctness keystone):** an apply renumbers `ClassId`s, so every
+  apply re-points live `BLESSED` entries **by class name**; a vanished class is unregistered
+  (blessing goes inert) and the tree is never killed.
+- **Reconciliation:** on startup, scan for leftover `cordon-bless-*` carriers — empty ones are
+  removed, populated ones re-registered if their class is still declared, populated ones of a
+  vanished class adopted inert (GC only). Never fails startup.
 
-### B1e. CLI — `crates/cli`
-- `cordon bless --class NAME -- <cmd> <args…>`: connect, drive the PAM conversation on the
-  **tty** (echo-off for passwords, render info for fingerprint), then the daemon spawns.
-  `--class` is canonical; a policy may designate a default class so it can be omitted. (`ro`/`rw`
-  are policy conventions, not built-in flags.)
-- `cordon bless list` (live blessings: id, class, user, tty, started, argv, pids) and
-  `cordon bless revoke <id>`.
-- The front-end is the existing `cordon` binary; it never asserts "I authed" — it only relays
-  the conversation (§16.5).
+### B1e. CLI — `crates/cli` ✅ *(shipped)*
+- `sudo cordon bless [--class NAME] [-- <cmd> <args…>]`: require root, mint, open the
+  carrier's `cgroup.procs` **before fork**, then fork with a `pre_exec` that joins the carrier
+  (still root) and *then* drops to `SUDO_UID`/`SUDO_GID` — join-before-drop is the boundary,
+  and joining before `exec` is what makes the target run zero instructions unblessed. Natural
+  tty/job control/signals; exit code propagated (`128 + signal` on signal death).
+- Identity: the invoker's passwd `HOME`/`USER`/`LOGNAME` (sudo left root's) **and their full
+  supplementary groups** (unlike the editor drop, which sheds all groups on purpose — a
+  blessed shell is the user's normal session). No `<cmd>` ⇒ the invoker's **passwd** shell
+  (`$SHELL` is reset by sudo), then `$SHELL`, then `/bin/sh`.
+- `cordon bless list` (id, class, age, pids, cgroup) and `sudo cordon bless revoke <id>`, via
+  clap `args_conflicts_with_subcommands` — so `bless list` is the subcommand and
+  `bless -- list` runs a command named `list`.
+- No CLI-side cleanup: daemon GC owns teardown.
 
-### B1f. Validation — `packaging/test/bpf-lsm-smoke.sh`
-- **Scoped grant:** a class scoped to `~/.aws` lets `cordon bless --class … -- <reader>` read
-  `~/.aws`, but the **same blessed reader is still denied** on another protected object the
-  class doesn't name (proves scope = the rule's object column, not blanket).
-- **Unblessed sibling** stays denied; the blessed access **outranks** the `who="*"` catch-all.
-- **Boundary test:** a non-root, same-uid process trying to write the blessed cgroup's
-  `cgroup.procs` (and `clone3(CLONE_INTO_CGROUP)` into it) fails (`EACCES`).
-- **Inheritance:** `bless … -- sh -c '<child reads in-scope secret>'` — the child is allowed.
-- **GC/teardown:** after the blessed tree exits, a fresh unblessed open is denied again, and
-  `BLESSED` no longer contains the id.
-- **Journal:** the bless-mediated access logs with the matched class.
-- (PAM in the smoke: a permissive test PAM service, or a daemon test hook injecting an
-  authenticated mint, so the e2e needs no real credential.)
+### B1f. Validation — `packaging/test/bpf-lsm-smoke.sh` ✅ *(shipped: scenarios 18–22, 22/22 green)*
+- **Scope (18):** a blessed read is allowed against a `who="*"` deny on that object; the
+  **same blessed exe is denied** on a second protected object the class doesn't name (scope =
+  the rule's object column); the same exe **unblessed** stays denied. Also the end-to-end
+  proof that the carrier's `st_ino` equals `bpf_get_current_cgroup_id()`.
+- **Boundary (19):** a non-root uid writing the carrier's `cgroup.procs` fails (`EACCES`);
+  `bless list` shows the live entry meanwhile.
+- **Inheritance + GC (20):** a blessed bash's *grandchild* reads the secret; after exit,
+  `bless list` drains **and** the carrier dir is gone (entry + table row + cgroup all reaped —
+  "re-open denied" alone would hold regardless).
+- **Revoke (21):** the blessed tree dies promptly via `cgroup.kill`; list + dirs drain.
+- **Journal (22):** the blessed access logs `blessing=ro` (class by name).
+- No PAM test hook needed — the smoke runs as root, so the CLI is invoked directly and the
+  daemon's uid-0 gate passes. Startup reconciliation gets incidental coverage (a scenario's
+  daemon is killed with carriers live; the next one logs "removed empty leftover carrier").
 
-### B1 decisions (to lock at impl start)
+### B1 decisions (locked at impl start; annotated with what shipped)
 1. **Blessing is a `SubjectMatch` predicate** (Wiring 2), not a separate grant table — scope
-   and precedence reuse the rule model.
+   and precedence reuse the rule model. *(Shipped as specced.)*
 2. **Carrier = per-invocation root-owned cgroup via systemd transient scope** (delegated
    subtree as fallback). Per-invocation, not shared-per-class.
+   → **Shipped with the fallback as the primary:** a delegated subtree (`Delegate=yes`), with
+   the daemon creating `cordon-bless-<id>.<class>` under its own cgroup. One code path with or
+   without systemd — which is also what lets the systemd-less smoke VM test it at all.
+   Per-invocation, as specced.
 3. **`BLESSED` is a small, unbanked, single-writer `cgroup_id → ClassId` map** (not in the
-   §15.8 double-buffer).
+   §15.8 double-buffer). *(Shipped as specced — and the single-writer property is what makes
+   the apply-time remap safe.)*
 4. **Scoped, fully customizable:** a class's action, object scope, conjunction, and polarity
    are whatever its policy rules say (a class may even be `audit`). No blanket grant.
+   *(Shipped as specced; smoke 18 + 22 prove scope and the `audit` case.)*
 5. **Precedence:** a `blessing` predicate is **one** unit of subject specificity (like `exe`).
    A concrete blessing rule outranks a `who="*"` catch-all; a *targeted* `deny <exe>` ties a
    bare `allow @blessed-x` at equal specificity → `deny>allow` wins (deny-list beats blessing).
-   Conjunctions (`{exe, blessing}` = 2) raise specificity normally.
+   Conjunctions (`{exe, blessing}` = 2) raise specificity normally. *(Shipped as specced;
+   smoke 18 proves the catch-all case in-kernel.)*
 6. **PAM in the daemon; conversation proxied to the tty; caller identity from `SO_PEERCRED`.**
+   → **Superseded for B1: `sudo` is the authenticator**, and the daemon gates mint/revoke on
+   `SO_PEERCRED` **uid 0**. Identity-from-peer-creds survives verbatim; only the human-presence
+   check moved out of the daemon. PAM mint is B3 (DESIGN §16.5 keeps the full design).
 7. **Child runs as the invoking user** with the caller's full env + cwd (privilege drop reused
-   from `sys.rs`).
+   from `sys.rs`). → **Shipped, via the CLI rather than the daemon:** since the CLI forks the
+   target itself, env and cwd are simply *inherited* (nothing ships over the socket) and the
+   drop reuses `sys.rs`. Refinement: the blessed child keeps the invoker's **full
+   supplementary groups** (the editor drop clears them — different threat shape).
 8. **No grace / auth-cache window** — every mint authenticates.
+   → **Not preserved as shipped:** sudo's timestamp cache is a grace window. Documented as an
+   accepted delta with the `Defaults!/usr/bin/cordon timestamp_timeout=0` deployment note that
+   restores the property; the PAM upgrade (B3) restores it by construction.
 
 ---
 
@@ -144,6 +188,28 @@ the blessing predicate during its normal bucket scan. Delivers the whole feature
   down to `P` for this invocation (tighten-only; never widens past the policy class).
 - Optional hardware-token-per-bless mode (`pam_u2f` touch *every* mint) for high-value classes
   — extra assurance the human is present at each grant.
+
+---
+
+## Milestone B3 — PAM authenticator (replaces the sudo gate)
+The upgrade B1 was deliberately shaped to accept: the mint verb is authenticator-agnostic, so
+this adds frames beside it rather than reshaping the IPC. Full design in DESIGN §16.5.
+
+- **PAM in the daemon** (new dep): authenticate the **peer uid's** user (from `SO_PEERCRED`,
+  as today) against a `cordon` PAM service; the conversation function proxies prompt/info
+  frames to the `cordon bless` front-end, which renders them on the tty and returns input. The
+  front-end never asserts "I authed" — it relays only, so a scraper on the socket controls the
+  I/O channel and never the verdict.
+- **Relaxes the uid-0 gate to "the authenticated peer":** `authorize()` stops requiring root
+  for mint, so **a non-sudoer can bless their own tools** — the property the sudo gate can't
+  offer. Revoke follows the same rule (your own blessings).
+- **Restores "no grace window" by construction** (every mint authenticates), retiring the
+  sudoers `timestamp_timeout=0` note.
+- **Keeps the CLI as spawner.** Nothing in B1's join-then-drop `pre_exec` path depends on the
+  authenticator; a PAM-authenticated non-root CLI cannot open the carrier's `cgroup.procs`,
+  though, so this milestone must also decide the placement mechanism — most likely the daemon
+  passing the CLI a **pre-opened `cgroup.procs` fd** over the socket (`SCM_RIGHTS`) after auth,
+  preserving both the boundary and the natural tty/job-control the daemon-spawn design lost.
 
 ---
 

@@ -147,11 +147,13 @@ smoke scenarios green):**
   `crates/cli/src/edit.rs` (privilege model **A**, self-privileged) + `crates/cli/src/sys.rs`
   (the privileged ops as safe `nix` wrappers over typed `Uid`/`Gid` — `chown` the temp to the
   invoker, passwd lookup for their `$HOME`/`$USER`, `setgroups`+`setgid`+`setuid` drop in the
-  editor child; the crate's lone `unsafe` is the `pre_exec` registration). The editor runs
-  with the **invoking user's** own `$HOME`/`$USER` (not root's, which `sudo` leaves as
-  `/root` — else e.g. nvim can't write its state). *Authorization is still open* (the socket
-  has no peer-cred check yet — whoever can reach it can `apply`); `edit` inherits root via
-  `sudo` for now, deferred to a later CLI-authorization pass.
+  editor child; the crate's `unsafe` is the two `pre_exec` registrations — the editor drop and
+  the bless carrier join). The editor runs with the **invoking user's** own `$HOME`/`$USER`
+  (not root's, which `sudo` leaves as `/root` — else e.g. nvim can't write its state).
+  *Authorization is partly open:* the socket now gates **bless mint/revoke** on `SO_PEERCRED`
+  uid 0 (the first real socket authorization here), but `apply`/`show`/`status` remain
+  ungated — whoever can reach the socket can `apply`. `edit` inherits root via `sudo` for now,
+  with the rest deferred to a later CLI-authorization pass.
 
 - **(8) System / user policy tiers — ✅ done (2026-06-29).** The effective policy is now
   **system ⊕ user tier** (DESIGN §15.8). A system fragment pulls in a user-tier file via an
@@ -181,19 +183,37 @@ smoke scenarios green):**
 today two daemons can't corrupt each other (each loads private maps), but two daemons sharing
 *pinned* maps would reintroduce a cross-process writer race.
 
-## Designed, not built — blessing (`cordon bless`)
-The runtime, PAM-authenticated access grant is **specced but unimplemented**: [`DESIGN.md`
-§16](docs/DESIGN.md) (design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (milestones B1–B2).
-It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
-(`blessing = "<class>"`), so a blessing rule is an ordinary rule — its action, **object scope**,
-and precedence all reuse the §15 model (scope = the rule's object column; **fully customizable
-in policy**, not blanket). The runtime pieces are a per-invocation **root-owned cgroup** carrier
-(the membership boundary is DAC on `cgroup.procs` — only the root daemon places a task in it,
-after PAM), a tiny unbanked `BLESSED: cgroup_id → ClassId` indirection map, and a
-`cordon bless --class NAME -- <cmd>` CLI. No grace window (every mint authenticates). B1 (the
-boundary) ships the whole scoped feature. (Authoring flow A was renamed observe → **admit** →
-enforce to reserve "bless" for this; the §8.1 threat-model "blessed binary" is unrelated
-generic usage.)
+## Blessing (`cordon bless`) — ✅ B1 done (2026-07-26), sudo-gated
+The runtime, human-authenticated access grant ships: [`DESIGN.md` §16](docs/DESIGN.md)
+(design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (B1 done; B2 ergonomics, B3 the PAM
+upgrade). It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
+(`blessing = "<class>"`), so a blessing rule is an ordinary rule — its action, **object
+scope**, and precedence all reuse the §15 model (scope = the rule's object column; **fully
+customizable in policy**, not blanket).
+
+`sudo cordon bless [--class NAME] [-- <cmd>]` mints a per-invocation **root-owned cgroup**
+carrier (`cordon-bless-<id>.<class>`, under the daemon's own cgroup via `Delegate=yes`),
+registers it in the tiny unbanked `BLESSED: cgroup_id → ClassId` map, and the CLI forks the
+target into it: `pre_exec` joins the carrier **while still root**, then drops to `SUDO_UID`
+(full supplementary groups, passwd `HOME`/`USER`), then execs — the target never runs
+unblessed, and keeps a natural tty, job control, and exit code. Descendants inherit. The
+daemon GCs the carrier when the tree drains (`cgroup.events populated 0`, with a 30s mint
+grace), `bless revoke <id>` kills it via `cgroup.kill`, and startup reconciles leftovers.
+Every apply **remaps live entries by class name** (`ClassId`s renumber on recompile — without
+this a live blessing would silently change meaning). Blessed decisions journal
+`blessing=<name>`. Validated by 5 VM smoke scenarios (18–22 of 22): scope, membership
+boundary, inheritance + full GC, revoke, journal.
+
+**Design change from the original spec** (DESIGN §16.5): the authenticator is **sudo**, not
+PAM-in-the-daemon — PAM proved far heavier than specced (conversation proxying as multi-frame
+IPC, stdio fd passing, degraded job control) and the systemd-less smoke VM can't test
+transient scopes. Two accepted deltas, both documented: sudo's **timestamp cache is a grace
+window** (deployment note: `Defaults!/usr/bin/cordon timestamp_timeout=0`), and blessing is
+**sudoer-only** until the B3 PAM upgrade, which the authenticator-agnostic mint verb is shaped
+to accept.
+
+(Authoring flow A was renamed observe → **admit** → enforce to reserve "bless" for this; the
+§8.1 threat-model "blessed binary" is unrelated generic usage.)
 
 ## Pre-rule-model history (retired)
 Phases 0–3 built an **owner model** — explicit rules + TOFU creator-owns, a root-owned

@@ -65,3 +65,40 @@ To edit it safely, `sudo cordon policy edit` is the **sudoedit analog**: it runs
 validates and, if it compiles, applies *and* saves in one step (rejecting a broken policy
 visudo-style instead of persisting it).
 
+## Blessing — `sudo cordon bless`
+
+Static rules name *known* exes. For the tools you reach for interactively over secrets —
+`cat`, `find`, a shell — there is no static subject that works: `allow /usr/bin/cat` would
+admit every `cat`, including the one a scraper runs. **Blessing is sudo for file reads:** it
+grants a *specific invocation* (and its descendants) a runtime pass, per a class you define in
+policy.
+
+```toml
+[group.subject.blessed-ro]
+blessing = "ro"                       # declare a class; the name is yours
+
+[[rule]]                              # ordinary rule — the object column IS the scope
+who = "@blessed-ro"
+where = "~/.aws"
+action = "read"
+policy = "allow"
+```
+
+```sh
+sudo cordon bless --class ro -- aws s3 ls   # this aws may read ~/.aws, nothing else
+sudo cordon bless --class ro                # …or a blessed shell (your login shell)
+cordon bless list                           # live blessings: id, class, age, pids
+sudo cordon bless revoke 3                  # kill that blessed tree now
+```
+
+`sudo` is the authenticator — a **human at the keyboard** is the one thing the one-shot
+scraper can't produce. The grant is carried by a per-invocation root-owned cgroup, so it
+evaporates when the command exits, it's scoped to whatever objects its rules name, and every
+blessed access is journaled with its class. Details in [`DESIGN.md` §16](docs/DESIGN.md).
+
+> **Sudoers note.** sudo caches its authentication (~15 min by default), so a second `bless`
+> inside that window won't prompt. To require a human for *every* mint, add to sudoers:
+> ```
+> Defaults!/usr/bin/cordon timestamp_timeout=0
+> ```
+
