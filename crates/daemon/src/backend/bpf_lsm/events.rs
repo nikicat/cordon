@@ -6,19 +6,20 @@
 //! run. The in-kernel suppressor already throttles the ring to ~one record per `(exe,
 //! object, action)` per second (carrying a folded `suppressed` count); here we collapse
 //! whatever a single drain *does* surface — one journal line per `(exe, object,
-//! action)` with the folded counts — so a burst never becomes a wall of identical log
-//! lines. Both layers together turn the audit's ~hundreds-of-opens floods into a line.
+//! action, blessing)` with the folded counts — so a burst never becomes a wall of
+//! identical log lines. Both layers together turn the audit's ~hundreds-of-opens floods
+//! into a line.
 
 use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
 use cordon_bpf_common::{
-    Action, Decision, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp, Pid,
-    Policy, SuppressedTotal, Uid,
+    Action, ClassId, Decision, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp,
+    Pid, Policy, SuppressedTotal, Uid,
 };
 use cordon_core::backend::{ApplyOutcome, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
-use cordon_core::policy::{PolicySource, UserName};
+use cordon_core::policy::{ClassName, PolicySource, UserName};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::HashMap;
@@ -42,6 +43,7 @@ pub(super) fn serve(
     control: &PolicyControl,
     shutdown: &Arc<Shutdown>,
     mut object_paths: HashMap<FileId, PathBuf>,
+    mut class_names: HashMap<ClassId, ClassName>,
 ) -> Result<()> {
     let mut ring = RingBuf::try_from(
         ebpf.take_map(MAP_EVENTS)
@@ -75,7 +77,7 @@ pub(super) fn serve(
                 // record's caller from the cache.
                 passwd.refresh();
                 for record in coalesce(&batch) {
-                    record.log(&object_paths, &passwd);
+                    record.log(&object_paths, &class_names, &passwd);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -83,7 +85,14 @@ pub(super) fn serve(
         }
         // Service any `policy apply` requests that arrived since the last tick.
         while let Ok(req) = control.apply_rx.try_recv() {
-            apply(ebpf, control, &req.sources, &req.reply, &mut object_paths);
+            apply(
+                ebpf,
+                control,
+                &req.sources,
+                &req.reply,
+                &mut object_paths,
+                &mut class_names,
+            );
         }
     }
     Ok(())
@@ -99,6 +108,7 @@ fn apply(
     sources: &[PolicySource],
     reply: &std::sync::mpsc::Sender<ApplyOutcome>,
     object_paths: &mut HashMap<FileId, PathBuf>,
+    class_names: &mut HashMap<ClassId, ClassName>,
 ) {
     let compiled = super::compile_sources(sources);
     let applied = if compiled.has_errors() {
@@ -108,6 +118,7 @@ fn apply(
             Ok(()) => {
                 *control.current.lock().unwrap() = Some(super::build_view(&compiled));
                 *object_paths = super::object_paths(&compiled);
+                *class_names = super::class_names(&compiled);
                 info!(objects = compiled.objects.len(), "policy applied");
                 true
             }
@@ -123,8 +134,8 @@ fn apply(
     });
 }
 
-/// A drain batch's worth of ring events sharing one `(exe, leaf, action)` identity,
-/// folded into a single journal record. `events` is how many ring records were folded
+/// A drain batch's worth of ring events sharing one `(exe, leaf, action, blessing)`
+/// identity, folded into a single journal record. `events` is how many ring records were folded
 /// (each one open that passed the in-kernel suppressor); `suppressed` is the sum of
 /// their in-kernel folded counts. `count` (their sum) is the true number of opens the
 /// burst represents.
@@ -143,6 +154,10 @@ struct Coalesced {
     /// The caller's real uid (representative, like `pid` — the in-kernel suppressor keys on
     /// `(exe, leaf, action)` regardless of uid, so a group can only carry one).
     uid: Uid,
+    /// The caller's resolved blessing class ([`ClassId::UNBLESSED`] when none). Part of the
+    /// coalesce key — a blessed and an unblessed burst mean different things and must not
+    /// fold — and rendered as `blessing=<name>` on the line, only when blessed.
+    blessing: ClassId,
     /// The opened file's path components (leaf-first) + how many are valid + truncation,
     /// for the `path=` field. Carried verbatim from the representative event.
     comps: [PathComp; PATH_MAX_DEPTH],
@@ -163,8 +178,15 @@ impl Coalesced {
     /// [`CallerUser`], `object`/`path` via [`AuditPath`], `action`/`exe` via their own
     /// `Display`); `tracing` renders them lazily — no eager `String`s. For a regular user
     /// (DESIGN §15.8) a path under their home renders as `~/…`, so a `deny` line drops
-    /// straight into that user's policy.
-    fn log(&self, object_paths: &HashMap<FileId, PathBuf>, passwd: &Passwd) {
+    /// straight into that user's policy. A blessed caller gets a trailing `blessing=<name>`
+    /// (bless is loud, DESIGN §16.3); the unblessed line stays byte-identical to before the
+    /// field existed.
+    fn log(
+        &self,
+        object_paths: &HashMap<FileId, PathBuf>,
+        class_names: &HashMap<ClassId, ClassName>,
+        passwd: &Passwd,
+    ) {
         let user = CallerUser::resolve(self.uid, passwd);
         let home = user.home();
         let exe = CallerExe::resolve(self.pid, self.exe);
@@ -173,34 +195,44 @@ impl Coalesced {
         let action = self.action;
         let policy = self.policy;
         let (count, suppressed) = (self.count(), self.suppressed);
-        match self.decision {
-            Decision::DENY => {
+        match (
+            self.decision,
+            BlessingName::resolve(self.blessing, class_names),
+        ) {
+            (Decision::DENY, Some(blessing)) => {
+                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, %blessing, "deny")
+            }
+            (Decision::DENY, None) => {
                 info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "deny")
             }
-            _ => {
+            (_, Some(blessing)) => {
+                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, %blessing, "audit")
+            }
+            (_, None) => {
                 info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "audit")
             }
         }
     }
 }
 
-/// Collapse a drain batch to one [`Coalesced`] record per `(exe, leaf, action)`, summing
-/// the ring-record count and the in-kernel suppressed totals. Keyed on the opened file
-/// (`leaf`), matching the in-kernel suppressor, so distinct files under one audited root
-/// each get their own journal line (DESIGN §15.10 flow B). Insertion order is preserved
-/// (first occurrence wins the representative decision/pid/path). Pure — the `/proc`
-/// resolution and logging happen later, per record.
+/// Collapse a drain batch to one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
+/// summing the ring-record count and the in-kernel suppressed totals. Keyed on the opened
+/// file (`leaf`), matching the in-kernel suppressor, so distinct files under one audited
+/// root each get their own journal line (DESIGN §15.10 flow B); split by blessing so a
+/// blessed access never folds into (or hides behind) an unblessed one. Insertion order is
+/// preserved (first occurrence wins the representative decision/pid/path). Pure — the
+/// `/proc` resolution and logging happen later, per record.
 fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
     let mut records: Vec<Coalesced> = Vec::new();
-    let mut index: HashMap<(FileId, FileId, Action), usize> = HashMap::new();
+    let mut index: HashMap<(FileId, FileId, Action, ClassId), usize> = HashMap::new();
     for e in events {
-        match index.get(&(e.exe, e.leaf, e.action)) {
+        match index.get(&(e.exe, e.leaf, e.action, e.blessing)) {
             Some(&i) => {
                 records[i].events += 1;
                 records[i].suppressed += e.suppressed;
             }
             None => {
-                index.insert((e.exe, e.leaf, e.action), records.len());
+                index.insert((e.exe, e.leaf, e.action, e.blessing), records.len());
                 records.push(Coalesced {
                     exe: e.exe,
                     object: e.object,
@@ -209,6 +241,7 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
                     policy: e.policy,
                     pid: e.pid,
                     uid: e.uid,
+                    blessing: e.blessing,
                     comps: e.comps,
                     depth: e.depth,
                     trunc: e.trunc,
@@ -259,6 +292,40 @@ impl fmt::Display for CallerUser<'_> {
         match self {
             CallerUser::Named { name, .. } => write!(f, "{name}"),
             CallerUser::Uid(uid) => write!(f, "{}", uid.0),
+        }
+    }
+}
+
+/// The caller's blessing class in the journal: the policy **name** when the live registry
+/// knows the id, else the raw id (an apply renumbered the registry between the kernel's
+/// verdict and this drain — rare, but a blessed access must never render as unblessed).
+/// `resolve` returns `None` for [`ClassId::UNBLESSED`], so unblessed lines carry no
+/// `blessing=` field at all. Borrows the registry, like [`CallerUser`].
+enum BlessingName<'a> {
+    Named(&'a ClassName),
+    Id(ClassId),
+}
+
+impl<'a> BlessingName<'a> {
+    fn resolve(
+        class: ClassId,
+        class_names: &'a HashMap<ClassId, ClassName>,
+    ) -> Option<BlessingName<'a>> {
+        if class == ClassId::UNBLESSED {
+            return None;
+        }
+        Some(match class_names.get(&class) {
+            Some(name) => BlessingName::Named(name),
+            None => BlessingName::Id(class),
+        })
+    }
+}
+
+impl fmt::Display for BlessingName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BlessingName::Named(name) => write!(f, "{name}"),
+            BlessingName::Id(id) => write!(f, "{id}"),
         }
     }
 }
@@ -435,6 +502,13 @@ mod tests {
         )
     }
 
+    /// [`ev`] with the caller resolved to a blessing class (the coalesce key's 4th part).
+    fn ev_blessed(exe: Ino, leaf: Ino, action: Action, class: ClassId) -> DecisionEvent {
+        let mut e = ev(exe, leaf, action, Suppressed(0));
+        e.blessing = class;
+        e
+    }
+
     /// A NUL-padded path component from a short name.
     fn comp(s: &str) -> PathComp {
         let mut c = PathComp::EMPTY;
@@ -492,9 +566,42 @@ mod tests {
         assert_eq!(coalesce(&batch).len(), 2);
     }
 
+    /// A blessed access must never fold into (or hide behind) an unblessed one with the
+    /// same `(exe, leaf, action)` — the blessing is part of the coalesce identity.
+    #[test]
+    fn distinct_blessings_stay_separate_identical_ones_fold() {
+        let batch = vec![
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)), // unblessed
+            ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(1)),
+            ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(2)), // different class
+            ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(1)), // dup → folds into the first
+        ];
+        let out = coalesce(&batch);
+        assert_eq!(out.len(), 3, "unblessed + class 1 + class 2");
+        assert_eq!(out[0].blessing, ClassId::UNBLESSED);
+        assert_eq!(out[1].blessing, ClassId(1));
+        assert_eq!(out[1].events, 2, "same class folded");
+        assert_eq!(out[2].blessing, ClassId(2));
+    }
+
     #[test]
     fn empty_batch_yields_nothing() {
         assert!(coalesce(&[]).is_empty());
+    }
+
+    #[test]
+    fn blessing_name_renders_name_or_raw_id_and_nothing_when_unblessed() {
+        let mut names = HashMap::new();
+        names.insert(ClassId(1), ClassName::new("ro"));
+        // A registered class renders its policy name.
+        let named = BlessingName::resolve(ClassId(1), &names).expect("blessed → Some");
+        assert_eq!(named.to_string(), "ro");
+        // An id the registry doesn't know (apply renumbered mid-flight) falls back to the
+        // raw id — a blessed access must never render as unblessed.
+        let raw = BlessingName::resolve(ClassId(7), &names).expect("blessed → Some");
+        assert_eq!(raw.to_string(), "7");
+        // UNBLESSED resolves to nothing: the journal line carries no `blessing=` field.
+        assert!(BlessingName::resolve(ClassId::UNBLESSED, &names).is_none());
     }
 
     #[test]
