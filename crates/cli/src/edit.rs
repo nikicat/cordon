@@ -155,18 +155,93 @@ enum Prompt {
     Quit,
 }
 
-/// What `cordon policy edit` opens — built at the CLI boundary from the mutually-exclusive
-/// `FILE` argument and `--user` flag.
+/// What `cordon policy edit` opens.
 pub(crate) enum EditTarget {
-    /// A system-tier policy file: the default path, a conf.d fragment name, or a path.
-    File(Option<PathBuf>),
+    /// A system-tier policy file: the configured path (`--system`), a conf.d fragment
+    /// name, or a path (`FILE`).
+    System(Option<PathBuf>),
     /// The user-tier policy a system `[[include]]` binds to this user.
     User(UserName),
 }
 
+/// The mutually-exclusive ways to name what to edit (clap-enforced). **Naming nothing
+/// edits your own tier** — the common case, and the reason `sudo cordon policy edit` no
+/// longer means "edit the system policy".
+#[derive(clap::Args, Clone, Debug)]
+pub struct EditTargetArgs {
+    /// Policy file to edit, system tier (for a conf.d directory, name a fragment,
+    /// e.g. `local` → `…/conf.d/local.toml`).
+    pub file: Option<PathBuf>,
+    /// Edit the user-tier policy a system `[[include]]` binds to this user (its rules
+    /// are confined to that user's home).
+    #[arg(long, conflicts_with = "file")]
+    pub user: Option<UserName>,
+    /// Edit the *system* policy at the configured path, rather than your own user tier.
+    #[arg(long, conflicts_with_all = ["file", "user"])]
+    pub system: bool,
+}
+
+impl EditTargetArgs {
+    /// Which policy these flags name. `invoker` is consulted only for the bare form, so
+    /// naming a target explicitly never depends on resolving one.
+    fn resolve(self, invoker: impl FnOnce() -> Result<UserName>) -> Result<EditTarget> {
+        Ok(match self {
+            EditTargetArgs { system: true, .. } => EditTarget::System(None),
+            EditTargetArgs {
+                user: Some(user), ..
+            } => EditTarget::User(user),
+            EditTargetArgs {
+                file: Some(file), ..
+            } => EditTarget::System(Some(file)),
+            _ => EditTarget::User(invoker()?),
+        })
+    }
+}
+
+/// The account whose tier a bare `cordon policy edit` opens: under `sudo` the invoking
+/// user, unprivileged the caller themselves (which is also what the future
+/// edit-without-sudo path wants — STATUS §(8) roadmap).
+fn invoking_user() -> Result<UserName> {
+    let uid = invoker_uid(
+        Uid::from_raw(config::euid()),
+        std::env::var("SUDO_UID").ok().as_deref(),
+    )?;
+    let (name, _home) = sys::user_identity(uid)
+        .ok_or_else(|| Error::msg(format!("uid {uid} has no passwd entry")))?;
+    Ok(name)
+}
+
+/// The uid behind [`invoking_user`]. Real root with no `SUDO_UID` (a root login, a cron
+/// job) has no "own tier": name the target rather than silently editing the system policy.
+fn invoker_uid(euid: Uid, sudo_uid: Option<&str>) -> Result<Uid> {
+    if !euid.is_root() {
+        return Ok(euid);
+    }
+    let no_invoker = || {
+        Error::msg(
+            "running as root with no invoking user — name what to edit: \
+             `--system` for the system policy, or `--user NAME` for a user tier",
+        )
+    };
+    let uid = Uid::from_raw(
+        sudo_uid
+            .ok_or_else(no_invoker)?
+            .parse::<u32>()
+            .map_err(|_| Error::msg(format!("invalid SUDO_UID: {:?}", sudo_uid.unwrap())))?,
+    );
+    if uid.is_root() {
+        return Err(no_invoker());
+    }
+    Ok(uid)
+}
+
 /// `cordon policy edit`. Returns the process exit code.
-pub fn run(target: EditTarget, root_editor: RootEditor, cli: &Cli) -> ExitCode {
-    match Session::open(target, root_editor, cli).and_then(Session::edit_loop) {
+pub fn run(target: EditTargetArgs, root_editor: RootEditor, cli: &Cli) -> ExitCode {
+    match target
+        .resolve(invoking_user)
+        .and_then(|t| Session::open(t, root_editor, cli))
+        .and_then(Session::edit_loop)
+    {
         Ok(code) => code,
         Err(e) => {
             eprintln!("cordon: {e}");
@@ -207,7 +282,7 @@ impl Session {
     fn open(target: EditTarget, root_editor: RootEditor, cli: &Cli) -> Result<Session> {
         let policy_root = crate::policy_path(None, cli)?;
         let (target, target_origin, scaffold) = match target {
-            EditTarget::File(file) => (
+            EditTarget::System(file) => (
                 resolve_target(file.as_deref(), &policy_root)?,
                 SourceOrigin::System,
                 None,
@@ -782,6 +857,62 @@ fn read_seed(target: &Path) -> Result<Seed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The target table. The headline is the **last** row: naming nothing edits your own
+    /// tier, so `sudo cordon policy edit` no longer means "edit the system policy".
+    #[test]
+    fn edit_target_resolution() {
+        let args = |file: Option<&str>, user: Option<&str>, system: bool| EditTargetArgs {
+            file: file.map(PathBuf::from),
+            user: user.map(UserName::new),
+            system,
+        };
+        let invoker = || Ok(UserName::new("nb"));
+        // An explicit target never consults the invoker — proven by a resolver that panics.
+        let no_invoker = || panic!("the invoker must not be resolved for an explicit target");
+
+        assert!(matches!(
+            args(None, None, true).resolve(no_invoker).unwrap(),
+            EditTarget::System(None)
+        ));
+        assert!(matches!(
+            args(Some("local"), None, false).resolve(no_invoker).unwrap(),
+            EditTarget::System(Some(p)) if p == Path::new("local")
+        ));
+        assert!(matches!(
+            args(None, Some("someone"), false).resolve(no_invoker).unwrap(),
+            EditTarget::User(u) if u.as_str() == "someone"
+        ));
+        // Bare: the invoker's own tier.
+        assert!(matches!(
+            args(None, None, false).resolve(invoker).unwrap(),
+            EditTarget::User(u) if u.as_str() == "nb"
+        ));
+        // …and a failure to resolve one is the caller's error, not a silent system edit.
+        assert!(
+            args(None, None, false)
+                .resolve(|| Err(Error::msg("no invoker")))
+                .is_err()
+        );
+    }
+
+    /// Who "your own tier" means. Root with no invoker has no answer — it must say so
+    /// rather than fall back to the system policy.
+    #[test]
+    fn invoker_uid_prefers_sudo_then_self() {
+        let root = Uid::from_raw(0);
+        let nb = Uid::from_raw(1000);
+        // Unprivileged: the caller themselves, SUDO_UID irrelevant.
+        assert_eq!(invoker_uid(nb, None).unwrap(), nb);
+        assert_eq!(invoker_uid(nb, Some("0")).unwrap(), nb);
+        // Under sudo: the invoking user.
+        assert_eq!(invoker_uid(root, Some("1000")).unwrap(), nb);
+        // Real root, and root-sudo-ing-to-root: no "own tier".
+        assert!(invoker_uid(root, None).is_err());
+        assert!(invoker_uid(root, Some("0")).is_err());
+        // A malformed SUDO_UID is loud, not silently ignored.
+        assert!(invoker_uid(root, Some("nb")).is_err());
+    }
 
     #[test]
     fn editor_command_splits_program_and_args() {

@@ -166,6 +166,17 @@ smoke scenarios green):**
   Multi-user deployments that must not disclose protected paths want `0660` + a `cordon`
   group instead — same table, narrower reach (DESIGN §15.8). VM scenario 24.
 
+- **(10) `policy edit` defaults to your own tier — ✅ done (B2).** **Breaking UX change:**
+  bare `sudo cordon policy edit` now opens the invoker's *user tier* (self-bootstrapping via
+  (8)), not the system policy — editing your own rules is the common case, and the old
+  default made the dangerous one the easy one. `--system` opens the system policy; `--user
+  NAME` and a `FILE`/fragment argument are unchanged; all three are clap-exclusive. The
+  invoker is `SUDO_UID` under sudo, the caller's own euid unprivileged (which is what the
+  "edit without sudo" roadmap in (8) wants); real root with neither has no "own tier" and
+  errors naming `--system`/`--user` rather than silently editing the system policy. The
+  three flags are one `EditTargetArgs` clap group with a table-tested `resolve()`, so the
+  choice is a type rather than a bool triple at the call site.
+
 - **(8) System / user policy tiers — ✅ done (2026-06-29).** The effective policy is now
   **system ⊕ user tier** (DESIGN §15.8). A system fragment pulls in a user-tier file via an
   `[[include]] user = "…" path = "…"` directive; the included file is loaded

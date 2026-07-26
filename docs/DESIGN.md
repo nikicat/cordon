@@ -826,9 +826,13 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
   rather than persisting a broken file. It writes the file **only after** the daemon accepts
   the policy, so on-disk == live (daemon down ⇒ saved, warned "not applied"). Self-privileged
   (the CLI stays root in the parent, drops only in the editor child); reuses `PolicyApply`,
-  no new IPC. `cordon policy edit FILE` edits a system file (a bare name → that conf.d
-  fragment); `cordon policy edit --user NAME` edits the user-tier file a system `[[include]]`
-  binds to `NAME` (home-scope-validated). When **no** include exists yet, `--user` is
+  no new IPC. **Bare `cordon policy edit` opens the invoker's own user tier** — the common
+  case, and the reason the dangerous target is the explicit one: `--system` edits the system
+  policy, `cordon policy edit FILE` a system file (a bare name → that conf.d fragment), and
+  `cordon policy edit --user NAME` the user-tier file a system `[[include]]` binds to `NAME`
+  (home-scope-validated). The invoker is `SUDO_UID` under sudo and the caller's own euid
+  unprivileged (which is what the future "edit without sudo" posture needs); real root with
+  neither has no own tier and must name a target. When **no** include exists yet, `--user` is
   self-bootstrapping: it opens the file at the convention path (`…/users/NAME.toml`) and, only
   **after** the edit validates and saves, registers the `[[include]]` in `…/conf.d/00-users.toml`
   — so a cancelled or rejected edit never leaves a stale binding. It reaches the daemon only

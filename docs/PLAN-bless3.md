@@ -79,19 +79,25 @@ socket mode stop carrying security weight:
 DESIGN §15.8 records `0660` + a `cordon` group as the multi-user deployment posture (same
 `authorize` table, narrower reach); it is not built.
 
-### Commit 2 — `feat(cli): `policy edit` defaults to the invoker's user tier`
+### Commit 2 — `feat(cli): `policy edit` defaults to the invoker's user tier` ✅ *done*
 
-- `crates/cli/src/main.rs`: `PolicyCmd::Edit` gains `--system`; bare `cordon policy edit`
-  now resolves `SUDO_UID` → username → that user's tier (the existing `--user`
-  self-bootstrapping path already handles "no `[[include]]` yet"). `--user NAME` keeps
-  editing someone else's tier; FILE, `--user` and `--system` stay mutually exclusive
-  (clap-enforced).
-- Real root with no `SUDO_UID` has no "own tier": error naming `--system`/`--user` rather
-  than silently editing the system policy.
-- Tests: target resolution table (sudo invoker / explicit `--user` / `--system` / FILE /
-  root-without-invoker).
+- The three ways to name a target became one clap group, `edit::EditTargetArgs`
+  (`FILE` / `--user NAME` / `--system`, mutually exclusive), with a `resolve()` that yields
+  the `EditTarget` domain type — so no bool triple reaches a hand-written signature.
+  `EditTarget::File` was renamed `System` now that `--system` names it explicitly.
+- Bare `cordon policy edit` resolves the invoker → that user's tier (the existing `--user`
+  self-bootstrapping path already handles "no `[[include]]` yet"). The invoker is
+  `SUDO_UID` under sudo and the caller's own euid unprivileged — the latter is what the
+  STATUS §(8) "edit without sudo" roadmap wants, for free.
+- Real root with no `SUDO_UID` has no "own tier": errors naming `--system`/`--user` rather
+  than silently editing the system policy. `resolve()` consults the invoker **only** for the
+  bare form (proven by a test whose resolver panics if called).
+- Tests: the target-resolution table and the `invoker_uid` table (sudo / unprivileged /
+  root-without-invoker / root-sudo-ing-to-root / malformed `SUDO_UID`).
 - **Breaking UX change** — `sudo cordon policy edit` means something different afterwards.
-  Call it out in `README.md` and `STATUS.md`.
+  Called out in `README.md` and `STATUS.md` §(10).
+- Smoke scenarios 16/17 pass an explicit FILE, so they keep covering the system-tier path
+  unchanged.
 
 ---
 
@@ -277,7 +283,7 @@ uid gate is the boundary), §16.6 (new lifecycle); PLAN-bless B2 marked done; `S
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Socket mode | **0666**, with `PolicyApply` moved behind the uid-0 gate (0660+group is the documented multi-user alternative) — ✅ shipped |
-| 2 | `policy edit` default | The invoker's tier; `--system` for the system policy; error if there is no invoker |
+| 2 | `policy edit` default | The invoker's tier; `--system` for the system policy; error if there is no invoker — ✅ shipped |
 | 3 | Join mechanism | `SCM_RIGHTS` fd from the daemon; the CLI never needs root |
 | 4 | Elevation | Client-side `$CORDON_SUDO` (default `sudo`); security is the daemon's uid-0 check, never the client's choice |
 | 5 | Carrier parent | The invoker's `session-N.scope` **if root-owned**, else fall back to the daemon's cgroup |

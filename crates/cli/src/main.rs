@@ -10,7 +10,6 @@ mod edit;
 mod sys;
 
 use clap::{Parser, Subcommand};
-use cordon_core::policy::UserName;
 use cordon_core::proto::{Pid, Request, Response, read_msg, write_msg};
 use cordon_core::{Config, Error, Result, policy};
 use std::io::{BufReader, BufWriter};
@@ -67,18 +66,15 @@ enum PolicyCmd {
         /// Policy file (default: the configured `policy` path).
         file: Option<PathBuf>,
     },
-    /// Edit the policy in `$EDITOR`, then validate + apply + save in one step — the
+    /// Edit a policy in `$EDITOR`, then validate + apply + save in one step — the
     /// sudoedit analog. The editor runs as the invoking user (never root); the result is
     /// compiled and pushed to the daemon, and the root-owned file is written only once the
     /// daemon accepts it. Run via `sudo` for a root-owned policy.
+    ///
+    /// With nothing named, edits **your own user tier**; `--system` edits the system policy.
     Edit {
-        /// Policy file to edit (default: the configured `policy` path; for a conf.d
-        /// directory, name a fragment, e.g. `local` → `…/conf.d/local.toml`).
-        file: Option<PathBuf>,
-        /// Edit the user-tier policy a system `[[include]]` binds to this user (its rules
-        /// are confined to that user's home). Mutually exclusive with FILE.
-        #[arg(long, conflicts_with = "file")]
-        user: Option<UserName>,
+        #[command(flatten)]
+        target: edit::EditTargetArgs,
         /// Launch the editor as root when there is no unprivileged invoker (e.g. a root
         /// login without sudo). Off by default — running an editor as root re-opens the
         /// same-uid escalation this command exists to avoid.
@@ -104,24 +100,14 @@ fn main() -> ExitCode {
     // daemon only via the shared `PolicyApply` path, so it routes here rather than through
     // the single-request round-trip below.
     if let Cmd::Policy {
-        cmd:
-            PolicyCmd::Edit {
-                file,
-                user,
-                allow_root_editor,
-            },
+        cmd: PolicyCmd::Edit {
+            target,
+            allow_root_editor,
+        },
     } = &cli.cmd
     {
-        // `--user` and FILE are mutually exclusive (clap-enforced), so one selects the target.
-        let target = match user {
-            Some(u) => edit::EditTarget::User(u.clone()),
-            None => edit::EditTarget::File(file.clone()),
-        };
-        return edit::run(
-            target,
-            edit::RootEditor::from_flag(*allow_root_editor),
-            &cli,
-        );
+        let root_editor = edit::RootEditor::from_flag(*allow_root_editor);
+        return edit::run(target.clone(), root_editor, &cli);
     }
 
     // `bless` drives its own flow (mint → fork into the carrier → drop → exec); its

@@ -65,6 +65,13 @@ To edit it safely, `sudo cordon policy edit` is the **sudoedit analog**: it runs
 validates and, if it compiles, applies *and* saves in one step (rejecting a broken policy
 visudo-style instead of persisting it).
 
+```sh
+sudo cordon policy edit             # your own user tier (the common case)
+sudo cordon policy edit --system    # the system policy
+sudo cordon policy edit --user bob  # someone else's tier
+sudo cordon policy edit local       # the system fragment …/conf.d/local.toml
+```
+
 Changing the policy is root-only: `policy apply` (and therefore `policy edit`) is gated on the
 peer's kernel-attested uid, so run those under `sudo`. Reading needs no privilege —
 `cordon status`, `cordon policy show` and `cordon bless list` work from your own account.
