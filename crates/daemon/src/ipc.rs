@@ -29,7 +29,7 @@ use crate::Ctx;
 use cordon_core::backend::{ApplyRequest, BlessOp, ControlMsg};
 use cordon_core::policy::ClassName;
 use cordon_core::proto::{
-    Nonce, Request, Response, StatusInfo, peer_uid, read_msg, send_msg_with_fd, write_msg,
+    Nonce, Request, Response, StatusInfo, peer_pid, peer_uid, read_msg, send_msg_with_fd, write_msg,
 };
 use cordon_core::{Error, Result, Uid};
 use std::io::{BufReader, BufWriter};
@@ -152,6 +152,11 @@ impl Ctx {
         class: Option<ClassName>,
         peer_uid: Uid,
     ) -> Result<()> {
+        // The carrier's placement follows *this* peer. Reading the pid here rather than
+        // after the approval wait is tidiness, not a guarantee — it is a number, and the
+        // cgroup behind it is only read at mint time (see `peer_pid`). Placement is not
+        // authorization, so a stale one costs at worst the session scope.
+        let peer_pid = peer_pid(stream)?;
         let nonce = Nonce::generate()?;
         let approved = self.register_pending(nonce.clone())?;
         let sent = write_msg(
@@ -173,6 +178,7 @@ impl Ctx {
         let (view, procs) = self.bless(|reply| BlessOp::Mint {
             class,
             owner: peer_uid,
+            requester: peer_pid,
             reply,
         })?;
         // Bypasses the buffered writer (empty here — `write_msg` flushes every message):

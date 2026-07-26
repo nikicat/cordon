@@ -26,7 +26,7 @@ use cordon_core::{Error, Result, Uid};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How long a fresh, never-populated carrier is left alone before GC may reap it.
 /// Load-bearing: a carrier is empty from mint until the CLI's `pre_exec` writes the
@@ -34,6 +34,16 @@ use tracing::{info, warn};
 /// Generous because the cost of a leak is one empty cgroup dir for 30s; a CLI that
 /// died before joining is cleaned up right after.
 const MINT_GRACE: Duration = Duration::from_secs(30);
+
+/// The cgroup2 mount. Both the daemon's own cgroup and a requester's session scope are
+/// resolved against it, since `/proc/<pid>/cgroup` gives a path *relative* to the root.
+///
+/// A function rather than a `const`, only because `Path::new` is not const-stable yet
+/// (rust-lang#143874); the point is that callers get a `Path` instead of re-wrapping a
+/// `&str` at each use.
+fn cgroup_root() -> &'static Path {
+    Path::new("/sys/fs/cgroup")
+}
 
 /// The live blessings table — backend-thread state beside the `Ebpf` handle.
 pub(super) struct Blessings {
@@ -103,6 +113,7 @@ impl Blessings {
         ebpf: &mut Ebpf,
         class: Option<ClassName>,
         owner: Uid,
+        requester: Pid,
         registry: &BTreeMap<ClassName, ClassId>,
     ) -> Result<(BlessingView, CarrierProcs)> {
         let root = self.root.as_ref().ok_or_else(|| {
@@ -122,7 +133,9 @@ impl Blessings {
         }
 
         let id = self.next;
-        let dir = root.join(dir_name(id, &class));
+        // In the requester's own session scope where possible, so the blessed process
+        // keeps its logind session and polkit/run0 keep working inside it.
+        let dir = carrier_parent(requester, root).join(dir_name(id, &class));
         std::fs::create_dir(&dir)
             .map_err(|e| Error::msg(format!("bless: mkdir {}: {e}", dir.display())))?;
         // The carrier's kernel cgroup id: cgroup2 (kernfs) guarantees st_ino == the id
@@ -286,23 +299,44 @@ impl Blessings {
     /// carrier whose class is still declared is re-registered (a blessing only ever
     /// *grants*, and its class was human-authorized); a populated carrier of a
     /// vanished class is adopted inert, for GC only. Never fails startup.
+    ///
+    /// **Only root-owned directories are adopted.** Re-registering is a *grant*, so this
+    /// has to be at least as strict as [`carrier_parent`], which refuses to create a
+    /// carrier under a parent it doesn't trust. Every legitimate carrier was created by
+    /// this daemon and is root-owned; anything else in the search space was planted, and
+    /// adopting it would register a cgroup whose membership someone else controls —
+    /// self-bless. Unreachable on a default systemd (every scanned level is root-owned
+    /// and unwritable), which is exactly why it is worth asserting rather than assuming:
+    /// a `Delegate=yes` drop-in or a wider [`carrier_roots`] would make it reachable
+    /// without anything here looking different.
     pub(super) fn reconcile(&mut self, ebpf: &mut Ebpf, registry: &BTreeMap<ClassName, ClassId>) {
         let Some(root) = self.root.clone() else {
             return;
         };
-        for found in scan(&root) {
-            if !found.populated {
-                let _ = std::fs::remove_dir(&found.dir);
-                info!(dir = %found.dir.display(), "bless: removed empty leftover carrier");
-                continue;
-            }
-            let cgroup = match std::fs::metadata(&found.dir) {
-                Ok(meta) => CgroupId(std::os::unix::fs::MetadataExt::ino(&meta)),
+        for found in carrier_roots(&root).iter().flat_map(|dir| scan(dir)) {
+            // One stat serves both checks: who owns it, and its inode — which on cgroup2
+            // *is* the id `bpf_get_current_cgroup_id()` reports.
+            let meta = match std::fs::metadata(&found.dir) {
+                Ok(meta) => meta,
                 Err(e) => {
                     warn!(dir = %found.dir.display(), error = %e, "bless: reconcile stat failed; skipped");
                     continue;
                 }
             };
+            let owner = Uid(std::os::unix::fs::MetadataExt::uid(&meta));
+            if !adoptable(owner) {
+                warn!(
+                    dir = %found.dir.display(), %owner,
+                    "bless: leftover carrier is not root-owned; ignored (not ours to adopt)"
+                );
+                continue;
+            }
+            if !found.populated {
+                let _ = std::fs::remove_dir(&found.dir);
+                info!(dir = %found.dir.display(), "bless: removed empty leftover carrier");
+                continue;
+            }
+            let cgroup = CgroupId(std::os::unix::fs::MetadataExt::ino(&meta));
             let registered = match registry.get(&found.class) {
                 Some(&class_id) => match seed::blessed_insert(ebpf, cgroup, class_id) {
                     Ok(()) => true,
@@ -486,13 +520,126 @@ fn carrier_root() -> Result<PathBuf> {
         .map_err(|e| Error::msg(format!("/proc/self/cgroup: {e}")))?;
     let rel = cgroup_v2_path(&text)
         .ok_or_else(|| Error::msg("/proc/self/cgroup has no unified-hierarchy (0::) line"))?;
-    Ok(Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+    Ok(under_cgroup_root(rel))
 }
 
 /// The unified-hierarchy path from a `/proc/<pid>/cgroup` listing: the `0::<path>`
-/// line's path part (without a leading `/`, it *is* the cgroup2 root).
-fn cgroup_v2_path(text: &str) -> Option<&str> {
-    text.lines().find_map(|l| l.strip_prefix("0::"))
+/// line's path part. It is **relative to the cgroup2 mount** despite the leading slash —
+/// `/` alone *is* the root — so joining it onto [`cgroup_root`] goes through
+/// [`under_cgroup_root`] rather than `join`, which would discard the base.
+fn cgroup_v2_path(text: &str) -> Option<&Path> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(Path::new)
+}
+
+/// Whether a leftover carrier directory may be adopted by [`Blessings::reconcile`] — the
+/// same trust question [`usable_session_scope`] asks of a parent, asked of the carrier
+/// itself. Root-owned only: this daemon creates carriers as root, so anything else was
+/// planted by whoever owns it.
+fn adoptable(owner: Uid) -> bool {
+    owner == Uid(0)
+}
+
+/// Resolve a `/proc/<pid>/cgroup` path against the cgroup2 mount.
+fn under_cgroup_root(rel: &Path) -> PathBuf {
+    cgroup_root().join(rel.strip_prefix("/").unwrap_or(rel))
+}
+
+/// Where a blessing's carrier should live: **the requester's own logind session scope**,
+/// falling back to `fallback` (the daemon's cgroup) when there isn't a usable one.
+///
+/// This is what makes a blessed shell a usable shell. polkit resolves a caller's session
+/// from its cgroup, so a carrier under `cordond.service` has no `session-N.scope`
+/// ancestor and every `run0`/`pkexec` inside it fails with "interactive authentication has
+/// not been enabled". Created under the requester's own scope instead, the blessed process
+/// keeps the session it was already in.
+///
+/// **Refuses any parent that is not root-owned**, which is a real check rather than
+/// belt-and-braces. A user-writable parent lets the invoker `rmdir` an empty carrier and
+/// `mkdir` a replacement — and a cgroup id *is* a recycled kernfs inode number, so within
+/// the GC window that replacement could land on an id still registered in `BLESSED`, i.e.
+/// self-bless. `session-N.scope` is `root:root`; `user@UID.service` is delegated to the
+/// user and must never be used, which the ownership check rejects on its own.
+fn carrier_parent(pid: Pid, fallback: &Path) -> PathBuf {
+    match usable_session_scope(pid) {
+        Ok(scope) => scope,
+        Err(reason) => {
+            debug!(pid = %pid, reason, "bless: carrier goes under the daemon's cgroup");
+            fallback.to_path_buf()
+        }
+    }
+}
+
+/// The requester's session scope if a carrier may be created there, else **why not**.
+///
+/// The `Err` is a reason string rather than a typed error because no caller branches on
+/// it — every failure means the same thing, "use the daemon's cgroup". Its only job is to
+/// say which of the four ways that happened, on one `debug!` line, when someone is working
+/// out why `run0` stopped working inside a blessed shell.
+fn usable_session_scope(pid: Pid) -> std::result::Result<PathBuf, &'static str> {
+    // A requester that exited between connecting and here has no cgroup to read. The mint
+    // will fail on its own shortly; meanwhile the daemon's cgroup is the safe placement.
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .map_err(|_| "requester's cgroup unreadable")?;
+    let rel = cgroup_v2_path(&text)
+        .and_then(session_scope_rel)
+        .ok_or("requester is in no logind session scope")?;
+    let scope = under_cgroup_root(rel);
+    match std::fs::metadata(&scope) {
+        Ok(meta) if std::os::unix::fs::MetadataExt::uid(&meta) == 0 => Ok(scope),
+        Ok(_) => Err("session scope is not root-owned"),
+        Err(_) => Err("session scope vanished"),
+    }
+}
+
+/// Every directory a carrier could have been created in — the daemon's own cgroup plus
+/// each live logind session scope. Reconcile's search space.
+///
+/// Without the session scopes, a carrier left by a restart would linger with its members
+/// still running: nothing would ever reap it, and a non-empty child keeps systemd from
+/// removing the session scope at logout. The walk is bounded to exactly the shape
+/// [`carrier_parent`] can produce (`user.slice/user-*.slice/session-*.scope`) rather than
+/// a recursive sweep of the whole hierarchy.
+fn carrier_roots(daemon_cgroup: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![daemon_cgroup.to_path_buf()];
+    let children = |dir: PathBuf, keep: fn(&str) -> bool| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(keep))
+            .map(|e| e.path())
+            .collect()
+    };
+    let user_slice = cgroup_root().join("user.slice");
+    for per_user in children(user_slice, |n| {
+        n.starts_with("user-") && n.ends_with(".slice")
+    }) {
+        roots.extend(children(per_user, |n| {
+            n.starts_with("session-") && n.ends_with(".scope")
+        }));
+    }
+    // The daemon's own cgroup *is* a session scope when cordond is started from a login
+    // shell rather than the unit, so it can turn up twice. A duplicate would adopt every
+    // leftover carrier twice — two table rows with one id, and a confusing `bless list`.
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The `session-N.scope` prefix of a cgroup path, if it has one — e.g.
+/// `/user.slice/user-1000.slice/session-3.scope/app.service` →
+/// `/user.slice/user-1000.slice/session-3.scope`.
+///
+/// Pure path work so the placement rule is testable without a cgroup hierarchy; the
+/// ownership check that makes it *safe* is [`carrier_parent`]'s.
+fn session_scope_rel(cgroup_path: &Path) -> Option<&Path> {
+    cgroup_path.ancestors().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("session-") && n.ends_with(".scope"))
+    })
 }
 
 /// Whether the carrier currently has members, from its `cgroup.events` (`populated
@@ -620,11 +767,132 @@ mod tests {
         // Hybrid listing: v1 controllers + the unified line.
         let text =
             "12:pids:/user.slice\n1:name=systemd:/init.scope\n0::/system.slice/cordond.service\n";
-        assert_eq!(cgroup_v2_path(text), Some("/system.slice/cordond.service"));
-        // Pure v2 at the root.
-        assert_eq!(cgroup_v2_path("0::/\n"), Some("/"));
+        assert_eq!(
+            cgroup_v2_path(text),
+            Some(Path::new("/system.slice/cordond.service"))
+        );
+        // Pure v2 at the root — relative to the mount, so it resolves to the mount itself.
+        assert_eq!(cgroup_v2_path("0::/\n"), Some(Path::new("/")));
+        assert_eq!(under_cgroup_root(Path::new("/")), cgroup_root());
+        assert_eq!(
+            under_cgroup_root(Path::new("/user.slice/session-3.scope")),
+            cgroup_root().join("user.slice/session-3.scope"),
+            "the leading slash must not make `join` discard the mount"
+        );
         // No unified hierarchy at all.
         assert_eq!(cgroup_v2_path("12:pids:/user.slice\n"), None);
+    }
+
+    /// Where a carrier goes, as pure string work. The blessed process must land under the
+    /// requester's `session-N.scope` — that ancestor is the whole reason polkit can still
+    /// resolve a session inside a blessed shell.
+    #[test]
+    fn session_scope_is_found_at_any_depth() {
+        // A `fn`, not a closure: the result borrows from the argument, and closure
+        // lifetime elision can't express that.
+        fn rel(p: &str) -> Option<&Path> {
+            session_scope_rel(Path::new(p))
+        }
+        let scope = Path::new("/user.slice/user-1000.slice/session-3.scope");
+        // The requester is the scope itself, or anywhere beneath it.
+        assert_eq!(
+            rel("/user.slice/user-1000.slice/session-3.scope"),
+            Some(scope)
+        );
+        assert_eq!(
+            rel("/user.slice/user-1000.slice/session-3.scope/cordon-bless-1.ro"),
+            Some(scope)
+        );
+        assert_eq!(
+            rel("/user.slice/user-1000.slice/session-12.scope/app.slice/x.service"),
+            Some(Path::new("/user.slice/user-1000.slice/session-12.scope"))
+        );
+        // No session ⇒ no placement. A service, the user manager (which is *delegated*,
+        // so it must never be chosen), and the cgroup root all fall back.
+        assert_eq!(rel("/system.slice/cordond.service"), None);
+        assert_eq!(
+            rel("/user.slice/user-1000.slice/user@1000.service/app.slice"),
+            None
+        );
+        assert_eq!(rel("/"), None);
+        // Near-misses must not match: the prefix and the suffix are both required.
+        assert_eq!(rel("/user.slice/session-3.slice"), None);
+        assert_eq!(rel("/user.slice/mysession-3.scope"), None);
+    }
+
+    /// Placement never returns somewhere unsafe. The security half is the ownership gate:
+    /// a user-writable parent lets the invoker `rmdir` an empty carrier and `mkdir` a
+    /// replacement, and a cgroup id is a recycled inode number, so that replacement could
+    /// land on an id still live in `BLESSED`.
+    ///
+    /// Asserted as an **invariant** rather than a fixed path on purpose — where the test
+    /// runner itself sits is environment-dependent (a GUI terminal lands under
+    /// `user@1000.service/app.slice`, with no session scope at all; a tty login lands in a
+    /// root-owned `session-N.scope`), and a test that only holds on one of those would
+    /// pass here and fail on a login shell or in CI.
+    #[test]
+    fn placement_is_the_fallback_or_a_root_owned_scope() {
+        let base = std::env::temp_dir().join(format!("cordon-parent-{}", std::process::id()));
+        let fallback = base.join("daemon-cgroup");
+        std::fs::create_dir_all(&fallback).unwrap();
+
+        let chosen = carrier_parent(Pid(std::process::id()), &fallback);
+        if chosen != fallback {
+            let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&chosen).unwrap());
+            assert_eq!(
+                owner, 0,
+                "chose a parent that is not root-owned: {chosen:?}"
+            );
+            assert!(session_scope_rel(&chosen).is_some(), "chose {chosen:?}");
+        }
+
+        // A pid that cannot exist has no cgroup to read: fall back, with a reason, rather
+        // than fail the mint.
+        assert_eq!(carrier_parent(Pid(0), &fallback), fallback);
+        assert_eq!(
+            usable_session_scope(Pid(0)),
+            Err("requester's cgroup unreadable")
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Reconcile's search space includes the daemon's own cgroup, contains only session
+    /// scopes besides it, and lists nothing twice — a duplicate would adopt every leftover
+    /// carrier twice, which happens for real when cordond is started from a login shell
+    /// (its own cgroup *is* then a session scope, found both ways).
+    #[test]
+    fn carrier_roots_are_the_daemon_cgroup_plus_session_scopes_deduped() {
+        let daemon = std::env::temp_dir().join(format!("cordon-roots-{}", std::process::id()));
+        let roots = carrier_roots(&daemon);
+        assert!(roots.contains(&daemon));
+        for extra in roots.iter().filter(|r| **r != daemon) {
+            let name = extra.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.starts_with("session-") && name.ends_with(".scope"),
+                "unexpected reconcile root: {extra:?}"
+            );
+        }
+        let mut unique = roots.clone();
+        unique.dedup();
+        assert_eq!(unique, roots, "reconcile would scan a directory twice");
+
+        // The case that motivates the dedup: cordond started from a tty, so its own
+        // cgroup is a session scope the walk also finds.
+        if let Some(scope) = roots.iter().find(|r| **r != daemon).cloned() {
+            let roots = carrier_roots(&scope);
+            let hits = roots.iter().filter(|r| **r == scope).count();
+            assert_eq!(hits, 1, "the daemon's cgroup was listed twice: {scope:?}");
+        }
+    }
+
+    /// Adoption is a *grant*, so it is gated on the same trust question placement asks:
+    /// a carrier this daemon did not create as root is not ours to re-register.
+    #[test]
+    fn only_root_owned_carriers_are_adoptable() {
+        assert!(adoptable(Uid(0)));
+        assert!(!adoptable(Uid(1000)));
+        assert!(!adoptable(Uid(u32::MAX)));
     }
 
     #[test]

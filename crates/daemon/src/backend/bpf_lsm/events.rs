@@ -142,11 +142,12 @@ fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
         BlessOp::Mint {
             class,
             owner,
+            requester,
             reply,
         } => {
             let outcome = runtime
                 .blessings
-                .mint(ebpf, class, owner, &runtime.registry)
+                .mint(ebpf, class, owner, requester, &runtime.registry)
                 .map_err(|e| e.to_string());
             let _ = reply.send(outcome);
         }

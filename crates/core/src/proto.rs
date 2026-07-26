@@ -196,12 +196,28 @@ pub struct BlessingView {
 #[derive(Debug)]
 pub struct CarrierProcs(pub std::os::fd::OwnedFd);
 
-/// A process id (thread-group id) on the control plane — a carrier cgroup member as
-/// listed in `cgroup.procs`. `u32` to match the kernel's pid width there; a newtype so
-/// it can't be mixed up with a [`BlessId`] or a raw count (the wire discipline of the
-/// bpf-common scalars, which this seam deliberately doesn't depend on).
+/// A process id (thread-group id) on the control plane: a carrier cgroup member as listed
+/// in `cgroup.procs`, or a socket peer as reported by [`peer_pid`]. `u32` to match the
+/// kernel's pid width there; a newtype so it can't be mixed up with a [`BlessId`] or a raw
+/// count (the wire discipline of the bpf-common scalars, which this seam deliberately
+/// doesn't depend on).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Pid(pub u32);
+
+impl Pid {
+    /// A pid as the kernel hands it over: `pid_t`, which is **signed**.
+    ///
+    /// The width mismatch is the kernel's, not ours — pids are non-negative, but `pid_t`
+    /// carries a sign because the `kill(2)` family overloads negatives to mean a process
+    /// *group*. Nothing that reaches this type is such an overload (`SO_PEERCRED` reports a
+    /// real peer), so a negative here is not a pid at all, and it becomes `0` — the same
+    /// "no usable process" value the non-Linux stub returns, which every consumer already
+    /// treats as "fall back". Converting in one place beats an `as u32` at each call site,
+    /// where the sign question is invisible.
+    pub fn from_raw(raw: i32) -> Pid {
+        Pid(raw.max(0) as u32)
+    }
+}
 
 impl std::fmt::Display for Pid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -278,6 +294,36 @@ pub fn peer_uid(sock: &UnixStream) -> Result<crate::Uid> {
 #[cfg(not(target_os = "linux"))]
 pub fn peer_uid(_sock: &UnixStream) -> Result<crate::Uid> {
     Ok(crate::Uid(u32::MAX))
+}
+
+/// The peer's pid, from the same `SO_PEERCRED` as [`peer_uid`]. The daemon reads the
+/// requester's cgroup through it to place a blessing carrier in that process's own logind
+/// session scope (DESIGN §16.6).
+///
+/// **Weaker than [`peer_uid`], and the difference matters.** The kernel records this at
+/// `connect(2)`, so no client asserts it — but what it records is a *number*, and pid
+/// numbers are recycled once the task is reaped. Between the connect and the daemon's
+/// `/proc/<pid>/cgroup` read sits the whole approval wait, so a pid that has since been
+/// reused names a different process. `SO_PEERPIDFD` (Linux 6.5) is the fix for that class
+/// of staleness if this ever needs to be authoritative.
+///
+/// It doesn't today, because placement is not authorization: the grant is gated on a uid-0
+/// `BlessApprove`, and anyone able to complete one already has root. A stale pid resolves
+/// to nothing, or to a cgroup with no session scope, and placement falls back to the
+/// daemon's own cgroup — the safe, pre-B2 behaviour.
+#[cfg(target_os = "linux")]
+pub fn peer_pid(sock: &UnixStream) -> Result<Pid> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let creds = getsockopt(sock, PeerCredentials)
+        .map_err(|e| crate::Error::msg(format!("SO_PEERCRED: {e}")))?;
+    Ok(Pid::from_raw(creds.pid()))
+}
+
+/// No `SO_PEERCRED` off Linux — see [`peer_uid`]'s note. Pid 0 is not a real process, so
+/// the cgroup read that follows simply fails and placement falls back.
+#[cfg(not(target_os = "linux"))]
+pub fn peer_pid(_sock: &UnixStream) -> Result<Pid> {
+    Ok(Pid::from_raw(0))
 }
 
 /// Send one newline-framed JSON message with a file descriptor riding along as
@@ -454,6 +500,19 @@ mod tests {
             .expect("a message");
         assert!(matches!(msg, Response::BlessRevoked { id: BlessId(3) }));
         assert!(fd.is_none());
+    }
+
+    /// `pid_t` is signed and pids are not. A real pid passes through; a negative — which
+    /// is a `kill(2)` process-group overload, never something that reaches this type —
+    /// lands on `0`, the "no usable process" value whose consumers already fall back.
+    #[test]
+    fn pid_from_raw_normalizes_the_kernels_signed_width() {
+        assert_eq!(Pid::from_raw(4242), Pid(4242));
+        assert_eq!(Pid::from_raw(0), Pid(0));
+        assert_eq!(Pid::from_raw(i32::MAX), Pid(i32::MAX as u32));
+        // Not wrapped to a huge pid, which is what a bare `as u32` would have done.
+        assert_eq!(Pid::from_raw(-1), Pid(0));
+        assert_eq!(Pid::from_raw(i32::MIN), Pid(0));
     }
 
     /// `SO_PEERCRED` reports the process on the other end, not the one asking. Both sides

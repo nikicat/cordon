@@ -10,7 +10,7 @@
 
 use crate::Uid;
 use crate::policy::{ClassName, Diagnostic, PolicySource};
-use crate::proto::{BlessId, BlessingView, CarrierProcs, PolicyView};
+use crate::proto::{BlessId, BlessingView, CarrierProcs, Pid, PolicyView};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -137,6 +137,11 @@ pub enum BlessOp {
         /// The **requester's** kernel-attested uid, recorded on the blessing so they can
         /// later revoke what they minted without needing root ([`Self::Revoke`]).
         owner: Uid,
+        /// The **requester's** kernel-attested pid. The daemon reads its cgroup to place
+        /// the carrier in that process's own logind session scope, so the blessed command
+        /// keeps a session polkit will resolve. Attested, never asserted: a client-supplied
+        /// pid would let a caller aim the carrier at *another* user's session.
+        requester: Pid,
         reply: Sender<std::result::Result<(BlessingView, CarrierProcs), String>>,
     },
     /// Snapshot the live blessings.

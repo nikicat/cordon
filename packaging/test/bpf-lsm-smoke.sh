@@ -102,6 +102,19 @@
 #                       refused, and refused *before* the elevation helper is spawned —
 #                       otherwise the human's authentication could be spent approving the
 #                       squatter's own parked request instead of their own.
+#  26. bless placement — the carrier is created in the REQUESTER's session-N.scope (read
+#                       from SO_PEERCRED, never asserted), which is what lets polkit still
+#                       resolve a session inside a blessed shell. logind isn't needed to
+#                       test it: a session scope is a root-owned cgroup dir in the shape
+#                       systemd makes, and the mechanics are the kernel's. A USER-owned
+#                       parent is refused and falls back — an invoker who could rmdir an
+#                       empty carrier and mkdir a replacement might land on a recycled
+#                       inode, i.e. a cgroup id still registered in BLESSED.
+#  27. bless reconcile — re-registering a leftover carrier on restart is a GRANT, so it is
+#                       gated on the same trust question as placement: only root-owned
+#                       carriers are adopted. Two populated leftovers are planted in a
+#                       session scope, one root-owned and one chowned to a user; exactly
+#                       the first comes back in `bless list`, and the refusal is journaled.
 #
 # The bless scenarios run the daemon in a NESTED cgroup, reproducing production's
 # `Delegate=yes` service cgroup without needing systemd (the carrier root is then a
@@ -1335,6 +1348,160 @@ while True: s.accept()
     return $fail
 }
 
+# --- scenario 26: the carrier lands in the requester's session scope ---------
+# The fix that makes a blessed shell usable: polkit resolves a caller's session from its
+# cgroup, so a carrier under cordond.service has no session-N.scope ancestor and every
+# run0/pkexec inside it fails. The daemon therefore reads the REQUESTER's pid from
+# SO_PEERCRED and creates the carrier under that process's own session scope.
+#
+# logind isn't here to create those scopes, but it doesn't have to be: a session scope is
+# just a root-owned cgroup directory in the shape systemd would make, and everything under
+# test is kernel mechanics (which cgroup the mkdir happens in, and who owns the parent).
+# The one thing this cannot show is polkit then being satisfied, which is a systemd
+# property rather than cordon code — that stays a host check.
+#
+# Both directions matter. Root-owned parent: use it. User-owned parent: REFUSE and fall
+# back, because an invoker who can rmdir an empty carrier and mkdir a replacement could
+# land on a recycled inode — i.e. a cgroup id still registered in BLESSED — and self-bless.
+scenario_bless_session_scope() {
+    echo "### scenario: the carrier is created in the requester's session scope"
+    ws_new
+    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
+    cgroup2_ready || { daemon_stop; return 0; }
+    local buid=4248
+    chmod 755 "$TMP"
+    local cordon="$TMP/cordon"; cp "$CORDON" "$cordon"; chmod 755 "$cordon"
+    # Somewhere the unprivileged blessed child can drop its readiness marker; $TMP itself
+    # is root-owned, and a marker that silently fails to appear would make the waits below
+    # pass on a timeout instead of on the thing they are waiting for.
+    local ready="$TMP/ready"; mkdir -p "$ready"; chown "$buid:$buid" "$ready"
+    local uslice="/sys/fs/cgroup/user.slice/user-$buid.slice"
+    local good="$uslice/session-99.scope"     # root-owned, as logind makes them
+    local bad="$uslice/session-98.scope"      # user-owned: must be refused
+    if ! mkdir -p "$good" "$bad" 2>/dev/null; then
+        echo "  SKIP: cannot create session scopes under /sys/fs/cgroup"; daemon_stop; return 0
+    fi
+    chown "$buid:$buid" "$bad"
+    session_cleanup() { rmdir "$good"/cordon-bless-* "$bad"/cordon-bless-* "$good" "$bad" "$uslice" 2>/dev/null; }
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start
+    if ! started; then session_cleanup; return 1; fi
+    fake_sudo_start || { echo "  SKIP: cannot build the elevation stand-in"; session_cleanup; daemon_stop; return 0; }
+    local fail=0
+
+    # Run the unprivileged CLI from *inside* a scope: join as root, then drop — the child
+    # inherits the cgroup, which is exactly how a logind session hands one over.
+    bless_from_scope() { # $1 scope  $2 marker file
+        sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$1" \
+            setpriv --reuid "$buid" --regid "$buid" --clear-groups \
+            env CORDON_SUDO="$CORDON_SUDO" CORDON_CONFIG="$CORDON_CONFIG" \
+            "$cordon" bless --class ro -- /bin/sh -c "touch '$2'; sleep 5" &
+    }
+
+    bless_from_scope "$good" "$ready/in-session"
+    local blessed=$!
+    for _ in $(seq 1 50); do [ -e "$ready/in-session" ] && break; sleep 0.1; done
+    [ -e "$ready/in-session" ] || { echo "  FAIL: the blessed child never started"; fail=1; }
+    if ls -d "$good"/cordon-bless-* >/dev/null 2>&1; then
+        echo "  OK: the carrier was created in the requester's session scope ($(basename "$(ls -d "$good"/cordon-bless-*)"))"
+    else
+        echo "  FAIL: no carrier under $good — placement regression?"
+        echo "        daemon cgroup holds: $(ls -d "$(bless_root)"/cordon-bless-* 2>/dev/null || echo none)"
+        sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    kill "$blessed" 2>/dev/null; wait "$blessed" 2>/dev/null
+
+    # The refusal: a user-owned parent is never used, however plausible its name.
+    bless_from_scope "$bad" "$ready/in-bad"
+    local rejected=$!
+    for _ in $(seq 1 50); do [ -e "$ready/in-bad" ] && break; sleep 0.1; done
+    [ -e "$ready/in-bad" ] || { echo "  FAIL: the fallback blessed child never started"; fail=1; }
+    if ls -d "$bad"/cordon-bless-* >/dev/null 2>&1; then
+        echo "  FAIL: a carrier was created under a USER-OWNED parent (inode-recycling hazard)"; fail=1
+    elif ls -d "$(bless_root)"/cordon-bless-* >/dev/null 2>&1; then
+        echo "  OK: a user-owned session scope is refused; the carrier fell back to the daemon's cgroup"
+    else
+        echo "  FAIL: no carrier anywhere for the fallback case"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    kill "$rejected" 2>/dev/null; wait "$rejected" 2>/dev/null
+
+    fake_sudo_stop
+    daemon_stop
+    session_cleanup
+    return $fail
+}
+
+# --- scenario 27: reconcile adopts only root-owned leftovers -----------------
+# On restart the daemon re-registers leftover carriers in BLESSED — which is a *grant*, so
+# it must be at least as strict as placement, which refuses parents it doesn't trust. A
+# carrier this daemon created is root-owned; anything else was planted, and adopting it
+# would register a cgroup whose membership someone else controls, i.e. self-bless.
+#
+# Plant two populated carriers in a session scope before the daemon starts: one root-owned,
+# one chowned to a user. Exactly the first may come back in `bless list`.
+scenario_bless_reconcile_ownership() {
+    echo "### scenario: reconcile adopts a root-owned leftover, ignores a planted one"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    local buid=4249
+    local uslice="/sys/fs/cgroup/user.slice/user-$buid.slice"
+    local scope="$uslice/session-97.scope"
+    if ! mkdir -p "$scope" 2>/dev/null; then
+        echo "  SKIP: cannot create a session scope under /sys/fs/cgroup"; daemon_stop; return 0
+    fi
+    local ours="$scope/cordon-bless-70.ro" theirs="$scope/cordon-bless-71.ro"
+    mkdir -p "$ours" "$theirs"
+    chown "$buid:$buid" "$theirs"          # as if planted by that user
+    # Populated, or reconcile just removes them as empty leftovers.
+    sleep 30 & local a=$!; echo $a > "$ours/cgroup.procs"
+    sleep 30 & local b=$!; echo $b > "$theirs/cgroup.procs"
+    reconcile_cleanup() {
+        kill $a $b 2>/dev/null; wait $a $b 2>/dev/null
+        rmdir "$ours" "$theirs" "$scope" "$uslice" 2>/dev/null
+    }
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start
+    if ! started; then reconcile_cleanup; return 1; fi
+    local fail=0
+    local listing; listing="$("$CORDON" bless list 2>&1)"
+    if printf '%s' "$listing" | grep -q '^70 \|^  70 '; then
+        echo "  OK: the root-owned leftover was adopted"
+    else
+        echo "  FAIL: the root-owned leftover was not adopted: $listing"; fail=1
+    fi
+    if printf '%s' "$listing" | grep -q '71'; then
+        echo "  FAIL: a NON-ROOT-OWNED carrier was adopted — self-bless primitive"; fail=1
+    else
+        echo "  OK: the planted (user-owned) carrier was ignored"
+    fi
+    if log_has 'not root-owned; ignored'; then
+        echo "  OK: the refusal is journaled"
+    else
+        echo "  FAIL: no journal line for the ignored carrier"; fail=1
+    fi
+    daemon_stop
+    reconcile_cleanup
+    return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -1362,6 +1529,8 @@ scenario_bless_journal     || rc=1
 scenario_bless_unprivileged || rc=1
 scenario_socket_authz      || rc=1
 scenario_bless_rejects_fake_daemon || rc=1
+scenario_bless_session_scope || rc=1
+scenario_bless_reconcile_ownership || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then
