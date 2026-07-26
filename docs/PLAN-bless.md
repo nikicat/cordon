@@ -11,7 +11,7 @@ new pieces are a carrier (a per-invocation root-owned cgroup), a tiny runtime in
 CLI.
 
 > **Status: B1 is done (2026-07-26), sudo-gated.** B1a–B1f all shipped and are VM-validated
-> (22/22 smoke scenarios). One design change during implementation: **`sudo` authenticates
+> (23/23 smoke scenarios). One design change during implementation: **`sudo` authenticates
 > instead of PAM-in-the-daemon**, and the CLI (root via sudo) spawns the target instead of the
 > daemon — see the B1d note and DESIGN §16.5 for the rationale and the accepted deltas. PAM
 > mint moves to **B3** below.
@@ -128,7 +128,7 @@ end-to-end, **scoped to the rule's object column** (no blanket).
   `bless -- list` runs a command named `list`.
 - No CLI-side cleanup: daemon GC owns teardown.
 
-### B1f. Validation — `packaging/test/bpf-lsm-smoke.sh` ✅ *(shipped: scenarios 18–22, 22/22 green)*
+### B1f. Validation — `packaging/test/bpf-lsm-smoke.sh` ✅ *(shipped: scenarios 18–23, 23/23 green)*
 - **Scope (18):** a blessed read is allowed against a `who="*"` deny on that object; the
   **same blessed exe is denied** on a second protected object the class doesn't name (scope =
   the rule's object column); the same exe **unblessed** stays denied. Also the end-to-end
@@ -140,9 +140,26 @@ end-to-end, **scoped to the rule's object column** (no blanket).
   "re-open denied" alone would hold regardless).
 - **Revoke (21):** the blessed tree dies promptly via `cgroup.kill`; list + dirs drain.
 - **Journal (22):** the blessed access logs `blessing=ro` (class by name).
+- **Drop to the invoker (23):** the `sudo` shape. A non-root blessed child **still reads the
+  secret** — true only if the carrier join preceded the privilege drop, which 18–22 cannot
+  show since they leave the child as root — plus the invoker's uid, their surviving
+  supplementary groups (`getgrouplist`), and their `$HOME`.
+- **Neither systemd nor sudo is needed for any of this**, because in both cases the thing
+  under test is a kernel-level property rather than the tool that arranges it:
+  - `SUDO_UID`/`SUDO_GID` is the *entire* interface sudo gives the CLI, so setting it as root
+    is byte-identical (the same substitution scenarios 16/17 make for `policy edit`). Real
+    sudo would test sudo.
+  - `Delegate=yes` buys "the daemon's own cgroup is a non-root cgroup it creates children
+    in" — mkdir + write a pid. All six bless scenarios run the daemon in such a **nested
+    cgroup**, which is *stricter* than the cgroup2 root they used to use (the root is exempt
+    from cgroup-v2's "no internal processes" rule). Scenario 18 asserts the nesting actually
+    engaged, so a silent fallback can't pass while testing nothing.
 - No PAM test hook needed — the smoke runs as root, so the CLI is invoked directly and the
   daemon's uid-0 gate passes. Startup reconciliation gets incidental coverage (a scenario's
   daemon is killed with carriers live; the next one logs "removed empty leftover carrier").
+- Out of scope, deliberately: real sudo's PAM prompt + timestamp cache, and systemd's own
+  cgroup bookkeeping — neither is cordon code. (`vng --systemd` exists but is EXPERIMENTAL
+  and boots the host's whole unit tree read-only.)
 
 ### B1 decisions (locked at impl start; annotated with what shipped)
 1. **Blessing is a `SubjectMatch` predicate** (Wiring 2), not a separate grant table — scope

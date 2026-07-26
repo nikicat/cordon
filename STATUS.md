@@ -201,8 +201,14 @@ daemon GCs the carrier when the tree drains (`cgroup.events populated 0`, with a
 grace), `bless revoke <id>` kills it via `cgroup.kill`, and startup reconciles leftovers.
 Every apply **remaps live entries by class name** (`ClassId`s renumber on recompile — without
 this a live blessing would silently change meaning). Blessed decisions journal
-`blessing=<name>`. Validated by 5 VM smoke scenarios (18–22 of 22): scope, membership
-boundary, inheritance + full GC, revoke, journal.
+`blessing=<name>`. Validated by 6 VM smoke scenarios (18–23 of 23): scope, membership
+boundary, inheritance + full GC, revoke, journal, and the `sudo` drop (a non-root blessed
+child still reads — the join-before-drop property — with the invoker's supplementary
+groups and `$HOME`). Those scenarios run the daemon in a **nested cgroup**, reproducing
+production's `Delegate=yes` service cgroup: neither systemd nor real sudo is needed, since
+`SUDO_UID`/`SUDO_GID` is the entire interface sudo gives the CLI and a nested cgroup is the
+kernel-level property `Delegate=yes` arranges (and the stricter one — the cgroup2 root is
+exempt from "no internal processes").
 
 **Design change from the original spec** (DESIGN §16.5): the authenticator is **sudo**, not
 PAM-in-the-daemon — PAM proved far heavier than specced (conversation proxying as multi-frame
