@@ -1,11 +1,13 @@
-//! The few privileged operations `policy edit` needs, isolated here. Every one is a safe
-//! `nix` wrapper except the single inherently-unsafe `Command::pre_exec` registration — so
-//! the whole crate's `unsafe` surface is the one block below. All serve the sudoedit-style
-//! boundary: the parent stays root to validate/apply/write while the editor child runs
-//! fully as the invoking user.
+//! The few privileged operations `policy edit` and `bless` need, isolated here. Every
+//! one is a safe `nix` wrapper except the two inherently-unsafe `Command::pre_exec`
+//! registrations — so the whole crate's `unsafe` surface is the two blocks below. Both
+//! serve the same boundary shape: the parent stays root while the child sheds root
+//! before exec ([`drop_to_on_exec`] for the editor; [`join_cgroup_and_drop_on_exec`]
+//! additionally joins the bless carrier cgroup *first*, while joining still needs root).
 
 use cordon_core::policy::UserName;
 use nix::unistd::{Gid, Uid, User};
+use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
@@ -59,6 +61,65 @@ pub fn drop_to_on_exec(cmd: &mut Command, uid: Uid, gid: Gid) {
     }
 }
 
+/// The identity a blessed child drops to before exec: the sudo invoker, with their
+/// **full** supplementary group list (unlike the editor's [`drop_to_on_exec`], which
+/// sheds all groups: a blessed shell is the user's normal session, and silently losing
+/// `wheel`/`docker`/… would be surprising). The list is resolved *before* fork
+/// (`getgrouplist` reads the group database — not async-signal-safe), so the `pre_exec`
+/// closure only applies ready values.
+pub struct DropTo {
+    pub uid: Uid,
+    pub gid: Gid,
+    pub groups: Vec<Gid>,
+}
+
+/// Arrange for `cmd`, in the forked child, to (1) **join the bless carrier cgroup** by
+/// writing its own pid into `procs` — the already-open `cgroup.procs` fd, opened by the
+/// root parent — and then (2) drop to the invoker per `drop` (`None` ⇒ a true-root
+/// invocation; the child stays root). The join-before-drop order is the boundary:
+/// joining needs root (the carrier is root-owned), and joining before exec is what
+/// makes the target run **zero** instructions unblessed.
+pub fn join_cgroup_and_drop_on_exec(cmd: &mut Command, procs: File, drop: Option<DropTo>) {
+    // SAFETY: the closure runs post-fork / pre-exec in the child, so only
+    // async-signal-safe operations are sound. Everything here qualifies: getpid(2) and
+    // write(2) are raw syscalls, the pid is formatted into a stack buffer (no
+    // allocation), and setgroups/setgid/setuid apply values resolved before the fork
+    // (same discipline as `drop_to_on_exec`, including its groups-gid-uid order).
+    unsafe {
+        cmd.pre_exec(move || {
+            let mut buf = [0u8; U32_DECIMAL_MAX];
+            let text = format_u32(std::process::id(), &mut buf);
+            if nix::unistd::write(&procs, text)? != text.len() {
+                return Err(io::Error::from(nix::errno::Errno::EIO));
+            }
+            if let Some(d) = &drop {
+                nix::unistd::setgroups(&d.groups)?;
+                nix::unistd::setgid(d.gid)?;
+                nix::unistd::setuid(d.uid)?;
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Decimal digits of `u32::MAX` — the buffer a [`format_u32`] caller provides.
+pub(crate) const U32_DECIMAL_MAX: usize = 10;
+
+/// Format `n` in decimal into the tail of `buf`, returning the used slice. No
+/// allocation, no `core::fmt` machinery — async-signal-safe for the `pre_exec` join.
+pub(crate) fn format_u32(mut n: u32, buf: &mut [u8; U32_DECIMAL_MAX]) -> &[u8] {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    &buf[i..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +131,17 @@ mod tests {
         let (name, home) = user_identity(Uid::current()).expect("current uid is in passwd");
         assert!(!name.as_str().is_empty());
         assert!(home.is_absolute(), "home should be absolute, got {home:?}");
+    }
+
+    /// The no-alloc formatter behind the async-signal-safe cgroup join: exact digits,
+    /// no leading zeros, both extremes.
+    #[test]
+    fn format_u32_renders_decimal() {
+        let mut buf = [0u8; U32_DECIMAL_MAX];
+        assert_eq!(format_u32(0, &mut buf), b"0");
+        assert_eq!(format_u32(7, &mut buf), b"7");
+        assert_eq!(format_u32(1234, &mut buf), b"1234");
+        assert_eq!(format_u32(u32::MAX, &mut buf), b"4294967295");
     }
 
     /// The temp-file chown is done through an **fd** (`fchown`), the symlink-safe primitive

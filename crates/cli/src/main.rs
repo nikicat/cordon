@@ -5,6 +5,7 @@
 //! the in-kernel maps; `policy show` and `status` read the effective policy. There are
 //! no per-object owner mutations — the owner model was retired with the rule model.
 
+mod bless;
 mod edit;
 mod sys;
 
@@ -46,6 +47,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
+    /// Run a command under a fresh blessing (root via `sudo`); also `bless list` /
+    /// `bless revoke <id>`.
+    Bless(bless::BlessArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -120,13 +124,12 @@ fn main() -> ExitCode {
         );
     }
 
-    let socket = match resolve_socket(&cli) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // `bless` drives its own flow (mint → fork into the carrier → drop → exec); its
+    // `list`/`revoke` subcommands come back through `run_request` like any other.
+    if let Cmd::Bless(args) = &cli.cmd {
+        return bless::run(args, &cli);
+    }
+
     let req = match build_request(&cli) {
         Ok(r) => r,
         Err(e) => {
@@ -134,7 +137,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let resp = match round_trip(&socket, &req) {
+    run_request(&req, &cli)
+}
+
+/// Send one request to the daemon and render the reply (honoring `--json`) — the
+/// shared tail of every daemon-bound command.
+fn run_request(req: &Request, cli: &Cli) -> ExitCode {
+    let socket = match resolve_socket(cli) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cordon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let resp = match round_trip(&socket, req) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cordon: {e}");
@@ -172,6 +188,7 @@ fn build_request(cli: &Cli) -> Result<Request> {
             PolicyCmd::Check { .. } => unreachable!("check is handled locally"),
             PolicyCmd::Edit { .. } => unreachable!("edit is handled locally"),
         },
+        Cmd::Bless(_) => unreachable!("bless is handled locally"),
     }
 }
 
