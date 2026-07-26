@@ -205,56 +205,76 @@ smoke scenarios green):**
 today two daemons can't corrupt each other (each loads private maps), but two daemons sharing
 *pinned* maps would reintroduce a cross-process writer race.
 
-## Blessing (`cordon bless`) — ✅ B1 done (2026-07-26), sudo-gated
-The runtime, human-authenticated access grant ships: [`DESIGN.md` §16](docs/DESIGN.md)
-(design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (milestone spine: B1 done; **B2 =
-usability, planned in [`docs/PLAN-bless3.md`](docs/PLAN-bless3.md) and the next thing to
-build**; B3 the PAM upgrade; B4 ergonomics). It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
-(`blessing = "<class>"`), so a blessing rule is an ordinary rule — its action, **object
-scope**, and precedence all reuse the §15 model (scope = the rule's object column; **fully
-customizable in policy**, not blanket).
+## Blessing (`cordon bless`) — ✅ B1 + B2 done (2026-07-27)
+The runtime, human-authenticated access grant ships, and as of B2 it is **usable**:
+[`DESIGN.md` §16](docs/DESIGN.md) (design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md)
+(milestone spine: B1 + B2 done, planned in [`docs/PLAN-bless3.md`](docs/PLAN-bless3.md);
+**B3 = the PAM upgrade, the next thing to build**; B4 ergonomics). It's additive to the rule
+model: **a blessing is one more `SubjectMatch` predicate** (`blessing = "<class>"`), so a
+blessing rule is an ordinary rule — its action, **object scope**, and precedence all reuse
+the §15 model (scope = the rule's object column; **fully customizable in policy**, not
+blanket).
 
-`sudo cordon bless [--class NAME] [-- <cmd>]` mints a per-invocation **root-owned cgroup**
-carrier (`cordon-bless-<id>.<class>`, under the daemon's own cgroup via `Delegate=yes`),
-registers it in the tiny unbanked `BLESSED: cgroup_id → ClassId` map, and the CLI forks the
-target into it: `pre_exec` joins the carrier **while still root**, then drops to `SUDO_UID`
-(full supplementary groups, passwd `HOME`/`USER`), then execs — the target never runs
-unblessed, and keeps a natural tty, job control, and exit code. Descendants inherit. The
-daemon GCs the carrier when the tree drains (`cgroup.events populated 0`, with a 30s mint
-grace), `bless revoke <id>` kills it via `cgroup.kill`, and startup reconciles leftovers.
-Every apply **remaps live entries by class name** (`ClassId`s renumber on recompile — without
-this a live blessing would silently change meaning). Blessed decisions journal
-`blessing=<name>`. Validated by 6 VM smoke scenarios (18–23 of 24): scope, membership
-boundary, inheritance + full GC, revoke, journal, and the `sudo` drop (a non-root blessed
-child still reads — the join-before-drop property — with the invoker's supplementary
-groups and `$HOME`). Those scenarios run the daemon in a **nested cgroup**, reproducing
-production's `Delegate=yes` service cgroup: neither systemd nor real sudo is needed, since
-`SUDO_UID`/`SUDO_GID` is the entire interface sudo gives the CLI and a nested cgroup is the
-kernel-level property `Delegate=yes` arranges (and the stricter one — the cgroup2 root is
-exempt from "no internal processes").
+**`cordon bless [--class NAME] [-- <cmd>]` — no `sudo` prefix; it runs as you.** The CLI
+verifies the daemon is root, sends `BlessRequest` and holds the connection open; the daemon
+parks a single-use 128-bit nonce and blocks. The CLI spawns
+`$CORDON_SUDO cordon bless-helper --nonce=…`, the human authenticates, and *that* helper
+reaches the daemon as **uid 0** — which is the entire proof of human presence. The daemon
+then mints a per-invocation **root-owned cgroup** carrier (`cordon-bless-<id>.<class>`) **in
+the requester's own `session-N.scope`**, registers it in the tiny unbanked
+`BLESSED: cgroup_id → ClassId` map, and passes the carrier's **`cgroup.procs` descriptor**
+back over `SCM_RIGHTS`. The CLI forks and `pre_exec` writes the child's pid through that
+descriptor before `exec` — so the target never runs unblessed, while the CLI never holds
+privilege (cgroup-v2 checks the descriptor's *opener*, not the writer). Descendants inherit.
+The daemon GCs the carrier when the tree drains (`cgroup.events populated 0`, 30s mint grace),
+`bless revoke <id>` kills it via `cgroup.kill` (root **or** the uid that minted it), and
+startup reconciles leftovers from its own cgroup and every session scope — adopting only
+root-owned ones, since re-registering is a grant. Every apply **remaps live entries by class
+name** (`ClassId`s renumber on recompile — without this a live blessing would silently change
+meaning). Blessed decisions journal `blessing=<name>`.
 
-**Known issues from the real-system run — planned in
-[`docs/PLAN-bless3.md`](docs/PLAN-bless3.md) (B2):**
-- ~~`cordon bless list` is unusable from a user account~~ — **fixed** by refinement (9) above:
-  `PolicyApply` moved behind the uid-0 gate and the socket opened to `0666`, so the ungated
-  read verbs B1 decision #1 specced are finally reachable.
-- **The blessed shell has no logind session and no environment.** The carrier under
-  `cordond.service` has no `session-N.scope` ancestor, so polkit refuses `run0`/`pkexec`;
-  and `sudo`/`run0` scrub the environment while the CLI restores only
-  `HOME`/`USER`/`LOGNAME`, so GUI apps get no `DISPLAY`. Both because the blessed process is
-  born in the wrong place — parented through a privilege tool, then relocated into the
-  daemon's cgroup. B2 inverts the privilege flow (unprivileged CLI + a `cgroup.procs` fd
-  over `SCM_RIGHTS`), which deletes the whole privilege-drop path.
-- A blessing's object scope must be enumerated, so it drifts against `@secrets` — an
-  "uncordoned" class is sketched in PLAN-bless B4.
+**Why the privilege flow was inverted (B2's whole point).** Under B1 the blessed process was
+born under a privilege tool and then relocated into the daemon's cgroup, which cost it two
+things the host run exposed: no `session-N.scope` ancestor, so polkit refused `run0`/`pkexec`;
+and a scrubbed environment, so GUI apps got no `DISPLAY`. Under `run0` there isn't even a
+parent chain left to recover the environment from — so "ship the env over IPC" was never an
+option, and fixing the environment was **not separable** from fixing who spawns the target.
+Now nothing moves it: environment, cwd, tty, job control and session are inherited by
+construction, and the entire privilege-drop path (`Invoker`, `DropTo`, `SUDO_UID` parsing,
+passwd lookup, `getgrouplist`, the `HOME`/`USER`/`LOGNAME` fixups) is **deleted**.
 
-**Design change from the original spec** (DESIGN §16.5): the authenticator is **sudo**, not
-PAM-in-the-daemon — PAM proved far heavier than specced (conversation proxying as multi-frame
-IPC, stdio fd passing, degraded job control) and the systemd-less smoke VM can't test
-transient scopes. Two accepted deltas, both documented: sudo's **timestamp cache is a grace
-window** (deployment note: `Defaults!/usr/bin/cordon timestamp_timeout=0`), and blessing is
-**sudoer-only** until the B3 PAM upgrade, which the authenticator-agnostic mint verb is shaped
-to accept.
+**Two boundary checks are load-bearing and easy to get wrong:**
+- The **daemon is the rendezvous**, not the helper. The helper's own credentials say nothing
+  about whose session this is (under `run0` it lives in a transient unit with no session), so
+  each fact is read from the peer that cannot lie about it: placement from the unprivileged
+  requester's `SO_PEERCRED`, human presence from the approver's uid.
+- The **client checks the daemon**. `cordon bless` requires `SO_PEERCRED` uid 0 on the daemon
+  end before sending anything, and passes the same `--socket` to the helper. Otherwise the
+  nonce is a bearer token handed to whoever answers: a local user squatting the client's socket
+  path could park its own request on the real daemon, answer the victim with that nonce, and
+  spend the human's authentication on the attacker's request.
+
+Validated by **10 VM smoke scenarios (18–27 of 27)**: scope, membership boundary, inheritance
++ full GC, revoke, journal, the unprivileged spawn (child runs as the invoking uid, an env
+canary survives, the blessed read proves the fd join) with a faked elevation refused, socket
+authorization, the anti-hijack guard (a squatted non-root daemon is refused *before* the
+elevation helper is spawned), session-scope placement in both directions, and reconcile
+adopting only root-owned leftovers. **logind is not needed to test placement** — a session
+scope is a root-owned cgroup directory in the shape systemd makes, and everything under test
+is kernel mechanics; only "polkit is then satisfied" is host-only.
+
+**Remaining known issue:** a blessing's object scope must be enumerated, so it drifts against
+`@secrets` — an "uncordoned" class is sketched in PLAN-bless B4.
+
+**Design change from the original spec** (DESIGN §16.5): the authenticator is **reaching uid
+0** via a client-side elevation tool, not PAM-in-the-daemon — PAM proved far heavier than
+specced (conversation proxying as multi-frame IPC, stdio fd passing, degraded job control) and
+the systemd-less smoke VM can't test transient scopes. Two accepted deltas, both documented:
+the elevation tool's **auth cache is a grace window** (deployment note:
+`Defaults!/usr/bin/cordon timestamp_timeout=0`), and blessing is **sudoer-only** until the B3
+PAM upgrade. B2 did that upgrade's structural work — the `SCM_RIGHTS` hand-off and the
+unprivileged CLI already ship — so B3 reduces to swapping *what proves a human is present*,
+and it **relaxes** the gate rather than tightening it.
 
 (Authoring flow A was renamed observe → **admit** → enforce to reserve "bless" for this; the
 §8.1 threat-model "blessed binary" is unrelated generic usage.)

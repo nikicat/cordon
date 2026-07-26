@@ -884,6 +884,15 @@ fake_sudo_start() {
     export CORDON_SUDO="$TMP/fakesudo"
 }
 
+# A copy of the CLI an unprivileged uid can actually execute. $CORDON lives in the
+# developer's source tree, which that uid cannot traverse into; the copy also becomes what
+# `current_exe()` resolves to, so the helper `cordon bless` re-spawns is this same binary.
+# Echoes the path.
+unpriv_cordon() {
+    chmod 755 "$TMP"
+    cp "$CORDON" "$TMP/cordon" && chmod 755 "$TMP/cordon" && echo "$TMP/cordon"
+}
+
 fake_sudo_stop() {
     [ -n "${FAKE_SUDO_PID:-}" ] && kill "$FAKE_SUDO_PID" 2>/dev/null
     FAKE_SUDO_PID=""
@@ -1154,11 +1163,7 @@ scenario_bless_unprivileged() {
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
     cgroup2_ready || { daemon_stop; return 0; }
     local buid=4244 bgid=4244
-    chmod 755 "$TMP"   # the unprivileged CLI must traverse to the socket, exe and secret
-    # $CORDON lives in the developer's source tree, which uid 4244 cannot traverse into.
-    # Copy it somewhere world-executable — and note the copy is what `current_exe()` will
-    # resolve to, so the helper it re-spawns is this same binary.
-    local cordon="$TMP/cordon"; cp "$CORDON" "$cordon"; chmod 755 "$cordon"
+    local cordon; cordon="$(unpriv_cordon)"
     local out="$TMP/blessed.id"; : > "$out"; chmod 666 "$out"
     # Reports its identity + the canary, then does the blessed read (denied ⇒ nonzero).
     cat > "$TMP/blessed-id.sh" <<EOF
@@ -1290,8 +1295,7 @@ scenario_bless_rejects_fake_daemon() {
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
     command -v python3 >/dev/null || { echo "  SKIP: python3 unavailable (needed to bind a fake socket)"; daemon_stop; return 0; }
     local buid=4247
-    chmod 755 "$TMP"
-    local cordon="$TMP/cordon"; cp "$CORDON" "$cordon"; chmod 755 "$cordon"
+    local cordon; cordon="$(unpriv_cordon)"
     write_policy <<EOF
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -1369,8 +1373,7 @@ scenario_bless_session_scope() {
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
     cgroup2_ready || { daemon_stop; return 0; }
     local buid=4248
-    chmod 755 "$TMP"
-    local cordon="$TMP/cordon"; cp "$CORDON" "$cordon"; chmod 755 "$cordon"
+    local cordon; cordon="$(unpriv_cordon)"
     # Somewhere the unprivileged blessed child can drop its readiness marker; $TMP itself
     # is root-owned, and a marker that silently fails to appear would make the waits below
     # pass on a timeout instead of on the thing they are waiting for.

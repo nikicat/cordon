@@ -76,7 +76,7 @@ Changing the policy is root-only: `policy apply` (and therefore `policy edit`) i
 peer's kernel-attested uid, so run those under `sudo`. Reading needs no privilege —
 `cordon status`, `cordon policy show` and `cordon bless list` work from your own account.
 
-## Blessing — `sudo cordon bless`
+## Blessing — `cordon bless`
 
 Static rules name *known* exes. For the tools you reach for interactively over secrets —
 `cat`, `find`, a shell — there is no static subject that works: `allow /usr/bin/cat` would
@@ -96,16 +96,21 @@ policy = "allow"
 ```
 
 ```sh
-sudo cordon bless --class ro -- aws s3 ls   # this aws may read ~/.aws, nothing else
-sudo cordon bless --class ro                # …or a blessed shell (your login shell)
-cordon bless list                           # live blessings: id, class, age, pids
-sudo cordon bless revoke 3                  # kill that blessed tree now
+cordon bless --class ro -- aws s3 ls   # this aws may read ~/.aws, nothing else
+cordon bless --class ro                # …or a blessed shell
+cordon bless list                      # live blessings: id, class, age, pids
+cordon bless revoke 3                  # kill that blessed tree now
 ```
 
-`sudo` is the authenticator — a **human at the keyboard** is the one thing the one-shot
-scraper can't produce. The grant is carried by a per-invocation root-owned cgroup, so it
-evaporates when the command exits, it's scoped to whatever objects its rules name, and every
-blessed access is journaled with its class. Details in [`DESIGN.md` §16](docs/DESIGN.md).
+**No `sudo` prefix** — `cordon bless` runs as you. It prompts for authentication partway
+through (via `sudo` by default; `$CORDON_SUDO` picks another tool), because a **human at the
+keyboard** is the one thing the one-shot scraper can't produce; but the blessed command is an
+ordinary child of your shell, so it keeps your environment, tty, job control and desktop
+session. Running GUI apps and `run0`/`pkexec` inside a blessed shell works.
+
+The grant is carried by a per-invocation root-owned cgroup, so it evaporates when the command
+exits, it's scoped to whatever objects its rules name, and every blessed access is journaled
+with its class. Details in [`DESIGN.md` §16](docs/DESIGN.md).
 
 > **Sudoers note.** sudo caches its authentication (~15 min by default), so a second `bless`
 > inside that window won't prompt. To require a human for *every* mint, add to sudoers:

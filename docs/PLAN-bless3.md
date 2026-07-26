@@ -1,5 +1,9 @@
 # cordon B2 — usable blessing (milestone B2 of [PLAN-bless.md](PLAN-bless.md)): socket authz, `policy edit` defaults, unprivileged spawner
 
+> **Status: ✅ done (2026-07-27).** All seven commits shipped; 27 VM smoke scenarios green on
+> the pinned v6.12. What each commit landed is recorded inline below. The host checks in
+> *Verification* are what close the milestone out, since the VM has no logind.
+
 ## Context
 
 B1 shipped and is validated at three tiers (unit, 23 VM scenarios, a real-system run on
@@ -207,7 +211,7 @@ sequenceDiagram
     D->>K: BLESSED remove + rmdir carrier
 ```
 
-### Commit 3 — `feat(bless): daemon hands back the carrier's cgroup.procs fd`
+### Commit 3 — `feat(bless): daemon hands back the carrier's cgroup.procs fd` ✅ *done*
 
 - `crates/core/src/proto.rs`: the `BlessMinted` reply gains an **out-of-band fd**. The wire
   stays newline-JSON; the fd rides as `SCM_RIGHTS` ancillary data on the same `sendmsg`.
@@ -222,7 +226,7 @@ sequenceDiagram
   The CLI closes the fd immediately after the join.
 - Tests: fd round-trip over a socketpair; mint failure paths still clean up the carrier.
 
-### Commit 4 — `feat(bless): unprivileged spawner — natural env, cwd, tty, session`
+### Commit 4 — `feat(bless): unprivileged spawner — natural env, cwd, tty, session` ✅ *done*
 
 The inversion. `cordon bless` runs **as the user**, a direct child of their shell:
 
@@ -245,7 +249,7 @@ The inversion. `cordon bless` runs **as the user**, a direct child of their shel
 - Tests: helper/parent handshake over a socketpair; peer-uid rejection; exit-status mapping
   (kept from B1).
 
-### Commit 5 — `feat(bless): create the carrier in the invoker's session subtree`
+### Commit 5 — `feat(bless): create the carrier in the invoker's session subtree` ✅ *done*
 
 Only if B0(2) passed.
 
@@ -260,7 +264,13 @@ Only if B0(2) passed.
   and is the target. Pure `carrier_parent()` + unit tests over a tempdir fake.
 - Reconcile must scan the new locations as well as the old.
 
-### Commit 6 — `test(bless): VM + host coverage for the new spawn model`
+### Commit 6 — `test(bless): VM + host coverage for the new spawn model` ✅ *done (absorbed into 3–5)*
+
+**Absorbed rather than separate:** every commit had to keep the smoke green to be reviewable,
+so each carried its own scenarios. The suite went 23 → 27: scenario 23 rewritten for the
+unprivileged path (+ faked elevation refused), 24 socket authorization, 25 the anti-hijack
+guard, 26 session placement (both directions), 27 reconcile adoption (both directions).
+Original plan below.
 
 - Smoke: replace scenario 23's `SUDO_UID` simulation with the **real** unprivileged path —
   run `cordon bless` as a non-root uid with `$CORDON_SUDO` set to a root no-op wrapper, and
@@ -272,7 +282,7 @@ Only if B0(2) passed.
 - Session placement is **not VM-testable** (no logind) — host-only, recorded in the plan's
   verification section.
 
-### Commit 7 — `docs(bless): record B2`
+### Commit 7 — `docs(bless): record B2` ✅ *done*
 
 DESIGN §16.4 (fd-delegation property), §16.5 (the elevation is now client-side; the daemon's
 uid gate is the boundary), §16.6 (new lifecycle); PLAN-bless B2 marked done; `STATUS.md`;
@@ -284,13 +294,16 @@ uid gate is the boundary), §16.6 (new lifecycle); PLAN-bless B2 marked done; `S
 |---|---|---|
 | 1 | Socket mode | **0666**, with `PolicyApply` moved behind the uid-0 gate (0660+group is the documented multi-user alternative) — ✅ shipped |
 | 2 | `policy edit` default | The invoker's tier; `--system` for the system policy; error if there is no invoker — ✅ shipped |
-| 3 | Join mechanism | `SCM_RIGHTS` fd from the daemon; the CLI never needs root |
-| 4 | Elevation | Client-side `$CORDON_SUDO` (default `sudo`); security is the daemon's uid-0 check, never the client's choice |
-| 5 | Carrier parent | The invoker's `session-N.scope` **if root-owned**, else fall back to the daemon's cgroup |
-| 6 | Env/cwd/tty | Inherited by construction (never re-parented) — nothing is shipped or restored |
-| 7 | Rendezvous | **The daemon itself**: request (uid 1000) → nonce → approve (uid 0) → fd back on the requester's connection. No rendezvous socket |
-| 8 | Session source | The **unprivileged** peer's `SO_PEERCRED` pid — never a client-asserted pid, which would let a caller target another user's session |
+| 3 | Join mechanism | `SCM_RIGHTS` fd from the daemon; the CLI never needs root — ✅ shipped |
+| 4 | Elevation | Client-side `$CORDON_SUDO` (default `sudo`); security is the daemon's uid-0 check, never the client's choice — ✅ shipped |
+| 5 | Carrier parent | The invoker's `session-N.scope` **if root-owned**, else fall back to the daemon's cgroup — ✅ shipped; reconcile applies the same check before adopting |
+| 6 | Env/cwd/tty | Inherited by construction (never re-parented) — nothing is shipped or restored — ✅ shipped |
+| 7 | Rendezvous | **The daemon itself**: request (uid 1000) → nonce → approve (uid 0) → fd back on the requester's connection. No rendezvous socket — ✅ shipped |
+| 8 | Session source | The **unprivileged** peer's `SO_PEERCRED` pid — never a client-asserted pid, which would let a caller target another user's session — ✅ shipped |
 | 9 | Revoke gate | Once mint is unprivileged (commit 4), `BlessRevoke` accepts uid 0 **or the uid that requested the blessing** — otherwise a user who just blessed unprivileged would need sudo to revoke it. The daemon already holds the requester's peer uid for the session lookup; record it on the `Blessing` row |
+
+| 13 | Client-side daemon check | ✅ shipped, from a security review of commit 4. `cordon bless` requires `SO_PEERCRED` uid 0 on the **daemon** end before sending, and passes the same `--socket` to the helper. Without it the nonce is a bearer token: a squatter at the client's socket path could park its own request on the real daemon, answer the victim with that nonce, and spend the human's authentication on the attacker's request |
+| 14 | Descriptor lifetime | ✅ shipped. The carrier fd is received `MSG_CMSG_CLOEXEC` — *not* the kernel's default for `SCM_RIGHTS` — so it dies at the blessed command's `exec` instead of becoming a standing capability inside it |
 
 ## Verification
 

@@ -10,11 +10,11 @@ new pieces are a carrier (a per-invocation root-owned cgroup), a tiny runtime in
 (`BLESSED: cgroup_id → ClassId`), a root-gated mint path in the daemon, and the `cordon bless`
 CLI.
 
-> **Status: B1 is done (2026-07-26), sudo-gated.** B1a–B1f all shipped and are VM-validated
-> (23/23 smoke scenarios). One design change during implementation: **`sudo` authenticates
-> instead of PAM-in-the-daemon**, and the CLI (root via sudo) spawns the target instead of the
-> daemon — see the B1d note and DESIGN §16.5 for the rationale and the accepted deltas. PAM
-> mint moves to **B3** below.
+> **Status: B1 + B2 are done (2026-07-27).** B1a–B1f shipped the boundary; **B2 made it
+> usable** and superseded B1's privilege model — `cordon bless` now runs *unprivileged*, and
+> the root-first spawn described in B1d/B1e below is history (kept for the record; see the
+> B2 section and DESIGN §16.5/§16.6 for what actually runs). VM-validated at 27/27 smoke
+> scenarios. PAM mint remains **B3** below, and B2 did most of its structural work.
 
 Guiding constraints (from §16):
 - **Authorization is the whole feature.** The carrier is forgeable (§8.1); security rests
@@ -113,7 +113,11 @@ end-to-end, **scoped to the rule's object column** (no blanket).
   removed, populated ones re-registered if their class is still declared, populated ones of a
   vanished class adopted inert (GC only). Never fails startup.
 
-### B1e. CLI — `crates/cli` ✅ *(shipped)*
+### B1e. CLI — `crates/cli` ✅ *(shipped in B1; **superseded by B2** — see below)*
+> **Superseded.** Everything in this section that concerns *privilege* was deleted in B2:
+> `cordon bless` no longer requires root, no longer drops to `SUDO_UID`, and no longer opens
+> the carrier by path. What survives is the shape — the CLI is the spawner, the join happens
+> in `pre_exec` before `exec`, and the exit code is propagated. Kept verbatim for the record.
 - `sudo cordon bless [--class NAME] [-- <cmd> <args…>]`: require root, mint, open the
   carrier's `cgroup.procs` **before fork**, then fork with a `pre_exec` that joins the carrier
   (still root) and *then* drops to `SUDO_UID`/`SUDO_GID` — join-before-drop is the boundary,
@@ -128,7 +132,7 @@ end-to-end, **scoped to the rule's object column** (no blanket).
   `bless -- list` runs a command named `list`.
 - No CLI-side cleanup: daemon GC owns teardown.
 
-### B1f. Validation — `packaging/test/bpf-lsm-smoke.sh` ✅ *(shipped: scenarios 18–23, 23/23 green)*
+### B1f. Validation — `packaging/test/bpf-lsm-smoke.sh` ✅ *(shipped: scenarios 18–23 of the then-23; B2 grew the suite to 27 and rewrote 23)*
 - **Scope (18):** a blessed read is allowed against a `who="*"` deny on that object; the
   **same blessed exe is denied** on a second protected object the class doesn't name (scope =
   the rule's object column); the same exe **unblessed** stays denied. Also the end-to-end
@@ -206,13 +210,27 @@ ergonomics, no logind/polkit):
   `root:root` and `connect(2)` needs *write*, so B1 decision #1 ("`BlessList` ungated") was
   inert. Fixed by gating `PolicyApply` on uid 0 and opening the socket to `0666`, which
   *tightens* authorization (DESIGN §15.8).
-- `policy edit` defaults to the system policy; the common case is your own user tier.
-- The blessed shell is barely usable: no logind session (so polkit refuses `run0`/`pkexec`)
-  and a scrubbed environment (no `DISPLAY`, so GUI apps fail). Both because the blessed
-  process is born in the wrong place — parented through a privilege tool and relocated into
-  the daemon's cgroup. Fixed by inverting the privilege flow: `cordon bless` runs
-  unprivileged as a child of the user's shell and the daemon passes back a `cgroup.procs` fd
-  over `SCM_RIGHTS`, which deletes the entire privilege-drop path.
+- ~~`policy edit` defaults to the system policy~~ — **done**: bare `cordon policy edit` opens
+  your own tier; `--system` names the system policy explicitly.
+- ~~The blessed shell is barely usable~~ — **done**, and this was the milestone: no logind
+  session (so polkit refused `run0`/`pkexec`) and a scrubbed environment (no `DISPLAY`), both
+  because the blessed process was born in the wrong place — parented through a privilege tool
+  and relocated into the daemon's cgroup. Under `run0` the environment cannot be recovered
+  after the fact, so fixing it was **not separable** from fixing who spawns the target. The
+  privilege flow is now inverted: `cordon bless` runs unprivileged as a child of the user's
+  shell, the daemon passes back the carrier's `cgroup.procs` descriptor over `SCM_RIGHTS`,
+  and the carrier is created in the requester's own `session-N.scope`. The entire
+  privilege-drop path is deleted.
+
+**What B2 shipped** (details in [`PLAN-bless3.md`](PLAN-bless3.md)):
+1. Socket authorization — every write root-gated, socket `0666`, reads usable unprivileged.
+2. `policy edit` defaults to the invoker's tier.
+3. The daemon hands back the carrier's `cgroup.procs` as an `SCM_RIGHTS` descriptor
+   (close-on-exec, so it never survives into the blessed process).
+4. The unprivileged spawner + the two-connection mint handshake, with the daemon as the
+   rendezvous and a client-side check that the daemon is root.
+5. Carrier placement in the requester's session scope, gated on root ownership; reconcile
+   scans session scopes too and adopts only root-owned leftovers.
 
 Its B0 spike (`packaging/test/bless-b2-derisk.sh`) confirmed both kernel/systemd assumptions
 on a real host; keep it as the "will bless work on this machine" check, since session-scope
@@ -220,7 +238,7 @@ ownership is distro-dependent.
 
 ---
 
-## Milestone B3 — PAM authenticator (replaces the sudo gate)
+## Milestone B3 — PAM authenticator (replaces the uid-0 gate) ← **next**
 The upgrade B1 was deliberately shaped to accept: the mint verb is authenticator-agnostic, so
 this adds frames beside it rather than reshaping the IPC. Full design in DESIGN §16.5.
 
