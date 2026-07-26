@@ -8,6 +8,7 @@
 //! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
 //! backends were retired with the rule-model migration (DESIGN §15).
 
+use crate::Uid;
 use crate::policy::{ClassName, Diagnostic, PolicySource};
 use crate::proto::{BlessId, BlessingView, CarrierProcs, PolicyView};
 use std::sync::mpsc::{Receiver, Sender};
@@ -133,15 +134,22 @@ pub enum BlessOp {
     /// credentials, not the writer's (DESIGN §16.4).
     Mint {
         class: Option<ClassName>,
+        /// The **requester's** kernel-attested uid, recorded on the blessing so they can
+        /// later revoke what they minted without needing root ([`Self::Revoke`]).
+        owner: Uid,
         reply: Sender<std::result::Result<(BlessingView, CarrierProcs), String>>,
     },
     /// Snapshot the live blessings.
     List {
         reply: Sender<std::result::Result<Vec<BlessingView>, String>>,
     },
-    /// Kill a blessing's carrier and unregister it.
+    /// Kill a blessing's carrier and unregister it. `by` is the caller's kernel-attested
+    /// uid: root revokes anything, anyone else only what they minted. The check lives here
+    /// rather than in the IPC `authorize` gate because it needs the live table — the gate
+    /// answers "may this uid speak this verb", ownership answers "is this one yours".
     Revoke {
         id: BlessId,
+        by: Uid,
         reply: Sender<std::result::Result<(), String>>,
     },
 }

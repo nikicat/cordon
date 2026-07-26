@@ -80,19 +80,28 @@
 #                       the blessed sleep dies, list + dirs drain.
 #  22. bless journal   — bless is loud: a blessed read under an `audit @blessed-ro` rule
 #                       journals with a trailing `blessing=ro` (class by NAME).
-#  23. bless drop      — the `sudo` shape: SUDO_UID/SUDO_GID is the ENTIRE interface sudo
-#                       gives the CLI, so setting them as root is byte-identical to a real
-#                       `sudo cordon bless` (same substitution 16/17 make for `policy
-#                       edit`). The blessed child is dropped to a non-root user and must
-#                       STILL read the secret — true only if the carrier join preceded the
-#                       drop. Also: the invoker's supplementary groups survive
-#                       (getgrouplist) and $HOME is theirs, not root's.
+#  23. bless unpriv    — the B2 inversion: `cordon bless` runs as YOU and never holds
+#                       privilege. An unprivileged CLI (uid 4244) proves human presence by
+#                       spawning a helper that reaches root, then joins the carrier through
+#                       an SCM_RIGHTS cgroup.procs DESCRIPTOR. Proves: the child runs as the
+#                       invoking uid by construction; a canary env var SURVIVES into it (the
+#                       old root-first shape was re-parented through sudo and lost $DISPLAY);
+#                       the blessed read works, i.e. an unprivileged process really did write
+#                       into a root-owned cgroup.procs. Plus: a faked elevation that stays
+#                       unprivileged is REFUSED by the daemon — security is the uid gate,
+#                       never the client's choice of elevation tool.
 #  24. socket authz    — the socket is 0666 so any local user can connect(2) (which needs
 #                       *write* — without it even the ungated reads were root-only, which is
 #                       what made `bless list` unusable from a user account). The boundary is
 #                       the daemon's peer-uid gate, not the file mode: an unprivileged uid
 #                       reads (status / policy show / bless list) but is REFUSED on
 #                       `policy apply`.
+#  25. bless anti-hijack — `cordon bless` hands its nonce to a process it then elevates to
+#                       root, so it first checks SO_PEERCRED on the DAEMON end. An
+#                       unprivileged squatter listening at the client's socket path is
+#                       refused, and refused *before* the elevation helper is spawned —
+#                       otherwise the human's authentication could be spent approving the
+#                       squatter's own parked request instead of their own.
 #
 # The bless scenarios run the daemon in a NESTED cgroup, reproducing production's
 # `Delegate=yes` service cgroup without needing systemd (the carrier root is then a
@@ -836,7 +845,36 @@ cgroup2_ready() {
         fi
     fi
     DCGROUP="$BLESS_DCGROUP"
+    # `cordon bless` runs unprivileged and proves human presence by spawning
+    # `$CORDON_SUDO cordon bless-helper` and requiring THAT to reach the daemon as root.
+    # There is no sudo in the guest, and the suite already runs as root, so `env` is a
+    # faithful stand-in: the helper really does connect as uid 0. Scenario 23 replaces
+    # this with a wrapper that elevates from an unprivileged CLI, which is the shape a
+    # real sudo provides.
+    export CORDON_SUDO="env"
     return 0
+}
+
+# A stand-in for sudo when the CLI itself is unprivileged: a root loop reads command
+# lines off a FIFO and runs them, and $CORDON_SUDO points at a wrapper that just forwards
+# its argv. No setuid binary (the guest's tmpfs may be nosuid) and no real sudo — and the
+# helper genuinely runs as root, which is the property under test. Sets $CORDON_SUDO.
+fake_sudo_start() {
+    local fifo="$TMP/sudo.fifo"
+    mkfifo "$fifo" && chmod 666 "$fifo" || return 1
+    # Hold a writer open so the reader never sees EOF between wrapper invocations.
+    exec 9<>"$fifo"
+    ( while IFS= read -r line; do [ -n "$line" ] && eval "$line" & done <"$fifo" ) &
+    FAKE_SUDO_PID=$!
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" > %s\n' "$fifo" > "$TMP/fakesudo"
+    chmod 755 "$TMP/fakesudo"
+    export CORDON_SUDO="$TMP/fakesudo"
+}
+
+fake_sudo_stop() {
+    [ -n "${FAKE_SUDO_PID:-}" ] && kill "$FAKE_SUDO_PID" 2>/dev/null
+    FAKE_SUDO_PID=""
+    exec 9>&-
 }
 
 # The daemon's carrier root: its own cgroup dir (carriers are created under it).
@@ -1085,33 +1123,34 @@ EOF
     daemon_stop; return $fail
 }
 
-# --- scenario 23: bless drops to the invoking user (the sudo path) -----------
-# `sudo` hands the CLI exactly two things: SUDO_UID and SUDO_GID. Setting them as root is
-# therefore byte-identical to a real `sudo cordon bless` from the code's point of view —
-# the same substitution scenarios 16/17 already make for `policy edit`. This covers what
-# 18–22 structurally cannot: the child is dropped to a NON-ROOT user and must *still* be
-# blessed, which holds only if the carrier join happened **before** the privilege drop
-# (both in one pre_exec). It also exercises the invoker's supplementary groups
-# (getgrouplist, resolved pre-fork) and their $HOME replacing root's.
-scenario_bless_drop_to_invoker() {
-    echo "### scenario: bless drops to the invoking user (SUDO_UID + groups + still blessed)"
+# --- scenario 23: unprivileged bless keeps env + identity ---------------------
+# The B2 inversion, and the regression test for the whole milestone. `cordon bless` now
+# runs as YOU: it never holds privilege, it proves human presence by spawning
+# `$CORDON_SUDO cordon bless-helper` (here a FIFO wrapper that reaches root without
+# setuid or a real sudo), and it joins the carrier through a cgroup.procs DESCRIPTOR the
+# daemon passed over SCM_RIGHTS. Three things follow, and 18–22 can show none of them
+# because they run the CLI as root:
+#   * the blessed child runs as the invoking uid — by construction now, not by a drop;
+#   * an environment variable set before the call SURVIVES into it (the old shape was
+#     re-parented through sudo/run0, which scrubbed the env and cost it $DISPLAY);
+#   * the blessed read still works, which proves an UNPRIVILEGED process successfully
+#     wrote its pid into a root-owned cgroup.procs — the fd-delegation property.
+scenario_bless_unprivileged() {
+    echo "### scenario: unprivileged bless (runs as you, env survives, still blessed)"
     ws_new
+    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
     cgroup2_ready || { daemon_stop; return 0; }
-    local buid=4244 bgid=4244 sgid=4245
-    local buser="cordonbless$$" bgroup="cordonextra$$"
-    local bhome="$TMP/bhome"; mkdir -p "$bhome"; chown "$buid:$bgid" "$bhome"
-    chmod 755 "$TMP"   # the dropped child must traverse to its exe + the secret
-    if ! printf '%s:x:%s:%s:Cordon Bless:%s:/bin/sh\n' "$buser" "$buid" "$bgid" "$bhome" >> /etc/passwd 2>/dev/null; then
-        echo "  SKIP: /etc/passwd not writable in this guest"; daemon_stop; return 0
-    fi
-    # A supplementary group the invoker belongs to — getgrouplist must carry it through
-    # the drop (the editor drop deliberately clears groups; the bless drop must not).
-    printf '%s:x:%s:%s\n' "$bgroup" "$sgid" "$buser" >> /etc/group 2>/dev/null
+    local buid=4244 bgid=4244
+    chmod 755 "$TMP"   # the unprivileged CLI must traverse to the socket, exe and secret
+    # $CORDON lives in the developer's source tree, which uid 4244 cannot traverse into.
+    # Copy it somewhere world-executable — and note the copy is what `current_exe()` will
+    # resolve to, so the helper it re-spawns is this same binary.
+    local cordon="$TMP/cordon"; cp "$CORDON" "$cordon"; chmod 755 "$cordon"
     local out="$TMP/blessed.id"; : > "$out"; chmod 666 "$out"
-    # Reports its identity, then does the blessed read (a denied read fails the script).
+    # Reports its identity + the canary, then does the blessed read (denied ⇒ nonzero).
     cat > "$TMP/blessed-id.sh" <<EOF
 #!/bin/bash
-{ id -u; id -G; echo "\$HOME"; } > "$out"
+{ id -u; echo "\$CORDON_CANARY"; } > "$out"
 exec 3< "$SECRET"
 EOF
     chmod 755 "$TMP/blessed-id.sh"
@@ -1131,34 +1170,46 @@ where = "$VAULT"
 action = "read"
 policy = "allow"
 EOF
-    bless_drop_cleanup() { sed -i "/^$buser:/d" /etc/passwd 2>/dev/null; sed -i "/^$bgroup:/d" /etc/group 2>/dev/null; }
     daemon_start
-    if ! started; then bless_drop_cleanup; return 1; fi
+    started || return 1
+    fake_sudo_start || { echo "  SKIP: cannot build the elevation stand-in"; daemon_stop; return 0; }
     local fail=0
-    if SUDO_UID="$buid" SUDO_GID="$bgid" "$CORDON" bless --class ro -- "$TMP/blessed-id.sh" 2>/dev/null; then
-        echo "  OK: a NON-ROOT blessed child read the secret (join happened before the drop)"
+    # The CLI itself is uid 4244 — only the helper it spawns reaches root.
+    local blesslog="$TMP/bless.log"
+    if setpriv --reuid "$buid" --regid "$bgid" --clear-groups \
+         env CORDON_SUDO="$CORDON_SUDO" CORDON_CONFIG="$CORDON_CONFIG" CORDON_CANARY=alive \
+         "$cordon" bless --class ro -- "$TMP/blessed-id.sh" >"$blesslog" 2>&1; then
+        echo "  OK: an UNPRIVILEGED bless read the secret (fd delegation joined the carrier)"
     else
-        echo "  FAIL: the dropped child was denied — join-before-drop regression?"
-        sed 's/^/  daemon| /' "$LOG"; fail=1
+        echo "  FAIL: unprivileged bless failed — handshake or fd-join regression?"
+        sed 's/^/  cordon| /' "$blesslog"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
-    local got_uid got_groups got_home
-    got_uid="$(sed -n 1p "$out")"; got_groups="$(sed -n 2p "$out")"; got_home="$(sed -n 3p "$out")"
+    local got_uid got_canary
+    got_uid="$(sed -n 1p "$out")"; got_canary="$(sed -n 2p "$out")"
     if [ "$got_uid" = "$buid" ]; then
-        echo "  OK: child ran as uid $buid (dropped from root via SUDO_UID)"
+        echo "  OK: the blessed child ran as uid $buid (no drop needed — it never was root)"
     else
         echo "  FAIL: child uid=${got_uid:-<none>}, expected $buid"; fail=1
     fi
-    if printf '%s' "$got_groups" | tr ' ' '\n' | grep -qx "$sgid"; then
-        echo "  OK: the invoker's supplementary group $sgid survived the drop (getgrouplist)"
+    if [ "$got_canary" = alive ]; then
+        echo "  OK: the caller's environment survived into the blessed child"
     else
-        echo "  FAIL: supplementary group $sgid missing (groups=${got_groups:-<none>})"; fail=1
+        echo "  FAIL: \$CORDON_CANARY=${got_canary:-<empty>} — the environment was scrubbed"; fail=1
     fi
-    if [ "$got_home" = "$bhome" ]; then
-        echo "  OK: \$HOME is the invoker's, not root's"
+    # And the security property the seam rests on: a faked elevation that never reaches
+    # root produces a non-root helper, whose approval the daemon refuses. Security is the
+    # daemon's uid check, never the client's choice of elevation tool.
+    local refused="$TMP/refused.log"
+    CORDON_SUDO="setpriv --reuid $buid --regid $bgid --clear-groups" \
+        "$CORDON" bless --class ro -- /bin/true >"$refused" 2>&1 && fail=1
+    if grep -qi 'requires root' "$refused"; then
+        echo "  OK: a faked elevation is refused by the daemon (uid gate, not the tool)"
     else
-        echo "  FAIL: HOME=${got_home:-<none>}, expected $bhome"; fail=1
+        echo "  FAIL: a non-root helper was not refused: $(head -2 "$refused")"; fail=1
     fi
-    daemon_stop; bless_drop_cleanup; return $fail
+    fake_sudo_stop
+    daemon_stop
+    return $fail
 }
 
 # --- scenario 24: socket authorization (reads open, writes root-only) --------
@@ -1209,6 +1260,81 @@ EOF
     return $fail
 }
 
+# --- scenario 25: bless refuses a non-root daemon (approval hijack) ----------
+# `cordon bless` hands the nonce it receives to a process it is about to elevate to root.
+# If it took that nonce from whoever answers the socket, a local user who leaves a
+# listener at the client's socket path could park its OWN request on the real daemon,
+# answer the victim with THAT nonce, and have the victim's authentication mint a carrier
+# for the attacker — the human authenticates, but not for their own request.
+#
+# So the CLI checks SO_PEERCRED on the daemon end first. Here a genuinely unprivileged
+# process squats a socket and the CLI must refuse it — and crucially must refuse BEFORE
+# spawning the elevation helper, so the human is never even prompted. The wrapper drops a
+# marker file when it runs; the absence of that marker is the assertion.
+scenario_bless_rejects_fake_daemon() {
+    echo "### scenario: bless refuses a non-root daemon (no nonce, no password prompt)"
+    ws_new
+    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
+    command -v python3 >/dev/null || { echo "  SKIP: python3 unavailable (needed to bind a fake socket)"; daemon_stop; return 0; }
+    local buid=4247
+    chmod 755 "$TMP"
+    local cordon="$TMP/cordon"; cp "$CORDON" "$cordon"; chmod 755 "$cordon"
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start
+    started || return 1
+    local fail=0
+
+    # The squatter: an unprivileged process listening where the client will look. Its
+    # own directory, since $TMP is root-owned — a real squatter binds inside
+    # $XDG_RUNTIME_DIR or /tmp, both of which it can write.
+    local squatdir="$TMP/squat"; mkdir -p "$squatdir"; chown "$buid:$buid" "$squatdir"
+    local fake="$squatdir/cordon.sock"
+    setpriv --reuid "$buid" --regid "$buid" --clear-groups python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1]); s.listen(8)
+while True: s.accept()
+' "$fake" &
+    local squatter=$!
+    for _ in $(seq 1 50); do [ -S "$fake" ] && break; sleep 0.1; done
+    if [ ! -S "$fake" ]; then
+        echo "  SKIP: could not bind a fake socket as uid $buid"; kill "$squatter" 2>/dev/null; daemon_stop; return 0
+    fi
+
+    # An elevation wrapper that records the fact it was reached. It must never run.
+    local marker="$TMP/elevation-was-spawned"
+    printf '#!/bin/sh\ntouch %s\nexec "$@"\n' "$marker" > "$TMP/marker-sudo"
+    chmod 755 "$TMP/marker-sudo"
+
+    local out="$TMP/fake.log"
+    setpriv --reuid "$buid" --regid "$buid" --clear-groups \
+        env CORDON_SUDO="$TMP/marker-sudo" CORDON_CONFIG="$CORDON_CONFIG" \
+        "$cordon" --socket "$fake" bless --class ro -- /bin/true >"$out" 2>&1
+    if [ $? -ne 0 ] && grep -q 'not root' "$out"; then
+        echo "  OK: the CLI refused a non-root daemon ($(head -1 "$out" | cut -c1-60)…)"
+    else
+        echo "  FAIL: a non-root daemon was not refused: $(head -2 "$out")"; fail=1
+    fi
+    if [ ! -e "$marker" ]; then
+        echo "  OK: the elevation helper was never spawned (no password prompt to hijack)"
+    else
+        echo "  FAIL: the elevation ran before the daemon was vetted"; fail=1
+    fi
+
+    kill "$squatter" 2>/dev/null
+    daemon_stop
+    return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -1233,8 +1359,9 @@ scenario_bless_boundary    || rc=1
 scenario_bless_inherit_gc  || rc=1
 scenario_bless_revoke      || rc=1
 scenario_bless_journal     || rc=1
-scenario_bless_drop_to_invoker || rc=1
+scenario_bless_unprivileged || rc=1
 scenario_socket_authz      || rc=1
+scenario_bless_rejects_fake_daemon || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

@@ -139,18 +139,22 @@ pub(super) fn serve(
 /// A dropped reply receiver (CLI gone) is fine — the op has already taken effect.
 fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
     match op {
-        BlessOp::Mint { class, reply } => {
+        BlessOp::Mint {
+            class,
+            owner,
+            reply,
+        } => {
             let outcome = runtime
                 .blessings
-                .mint(ebpf, class, &runtime.registry)
+                .mint(ebpf, class, owner, &runtime.registry)
                 .map_err(|e| e.to_string());
             let _ = reply.send(outcome);
         }
         BlessOp::List { reply } => {
             let _ = reply.send(Ok(runtime.blessings.list()));
         }
-        BlessOp::Revoke { id, reply } => {
-            let _ = reply.send(runtime.blessings.revoke(id).map_err(|e| e.to_string()));
+        BlessOp::Revoke { id, by, reply } => {
+            let _ = reply.send(runtime.blessings.revoke(id, by).map_err(|e| e.to_string()));
         }
     }
 }
@@ -350,7 +354,7 @@ impl fmt::Display for CallerUser<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CallerUser::Named { name, .. } => write!(f, "{name}"),
-            CallerUser::Uid(uid) => write!(f, "{}", uid.0),
+            CallerUser::Uid(uid) => write!(f, "{uid}"),
         }
     }
 }

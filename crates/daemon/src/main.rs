@@ -15,10 +15,13 @@ mod proc;
 use clap::Parser;
 use cordon_core::backend::{BackendKind, ControlSender, Shutdown, control};
 use cordon_core::config::SocketPath;
+use cordon_core::proto::Nonce;
 use cordon_core::{Config, config};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::{Mutex, mpsc};
 use tracing::{error, info};
 
 /// Shared daemon state + the IPC server behavior over it (the `impl` lives in
@@ -29,6 +32,11 @@ pub struct Ctx {
     pub backend: BackendKind,
     pub socket: PathBuf,
     pub policy: PathBuf,
+    /// Blessing requests awaiting a root approval, by nonce (DESIGN §16.5). The value
+    /// releases the connection thread parked in `serve_bless_request`; that thread owns
+    /// its entry and removes it on every exit path, so there is no reaper and no TTL
+    /// sweep — a nonce lives exactly as long as someone is waiting on it.
+    pub pending: Mutex<HashMap<Nonce, mpsc::Sender<()>>>,
 }
 
 #[derive(Parser, Debug)]
@@ -118,6 +126,7 @@ fn run(args: Args) -> cordon_core::Result<()> {
         backend: cfg.backend,
         socket: cfg.socket.into(),
         policy: cfg.policy,
+        pending: Mutex::new(HashMap::new()),
     });
 
     let serve_result = ctx.serve();

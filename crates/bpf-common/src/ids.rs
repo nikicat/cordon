@@ -35,6 +35,16 @@ pub struct Pid(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Uid(pub u32);
 
+/// Render the bare number — for the journal's `user=` fallback when passwd has no name for
+/// the uid, and for the `owner=` field on a minted blessing (recorded through `Display` via
+/// the `%` sigil — see [`SuppressedTotal`]'s note on `tracing`'s sealed `Value`). Having it
+/// is what keeps callers from reaching past the newtype with `.0` just to log one.
+impl core::fmt::Display for Uid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A cgroup-v2 id, as returned by `bpf_get_current_cgroup_id()` — the kernel-assigned,
 /// per-directory unique handle for a cgroup. The `cgroup` subject predicate
 /// ([`crate::SubjectMatch::cgroup`], M2) matches it directly, and it is the key of

@@ -4,10 +4,10 @@
 //! each. The hooks they register are ordinary safe code, hoisted into `let` bindings so
 //! the `unsafe` block covers only the operation that is actually unsound to get wrong.
 //!
-//! Both serve the same boundary shape: the parent stays root while the child sheds root
-//! before exec ([`drop_to_on_exec`] for the editor; [`join_cgroup_and_drop_on_exec`]
-//! additionally joins the bless carrier cgroup *first*, so the target runs zero
-//! instructions unblessed).
+//! The two hooks are no longer the same shape, which is the point of B2:
+//! [`drop_to_on_exec`] still sheds root in the editor child while the parent keeps it,
+//! but [`join_cgroup_on_exec`] has no drop left to do — `cordon bless` runs as the user
+//! from the start, and the carrier join rides a descriptor rather than privilege.
 
 use cordon_core::policy::UserName;
 use cordon_core::proto::CarrierProcs;
@@ -65,44 +65,27 @@ pub fn drop_to_on_exec(cmd: &mut Command, uid: Uid, gid: Gid) {
     unsafe { cmd.pre_exec(hook) };
 }
 
-/// The identity a blessed child drops to before exec: the sudo invoker, with their
-/// **full** supplementary group list (unlike the editor's [`drop_to_on_exec`], which
-/// sheds all groups: a blessed shell is the user's normal session, and silently losing
-/// `wheel`/`docker`/… would be surprising). The list is resolved *before* fork
-/// (`getgrouplist` reads the group database — not async-signal-safe), so the `pre_exec`
-/// closure only applies ready values.
-pub struct DropTo {
-    pub uid: Uid,
-    pub gid: Gid,
-    pub groups: Vec<Gid>,
-}
-
-/// Arrange for `cmd`, in the forked child, to (1) **join the bless carrier cgroup** by
-/// writing its own pid into `procs` — the `cgroup.procs` descriptor the root daemon
-/// opened and handed over — and then (2) drop to the invoker per `drop` (`None` ⇒ a
-/// true-root invocation; the child stays root). Joining before exec is what makes the
-/// target run **zero** instructions unblessed; the write succeeds regardless of the
-/// child's own credentials because the kernel checks the fd's *opener* (DESIGN §16.4).
-pub fn join_cgroup_and_drop_on_exec(cmd: &mut Command, procs: CarrierProcs, drop: Option<DropTo>) {
+/// Arrange for `cmd`, in the forked child, to **join the bless carrier cgroup** by
+/// writing its own pid through `procs` — the `cgroup.procs` descriptor the root daemon
+/// opened and handed over.
+///
+/// Joining before `exec` is what makes the target run **zero** instructions unblessed.
+/// There is no privilege drop any more and none is needed: `cordon bless` runs as the
+/// user throughout, and the write succeeds anyway because the kernel checks the
+/// descriptor's *opener*, not the writer (DESIGN §16.4).
+pub fn join_cgroup_on_exec(cmd: &mut Command, procs: CarrierProcs) {
     let hook = move || -> io::Result<()> {
         let mut buf = [0u8; U32_DECIMAL_MAX];
         let text = format_u32(std::process::id(), &mut buf);
         if nix::unistd::write(&procs.0, text)? != text.len() {
             return Err(io::Error::from(nix::errno::Errno::EIO));
         }
-        // Same groups-gid-uid order as `drop_to_on_exec`, for the same reason.
-        if let Some(d) = &drop {
-            nix::unistd::setgroups(&d.groups)?;
-            nix::unistd::setgid(d.gid)?;
-            nix::unistd::setuid(d.uid)?;
-        }
         Ok(())
     };
     // SAFETY: `hook` runs post-fork / pre-exec in the child, where only async-signal-safe
-    // operations are sound. Everything it does qualifies: getpid(2) and write(2) are raw
-    // syscalls, the pid is formatted into a stack buffer (no allocation — a `format!` here
-    // could deadlock on an allocator lock another thread held at fork time), and the
-    // credential syscalls apply values resolved before the fork.
+    // operations are sound. getpid(2) and write(2) are raw syscalls and the pid is
+    // formatted into a stack buffer — no allocation, which could otherwise deadlock on an
+    // allocator lock another thread held at fork time.
     unsafe { cmd.pre_exec(hook) };
 }
 

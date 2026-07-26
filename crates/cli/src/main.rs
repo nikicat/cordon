@@ -10,7 +10,7 @@ mod edit;
 mod sys;
 
 use clap::{Parser, Subcommand};
-use cordon_core::proto::{Pid, Request, Response, read_msg, write_msg};
+use cordon_core::proto::{Nonce, Pid, Request, Response, read_msg, write_msg};
 use cordon_core::{Config, Error, Result, policy};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -46,9 +46,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
-    /// Run a command under a fresh blessing (root via `sudo`); also `bless list` /
-    /// `bless revoke <id>`.
+    /// Run a command under a fresh blessing; also `bless list` / `bless revoke <id>`.
+    /// Runs as you — no `sudo` prefix; the human-presence check is a helper it spawns.
     Bless(bless::BlessArgs),
+    /// Internal: approve a pending blessing. `cordon bless` spawns this under
+    /// `$CORDON_SUDO` so it reaches the daemon as root — which *is* the proof a human
+    /// authenticated (DESIGN §16.5). Never invoked by hand; hidden from `--help`.
+    #[command(hide = true)]
+    BlessHelper {
+        #[arg(long)]
+        nonce: Nonce,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -116,6 +124,17 @@ fn main() -> ExitCode {
         return bless::run(args, &cli);
     }
 
+    // The approval half of the bless handshake: one request, and what makes it count is
+    // the uid it arrives from, not anything it says.
+    if let Cmd::BlessHelper { nonce } = &cli.cmd {
+        return run_request(
+            &Request::BlessApprove {
+                nonce: nonce.clone(),
+            },
+            &cli,
+        );
+    }
+
     let req = match build_request(&cli) {
         Ok(r) => r,
         Err(e) => {
@@ -175,6 +194,7 @@ fn build_request(cli: &Cli) -> Result<Request> {
             PolicyCmd::Edit { .. } => unreachable!("edit is handled locally"),
         },
         Cmd::Bless(_) => unreachable!("bless is handled locally"),
+        Cmd::BlessHelper { .. } => unreachable!("bless-helper is handled locally"),
     }
 }
 
@@ -263,14 +283,6 @@ fn render(resp: &Response) {
             }
         }
         Response::PolicyView(None) => println!("(no policy loaded)"),
-        Response::BlessMinted(b) => {
-            println!(
-                "blessed: id={} class={} cgroup={}",
-                b.id,
-                b.class,
-                b.cgroup.display()
-            );
-        }
         Response::Blessings(list) => {
             if list.is_empty() {
                 println!("(no live blessings)");
@@ -288,6 +300,15 @@ fn render(resp: &Response) {
             }
         }
         Response::BlessRevoked { id } => println!("revoked: {id}"),
+        // `bless-helper` succeeding is silent on purpose — it is spawned mid-command, not
+        // run by a human, and its whole output is its exit status.
+        Response::BlessApproved => {}
+        // Both halves of the mint hand-off are consumed inside `bless`'s own connection
+        // (they carry a descriptor and a handshake state this renderer has no use for), so
+        // reaching here at all means a client got its protocol wrong.
+        Response::BlessPending { .. } | Response::BlessMinted(_) => {
+            eprintln!("cordon: unexpected mid-handshake reply outside `cordon bless`")
+        }
         Response::Error { message } => eprintln!("cordon: error: {message}"),
     }
 }

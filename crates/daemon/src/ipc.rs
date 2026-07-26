@@ -3,21 +3,33 @@
 //!
 //! Requests: `Status`, `PolicyShow` (read the effective compiled policy), `PolicyApply`
 //! (hand the policy text to the backend thread and wait for the compile/seed outcome),
-//! and the bless ops (`BlessMint`/`BlessList`/`BlessRevoke`, DESIGN §16). The verdict
-//! path is in-kernel — none of this is on it.
+//! and the bless ops (`BlessRequest`/`BlessApprove`/`BlessList`/`BlessRevoke`, DESIGN
+//! §16). The verdict path is in-kernel — none of this is on it.
 //!
 //! ## Authorization
-//! Every **write** — `PolicyApply`, `BlessMint`, `BlessRevoke` — is gated on the peer's
-//! kernel-attested uid (`SO_PEERCRED`) being **root**; reads (`Status`, `PolicyShow`,
-//! `BlessList`) are open. The socket itself is `0666`, so the file mode carries no
-//! security weight: it decides who can *reach* the daemon, `authorize()` decides what
-//! they may do. (A multi-user host that must not disclose protected paths to every local
-//! account wants `0660` + a `cordon` group instead — DESIGN §15.8.)
+//! `PolicyApply` and `BlessApprove` require the peer's kernel-attested uid (`SO_PEERCRED`)
+//! to be **root**. Reads (`Status`, `PolicyShow`, `BlessList`) are open, and so is
+//! `BlessRequest` — asking for a blessing is not getting one, since the request stays
+//! inert until a uid-0 peer approves it. `BlessRevoke` passes this gate for anyone and is
+//! ownership-checked in the backend, which is where the live table is: this gate answers
+//! "may this uid speak this verb", not "is this particular object yours".
+//!
+//! The socket itself is `0666`, so the file mode carries no security weight: it decides
+//! who can *reach* the daemon, `authorize()` decides what they may do. (A multi-user host
+//! that must not disclose protected paths to every local account wants `0660` + a `cordon`
+//! group instead — DESIGN §15.8.)
+//!
+//! ## The mint handshake
+//! One blessing spans **two** connections: the unprivileged `cordon bless` sends
+//! `BlessRequest` and holds its connection open; the root helper it spawns sends
+//! `BlessApprove` with the returned nonce on a second one; the carrier and its
+//! `cgroup.procs` descriptor then go back down the *first*. See `serve_bless_request`.
 
 use crate::Ctx;
 use cordon_core::backend::{ApplyRequest, BlessOp, ControlMsg};
+use cordon_core::policy::ClassName;
 use cordon_core::proto::{
-    CarrierProcs, Request, Response, StatusInfo, read_msg, send_msg_with_fd, write_msg,
+    Nonce, Request, Response, StatusInfo, peer_uid, read_msg, send_msg_with_fd, write_msg,
 };
 use cordon_core::{Error, Result, Uid};
 use std::io::{BufReader, BufWriter};
@@ -37,15 +49,15 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// a bare zero.
 const ROOT: Uid = Uid(0);
 
-/// What a dispatched request replies with. Almost everything is JSON alone; a mint
-/// additionally hands back the carrier's `cgroup.procs`, which cannot be serialized — it
-/// is a descriptor, and travels as `SCM_RIGHTS` ancillary data beside the same message
-/// (DESIGN §16.4). Modelled as a variant rather than an `Option` tacked onto the response
-/// so the two transports can't be confused at the write site.
-enum Reply {
-    Plain(Response),
-    WithCarrier(Response, CarrierProcs),
-}
+/// How long a `BlessRequest` waits for its approval before giving up. Generous because a
+/// human is in the loop: a polkit dialog or a mistyped password burns real seconds, and
+/// the cost of waiting is one parked thread the requester is holding open anyway.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many requests may await approval at once. `BlessRequest` is ungated on a
+/// world-connectable socket, so the table needs a ceiling; concurrent *pending* blessings
+/// on one machine is a handful at most.
+const MAX_PENDING: usize = 16;
 
 impl Ctx {
     /// Bind the socket and accept connections forever, one handler thread each.
@@ -94,27 +106,109 @@ impl Ctx {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = BufWriter::new(stream.try_clone()?);
         while let Some(req) = read_msg::<_, Request>(&mut reader)? {
-            let replied = match authorize(&req, peer_uid) {
-                Ok(()) => self.dispatch(req),
+            let outcome = match authorize(&req, peer_uid) {
+                // `BlessRequest` is the one verb that doesn't fit request→response: it
+                // replies twice on one connection and the second reply carries a
+                // descriptor, so it owns the raw socket for its duration.
+                Ok(()) => match req {
+                    Request::BlessRequest { class } => {
+                        self.serve_bless_request(&stream, &mut writer, class, peer_uid)
+                    }
+                    other => self
+                        .dispatch(other, peer_uid)
+                        .and_then(|resp| write_msg(&mut writer, &resp)),
+                },
                 Err(e) => Err(e),
-            }
-            .unwrap_or_else(|e| {
-                Reply::Plain(Response::Error {
-                    message: e.to_string(),
-                })
-            });
-            match replied {
-                Reply::Plain(resp) => write_msg(&mut writer, &resp)?,
-                // The carrier fd can only travel as ancillary data, so this one reply
-                // goes out with `sendmsg` on the raw socket rather than through the
-                // buffered writer — which is empty here, since `write_msg` flushes every
-                // message it writes.
-                Reply::WithCarrier(resp, procs) => {
-                    send_msg_with_fd(&stream, &resp, procs.0.as_fd())?
-                }
+            };
+            // Any failure — refused, timed out, backend error — becomes an `Error` reply
+            // rather than a dropped connection, so the CLI can say why.
+            if let Err(e) = outcome {
+                write_msg(
+                    &mut writer,
+                    &Response::Error {
+                        message: e.to_string(),
+                    },
+                )?;
             }
         }
         Ok(())
+    }
+
+    /// The unprivileged half of the mint handshake (DESIGN §16.5, PLAN-bless3 decision #7).
+    ///
+    /// Register a nonce, hand it to the requester, and block until a **uid-0** peer
+    /// approves it on a *different* connection. Only then mint, and send the carrier's
+    /// `cgroup.procs` back down this connection.
+    ///
+    /// The daemon is the rendezvous — rather than the elevation helper forwarding the
+    /// descriptor — because the helper's own credentials say nothing about *whose* session
+    /// this is: under `run0` it lives in a transient unit with no session at all. Here the
+    /// placement decision rests on this peer's kernel-attested identity, and the human
+    /// presence check rests on the approver's. Neither is a client's assertion.
+    fn serve_bless_request(
+        &self,
+        stream: &UnixStream,
+        writer: &mut BufWriter<UnixStream>,
+        class: Option<ClassName>,
+        peer_uid: Uid,
+    ) -> Result<()> {
+        let nonce = Nonce::generate()?;
+        let approved = self.register_pending(nonce.clone())?;
+        let sent = write_msg(
+            writer,
+            &Response::BlessPending {
+                nonce: nonce.clone(),
+            },
+        );
+        let waited = sent.and_then(|()| {
+            approved.recv_timeout(APPROVAL_TIMEOUT).map_err(|_| {
+                Error::msg("no approval within the timeout — was the elevation cancelled?")
+            })
+        });
+        // Ours to clean up on every path, including the timeout: the entry lives exactly
+        // as long as this call, which is why no reaper thread is needed.
+        self.pending.lock().unwrap().remove(&nonce);
+        waited?;
+
+        let (view, procs) = self.bless(|reply| BlessOp::Mint {
+            class,
+            owner: peer_uid,
+            reply,
+        })?;
+        // Bypasses the buffered writer (empty here — `write_msg` flushes every message):
+        // the descriptor can only travel as ancillary data on a raw `sendmsg`.
+        send_msg_with_fd(stream, &Response::BlessMinted(view), procs.0.as_fd())
+    }
+
+    /// Park a nonce for an approver to release. Bounded: `BlessRequest` is ungated on a
+    /// world-connectable socket, so the table must not be a place anyone can pile into.
+    fn register_pending(&self, nonce: Nonce) -> Result<mpsc::Receiver<()>> {
+        let (tx, rx) = mpsc::channel();
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING {
+            return Err(Error::msg(
+                "too many blessing requests are awaiting approval",
+            ));
+        }
+        pending.insert(nonce, tx);
+        Ok(rx)
+    }
+
+    /// Release the requester waiting on `nonce`. Removing before signalling is what makes
+    /// a nonce single-use: a replay finds nothing parked.
+    fn approve(&self, nonce: &Nonce) -> Result<Response> {
+        let waiting = self
+            .pending
+            .lock()
+            .unwrap()
+            .remove(nonce)
+            .ok_or_else(|| Error::msg("no blessing request is waiting for that nonce"))?;
+        // A dropped receiver means the requester gave up first; the nonce is spent either
+        // way, and there is nothing left to mint for.
+        waiting
+            .send(())
+            .map_err(|_| Error::msg("the blessing request was abandoned"))?;
+        Ok(Response::BlessApproved)
     }
 
     /// Send one bless op to the backend thread (which owns the maps and the carrier
@@ -134,7 +228,7 @@ impl Ctx {
             .map_err(Error::msg)
     }
 
-    fn dispatch(&self, req: Request) -> Result<Reply> {
+    fn dispatch(&self, req: Request, peer_uid: Uid) -> Result<Response> {
         match req {
             Request::Status => {
                 let objects = self
@@ -144,17 +238,17 @@ impl Ctx {
                     .unwrap()
                     .as_ref()
                     .map(|v| v.objects.len());
-                Ok(Reply::Plain(Response::Status(StatusInfo {
+                Ok(Response::Status(StatusInfo {
                     backend: self.backend,
                     socket: self.socket.clone(),
                     policy: self.policy.clone(),
                     objects,
-                })))
+                }))
             }
 
-            Request::PolicyShow => Ok(Reply::Plain(Response::PolicyView(
+            Request::PolicyShow => Ok(Response::PolicyView(
                 self.control.current.lock().unwrap().clone(),
-            ))),
+            )),
 
             Request::PolicyApply { sources } => {
                 // Hand the fragments to the backend thread (which owns the BPF maps)
@@ -173,24 +267,30 @@ impl Ctx {
                 let outcome = reply_rx.recv_timeout(REPLY_TIMEOUT).map_err(|_| {
                     Error::msg("timed out waiting for the backend to apply the policy")
                 })?;
-                Ok(Reply::Plain(Response::PolicyApplied {
+                Ok(Response::PolicyApplied {
                     applied: outcome.applied,
                     diagnostics: outcome.diagnostics,
-                }))
+                })
             }
 
-            Request::BlessMint { class } => {
-                let (view, procs) = self.bless(|reply| BlessOp::Mint { class, reply })?;
-                Ok(Reply::WithCarrier(Response::BlessMinted(view), procs))
+            // Handled by `serve_bless_request`, which needs the raw socket.
+            Request::BlessRequest { .. } => {
+                unreachable!("BlessRequest is served on the connection, not dispatched")
             }
 
-            Request::BlessList => Ok(Reply::Plain(Response::Blessings(
+            Request::BlessApprove { nonce } => self.approve(&nonce),
+
+            Request::BlessList => Ok(Response::Blessings(
                 self.bless(|reply| BlessOp::List { reply })?,
-            ))),
+            )),
 
             Request::BlessRevoke { id } => {
-                self.bless(|reply| BlessOp::Revoke { id, reply })?;
-                Ok(Reply::Plain(Response::BlessRevoked { id }))
+                self.bless(|reply| BlessOp::Revoke {
+                    id,
+                    by: peer_uid,
+                    reply,
+                })?;
+                Ok(Response::BlessRevoked { id })
             }
         }
     }
@@ -205,10 +305,11 @@ fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
         return Ok(());
     }
     match req {
-        // Sudo's PAM stack is the human-presence authenticator (DESIGN §16.5), and a
-        // same-uid scraper must not mint itself access.
-        Request::BlessMint { .. } | Request::BlessRevoke { .. } => Err(Error::msg(
-            "blessing requires root — invoke via `sudo cordon bless`",
+        // The human-presence check: reaching uid 0 is what proves someone authenticated,
+        // whatever tool did the elevating. A same-uid scraper reaching the socket directly
+        // cannot approve its own request.
+        Request::BlessApprove { .. } => Err(Error::msg(
+            "approving a blessing requires root — `cordon bless` spawns this via $CORDON_SUDO",
         )),
         // The policy is root-owned; this gate is what lets the socket be world-
         // connectable without handing everyone the boundary.
@@ -216,26 +317,15 @@ fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
             "applying policy requires root — invoke via `sudo cordon policy apply`",
         )),
         // Reads stay open, the parity `BlessList` was specced with (B1 decision #1).
-        Request::Status | Request::PolicyShow | Request::BlessList => Ok(()),
+        // `BlessRequest` joins them: asking is not minting — the request is inert until a
+        // uid-0 peer approves it. `BlessRevoke` is ownership-checked in the backend, which
+        // is where the live table is; this gate only decides who may speak the verb.
+        Request::Status
+        | Request::PolicyShow
+        | Request::BlessList
+        | Request::BlessRequest { .. }
+        | Request::BlessRevoke { .. } => Ok(()),
     }
-}
-
-/// The peer's kernel-attested uid, via `SO_PEERCRED` (std's `peer_cred()` is still
-/// unstable).
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> Result<Uid> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let creds =
-        getsockopt(stream, PeerCredentials).map_err(|e| Error::msg(format!("SO_PEERCRED: {e}")))?;
-    Ok(Uid(creds.uid()))
-}
-
-/// No `SO_PEERCRED` off Linux: report an impossible-to-authorize uid so the root-gated
-/// ops are refused (the enforcement backend is Linux-only anyway; this keeps the
-/// non-Linux build compiling, per the Cargo feature notes).
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> Result<Uid> {
-    Ok(Uid(u32::MAX))
 }
 
 #[cfg(test)]
@@ -243,27 +333,49 @@ mod tests {
     use super::*;
     use cordon_core::proto::BlessId;
 
-    /// The authorization table: every write is root-only, every read is open — which is
-    /// what lets the socket be `0666` without the mode carrying security weight.
+    fn a_nonce() -> Nonce {
+        Nonce::generate().expect("/dev/urandom")
+    }
+
+    /// The authorization table. The security-critical row is `BlessApprove`: it is the
+    /// human-presence check, so a same-uid scraper reaching the now-world-connectable
+    /// socket must not be able to approve its own request.
     #[test]
     fn authorize_gates_writes_on_root() {
         for req in [
-            Request::BlessMint { class: None },
-            Request::BlessRevoke { id: BlessId(1) },
+            Request::BlessApprove { nonce: a_nonce() },
             Request::PolicyApply {
                 sources: Vec::new(),
             },
         ] {
             assert!(authorize(&req, ROOT).is_ok());
-            // Anyone else does not — including the same-uid scraper reaching the socket
-            // directly, now that it is world-connectable.
             assert!(authorize(&req, Uid(1000)).is_err());
             assert!(authorize(&req, Uid(u32::MAX)).is_err());
         }
-        // Reads stay open regardless of uid.
-        for req in [Request::Status, Request::PolicyShow, Request::BlessList] {
+        // Reads pass any uid, and so do the two verbs that are *not* gated here:
+        // `BlessRequest` (asking is inert until approved) and `BlessRevoke` (ownership is
+        // checked in the backend, which is the only place that knows who minted what).
+        for req in [
+            Request::Status,
+            Request::PolicyShow,
+            Request::BlessList,
+            Request::BlessRequest { class: None },
+            Request::BlessRevoke { id: BlessId(1) },
+        ] {
             assert!(authorize(&req, ROOT).is_ok());
             assert!(authorize(&req, Uid(1000)).is_ok());
+        }
+    }
+
+    /// A nonce must survive the round trip through argv — the helper is spawned with
+    /// `--nonce=<value>` and parses it back — and must reject anything else.
+    #[test]
+    fn nonce_round_trips_and_rejects_junk() {
+        let n = a_nonce();
+        assert_eq!(n.to_string().parse::<Nonce>().unwrap(), n);
+        assert_ne!(a_nonce(), a_nonce(), "nonces must not repeat");
+        for junk in ["", "nope", "0011223344556677889900aabbccddeeff00"] {
+            assert!(junk.parse::<Nonce>().is_err(), "accepted {junk:?}");
         }
     }
 }

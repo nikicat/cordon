@@ -22,6 +22,11 @@ nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
 
 [dependencies]
 serde = { workspace = true }
+# The blessing nonce (DESIGN §16.5) — the tree's only randomness, and it must be
+# unguessable. A thin wrapper over `getrandom(2)`: no descriptor to open, so it can't be
+# defeated by exhausted fds or a missing /dev, and it blocks correctly on an unseeded pool
+# rather than handing back weak bytes. `libc` is its only dependency here, already present.
+getrandom = "0.4.3"
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

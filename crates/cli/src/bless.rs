@@ -1,30 +1,52 @@
 //! `cordon bless` — run a command under a fresh blessing (DESIGN §16).
 //!
-//! Sudo-gated: the command must run as root (`sudo cordon bless …`) — sudo's PAM stack
-//! is the human-presence authenticator, the daemon's mint verb requires peer uid 0,
-//! and joining the root-owned carrier cgroup requires root anyway. The flow:
+//! **Runs as you.** `cordon bless` is an ordinary child of your shell and never holds
+//! privilege; what it obtains from the daemon is a *descriptor*, not authority. That
+//! inversion is the point: the blessed command inherits your environment, cwd, tty, job
+//! control and **logind session** because nothing ever moved it — where the older,
+//! root-first shape was born under a privilege tool (under `run0`, a transient unit with
+//! no session at all) and then relocated, losing `$DISPLAY` and breaking polkit.
 //!
-//! 1. Mint via the daemon → a carrier cgroup registered in the kernel's BLESSED map,
-//!    with its `cgroup.procs` handed back **as a descriptor** (`SCM_RIGHTS`) rather than
-//!    a path: the daemon opened it as root, and that is what the kernel checks.
-//! 2. Fork the target; its `pre_exec` writes the child pid through that fd, *then* drops
-//!    to the sudo invoker, then execs — the target never runs a single instruction
-//!    unblessed, with natural tty/job control/signals/exit code.
+//! The flow (DESIGN §16.5, PLAN-bless3 decision #7):
+//!
+//! 1. Send `BlessRequest` and hold the connection open. The daemon replies with a
+//!    single-use nonce; nothing is minted yet.
+//! 2. Spawn `$CORDON_SUDO cordon bless-helper --nonce=…`. The human authenticates to
+//!    whatever that tool is; the helper reaches the daemon as **uid 0**, which is the
+//!    entire proof of human presence, and approves.
+//! 3. The daemon mints and sends the carrier's `cgroup.procs` back down *our* connection.
+//! 4. Fork the target; its `pre_exec` writes the child pid through that descriptor and
+//!    execs — so the target runs zero instructions unblessed, with a natural exit code.
+//!
+//! Security lives in the daemon's uid-0 check on the approval, never in `$CORDON_SUDO`:
+//! a faked elevation simply yields a non-root helper whose approval is refused. That is
+//! what makes the variable safe to expose as a test seam.
 //!
 //! No CLI-side cleanup: the daemon GCs the carrier when it empties (its mint grace
 //! covers a CLI that dies before the join).
 
 use crate::Cli;
-use crate::sys::{self, DropTo};
+use crate::sys;
 use clap::Subcommand;
 use cordon_core::policy::ClassName;
-use cordon_core::proto::{BlessId, CarrierProcs, Request, Response, read_msg_with_fd, write_msg};
-use cordon_core::{Error, Result, config};
-use nix::unistd::{Gid, Uid, User};
+use cordon_core::proto::{
+    BlessId, CarrierProcs, Nonce, Request, Response, peer_uid, read_msg_with_fd, write_msg,
+};
+use cordon_core::{Error, Result, Uid};
 use std::ffi::OsString;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+/// The elevation command `cordon bless` spawns its approval helper under. A command
+/// string, so `CORDON_SUDO="setpriv --reuid 0"` works as well as a bare program.
+const ELEVATION_ENV: &str = "CORDON_SUDO";
+const DEFAULT_ELEVATION: &str = "sudo";
+
+/// The only uid a daemon we will request a blessing from may run as — see
+/// [`require_root_daemon`].
+const ROOT: Uid = Uid(0);
 
 /// `cordon bless [--class <name>] [-- <command>…]` | `bless list` | `bless revoke <id>`.
 /// `list`/`revoke` are subcommands; a command literally named `list` runs via
@@ -53,8 +75,8 @@ enum BlessCmd {
 
 pub fn run(args: &BlessArgs, cli: &Cli) -> ExitCode {
     match &args.cmd {
-        // list/revoke are plain round trips — render like any other command (the
-        // daemon gates revoke on peer uid 0 and says so if refused).
+        // list/revoke are plain round trips — render like any other command (revoke is
+        // yours to call for a blessing you minted; the daemon says so if it isn't).
         Some(sub) => {
             let req = match sub {
                 BlessCmd::List => Request::BlessList,
@@ -72,127 +94,149 @@ pub fn run(args: &BlessArgs, cli: &Cli) -> ExitCode {
     }
 }
 
-/// The blessed-exec flow: mint, then fork the target into the carrier.
+/// The blessed-exec flow: request → elevate → receive the carrier → fork the target.
 fn mint_and_exec(args: &BlessArgs, cli: &Cli) -> Result<ExitCode> {
-    if !config::is_root() {
-        return Err(Error::msg(
-            "blessing requires root — invoke via `sudo cordon bless`",
-        ));
-    }
     let socket = crate::resolve_socket(cli)?;
-    let procs = mint(
-        &socket,
-        &Request::BlessMint {
-            class: args.class.clone(),
-        },
-    )?;
-
-    let invoker = invoker()?;
-    let mut cmd = build_command(&args.command, invoker.as_ref())?;
-    sys::join_cgroup_and_drop_on_exec(&mut cmd, procs, invoker.map(|i| i.drop));
+    let procs = request_and_approve(&socket, args.class.clone())?;
+    let mut cmd = build_command(&args.command);
+    sys::join_cgroup_on_exec(&mut cmd, procs);
     let status = cmd
         .status()
         .map_err(|e| Error::msg(format!("spawn blessed command: {e}")))?;
     Ok(ExitCode::from(exit_byte(status.code(), status.signal())))
 }
 
-/// Mint a blessing and take delivery of the carrier's `cgroup.procs`.
+/// Run the mint handshake and take delivery of the carrier's `cgroup.procs`.
 ///
-/// The fd — not the path — is the grant: the daemon opened it as root, and cgroup-v2
-/// checks migration permission against the *opener's* credentials, so writing a pid
-/// through it works without privilege (DESIGN §16.4). It also has to be a dedicated
+/// One connection, two replies, an elevation in between — and it must be a dedicated
 /// connection rather than [`crate::round_trip`], because ancillary data is lost to any
-/// buffered read.
-fn mint(socket: &Path, req: &Request) -> Result<CarrierProcs> {
-    let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
+/// buffered read (see `read_msg_with_fd`).
+fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<CarrierProcs> {
+    let stream = UnixStream::connect(socket).map_err(|e| {
         Error::msg(format!(
             "connect {}: {e} (is cordond running?)",
             socket.display()
         ))
     })?;
-    write_msg(&mut &stream, req)?;
-    match read_msg_with_fd::<Response>(&stream)? {
-        Some((Response::BlessMinted(_view), Some(procs))) => Ok(CarrierProcs(procs)),
-        Some((Response::BlessMinted(view), None)) => Err(Error::msg(format!(
+    require_root_daemon(&stream, socket)?;
+    write_msg(&mut &stream, &Request::BlessRequest { class })?;
+    let nonce = match reply(&stream)? {
+        (Response::BlessPending { nonce }, _) => nonce,
+        (other, _) => return Err(unexpected(other)),
+    };
+
+    // Blocks while the human authenticates. Waiting for the helper to exit first means a
+    // cancelled password prompt reports itself immediately, instead of stalling until the
+    // daemon's approval timeout. The same `socket` goes to the helper, so both halves of
+    // the handshake provably reach the daemon we just vetted.
+    elevate(&nonce, socket)?;
+
+    match reply(&stream)? {
+        (Response::BlessMinted(_), Some(procs)) => Ok(CarrierProcs(procs)),
+        (Response::BlessMinted(view), None) => Err(Error::msg(format!(
             "daemon minted {} but passed no cgroup.procs descriptor",
             view.cgroup.display()
         ))),
+        (other, _) => Err(unexpected(other)),
+    }
+}
+
+/// Refuse to continue unless the process on the other end of `stream` is **root**.
+///
+/// Without this the nonce is a bearer token handed to whoever answers the socket, and the
+/// elevation that follows is a confused deputy: a local user who leaves a listener at the
+/// client's socket path (`$XDG_RUNTIME_DIR/cordon.sock`, or `/tmp/cordon-<uid>.sock` when
+/// `XDG_RUNTIME_DIR` is unset — a world-writable directory) can park its *own* request on
+/// the real daemon, answer us with *that* nonce, and let the human's authentication mint a
+/// carrier for the attacker. The human really did authenticate — just not for this request.
+///
+/// So the check is not "is a daemon there" but "is the thing I am about to have a root
+/// process approve actually the root daemon". Blessing against a non-root daemon could
+/// never work anyway: the carrier's whole boundary is that only root can place tasks in it
+/// (DESIGN §16.4), so a user-owned daemon has nothing to grant.
+fn require_root_daemon(stream: &UnixStream, socket: &Path) -> Result<()> {
+    let uid = peer_uid(stream)?;
+    if uid != ROOT {
+        return Err(Error::msg(format!(
+            "the daemon on {} runs as uid {}, not root — refusing to request a blessing \
+             from it (it could grant nothing, and approving its request would spend your \
+             authentication on whatever it asked for)",
+            socket.display(),
+            uid,
+        )));
+    }
+    Ok(())
+}
+
+/// Read one reply, turning a daemon-side `Error` and a hang-up into our error type so
+/// callers only ever match the replies they expect.
+fn reply(stream: &UnixStream) -> Result<(Response, Option<std::os::fd::OwnedFd>)> {
+    match read_msg_with_fd::<Response>(stream)? {
         Some((Response::Error { message }, _)) => Err(Error::msg(format!("daemon: {message}"))),
-        Some((other, _)) => Err(Error::msg(format!("unexpected daemon reply: {other:?}"))),
+        Some(other) => Ok(other),
         None => Err(Error::msg("daemon closed the connection without replying")),
     }
 }
 
-/// The sudo invoker to drop the blessed child to, resolved from `SUDO_UID`/`SUDO_GID`
-/// and passwd. `None` ⇒ stay root: true root without sudo, or `SUDO_UID=0` (root
-/// sudo-ing — no one lower to drop to).
-struct Invoker {
-    drop: DropTo,
-    name: String,
-    home: PathBuf,
-    /// The invoker's login shell from passwd — the no-command default (`$SHELL` is
-    /// reset by sudo, so it can't be trusted as *their* shell).
-    shell: Option<PathBuf>,
+fn unexpected(resp: Response) -> Error {
+    Error::msg(format!("unexpected daemon reply: {resp:?}"))
 }
 
-fn invoker() -> Result<Option<Invoker>> {
-    let (Ok(u), Ok(g)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
-        return Ok(None);
-    };
-    let uid = Uid::from_raw(
-        u.parse::<u32>()
-            .map_err(|_| Error::msg(format!("invalid SUDO_UID: {u:?}")))?,
-    );
-    let gid = Gid::from_raw(
-        g.parse::<u32>()
-            .map_err(|_| Error::msg(format!("invalid SUDO_GID: {g:?}")))?,
-    );
-    if uid.is_root() {
-        return Ok(None);
+/// Prove a human is present: run `cordon bless-helper --nonce=…` under `$CORDON_SUDO`,
+/// which authenticates and reaches the daemon as root.
+///
+/// `--nonce=VALUE` is deliberately **one argv token**: elevation wrappers vary in how
+/// they re-split arguments, and a separated flag and value is the sort of thing one of
+/// them will helpfully rearrange.
+///
+/// `socket` is passed explicitly rather than left to the helper to re-derive. Elevation
+/// resets the environment, so a helper that resolved its own path would consult *root's*
+/// config and could end up approving at a different daemon than the one we asked — which
+/// silently breaks `--socket` and a per-user config, and would leave the two halves of the
+/// handshake talking past each other. Naming it keeps them provably on the one daemon
+/// [`require_root_daemon`] just vetted.
+fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
+    let elevation = std::env::var(ELEVATION_ENV).unwrap_or_else(|_| DEFAULT_ELEVATION.to_string());
+    let mut words = elevation.split_whitespace();
+    let program = words
+        .next()
+        .ok_or_else(|| Error::msg(format!("${ELEVATION_ENV} is empty")))?;
+    let me = std::env::current_exe()
+        .map_err(|e| Error::msg(format!("cannot locate the cordon binary: {e}")))?;
+    let status = Command::new(program)
+        .args(words)
+        .arg(me)
+        .arg("--socket")
+        .arg(socket)
+        .arg("bless-helper")
+        .arg(format!("--nonce={nonce}"))
+        .status()
+        .map_err(|e| Error::msg(format!("spawn {program}: {e}")))?;
+    if !status.success() {
+        return Err(Error::msg(format!(
+            "elevation via {program} did not succeed ({status}) — blessing refused"
+        )));
     }
-    let user = User::from_uid(uid)
-        .map_err(|e| Error::msg(format!("passwd lookup for uid {uid}: {e}")))?
-        .ok_or_else(|| Error::msg(format!("uid {uid} (SUDO_UID) has no passwd entry")))?;
-    // The full supplementary list, resolved now — the pre_exec closure must not touch
-    // the group database. A blessed shell is the user's normal session, groups intact.
-    let cname = std::ffi::CString::new(user.name.clone())
-        .map_err(|_| Error::msg("passwd name contains NUL"))?;
-    let groups = nix::unistd::getgrouplist(&cname, gid)
-        .map_err(|e| Error::msg(format!("getgrouplist({}): {e}", user.name)))?;
-    Ok(Some(Invoker {
-        drop: DropTo { uid, gid, groups },
-        name: user.name,
-        home: user.dir,
-        shell: (!user.shell.as_os_str().is_empty()).then_some(user.shell),
-    }))
+    Ok(())
 }
 
-/// The target `Command`: the given argv, or (empty) the invoker's shell. When dropping
-/// to an invoker, hand the child *their* `HOME`/`USER`/`LOGNAME` — sudo left root's.
-fn build_command(argv: &[OsString], invoker: Option<&Invoker>) -> Result<Command> {
-    let mut cmd = match argv.split_first() {
+/// The target `Command`: the given argv, or (empty) your shell. Nothing is set on the
+/// environment — we are an ordinary child of the caller's shell, so it is already theirs.
+fn build_command(argv: &[OsString]) -> Command {
+    match argv.split_first() {
         Some((program, rest)) => {
             let mut c = Command::new(program);
             c.args(rest);
             c
         }
-        None => Command::new(default_shell(
-            invoker.and_then(|i| i.shell.clone()),
-            std::env::var_os("SHELL").map(PathBuf::from),
-        )),
-    };
-    if let Some(i) = invoker {
-        cmd.env("HOME", &i.home)
-            .env("USER", &i.name)
-            .env("LOGNAME", &i.name);
+        None => Command::new(default_shell(std::env::var_os("SHELL").map(PathBuf::from))),
     }
-    Ok(cmd)
 }
 
-/// The no-command shell: the invoker's passwd shell, else `$SHELL`, else `/bin/sh`.
-fn default_shell(passwd_shell: Option<PathBuf>, env_shell: Option<PathBuf>) -> PathBuf {
-    passwd_shell
-        .or(env_shell)
+/// The no-command shell: `$SHELL`, else `/bin/sh`. `$SHELL` is trustworthy again now that
+/// nothing re-parents us through a privilege tool that would have reset it.
+fn default_shell(env_shell: Option<PathBuf>) -> PathBuf {
+    env_shell
         .filter(|s| !s.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
@@ -211,6 +255,42 @@ fn exit_byte(code: Option<i32>, signal: Option<i32>) -> u8 {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// The confused-deputy guard, exercised against the attacker's actual precondition: a
+    /// socket that a *non-root* local process left listening where the client looks.
+    ///
+    /// The test suite runs unprivileged, so a listener it binds itself has exactly the
+    /// ownership a squatter's would. `request_and_approve` must bail on the peer's uid
+    /// **before** it writes anything — sending `BlessRequest` would already be too late,
+    /// since the next step hands the reply's nonce to a process about to become root.
+    #[test]
+    fn a_non_root_daemon_is_refused_before_any_request_is_sent() {
+        let dir = std::env::temp_dir().join(format!("cordon-fakedaemon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cordon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        let err = request_and_approve(&path, None).expect_err("a non-root peer must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("not root"), "unexpected refusal: {msg}");
+
+        // Nothing was written: the guard fires before the request, so a squatter never
+        // even learns a bless was attempted, let alone gets to answer it. By now the
+        // client has hung up, so an empty read is EOF rather than a would-block — either
+        // way what matters is that zero bytes arrived.
+        listener.set_nonblocking(true).unwrap();
+        let (peer, _) = listener.accept().expect("the client did connect");
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        let sent = match std::io::Read::read(&mut &peer, &mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("reading the squatted socket: {e}"),
+        };
+        assert_eq!(sent, 0, "the client sent bytes to a non-root daemon");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Parse through the real `Cli` so the `args_conflicts_with_subcommands` shape is
     /// tested exactly as shipped.
@@ -253,18 +333,17 @@ mod tests {
     }
 
     #[test]
-    fn default_shell_prefers_passwd_then_env_then_sh() {
-        let passwd = Some(PathBuf::from("/bin/fish"));
-        let env = Some(PathBuf::from("/bin/zsh"));
+    fn default_shell_prefers_env_then_sh() {
+        // `$SHELL` is authoritative again: nothing re-parents us through sudo, so it is
+        // still the shell the user is actually running under.
         assert_eq!(
-            default_shell(passwd.clone(), env.clone()),
+            default_shell(Some(PathBuf::from("/bin/fish"))),
             PathBuf::from("/bin/fish")
         );
-        assert_eq!(default_shell(None, env), PathBuf::from("/bin/zsh"));
-        assert_eq!(default_shell(None, None), PathBuf::from("/bin/sh"));
+        assert_eq!(default_shell(None), PathBuf::from("/bin/sh"));
         // An empty $SHELL (set but blank) falls through to /bin/sh.
         assert_eq!(
-            default_shell(None, Some(PathBuf::new())),
+            default_shell(Some(PathBuf::new())),
             PathBuf::from("/bin/sh")
         );
     }

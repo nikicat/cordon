@@ -22,7 +22,7 @@ use aya::Ebpf;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
 use cordon_core::policy::ClassName;
 use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, Pid};
-use cordon_core::{Error, Result};
+use cordon_core::{Error, Result, Uid};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -56,6 +56,10 @@ struct Blessing {
     class: ClassName,
     /// The carrier cgroup directory (root-owned; membership is the boundary).
     dir: PathBuf,
+    /// Who asked for it — the requester's kernel-attested uid. Only they and root may
+    /// revoke it. A blessing adopted from a previous daemon run has no recorded owner
+    /// (`None`): the requester is long gone, so revoking it is root's call.
+    owner: Option<Uid>,
     /// The carrier's kernel cgroup id — the `MAP_BLESSED` key.
     cgroup: CgroupId,
     /// Whether a `MAP_BLESSED` entry currently exists for it. `false` when the class
@@ -98,6 +102,7 @@ impl Blessings {
         &mut self,
         ebpf: &mut Ebpf,
         class: Option<ClassName>,
+        owner: Uid,
         registry: &BTreeMap<ClassName, ClassId>,
     ) -> Result<(BlessingView, CarrierProcs)> {
         let root = self.root.as_ref().ok_or_else(|| {
@@ -158,13 +163,14 @@ impl Blessings {
             id,
             class: class.clone(),
             dir: dir.clone(),
+            owner: Some(owner),
             cgroup,
             registered: true,
             saw_populated: false,
             revoked: false,
             minted: Instant::now(),
         });
-        info!(%id, %class, cgroup = %dir.display(), "blessing minted");
+        info!(%id, %class, %owner, cgroup = %dir.display(), "blessing minted");
         Ok((
             BlessingView {
                 id,
@@ -193,12 +199,19 @@ impl Blessings {
 
     /// Kill a blessing's carrier tree (`cgroup.kill`); the regular GC observes the
     /// resulting `populated 0` and finishes (unregister + rmdir).
-    pub(super) fn revoke(&mut self, id: BlessId) -> Result<()> {
+    ///
+    /// `by` is the caller's kernel-attested uid — root, or the uid that minted it.
+    pub(super) fn revoke(&mut self, id: BlessId, by: Uid) -> Result<()> {
         let b = self
             .live
             .iter_mut()
             .find(|b| b.id == id)
             .ok_or_else(|| Error::msg(format!("no blessing with id {id}")))?;
+        if !may_revoke(b.owner, by) {
+            // Deliberately the same shape as "no such id": whether a blessing exists is
+            // itself information, and `bless list` is the way to ask that question.
+            return Err(Error::msg(format!("no blessing with id {id}")));
+        }
         b.revoked = true;
         // A write error means the carrier is already gone or dying — `revoked` alone
         // lets GC reap it, so report success either way.
@@ -312,6 +325,7 @@ impl Blessings {
                 id: found.id,
                 class: found.class,
                 dir: found.dir,
+                owner: None,
                 cgroup,
                 registered,
                 // It has members *now*; when they exit, GC may reap without grace.
@@ -339,6 +353,13 @@ fn reap(ebpf: &mut Ebpf, b: &Blessing) {
 /// The pure GC predicate, given a carrier that currently reads `populated 0`: reap
 /// once the emptiness is meaningful — it had members and they exited, it was revoked,
 /// or the mint grace expired (a CLI that died before joining).
+/// Who may revoke a blessing: root always, otherwise only the uid that minted it. A
+/// blessing adopted by reconcile has no recorded owner — its requester died with the
+/// previous daemon — so it is root's to tear down.
+fn may_revoke(owner: Option<Uid>, by: Uid) -> bool {
+    by == Uid(0) || owner == Some(by)
+}
+
 fn should_reap(saw_populated: bool, revoked: bool, age: Duration) -> bool {
     saw_populated || revoked || age > MINT_GRACE
 }

@@ -32,16 +32,78 @@ pub enum Request {
     },
     /// The effective (currently-loaded) compiled policy.
     PolicyShow,
-    /// Mint a blessing (DESIGN §16): create a carrier cgroup registered under `class`
-    /// (`None` → the sole declared class) and return it for the CLI to exec into.
-    /// **Root-gated** (`SO_PEERCRED` uid 0): sudo is the B1 authenticator.
-    BlessMint { class: Option<ClassName> },
+    /// Ask for a blessing under `class` (`None` → the sole declared class) — the
+    /// **unprivileged** half of the mint handshake (DESIGN §16.5).
+    ///
+    /// Ungated on purpose: this connection's only power is to *ask*. The daemon replies
+    /// [`Response::BlessPending`] with a single-use [`Nonce`] and **keeps the connection
+    /// open**; nothing is minted until a uid-0 peer sends the matching [`Self::BlessApprove`]
+    /// on a second connection, at which point the carrier and its `cgroup.procs` come back
+    /// down *this* one. Reading the session placement from this peer, which cannot lie
+    /// about its own credentials, is why the daemon is the rendezvous rather than the
+    /// elevation helper.
+    BlessRequest { class: Option<ClassName> },
+    /// Approve a pending [`Self::BlessRequest`] — the human-presence half. **Root-gated**
+    /// (`SO_PEERCRED` uid 0): reaching uid 0 is what proves a human authenticated, whatever
+    /// tool did the elevating. Single-use; the nonce is consumed whether or not the mint
+    /// then succeeds.
+    BlessApprove { nonce: Nonce },
     /// The live blessings (carrier cgroup, member pids, age). Ungated — read-only,
     /// parity with `PolicyShow`.
     BlessList,
-    /// Kill a live blessing's carrier cgroup and unregister it. Root-gated like
-    /// `BlessMint`.
+    /// Kill a live blessing's carrier cgroup and unregister it. Allowed for uid 0 **or the
+    /// uid that requested the blessing** — having minted one unprivileged, you must be able
+    /// to revoke it the same way.
     BlessRevoke { id: BlessId },
+}
+
+/// A single-use handle binding an unprivileged [`Request::BlessRequest`] to the root
+/// [`Request::BlessApprove`] that authorizes it.
+///
+/// 128 bits from `/dev/urandom`, hex. It must be **unguessable**, which is the whole reason
+/// it isn't a counter: with a predictable value an attacker could register their own
+/// request, predict the nonce your session is about to be issued, and have *your*
+/// authenticated helper approve *their* request — handing them the carrier. Knowing an
+/// already-issued nonce is harmless by contrast: approving it still requires uid 0, and the
+/// carrier descriptor goes back down the requester's own connection, never to whoever
+/// approved.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Nonce(String);
+
+impl Nonce {
+    /// Bytes of entropy behind a nonce. 16 = 128 bits: far past guessing, and the value
+    /// only has to survive the seconds between a request and its approval.
+    const BYTES: usize = 16;
+
+    /// Mint a fresh nonce from the kernel CSPRNG, via `getrandom(2)`.
+    ///
+    /// An error here refuses the blessing rather than minting a weak one — the
+    /// fail-closed direction, and the only one that matters for an unguessable value.
+    pub fn generate() -> Result<Nonce> {
+        let mut buf = [0u8; Nonce::BYTES];
+        getrandom::fill(&mut buf).map_err(|e| crate::Error::msg(format!("getrandom: {e}")))?;
+        Ok(Nonce(buf.map(|b| format!("{b:02x}")).concat()))
+    }
+}
+
+impl std::fmt::Display for Nonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for Nonce {
+    type Err = crate::Error;
+    /// Parse the `--nonce=` argument the helper is spawned with. Validated rather than
+    /// trusted: a malformed value can only ever miss in the pending table, but rejecting it
+    /// at the boundary keeps junk out of the daemon's map keys.
+    fn from_str(s: &str) -> Result<Nonce> {
+        if s.len() == Nonce::BYTES * 2 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(Nonce(s.to_ascii_lowercase()))
+        } else {
+            Err(crate::Error::msg("malformed bless nonce"))
+        }
+    }
 }
 
 /// A live blessing's daemon-assigned handle — what `cordon bless list` prints and
@@ -84,8 +146,17 @@ pub enum Response {
     },
     /// The effective policy (`PolicyShow`), or `None` if none is loaded.
     PolicyView(Option<PolicyView>),
-    /// A freshly-minted blessing (`BlessMint`): the carrier cgroup the CLI now execs
-    /// the target into.
+    /// A `BlessRequest` is registered and awaiting approval. The connection stays open;
+    /// the requester spawns an elevation helper with this nonce and then blocks for the
+    /// [`Self::BlessMinted`] that follows.
+    BlessPending {
+        nonce: Nonce,
+    },
+    /// A `BlessApprove` was accepted: the waiting requester has been released.
+    BlessApproved,
+    /// A freshly-minted blessing, sent to the **requester** once approval landed. Carries
+    /// the carrier's `cgroup.procs` out-of-band as `SCM_RIGHTS` ([`CarrierProcs`]) — the
+    /// descriptor, not the path, is the grant.
     BlessMinted(BlessingView),
     /// The live blessings (`BlessList`).
     Blessings(Vec<BlessingView>),
@@ -180,6 +251,33 @@ pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>>
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(line.trim_end())?))
+}
+
+/// The peer's **kernel-attested** uid on a connected Unix socket, via `SO_PEERCRED`
+/// (std's `peer_cred()` is still unstable).
+///
+/// Used from **both** ends, and for the same reason each way. The daemon asks who is
+/// calling, so it can gate the writes. The client asks who answered, because a socket
+/// path is not proof of a daemon: `cordon bless` hands the reply's nonce to a process it
+/// then elevates to root, so it must know it is talking to the real root daemon and not
+/// to something a local user left listening at the same path (DESIGN §16.5).
+///
+/// This is the only identity in the protocol that isn't asserted by the party it
+/// describes — which is exactly why every authorization decision rests on it.
+#[cfg(target_os = "linux")]
+pub fn peer_uid(sock: &UnixStream) -> Result<crate::Uid> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let creds = getsockopt(sock, PeerCredentials)
+        .map_err(|e| crate::Error::msg(format!("SO_PEERCRED: {e}")))?;
+    Ok(crate::Uid(creds.uid()))
+}
+
+/// No `SO_PEERCRED` off Linux: report an impossible uid so every check that consults it
+/// fails closed (the enforcement backend is Linux-only anyway; this keeps the non-Linux
+/// build compiling, per the Cargo feature notes).
+#[cfg(not(target_os = "linux"))]
+pub fn peer_uid(_sock: &UnixStream) -> Result<crate::Uid> {
+    Ok(crate::Uid(u32::MAX))
 }
 
 /// Send one newline-framed JSON message with a file descriptor riding along as
@@ -310,6 +408,7 @@ fn recv_byte_with_fd(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::config;
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsFd;
 
@@ -355,6 +454,22 @@ mod tests {
             .expect("a message");
         assert!(matches!(msg, Response::BlessRevoked { id: BlessId(3) }));
         assert!(fd.is_none());
+    }
+
+    /// `SO_PEERCRED` reports the process on the other end, not the one asking. Both sides
+    /// of a socketpair are this test, so both reads must be our own uid — enough to pin
+    /// that the value is real and not, say, a hardcoded zero that would make every
+    /// uid check pass.
+    #[test]
+    fn peer_uid_reports_the_other_end() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let me = crate::Uid(config::euid());
+        assert_eq!(peer_uid(&a).unwrap(), me);
+        assert_eq!(peer_uid(&b).unwrap(), me);
+        // And a non-root test runner must not look like root to the caller's check.
+        if !config::is_root() {
+            assert_ne!(peer_uid(&a).unwrap(), crate::Uid(0));
+        }
     }
 
     /// A closed peer is `None`, the same clean-EOF contract as [`read_msg`] — so a caller
