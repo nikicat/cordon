@@ -667,25 +667,40 @@ impl Scaffold {
             self.user.as_str(),
             self.path.display().to_string(),
         ));
-        atomic_write(&self.fragment, &text)
+        install_atomically(&self.fragment, &text)
     }
 }
 
-/// Write `text` to `path` atomically (sibling temp + rename), creating parents — for the
-/// scaffolded system fragment. Mode 0644 to match the other root-owned policy fragments.
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
+/// Mode for a policy file this command **creates**. An existing file keeps whatever mode
+/// it has ([`install_atomically`]), so this only ever applies to a first write. `0644`
+/// root-owned matches the rest of the tree and is what an unprivileged `cordon policy
+/// check` needs to read; the file holds rules — paths and exe names — not credentials, and
+/// the daemon already serves a summary of them to any local user (DESIGN §15.8).
+const NEW_POLICY_MODE: u32 = 0o644;
+
+/// Write `text` to `path` atomically: sibling staging file → fsync → rename, creating
+/// parent directories, cleaning the staging file up on either failure.
+///
+/// **An existing file keeps its mode.** Both callers write root-owned policy files that an
+/// admin may have tightened deliberately, and a save must not quietly widen (or narrow)
+/// what they chose; only a file being created for the first time takes
+/// [`NEW_POLICY_MODE`].
+fn install_atomically(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
             .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
     }
+    let mode = fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(NEW_POLICY_MODE);
     let fname = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "fragment".to_string());
+        .unwrap_or_else(|| "policy".to_string());
     let staging = path.with_file_name(format!(".{fname}.cordon-{}.tmp", std::process::id()));
-    if let Err(e) = write_staging(&staging, text, 0o644) {
+    if let Err(e) = write_staging(&staging, text, mode) {
         let _ = fs::remove_file(&staging);
         return Err(Error::msg(format!("write {}: {e}", path.display())));
     }
@@ -769,31 +784,10 @@ impl TempEdit {
         Ok(tmp)
     }
 
-    /// Atomically install `text` at `target` (write a sibling temp, fsync, rename),
-    /// preserving the existing file's mode (else 0600 for a new root-owned policy).
+    /// Install the edited text at `target`. The temp copy is user-owned while the editor
+    /// runs; only this validated string crosses back, and it lands atomically.
     fn commit(&self, target: &Path, text: &str) -> Result<()> {
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
-        }
-        let mode = fs::metadata(target)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let fname = target
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "policy".to_string());
-        let staging = target.with_file_name(format!(".{fname}.cordon-{}.tmp", std::process::id()));
-        if let Err(e) = write_staging(&staging, text, mode) {
-            let _ = fs::remove_file(&staging);
-            return Err(Error::msg(format!("write {}: {e}", target.display())));
-        }
-        fs::rename(&staging, target).map_err(|e| {
-            let _ = fs::remove_file(&staging);
-            Error::msg(format!("install {}: {e}", target.display()))
-        })
+        install_atomically(target, text)
     }
 }
 
@@ -912,6 +906,42 @@ mod tests {
         assert!(invoker_uid(root, Some("0")).is_err());
         // A malformed SUDO_UID is loud, not silently ignored.
         assert!(invoker_uid(root, Some("nb")).is_err());
+    }
+
+    /// A save must never quietly change what an admin chose: an existing file keeps its
+    /// mode, and only a brand-new one takes the default. Both policy writes — the edited
+    /// file and the scaffolded `[[include]]` fragment — go through here, and the fragment
+    /// path used to hardcode 0644, so a tightened `/etc/cordon/policy.toml` was widened by
+    /// a first bare `policy edit`.
+    #[test]
+    fn install_preserves_an_existing_mode_and_defaults_a_new_file() {
+        let dir = std::env::temp_dir().join(format!("cordon-install-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let fresh = dir.join("new.toml");
+        install_atomically(&fresh, "# new\n").unwrap();
+        assert_eq!(
+            mode_of(&fresh),
+            NEW_POLICY_MODE,
+            "a new file takes the default"
+        );
+
+        let tightened = dir.join("tight.toml");
+        install_atomically(&tightened, "# first\n").unwrap();
+        fs::set_permissions(&tightened, Permissions::from_mode(0o600)).unwrap();
+        install_atomically(&tightened, "# second\n").unwrap();
+        assert_eq!(
+            mode_of(&tightened),
+            0o600,
+            "an existing mode survives a rewrite"
+        );
+        assert_eq!(fs::read_to_string(&tightened).unwrap(), "# second\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
