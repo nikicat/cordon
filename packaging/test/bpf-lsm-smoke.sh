@@ -64,6 +64,22 @@
 #                       `policy edit` runs; the fd-based (`fchown`) hand-off keeps a root-owned
 #                       sentinel from ever being chowned to the invoker (a path chown would
 #                       follow the symlink — an arbitrary-chown → local-root TOCTOU).
+#  18. bless scope     — `deny * read V` + `allow @blessed-ro read V` + a second protected
+#                       V2: a blessed read of V is allowed (a concrete blessing outranks the
+#                       catch-all), the SAME blessed exe is denied on V2 (the grant's scope
+#                       is the object column), and the unblessed exe stays denied on V.
+#                       End-to-end proof that mkdir-inode == bpf_get_current_cgroup_id.
+#  19. bless boundary  — carrier membership IS the boundary: a non-root uid cannot write
+#                       into the root-owned carrier's cgroup.procs (EACCES); `bless list`
+#                       shows the live entry meanwhile.
+#  20. bless inherit+GC — a blessed bash's *grandchild* reads the secret (cgroup membership
+#                       is inherited); after exit the daemon GC reaps everything — `bless
+#                       list` drains AND the carrier dir is gone (BLESSED entry + table +
+#                       cgroup, not just "re-open denied").
+#  21. bless revoke    — `bless revoke <id>` kills the carrier tree promptly (cgroup.kill):
+#                       the blessed sleep dies, list + dirs drain.
+#  22. bless journal   — bless is loud: a blessed read under an `audit @blessed-ro` rule
+#                       journals with a trailing `blessing=ro` (class by NAME).
 #
 # Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
 # list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
@@ -757,6 +773,258 @@ RACER
     edit_env_teardown; return $fail
 }
 
+# --- bless scenarios (18–22): shared helpers ---------------------------------
+# The smoke runs as root, so the CLI is invoked directly (peer uid 0 — the daemon's
+# SO_PEERCRED gate passes) and the blessed child stays root (no SUDO_UID to drop to).
+
+# cgroup2 is required for the carrier cgroups; mount it if the guest hasn't (virtme
+# usually has). SKIP (like the setpriv guard) when it can't be made available.
+cgroup2_ready() {
+    [ -f /sys/fs/cgroup/cgroup.controllers ] && return 0
+    mkdir -p /sys/fs/cgroup 2>/dev/null
+    mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null && return 0
+    echo "  SKIP: cgroup2 unavailable (cannot mount /sys/fs/cgroup)"
+    return 1
+}
+
+# The daemon's carrier root: its own cgroup dir (carriers are created under it).
+bless_root() {
+    local rel; rel="$(sed -n 's/^0:://p' "/proc/$DPID/cgroup")"
+    echo "/sys/fs/cgroup${rel%/}"
+}
+# The live carrier dirs (cordon-bless-<id>.<class>), if any.
+bless_dirs() { ls -d "$(bless_root)"/cordon-bless-* 2>/dev/null; }
+# The first live blessing's id from `bless list` ("" when none).
+bless_first_id() { "$CORDON" bless list 2>/dev/null | awk '/class=/{print $1; exit}'; }
+
+# The first carrier that actually has members; echoes its dir. NB: `cgroup.procs` is a
+# kernfs file — its st_size is 0 even when populated, so `[ -s ]` would always be false
+# and only reading it tells the truth.
+bless_populated_dir() {
+    local d
+    for d in $(bless_dirs); do
+        [ -n "$(cat "$d/cgroup.procs" 2>/dev/null)" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+# Poll until some carrier has members (the CLI's pre_exec join landed); echoes its dir.
+bless_wait_populated() { for _ in $(seq 1 50); do bless_populated_dir && return 0; sleep 0.1; done; return 1; }
+
+# Open FILE for read as subject EXE inside a fresh blessing of CLASS. The CLI mints,
+# forks the exe into the carrier, and propagates its exit code.
+bless_read_as() { "$CORDON" bless --class "$1" -- "$2" -c 'exec 3<"$1"' bash "$3" 2>/dev/null; } # $1 class $2 exe $3 file
+
+# Poll until the daemon has reaped every blessing: list drained AND carrier dirs gone.
+bless_drained() {
+    for _ in $(seq 1 40); do
+        [ -z "$(bless_dirs)" ] && "$CORDON" bless list 2>/dev/null | grep -q "no live blessings" && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# --- scenario 18: bless scope (grant outranks catch-all; scoped to the object) --
+scenario_bless_scope() {
+    echo "### scenario: bless scope (blessed read allowed on V, denied on V2, unblessed denied)"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    local vault2="$TMP/vault2"; mkdir -p "$vault2"; echo S2 > "$vault2/secret"
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = "read"
+policy = "deny"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+
+[[rule]]
+who = "*"
+where = "$vault2"
+action = "read"
+policy = "deny"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # The blessed read must outrank the who="*" deny on the same object (B1 decision #5)
+    # — this is also the end-to-end proof that the mkdir'd carrier's st_ino equals what
+    # bpf_get_current_cgroup_id() sees.
+    expect_allow "blessed exe reads V (grant outranks the catch-all deny)" bless_read_as ro "$OWNER" "$SECRET" || fail=1
+    expect_deny  "same exe unblessed is denied V"                          read_as "$OWNER" "$SECRET"          || fail=1
+    expect_deny  "blessed exe denied V2 (grant scope = the object column)" bless_read_as ro "$OWNER" "$vault2/secret" || fail=1
+    daemon_stop; return $fail
+}
+
+# --- scenario 19: bless boundary (non-root cannot join the carrier) ----------
+scenario_bless_boundary() {
+    echo "### scenario: bless boundary (non-root write to the carrier cgroup.procs fails)"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    "$CORDON" bless --class ro -- sleep 300 &
+    local clipid=$!
+    # Wait for the carrier to exist and the sleep to have joined it.
+    local dir=""
+    if dir="$(bless_wait_populated)"; then
+        echo "  OK: carrier populated ($(basename "$dir"))"
+    else
+        echo "  FAIL: no populated carrier appeared"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    if "$CORDON" bless list 2>/dev/null | grep -q "class=ro"; then
+        echo "  OK: bless list shows the live entry"
+    else
+        echo "  FAIL: bless list does not show the entry"; "$CORDON" bless list 2>&1 | sed 's/^/  cli| /'; fail=1
+    fi
+    # THE membership boundary: a non-root uid must not be able to write itself into the
+    # root-owned carrier (else any process could self-bless).
+    expect_deny "non-root write to the carrier cgroup.procs" \
+        setpriv --reuid 4242 --regid 4242 --clear-groups sh -c "echo \$\$ > '$dir/cgroup.procs'" || fail=1
+    # Cleanup: revoke, let the CLI reap its child, and let GC drain the carrier.
+    "$CORDON" bless revoke "$(bless_first_id)" >/dev/null 2>&1
+    wait "$clipid" 2>/dev/null
+    bless_drained || { echo "  FAIL: blessing did not drain after revoke"; fail=1; }
+    daemon_stop; return $fail
+}
+
+# --- scenario 20: bless inheritance + GC --------------------------------------
+scenario_bless_inherit_gc() {
+    echo "### scenario: bless inherit + GC (grandchild reads; carrier fully reaped after exit)"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = "read"
+policy = "deny"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # The blessed child spawns a GRANDCHILD to do the read — cgroup membership (hence
+    # the blessing) is inherited by the whole tree. The trailing sleep outlives a GC
+    # tick (500ms) so the daemon observes the carrier populated; without that, a fast
+    # exit would defer the reap to the 30s mint grace and stall this scenario.
+    cat > "$TMP/blessed-read.sh" <<EOF
+#!/bin/bash
+bash -c 'exec 3<"$SECRET"'
+rc=\$?
+sleep 1.2
+exit \$rc
+EOF
+    chmod 755 "$TMP/blessed-read.sh"
+    expect_allow "blessed grandchild reads the secret (inherited)" "$CORDON" bless --class ro -- "$TMP/blessed-read.sh" || fail=1
+    # After exit, the daemon must reap EVERYTHING: BLESSED entry + table row + cgroup
+    # dir. "list drains and the dir is gone" proves all three ("re-open denied" alone
+    # would hold regardless).
+    if bless_drained; then
+        echo "  OK: blessing fully reaped after exit (list empty, carrier dir gone)"
+    else
+        echo "  FAIL: blessing not reaped (list or carrier dir lingers)"
+        "$CORDON" bless list 2>&1 | sed 's/^/  cli| /'; bless_dirs | sed 's/^/  dir| /'
+        sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    daemon_stop; return $fail
+}
+
+# --- scenario 21: bless revoke (cgroup.kill; prompt death; drain) -------------
+scenario_bless_revoke() {
+    echo "### scenario: bless revoke (the blessed tree dies promptly; list + dirs drain)"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    "$CORDON" bless --class ro -- sleep 300 &
+    local clipid=$!
+    local id=""
+    bless_wait_populated >/dev/null && id="$(bless_first_id)"
+    [ -n "$id" ] || { echo "  FAIL: no populated blessing appeared"; sed 's/^/  daemon| /' "$LOG"; kill "$clipid" 2>/dev/null; daemon_stop; return 1; }
+    if "$CORDON" bless revoke "$id" 2>/dev/null | grep -q "revoked: $id"; then
+        echo "  OK: revoke accepted (id $id)"
+    else
+        echo "  FAIL: revoke errored"; "$CORDON" bless revoke "$id" 2>&1 | sed 's/^/  cli| /'; fail=1
+    fi
+    # cgroup.kill slays the tree → the CLI (waiting on the sleep) exits promptly.
+    local died=0
+    for _ in $(seq 1 30); do kill -0 "$clipid" 2>/dev/null || { died=1; break; }; sleep 0.1; done
+    if [ "$died" -eq 1 ]; then
+        echo "  OK: the blessed sleep died promptly after revoke"
+    else
+        echo "  FAIL: the blessed sleep survived revoke"; kill "$clipid" 2>/dev/null; fail=1
+    fi
+    wait "$clipid" 2>/dev/null
+    if bless_drained; then
+        echo "  OK: list + carrier dirs drained after revoke"
+    else
+        echo "  FAIL: blessing lingered after revoke"; "$CORDON" bless list 2>&1 | sed 's/^/  cli| /'; fail=1
+    fi
+    daemon_stop; return $fail
+}
+
+# --- scenario 22: bless journal (blessing=<name> on the audit line) -----------
+scenario_bless_journal() {
+    echo "### scenario: bless journal (a blessed read logs blessing=ro — bless is loud)"
+    ws_new
+    cgroup2_ready || { daemon_stop; return 0; }
+    write_policy <<EOF
+[group.subject.blessed-ro]
+blessing = "ro"
+
+[[rule]]
+who = "@blessed-ro"
+where = "$VAULT"
+action = "read"
+policy = "audit"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    expect_allow "blessed read under the audit rule" bless_read_as ro "$OWNER" "$SECRET" || fail=1
+    # The class is journaled by NAME, appended after the standard fields.
+    if wait_log 'audit .*blessing=ro'; then
+        echo "  OK: audit line carries blessing=ro"
+    else
+        echo "  FAIL: no audit line with blessing=ro"; sed 's/^/  daemon| /' "$LOG"; fail=1
+    fi
+    daemon_stop; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -776,6 +1044,11 @@ scenario_user_tier         || rc=1
 scenario_user_home_tilde   || rc=1
 scenario_policy_edit_leak  || rc=1
 scenario_policy_edit_chown || rc=1
+scenario_bless_scope       || rc=1
+scenario_bless_boundary    || rc=1
+scenario_bless_inherit_gc  || rc=1
+scenario_bless_revoke      || rc=1
+scenario_bless_journal     || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then
