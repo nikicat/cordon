@@ -150,10 +150,21 @@ smoke scenarios green):**
   editor child; the crate's `unsafe` is the two `pre_exec` registrations — the editor drop and
   the bless carrier join). The editor runs with the **invoking user's** own `$HOME`/`$USER`
   (not root's, which `sudo` leaves as `/root` — else e.g. nvim can't write its state).
-  *Authorization is partly open:* the socket now gates **bless mint/revoke** on `SO_PEERCRED`
-  uid 0 (the first real socket authorization here), but `apply`/`show`/`status` remain
-  ungated — whoever can reach the socket can `apply`. `edit` inherits root via `sudo` for now,
-  with the rest deferred to a later CLI-authorization pass.
+  Authorization now rests on the socket gate below rather than on `sudo` alone.
+
+- **(9) Socket authorization — ✅ done (B2).** Every control-socket **write**
+  (`PolicyApply`, `BlessMint`, `BlessRevoke`) requires peer uid 0 via `SO_PEERCRED`; every
+  **read** (`Status`, `PolicyShow`, `BlessList`) is open. `authorize()` is a pure table with
+  an **exhaustive** match, so a new verb can't be added without picking a side. With the gate
+  in the daemon, the socket is `chmod 0666` right after `bind` — `connect(2)` needs *write*,
+  so a `root:root` socket had made every verb root-only in practice and left `PolicyApply`
+  protected by nothing but that accident. Net effect is **tighter**: what used to be "whoever
+  can reach the socket can apply" is now root-only, and reads became usable unprivileged.
+  Client-side, `SocketPath::{Configured,Default}` carries the path's provenance so a *default*
+  per-user socket with nothing listening falls back to `/run/cordon.sock` (an unprivileged
+  `cordon` finds the system daemon) while an explicitly configured path is never redirected.
+  Multi-user deployments that must not disclose protected paths want `0660` + a `cordon`
+  group instead — same table, narrower reach (DESIGN §15.8). VM scenario 24.
 
 - **(8) System / user policy tiers — ✅ done (2026-06-29).** The effective policy is now
   **system ⊕ user tier** (DESIGN §15.8). A system fragment pulls in a user-tier file via an
@@ -202,7 +213,7 @@ daemon GCs the carrier when the tree drains (`cgroup.events populated 0`, with a
 grace), `bless revoke <id>` kills it via `cgroup.kill`, and startup reconciles leftovers.
 Every apply **remaps live entries by class name** (`ClassId`s renumber on recompile — without
 this a live blessing would silently change meaning). Blessed decisions journal
-`blessing=<name>`. Validated by 6 VM smoke scenarios (18–23 of 23): scope, membership
+`blessing=<name>`. Validated by 6 VM smoke scenarios (18–23 of 24): scope, membership
 boundary, inheritance + full GC, revoke, journal, and the `sudo` drop (a non-root blessed
 child still reads — the join-before-drop property — with the invoker's supplementary
 groups and `$HOME`). Those scenarios run the daemon in a **nested cgroup**, reproducing
@@ -211,12 +222,11 @@ production's `Delegate=yes` service cgroup: neither systemd nor real sudo is nee
 kernel-level property `Delegate=yes` arranges (and the stricter one — the cgroup2 root is
 exempt from "no internal processes").
 
-**Known issues from the real-system run — all planned in
-[`docs/PLAN-bless3.md`](docs/PLAN-bless3.md) (B2), none VM-detectable:**
-- `cordon bless list` is unusable from a user account: the socket is `srwxr-xr-x root:root`
-  and `connect(2)` needs *write*, so every verb is root-only in practice and B1 decision #1
-  ("`BlessList` ungated") is inert. The fix gates `PolicyApply` on uid 0 and opens the
-  socket — tightening authorization, and closing the "no peer-cred check" caveat below.
+**Known issues from the real-system run — planned in
+[`docs/PLAN-bless3.md`](docs/PLAN-bless3.md) (B2):**
+- ~~`cordon bless list` is unusable from a user account~~ — **fixed** by refinement (9) above:
+  `PolicyApply` moved behind the uid-0 gate and the socket opened to `0666`, so the ungated
+  read verbs B1 decision #1 specced are finally reachable.
 - **The blessed shell has no logind session and no environment.** The carrier under
   `cordond.service` has no `session-N.scope` ancestor, so polkit refuses `run0`/`pkexec`;
   and `sudo`/`run0` scrub the environment while the CLI restores only

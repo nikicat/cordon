@@ -202,9 +202,10 @@ end-to-end, **scoped to the rule's object column** (no blanket).
 things the VM structurally cannot test (it has no unprivileged socket clients, no sudoedit
 ergonomics, no logind/polkit):
 
-- `cordon bless list` is unusable from a user account — the socket is `root:root` and
-  `connect(2)` needs *write*, so B1 decision #1 ("`BlessList` ungated") is inert. Fixed by
-  gating `PolicyApply` on uid 0 and opening the socket, which *tightens* authorization.
+- ~~`cordon bless list` is unusable from a user account~~ — **done**: the socket was
+  `root:root` and `connect(2)` needs *write*, so B1 decision #1 ("`BlessList` ungated") was
+  inert. Fixed by gating `PolicyApply` on uid 0 and opening the socket to `0666`, which
+  *tightens* authorization (DESIGN §15.8).
 - `policy edit` defaults to the system policy; the common case is your own user tier.
 - The blessed shell is barely usable: no logind session (so polkit refuses `run0`/`pkexec`)
   and a scrubbed environment (no `DISPLAY`, so GUI apps fail). Both because the blessed

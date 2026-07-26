@@ -831,10 +831,25 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
   binds to `NAME` (home-scope-validated). When **no** include exists yet, `--user` is
   self-bootstrapping: it opens the file at the convention path (`…/users/NAME.toml`) and, only
   **after** the edit validates and saves, registers the `[[include]]` in `…/conf.d/00-users.toml`
-  — so a cancelled or rejected edit never leaves a stale binding. *(Who may run it is still the
-  open authorization question: the socket gates only the §16 bless mint/revoke on `SO_PEERCRED`
-  uid 0 — `apply`/`show`/`status` remain ungated — so `edit` relies on inheriting root via
-  `sudo`. Extending the peer-cred gate to `apply` is deferred to a CLI-authorization pass.)*
+  — so a cancelled or rejected edit never leaves a stale binding. It reaches the daemon only
+  through `PolicyApply`, so it is covered by the socket authorization below.
+- **Socket authorization** (✅ B2). Every **write** on the control socket — `PolicyApply`,
+  `BlessMint`, `BlessRevoke` — requires the peer to be **root**, kernel-attested via
+  `SO_PEERCRED`; every **read** — `Status`, `PolicyShow`, `BlessList` — is open. The gate is a
+  pure `authorize(req, peer_uid)` table with an exhaustive match, so a new verb cannot be added
+  without choosing a side.
+
+  The socket is `0666`, and this is deliberate: `connect(2)` on a Unix socket needs *write*, so
+  a `root:root` socket made **every** verb root-only in practice — which is what made
+  `cordon bless list` unusable from a user account (§16). Opening it while moving `PolicyApply`
+  behind the uid gate is strictly *tighter* than the previous state, where "whoever can reach
+  the socket can apply" was literally true and DAC was the only thing standing in the way. The
+  file mode now decides who can *reach* the daemon; `authorize` decides what they may do.
+
+  **Deployment posture.** `0666` makes `PolicyShow` world-readable, which discloses protected
+  *paths* to any local account. On a single-user workstation that is the intent. A multi-user
+  host that must not disclose them wants `0660` + a `cordon` group instead (the group created
+  by packaging, members added deliberately) — same `authorize` table, narrower reach.
 - **Atomic swap** in-kernel — **implemented** as a generation-counter **double-buffer**:
   the rule maps are banked, the daemon fills the inactive bank and flips `active_bank` in
   one write (RCU-style), so an `apply` has no visible window.
@@ -1063,10 +1078,10 @@ it later without reshaping the IPC.
   runs at all. Same "zero cordon code, admin picks the method" property PAM-in-daemon was
   chosen for, minus a PAM dependency, conversation proxying, and stdio fd passing.
 - **The daemon gates on `SO_PEERCRED` uid 0.** `BlessMint` and `BlessRevoke` are refused
-  unless the peer is **root** — kernel-attested, never asserted by the client. This is the
-  first real socket authorization in the codebase; `BlessList` stays open (read-only, parity
-  with `PolicyShow`), and `PolicyApply` gating remains the open question (§15.8 / `STATUS.md`).
-  The same-uid scraper hitting the socket directly cannot mint.
+  unless the peer is **root** — kernel-attested, never asserted by the client. `BlessList`
+  stays open (read-only, parity with `PolicyShow`), and `PolicyApply` joined the root-gated
+  side in B2, which is what let the socket be opened to `0666` without loosening anything
+  (§15.8). The same-uid scraper hitting the socket directly cannot mint.
 - **Known deltas, accepted (the honest cost of the substitution):**
   - **The timestamp cache is a grace window.** §16.2 argues for *no* auth cache; sudo has one
     (~15 min by default), so a resident adversary who runs `cordon bless` inside that window

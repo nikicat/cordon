@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub backend: BackendKind,
-    pub socket: PathBuf,
+    pub socket: SocketPath,
     /// Reserved for autolearn (M4, DESIGN §15.9): the roots where learning may
     /// propose rules. Accepted but unused by M1 enforcement.
     pub zones: Vec<PathBuf>,
@@ -72,8 +72,8 @@ impl Config {
                 None => BackendKind::default(),
             },
             socket: match f.socket {
-                Some(s) => PathBuf::from(interpolate(&s)?),
-                None => default_socket(),
+                Some(s) => SocketPath::Configured(PathBuf::from(interpolate(&s)?)),
+                None => SocketPath::Default(default_socket()),
             },
             zones: match f.zones {
                 Some(list) => list
@@ -152,14 +152,66 @@ fn default_config_path() -> PathBuf {
     base.join("cordon/config.toml")
 }
 
+/// Where the **system** daemon listens — the one a packaged `cordond` binds and every
+/// unprivileged client ultimately falls back to.
+pub const SYSTEM_SOCKET: &str = "/run/cordon.sock";
+
 fn default_socket() -> PathBuf {
     if is_root() {
-        return PathBuf::from("/run/cordon.sock");
+        return PathBuf::from(SYSTEM_SOCKET);
     }
     if let Some(rt) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(rt).join("cordon.sock");
     }
     env::temp_dir().join(format!("cordon-{}.sock", euid()))
+}
+
+/// The daemon socket path *and where it came from*. The provenance is load-bearing on
+/// the client side, so it travels with the path rather than beside it: a built-in default
+/// that nothing is listening on means "no per-user daemon — talk to the system one",
+/// while a path the operator wrote down is used verbatim, so a typo is reported as
+/// written instead of silently redirected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketPath {
+    /// An explicit `socket =` in the config file, or a `--socket` flag.
+    Configured(PathBuf),
+    /// The built-in per-euid default ([`default_socket`]).
+    Default(PathBuf),
+}
+
+impl SocketPath {
+    /// The path itself — what the daemon binds.
+    pub fn path(&self) -> &Path {
+        match self {
+            SocketPath::Configured(p) | SocketPath::Default(p) => p,
+        }
+    }
+
+    /// The socket a **client** should talk to.
+    ///
+    /// [`default_socket`] resolves by euid, so an unprivileged `cordon` would otherwise
+    /// look for a *per-user* daemon that almost never exists and never find the system
+    /// one — which is what made `cordon bless list` unusable from a user account. A
+    /// default with nothing listening therefore falls back to [`SYSTEM_SOCKET`];
+    /// a configured path never does.
+    pub fn for_client(self, exists: impl Fn(&Path) -> bool) -> PathBuf {
+        match self {
+            SocketPath::Configured(p) => p,
+            // Root's default already *is* the system socket, and it is legitimately
+            // absent while the daemon is down — the connect error names it, which is the
+            // diagnostic we want.
+            SocketPath::Default(p) if p == Path::new(SYSTEM_SOCKET) || exists(&p) => p,
+            SocketPath::Default(_) => PathBuf::from(SYSTEM_SOCKET),
+        }
+    }
+}
+
+impl From<SocketPath> for PathBuf {
+    fn from(s: SocketPath) -> PathBuf {
+        match s {
+            SocketPath::Configured(p) | SocketPath::Default(p) => p,
+        }
+    }
 }
 
 /// Default eBPF object location: where production packaging installs it. In dev,
@@ -216,5 +268,28 @@ mod tests {
     fn missing_file_yields_defaults() {
         let cfg = Config::load(Some(Path::new("/nonexistent/cordon/config.toml"))).unwrap();
         assert_eq!(cfg.backend, BackendKind::BpfLsm);
+        assert!(matches!(cfg.socket, SocketPath::Default(_)));
+    }
+
+    #[test]
+    fn client_socket_falls_back_to_the_system_daemon() {
+        let user = PathBuf::from("/run/user/1000/cordon.sock");
+        let system = PathBuf::from(SYSTEM_SOCKET);
+        let missing = |_: &Path| false;
+        let present = |_: &Path| true;
+
+        // The per-user default with no daemon there ⇒ the system daemon.
+        let d = SocketPath::Default(user.clone());
+        assert_eq!(d.for_client(missing), system);
+        // …but a per-user daemon that *is* listening wins.
+        let d = SocketPath::Default(user.clone());
+        assert_eq!(d.for_client(present), user);
+        // An explicit `socket =` is never redirected, even when absent — a
+        // misconfigured path must be reported as written.
+        let c = SocketPath::Configured(user.clone());
+        assert_eq!(c.for_client(missing), user);
+        // Root's default is already the system socket: no existence check needed.
+        let d = SocketPath::Default(system.clone());
+        assert_eq!(d.for_client(missing), system);
     }
 }

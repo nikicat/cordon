@@ -87,6 +87,12 @@
 #                       STILL read the secret — true only if the carrier join preceded the
 #                       drop. Also: the invoker's supplementary groups survive
 #                       (getgrouplist) and $HOME is theirs, not root's.
+#  24. socket authz    — the socket is 0666 so any local user can connect(2) (which needs
+#                       *write* — without it even the ungated reads were root-only, which is
+#                       what made `bless list` unusable from a user account). The boundary is
+#                       the daemon's peer-uid gate, not the file mode: an unprivileged uid
+#                       reads (status / policy show / bless list) but is REFUSED on
+#                       `policy apply`.
 #
 # The bless scenarios run the daemon in a NESTED cgroup, reproducing production's
 # `Delegate=yes` service cgroup without needing systemd (the carrier root is then a
@@ -1155,6 +1161,54 @@ EOF
     daemon_stop; bless_drop_cleanup; return $fail
 }
 
+# --- scenario 24: socket authorization (reads open, writes root-only) --------
+# The socket is 0666 so any local user can `connect(2)` — which needs *write*, and without
+# it even the ungated read verbs were root-only in practice, making `cordon bless list`
+# unusable from a user account. The file mode therefore carries NO security weight: the
+# boundary is the daemon's `authorize()` peer-uid gate. This asserts both halves at once —
+# an unprivileged uid can read (status / policy show / bless list) and CANNOT apply.
+scenario_socket_authz() {
+    echo "### scenario: socket authorization — unprivileged reads work, apply is refused"
+    ws_new
+    if ! command -v setpriv >/dev/null; then
+        echo "  SKIP: setpriv unavailable — cannot run the CLI as a non-root uid"; daemon_stop; return 0
+    fi
+    local uid=4246
+    chmod 755 "$TMP"   # let $uid traverse to the socket, config and policy
+    write_policy <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "deny"
+EOF
+    daemon_start
+    started || return 1
+    local fail=0
+    # `cordon` as an ordinary user, with the workspace config it can read.
+    as_uid() { setpriv --reuid "$uid" --regid "$uid" --clear-groups "$CORDON" "$@"; }
+
+    local mode; mode="$(stat -c %a "$SOCK")"
+    if [ "$mode" = 666 ]; then
+        echo "  OK: the socket is 0666 (connectable by any local user)"
+    else
+        echo "  FAIL: socket mode is $mode, expected 666 — unprivileged connect(2) needs write"; fail=1
+    fi
+    expect_allow "unprivileged status"      as_uid status      || fail=1
+    expect_allow "unprivileged policy show" as_uid policy show || fail=1
+    expect_allow "unprivileged bless list"  as_uid bless list  || fail=1
+    # The write. It must fail *in the daemon*, naming root — not fail to connect, and not
+    # succeed: before this gate existed, "whoever can reach the socket can apply" was true.
+    local out; out="$(as_uid policy apply 2>&1)"
+    if [ -n "$out" ] && ! as_uid policy apply >/dev/null 2>&1 && printf '%s' "$out" | grep -q "requires root"; then
+        echo "  OK: unprivileged policy apply refused by the daemon (peer uid gate)"
+    else
+        echo "  FAIL: unprivileged policy apply was not refused with a root message: ${out:-<no output>}"; fail=1
+    fi
+    daemon_stop
+    return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -1180,6 +1234,7 @@ scenario_bless_inherit_gc  || rc=1
 scenario_bless_revoke      || rc=1
 scenario_bless_journal     || rc=1
 scenario_bless_drop_to_invoker || rc=1
+scenario_socket_authz      || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

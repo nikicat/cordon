@@ -17,6 +17,11 @@ pub mod proto;
 
 pub use backend::BackendKind;
 pub use config::Config;
+/// Re-exported so a `user` identity has ONE type across the tree — the kernel's audit
+/// record ([`passwd`]), the socket's `SO_PEERCRED` peer, and any future caller identity —
+/// without every consumer depending on `cordon-bpf-common` directly (the daemon pulls
+/// that in only behind its `bpf-lsm` feature).
+pub use cordon_bpf_common::Uid;
 
 /// Errors surfaced by the policy core.
 #[derive(Debug, thiserror::Error)]

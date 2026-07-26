@@ -14,6 +14,7 @@ mod proc;
 
 use clap::Parser;
 use cordon_core::backend::{BackendKind, ControlSender, Shutdown, control};
+use cordon_core::config::SocketPath;
 use cordon_core::{Config, config};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -81,7 +82,7 @@ fn init_tracing() {
 fn run(args: Args) -> cordon_core::Result<()> {
     let mut cfg = Config::load(args.config.as_deref())?;
     if let Some(s) = args.socket {
-        cfg.socket = s;
+        cfg.socket = SocketPath::Configured(s);
     }
     if let Some(b) = args.backend {
         cfg.backend = b.parse()?;
@@ -93,7 +94,7 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let backend = backend::select(&cfg)?;
     info!(
         backend = backend.name(),
-        socket = %cfg.socket.display(),
+        socket = %cfg.socket.path().display(),
         policy = %cfg.policy.display(),
         privilege = if config::is_root() { "root" } else { "user (NOT a boundary)" },
         "cordond started",
@@ -115,7 +116,7 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let ctx = Arc::new(Ctx {
         control: control_sender,
         backend: cfg.backend,
-        socket: cfg.socket,
+        socket: cfg.socket.into(),
         policy: cfg.policy,
     });
 

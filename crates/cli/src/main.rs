@@ -330,12 +330,16 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `--socket` wins; otherwise the socket from the config file (or its default).
+/// `--socket` wins; otherwise the socket from the config file, or — when that is only
+/// the per-euid default and nothing is listening there — the system daemon's, so an
+/// unprivileged `cordon` finds `cordond` (`SocketPath::for_client`).
 fn resolve_socket(cli: &Cli) -> Result<PathBuf> {
     if let Some(s) = cli.socket.clone() {
         return Ok(s);
     }
-    Ok(Config::load(cli.config.as_deref())?.socket)
+    Ok(Config::load(cli.config.as_deref())?
+        .socket
+        .for_client(|p| p.exists()))
 }
 
 fn round_trip(socket: &Path, req: &Request) -> Result<Response> {

@@ -25,10 +25,11 @@ pub struct Ino(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Pid(pub u32);
 
-/// The caller's **real** user id, captured in-kernel from
-/// `bpf_get_current_uid_gid()` (its low 32 bits) and carried in [`crate::DecisionEvent`]
-/// so the daemon can name the user on the audit line and collapse a path under that
-/// user's home to `~`. `u32` to match the kernel/passwd width. `Ord` so a uid can be
+/// A **real** user id — always kernel-attested, never client-asserted. Two capture
+/// sites, one type: the eBPF program reads `bpf_get_current_uid_gid()` (low 32 bits) into
+/// [`crate::DecisionEvent`], so the daemon can name the user on the audit line and
+/// collapse a path under that user's home to `~`; the IPC server reads `SO_PEERCRED` to
+/// authorize a request. `u32` to match the kernel/passwd width. `Ord` so a uid can be
 /// range-checked against the regular-account window (`cordon_core`'s `REGULAR_UID_RANGE`).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

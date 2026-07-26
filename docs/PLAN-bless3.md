@@ -41,7 +41,7 @@ gold-plating.
 
 **Before each commit: stop, present the diff summary, wait for explicit review + approval.**
 Every commit: compiles, `just test` green (cargo test + clippy `-D warnings` + fmt), the
-existing 23 smoke scenarios stay green. VM runs via `packaging/test/run-bpf-lsm-vm.sh`
+existing smoke scenarios stay green. VM runs via `packaging/test/run-bpf-lsm-vm.sh`
 (CI-pinned v6.12 by default).
 
 Part A (commits 1–2) is independent and mechanical. Part B (the spawn rework) opens with a
@@ -51,31 +51,33 @@ Part A (commits 1–2) is independent and mechanical. Part B (the spawn rework) 
 
 ## Part A — small, independent
 
-### Commit 1 — `fix(ipc): gate policy apply on root, open the socket to unprivileged readers`
+### Commit 1 — `fix(ipc): gate policy apply on root, open the socket to unprivileged readers` ✅ *done*
 
-The fix that *tightens* security rather than trading it away. Today `PolicyApply` is
-protected **only** by socket DAC — the handler is ungated, so "whoever can reach the socket
-can apply" is literally true. Move that protection into `authorize()` and the socket mode
-stops carrying security weight:
+The fix that *tightens* security rather than trading it away. Before this, `PolicyApply` was
+protected **only** by socket DAC — the handler was ungated, so "whoever can reach the socket
+can apply" was literally true. Moving that protection into `authorize()` is what lets the
+socket mode stop carrying security weight:
 
 - `crates/daemon/src/ipc.rs`: `authorize()` requires uid 0 for `PolicyApply` as well as
-  `BlessMint`/`BlessRevoke`. Reads (`Status`, `PolicyShow`, `BlessList`) stay open. Extend
-  the existing `authorize` table test.
+  `BlessMint`/`BlessRevoke`. Reads (`Status`, `PolicyShow`, `BlessList`) stay open. The match
+  is **exhaustive** (no `_` arm), so a new verb must choose a side. Table test extended.
 - `crates/daemon/src/ipc.rs`: `chmod` the socket to **0666** right after `bind` (before the
-  accept loop), so any local user can connect. Writes are root-gated in `authorize`; reads
-  are deliberately world-readable.
-- `crates/cli/src/main.rs` / `crates/core/src/config.rs`: when no explicit `--socket`/config
-  socket is set and the per-user default does not exist, fall back to `/run/cordon.sock` —
-  so an unprivileged `cordon bless list` finds the system daemon. Pure function +
-  unit test (`resolve socket: explicit > config > user default if present > system`).
-- Closes the "the socket has no peer-cred check yet" caveat carried in `STATUS.md` and
-  DESIGN §15.8 — update both.
+  accept loop), so any local user can connect. Widening after `bind` has no window: until
+  then the mode is `0777 & ~umask`, which is narrower.
+- `crates/core/src/config.rs` / `crates/cli/src/main.rs`: `Config.socket` became
+  **`SocketPath::{Configured, Default}`** — the provenance travels *with* the path instead of
+  in a parallel bool, because it changes what the value means. `SocketPath::for_client`
+  falls back to `/run/cordon.sock` when a *default* per-user socket has nothing listening (so
+  an unprivileged `cordon bless list` finds the system daemon) and never redirects a
+  configured path (a typo must be reported as written). Pure, table-tested.
+- Closed the "the socket has no peer-cred check yet" caveat in `STATUS.md` and DESIGN §15.8.
+- VM: smoke **scenario 24** — as a non-root uid, `status`/`policy show`/`bless list` succeed
+  and `policy apply` is refused naming root; the socket is asserted `0666`.
 
-**Open decision (needs your call):** 0666 makes `PolicyShow` world-readable, which discloses
-protected *paths* to any local user. On a single-user workstation that matches B1 decision
-#1's intent; on a multi-user host it leaks. The alternative is 0660 with a `cordon` group,
-which needs group management in packaging. Recommendation: **0666 now**, note the group
-option in DESIGN as the multi-user deployment posture.
+**Decision (settled): 0666.** It makes `PolicyShow` world-readable, which discloses protected
+*paths* to any local account — the intent on a single-user workstation, per B1 decision #1.
+DESIGN §15.8 records `0660` + a `cordon` group as the multi-user deployment posture (same
+`authorize` table, narrower reach); it is not built.
 
 ### Commit 2 — `feat(cli): `policy edit` defaults to the invoker's user tier`
 
@@ -274,7 +276,7 @@ uid gate is the boundary), §16.6 (new lifecycle); PLAN-bless B2 marked done; `S
 
 | # | Decision | Choice |
 |---|---|---|
-| 1 | Socket mode | 0666, with `PolicyApply` moved behind the uid-0 gate (recommend; 0660+group is the multi-user alternative) |
+| 1 | Socket mode | **0666**, with `PolicyApply` moved behind the uid-0 gate (0660+group is the documented multi-user alternative) — ✅ shipped |
 | 2 | `policy edit` default | The invoker's tier; `--system` for the system policy; error if there is no invoker |
 | 3 | Join mechanism | `SCM_RIGHTS` fd from the daemon; the CLI never needs root |
 | 4 | Elevation | Client-side `$CORDON_SUDO` (default `sudo`); security is the daemon's uid-0 check, never the client's choice |
@@ -282,6 +284,7 @@ uid gate is the boundary), §16.6 (new lifecycle); PLAN-bless B2 marked done; `S
 | 6 | Env/cwd/tty | Inherited by construction (never re-parented) — nothing is shipped or restored |
 | 7 | Rendezvous | **The daemon itself**: request (uid 1000) → nonce → approve (uid 0) → fd back on the requester's connection. No rendezvous socket |
 | 8 | Session source | The **unprivileged** peer's `SO_PEERCRED` pid — never a client-asserted pid, which would let a caller target another user's session |
+| 9 | Revoke gate | Once mint is unprivileged (commit 4), `BlessRevoke` accepts uid 0 **or the uid that requested the blessing** — otherwise a user who just blessed unprivileged would need sudo to revoke it. The daemon already holds the requester's peer uid for the session lookup; record it on the `Blessing` row |
 
 ## Verification
 

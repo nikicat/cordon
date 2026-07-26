@@ -7,17 +7,19 @@
 //! path is in-kernel — none of this is on it.
 //!
 //! ## Authorization
-//! Mint and revoke are gated on the peer's kernel-attested uid (`SO_PEERCRED`) being
-//! **root** — sudo is the B1 authenticator, and the same-uid scraper must not be able
-//! to mint itself a blessing. Everything else stays open (socket permissions are the
-//! only other gate today; `PolicyApply` peer-cred gating is tracked in STATUS).
+//! Every **write** — `PolicyApply`, `BlessMint`, `BlessRevoke` — is gated on the peer's
+//! kernel-attested uid (`SO_PEERCRED`) being **root**; reads (`Status`, `PolicyShow`,
+//! `BlessList`) are open. The socket itself is `0666`, so the file mode carries no
+//! security weight: it decides who can *reach* the daemon, `authorize()` decides what
+//! they may do. (A multi-user host that must not disclose protected paths to every local
+//! account wants `0660` + a `cordon` group instead — DESIGN §15.8.)
 
 use crate::Ctx;
 use cordon_core::backend::{ApplyRequest, BlessOp, ControlMsg};
 use cordon_core::proto::{Request, Response, StatusInfo, read_msg, write_msg};
-use cordon_core::{Error, Result};
+use cordon_core::{Error, Result, Uid};
 use std::io::{BufReader, BufWriter};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -27,6 +29,10 @@ use tracing::{error, warn};
 /// How long a request waits for the backend thread's reply (compile + seed for an
 /// apply; a map write + mkdir for a bless op) before giving up.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The only uid `authorize` privileges. Named so the gate reads as intent rather than as
+/// a bare zero.
+const ROOT: Uid = Uid(0);
 
 impl Ctx {
     /// Bind the socket and accept connections forever, one handler thread each.
@@ -45,6 +51,12 @@ impl Ctx {
         }
 
         let listener = UnixListener::bind(&socket)?;
+        // Open the socket to every local user: `connect(2)` needs *write*, so without
+        // this even the ungated read verbs are root-only in practice. Authorization is
+        // `authorize()`'s job (uid 0 for every write), never the file mode. Widening
+        // after `bind` is safe: until this lands the mode is `0777 & ~umask`, which is
+        // narrower, so there is no window where the socket is more open than intended.
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))?;
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
@@ -159,36 +171,46 @@ impl Ctx {
     }
 }
 
-/// The pure authorization gate, applied to every request before dispatch: minting and
-/// revoking blessings require the peer to be **root** (kernel-attested via
-/// `SO_PEERCRED`) — sudo's PAM stack is the human-presence authenticator (DESIGN
-/// §16.5), and a same-uid scraper must not mint itself access. `BlessList` is
-/// read-only and stays open, like `PolicyShow`.
-fn authorize(req: &Request, peer_uid: u32) -> Result<()> {
+/// The pure authorization gate, applied to every request before dispatch. Every write
+/// requires the peer to be **root**, kernel-attested via `SO_PEERCRED`; reads are open.
+/// The match is deliberately **exhaustive** (no `_` arm) so a new verb cannot be added
+/// without choosing a side.
+fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
+    if peer_uid == ROOT {
+        return Ok(());
+    }
     match req {
-        Request::BlessMint { .. } | Request::BlessRevoke { .. } if peer_uid != 0 => Err(
-            Error::msg("blessing requires root — invoke via `sudo cordon bless`"),
-        ),
-        _ => Ok(()),
+        // Sudo's PAM stack is the human-presence authenticator (DESIGN §16.5), and a
+        // same-uid scraper must not mint itself access.
+        Request::BlessMint { .. } | Request::BlessRevoke { .. } => Err(Error::msg(
+            "blessing requires root — invoke via `sudo cordon bless`",
+        )),
+        // The policy is root-owned; this gate is what lets the socket be world-
+        // connectable without handing everyone the boundary.
+        Request::PolicyApply { .. } => Err(Error::msg(
+            "applying policy requires root — invoke via `sudo cordon policy apply`",
+        )),
+        // Reads stay open, the parity `BlessList` was specced with (B1 decision #1).
+        Request::Status | Request::PolicyShow | Request::BlessList => Ok(()),
     }
 }
 
 /// The peer's kernel-attested uid, via `SO_PEERCRED` (std's `peer_cred()` is still
 /// unstable).
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> Result<u32> {
+fn peer_uid(stream: &UnixStream) -> Result<Uid> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     let creds =
         getsockopt(stream, PeerCredentials).map_err(|e| Error::msg(format!("SO_PEERCRED: {e}")))?;
-    Ok(creds.uid())
+    Ok(Uid(creds.uid()))
 }
 
 /// No `SO_PEERCRED` off Linux: report an impossible-to-authorize uid so the root-gated
 /// ops are refused (the enforcement backend is Linux-only anyway; this keeps the
 /// non-Linux build compiling, per the Cargo feature notes).
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> Result<u32> {
-    Ok(u32::MAX)
+fn peer_uid(_stream: &UnixStream) -> Result<Uid> {
+    Ok(Uid(u32::MAX))
 }
 
 #[cfg(test)]
@@ -196,30 +218,27 @@ mod tests {
     use super::*;
     use cordon_core::proto::BlessId;
 
-    /// The authorization table: mint/revoke are root-only; reads and applies pass any
-    /// uid (socket permissions are their only gate today — see STATUS).
+    /// The authorization table: every write is root-only, every read is open — which is
+    /// what lets the socket be `0666` without the mode carrying security weight.
     #[test]
-    fn authorize_gates_mint_and_revoke_on_root() {
-        let mint = Request::BlessMint { class: None };
-        let revoke = Request::BlessRevoke { id: BlessId(1) };
-        // Root mints and revokes.
-        assert!(authorize(&mint, 0).is_ok());
-        assert!(authorize(&revoke, 0).is_ok());
-        // Anyone else does not — including the same-uid scraper.
-        assert!(authorize(&mint, 1000).is_err());
-        assert!(authorize(&revoke, 1000).is_err());
-        assert!(authorize(&mint, u32::MAX).is_err());
-        // Reads and applies stay open regardless of uid.
+    fn authorize_gates_writes_on_root() {
         for req in [
-            Request::Status,
-            Request::PolicyShow,
-            Request::BlessList,
+            Request::BlessMint { class: None },
+            Request::BlessRevoke { id: BlessId(1) },
             Request::PolicyApply {
                 sources: Vec::new(),
             },
         ] {
-            assert!(authorize(&req, 0).is_ok());
-            assert!(authorize(&req, 1000).is_ok());
+            assert!(authorize(&req, ROOT).is_ok());
+            // Anyone else does not — including the same-uid scraper reaching the socket
+            // directly, now that it is world-connectable.
+            assert!(authorize(&req, Uid(1000)).is_err());
+            assert!(authorize(&req, Uid(u32::MAX)).is_err());
+        }
+        // Reads stay open regardless of uid.
+        for req in [Request::Status, Request::PolicyShow, Request::BlessList] {
+            assert!(authorize(&req, ROOT).is_ok());
+            assert!(authorize(&req, Uid(1000)).is_ok());
         }
     }
 }
