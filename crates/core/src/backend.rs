@@ -8,8 +8,8 @@
 //! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
 //! backends were retired with the rule-model migration (DESIGN §15).
 
-use crate::policy::{Diagnostic, PolicySource};
-use crate::proto::PolicyView;
+use crate::policy::{ClassName, Diagnostic, PolicySource};
+use crate::proto::{BlessId, BlessingView, PolicyView};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -83,33 +83,64 @@ impl Shutdown {
     }
 }
 
-/// The control-plane handle the daemon hands the backend thread: a channel of
-/// `cordon policy apply` requests to honor, and a slot to publish the effective
-/// policy into for `cordon policy show`. The IPC side holds the matching
-/// [`ControlSender`].
+/// The control-plane handle the daemon hands the backend thread: **one** channel of
+/// control messages (`policy apply` + bless ops) to honor, and a slot to publish the
+/// effective policy into for `cordon policy show`. One channel, not two, on purpose:
+/// an apply renumbers `ClassId`s and remaps the live blessings, so strict ordering
+/// between applies and bless ops is what keeps a mint from racing the remap. The IPC
+/// side holds the matching [`ControlSender`].
 pub struct PolicyControl {
-    pub apply_rx: Receiver<ApplyRequest>,
+    pub msg_rx: Receiver<ControlMsg>,
     pub current: Arc<Mutex<Option<PolicyView>>>,
 }
 
-/// The IPC side of [`PolicyControl`]: send applies, read the current policy.
+/// The IPC side of [`PolicyControl`]: send control messages, read the current policy.
 #[derive(Clone)]
 pub struct ControlSender {
-    pub apply_tx: Sender<ApplyRequest>,
+    pub msg_tx: Sender<ControlMsg>,
     pub current: Arc<Mutex<Option<PolicyView>>>,
 }
 
 /// Create a connected [`PolicyControl`] / [`ControlSender`] pair.
 pub fn control() -> (PolicyControl, ControlSender) {
-    let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel();
     let current = Arc::new(Mutex::new(None));
     (
         PolicyControl {
-            apply_rx,
+            msg_rx,
             current: Arc::clone(&current),
         },
-        ControlSender { apply_tx, current },
+        ControlSender { msg_tx, current },
     )
+}
+
+/// One control-plane message to the backend thread (which owns the BPF maps — every
+/// map write funnels through this single channel, preserving the single-writer
+/// discipline).
+pub enum ControlMsg {
+    Apply(ApplyRequest),
+    Bless(BlessOp),
+}
+
+/// A blessing operation (DESIGN §16). Replies are `Result<_, String>`: the failure is
+/// only ever shown to the human on the CLI end, and `String` keeps the backend's
+/// error types out of the seam.
+pub enum BlessOp {
+    /// Mint a blessing: create + register a carrier cgroup for `class` (`None` → the
+    /// sole declared class).
+    Mint {
+        class: Option<ClassName>,
+        reply: Sender<std::result::Result<BlessingView, String>>,
+    },
+    /// Snapshot the live blessings.
+    List {
+        reply: Sender<std::result::Result<Vec<BlessingView>, String>>,
+    },
+    /// Kill a blessing's carrier and unregister it.
+    Revoke {
+        id: BlessId,
+        reply: Sender<std::result::Result<(), String>>,
+    },
 }
 
 /// One `policy apply`: the policy fragments to compile + a one-shot reply channel for

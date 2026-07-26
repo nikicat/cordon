@@ -24,6 +24,7 @@
 //! double-buffer swap** ([`seed`]).
 //! Fail-safe **pinning** (enforcement surviving daemon death) is the next increment.
 
+mod bless;
 mod events;
 mod seed;
 
@@ -128,17 +129,15 @@ impl Backend for BpfLsmBackend {
             "bpf-lsm active on the file_open hook (self-test passed)",
         );
 
-        // Drain the ring buffer + honor `policy apply` requests until shutdown. The
-        // object→path and class-id→name maps let the journal name the protected object
-        // (`object=~/.aws`) and a blessed caller's class (`blessing=ro`) instead of raw
-        // ids; the apply path refreshes both on each re-seed.
-        events::serve(
-            &mut ebpf,
-            &control,
-            &shutdown,
-            object_paths(&compiled),
-            class_names(&compiled),
-        )
+        // The per-run state beside the Ebpf handle (journal naming maps, class
+        // registry, blessings table), then adopt any carrier cgroups a previous
+        // daemon run left behind (its map entries died with it).
+        let mut runtime = events::Runtime::new(&compiled);
+        runtime.blessings.reconcile(&mut ebpf, &runtime.registry);
+
+        // Drain the ring buffer + honor control requests (applies, bless ops) until
+        // shutdown; the apply path refreshes the runtime's maps on each re-seed.
+        events::serve(&mut ebpf, &control, &shutdown, runtime)
     }
 }
 
@@ -208,6 +207,13 @@ pub(super) fn class_names(c: &CompiledPolicy) -> HashMap<ClassId, ClassName> {
         .iter()
         .map(|(name, id)| (*id, name.clone()))
         .collect()
+}
+
+/// The compile's blessing-class registry (`name → ClassId`) — what `cordon bless`
+/// resolves `--class` against and what an apply remaps live blessings with. A
+/// `BTreeMap` so error messages list the classes in stable (name) order.
+pub(super) fn class_registry(c: &CompiledPolicy) -> std::collections::BTreeMap<ClassName, ClassId> {
+    c.blessing_classes.iter().cloned().collect()
 }
 
 /// Where `~` in the (system-wide, root-owned) policy expands to. M1 uses the daemon's

@@ -10,7 +10,7 @@ mod sys;
 
 use clap::{Parser, Subcommand};
 use cordon_core::policy::UserName;
-use cordon_core::proto::{Request, Response, read_msg, write_msg};
+use cordon_core::proto::{Pid, Request, Response, read_msg, write_msg};
 use cordon_core::{Config, Error, Result, policy};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -260,6 +260,31 @@ fn render(resp: &Response) {
             }
         }
         Response::PolicyView(None) => println!("(no policy loaded)"),
+        Response::BlessMinted(b) => {
+            println!(
+                "blessed: id={} class={} cgroup={}",
+                b.id,
+                b.class,
+                b.cgroup.display()
+            );
+        }
+        Response::Blessings(list) => {
+            if list.is_empty() {
+                println!("(no live blessings)");
+            }
+            for b in list {
+                let pids: Vec<String> = b.pids.iter().map(Pid::to_string).collect();
+                println!(
+                    "  {} class={} age={}s pids=[{}] cgroup={}",
+                    b.id,
+                    b.class,
+                    b.age.as_secs(),
+                    pids.join(","),
+                    b.cgroup.display(),
+                );
+            }
+        }
+        Response::BlessRevoked { id } => println!("revoked: {id}"),
         Response::Error { message } => eprintln!("cordon: error: {message}"),
     }
 }

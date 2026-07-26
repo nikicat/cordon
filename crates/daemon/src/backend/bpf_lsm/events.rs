@@ -10,6 +10,7 @@
 //! identical log lines. Both layers together turn the audit's ~hundreds-of-opens floods
 //! into a line.
 
+use super::bless::Blessings;
 use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
@@ -17,12 +18,12 @@ use cordon_bpf_common::{
     Action, ClassId, Decision, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp,
     Pid, Policy, SuppressedTotal, Uid,
 };
-use cordon_core::backend::{ApplyOutcome, PolicyControl, Shutdown};
+use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
-use cordon_core::policy::{ClassName, PolicySource, UserName};
+use cordon_core::policy::{ClassName, CompiledPolicy, PolicySource, UserName};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -31,19 +32,53 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// Poll wakeup cadence so the reader re-checks shutdown + the apply channel.
+/// Poll wakeup cadence so the reader re-checks shutdown + the control channel (and
+/// ticks the blessing GC).
 const POLL_TIMEOUT_MS: u16 = 500;
 
-/// Drain the ring buffer into the journal and honor `policy apply` requests until
-/// shutdown. The ring poll's timeout doubles as the apply-channel tick: each wakeup
-/// (event or `POLL_TIMEOUT_MS`) we also service any pending apply, so a `cordon policy
-/// apply` lands within one poll interval.
+/// The backend thread's per-run state beside the `Ebpf` handle: the journal's naming
+/// maps, the class registry (for mint/remap), and the live blessings table. One
+/// bundle, one owner — every mutation happens on this thread.
+pub(super) struct Runtime {
+    /// `inode → path` for naming protected objects in the journal.
+    pub object_paths: HashMap<FileId, PathBuf>,
+    /// `ClassId → name` for naming a blessed caller's class in the journal.
+    pub class_names: HashMap<ClassId, ClassName>,
+    /// `name → ClassId` — the compile's blessing-class registry; what mints resolve
+    /// against and what an apply remaps live blessings with.
+    pub registry: BTreeMap<ClassName, ClassId>,
+    pub blessings: Blessings,
+}
+
+impl Runtime {
+    pub(super) fn new(compiled: &CompiledPolicy) -> Runtime {
+        Runtime {
+            object_paths: super::object_paths(compiled),
+            class_names: super::class_names(compiled),
+            registry: super::class_registry(compiled),
+            blessings: Blessings::new(),
+        }
+    }
+
+    /// Refresh the compile-derived maps after a successful apply. The caller must
+    /// follow with `blessings.remap` — ids were just renumbered.
+    fn refresh(&mut self, compiled: &CompiledPolicy) {
+        self.object_paths = super::object_paths(compiled);
+        self.class_names = super::class_names(compiled);
+        self.registry = super::class_registry(compiled);
+    }
+}
+
+/// Drain the ring buffer into the journal and honor control requests (policy applies,
+/// bless ops) until shutdown. The ring poll's timeout doubles as the control tick:
+/// each wakeup (event or `POLL_TIMEOUT_MS`) we also service pending control messages
+/// and run the blessing GC, so applies land and dead carriers are reaped within one
+/// poll interval.
 pub(super) fn serve(
     ebpf: &mut Ebpf,
     control: &PolicyControl,
     shutdown: &Arc<Shutdown>,
-    mut object_paths: HashMap<FileId, PathBuf>,
-    mut class_names: HashMap<ClassId, ClassName>,
+    mut runtime: Runtime,
 ) -> Result<()> {
     let mut ring = RingBuf::try_from(
         ebpf.take_map(MAP_EVENTS)
@@ -77,25 +112,47 @@ pub(super) fn serve(
                 // record's caller from the cache.
                 passwd.refresh();
                 for record in coalesce(&batch) {
-                    record.log(&object_paths, &class_names, &passwd);
+                    record.log(&runtime.object_paths, &runtime.class_names, &passwd);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::msg(format!("bpf-lsm: poll: {e}"))),
         }
-        // Service any `policy apply` requests that arrived since the last tick.
-        while let Ok(req) = control.apply_rx.try_recv() {
-            apply(
-                ebpf,
-                control,
-                &req.sources,
-                &req.reply,
-                &mut object_paths,
-                &mut class_names,
-            );
+        // Service the control messages that arrived since the last tick. One channel
+        // for applies AND bless ops: strict ordering is what makes the apply-time
+        // remap safe (a mint can't interleave with the renumbering).
+        while let Ok(msg) = control.msg_rx.try_recv() {
+            match msg {
+                ControlMsg::Apply(req) => {
+                    apply(ebpf, control, &req.sources, &req.reply, &mut runtime)
+                }
+                ControlMsg::Bless(op) => bless_op(ebpf, &mut runtime, op),
+            }
         }
+        // Reap dead blessing carriers (`populated 0`) each tick.
+        runtime.blessings.gc(ebpf);
     }
     Ok(())
+}
+
+/// Execute one bless op against the runtime's table + maps and send the outcome back.
+/// A dropped reply receiver (CLI gone) is fine — the op has already taken effect.
+fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
+    match op {
+        BlessOp::Mint { class, reply } => {
+            let outcome = runtime
+                .blessings
+                .mint(ebpf, class, &runtime.registry)
+                .map_err(|e| e.to_string());
+            let _ = reply.send(outcome);
+        }
+        BlessOp::List { reply } => {
+            let _ = reply.send(Ok(runtime.blessings.list()));
+        }
+        BlessOp::Revoke { id, reply } => {
+            let _ = reply.send(runtime.blessings.revoke(id).map_err(|e| e.to_string()));
+        }
+    }
 }
 
 /// Handle one `policy apply`: recompile the text, and if it has no errors re-seed the
@@ -107,8 +164,7 @@ fn apply(
     control: &PolicyControl,
     sources: &[PolicySource],
     reply: &std::sync::mpsc::Sender<ApplyOutcome>,
-    object_paths: &mut HashMap<FileId, PathBuf>,
-    class_names: &mut HashMap<ClassId, ClassName>,
+    runtime: &mut Runtime,
 ) {
     let compiled = super::compile_sources(sources);
     let applied = if compiled.has_errors() {
@@ -117,8 +173,11 @@ fn apply(
         match super::seed::seed_policy(ebpf, &compiled) {
             Ok(()) => {
                 *control.current.lock().unwrap() = Some(super::build_view(&compiled));
-                *object_paths = super::object_paths(&compiled);
-                *class_names = super::class_names(&compiled);
+                runtime.refresh(&compiled);
+                // The keystone: this compile renumbered ClassIds (dense, name-sorted),
+                // so every live blessing's MAP_BLESSED value must be re-pointed **by
+                // class name** — or a live blessing silently changes meaning.
+                runtime.blessings.remap(ebpf, &runtime.registry);
                 info!(objects = compiled.objects.len(), "policy applied");
                 true
             }
