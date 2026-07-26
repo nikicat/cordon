@@ -197,14 +197,25 @@ end-to-end, **scoped to the rule's object column** (no blanket).
 
 ---
 
-## Milestone B2 — Ergonomics & observability
-- Rich `cordon bless list` / structured journal; `revoke` polish; optional blessed-shell
-  affordance (a prompt marker / hint **derived from cgroup membership**, never an env var
-  *carrier* — env is forgeable as a carrier, §16.2; inheriting env into the child is fine).
-- (Optional) per-invocation **narrowing** `--path P` that intersects the chosen class's scope
-  down to `P` for this invocation (tighten-only; never widens past the policy class).
-- Optional hardware-token-per-bless mode (`pam_u2f` touch *every* mint) for high-value classes
-  — extra assurance the human is present at each grant.
+## Milestone B2 — Usable blessing → [`PLAN-bless3.md`](PLAN-bless3.md)
+**Detailed plan: [`PLAN-bless3.md`](PLAN-bless3.md).** B1's real-system run exposed three
+things the VM structurally cannot test (it has no unprivileged socket clients, no sudoedit
+ergonomics, no logind/polkit):
+
+- `cordon bless list` is unusable from a user account — the socket is `root:root` and
+  `connect(2)` needs *write*, so B1 decision #1 ("`BlessList` ungated") is inert. Fixed by
+  gating `PolicyApply` on uid 0 and opening the socket, which *tightens* authorization.
+- `policy edit` defaults to the system policy; the common case is your own user tier.
+- The blessed shell is barely usable: no logind session (so polkit refuses `run0`/`pkexec`)
+  and a scrubbed environment (no `DISPLAY`, so GUI apps fail). Both because the blessed
+  process is born in the wrong place — parented through a privilege tool and relocated into
+  the daemon's cgroup. Fixed by inverting the privilege flow: `cordon bless` runs
+  unprivileged as a child of the user's shell and the daemon passes back a `cgroup.procs` fd
+  over `SCM_RIGHTS`, which deletes the entire privilege-drop path.
+
+Its B0 spike (`packaging/test/bless-b2-derisk.sh`) confirmed both kernel/systemd assumptions
+on a real host; keep it as the "will bless work on this machine" check, since session-scope
+ownership is distro-dependent.
 
 ---
 
@@ -222,11 +233,33 @@ this adds frames beside it rather than reshaping the IPC. Full design in DESIGN 
   offer. Revoke follows the same rule (your own blessings).
 - **Restores "no grace window" by construction** (every mint authenticates), retiring the
   sudoers `timestamp_timeout=0` note.
-- **Keeps the CLI as spawner.** Nothing in B1's join-then-drop `pre_exec` path depends on the
-  authenticator; a PAM-authenticated non-root CLI cannot open the carrier's `cgroup.procs`,
-  though, so this milestone must also decide the placement mechanism — most likely the daemon
-  passing the CLI a **pre-opened `cgroup.procs` fd** over the socket (`SCM_RIGHTS`) after auth,
-  preserving both the boundary and the natural tty/job-control the daemon-spawn design lost.
+- **Mechanically, B2 already did the hard part.** The `SCM_RIGHTS` `cgroup.procs` hand-off
+  this milestone would otherwise have had to invent ships in B2, along with an unprivileged
+  CLI — so B3 reduces to swapping *what proves a human is present*: replace the
+  `bless-helper`'s uid-0 approval with a PAM conversation against the requesting peer. The
+  spawn path, the carrier placement and the boundary are unchanged.
+
+---
+
+## Milestone B4 — Ergonomics & observability
+- Rich `cordon bless list` / structured journal; `revoke` polish; optional blessed-shell
+  affordance (a prompt marker / hint **derived from cgroup membership**, never an env var
+  *carrier* — env is forgeable as a carrier, §16.2; inheriting env into the child is fine).
+- (Optional) per-invocation **narrowing** `--path P` that intersects the chosen class's scope
+  down to `P` for this invocation (tighten-only; never widens past the policy class).
+- Optional hardware-token-per-bless mode (`pam_u2f` touch *every* mint) for high-value classes
+  — extra assurance the human is present at each grant.
+- **An "uncondoned" blessing class** (raised on the host run): today a class's object scope
+  must be enumerated, so every dir added to `@secrets` must also be added to the blessing's
+  scope or a blessed session hits a surprise denial — two lists that drift. The cheap form is
+  to allow `*` in the object column **for allow-polarity rules only**, with the compiler
+  fanning the rule into every protected object's bucket: no kernel change, no new bypass in
+  `decide()`, and "allow on every protected object" *is* the complete definition of
+  uncordoned, since an unprotected path is already unmediated. `where = "*"` is currently
+  rejected outright (`resolve.rs:173`) because it can't work for *deny*. Open questions: what
+  a bare `*` means in a home-scoped user-tier fragment, and that a blanket class is a skeleton
+  key that widens the §16.7 ptrace/open-fd exposure — so it must be an opt-in second class,
+  never a change to what blessing means.
 
 ---
 

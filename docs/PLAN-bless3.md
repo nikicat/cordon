@@ -1,4 +1,4 @@
-# cordon B2 — usable blessing: socket authz, `policy edit` defaults, unprivileged spawner
+# cordon B2 — usable blessing (milestone B2 of [PLAN-bless.md](PLAN-bless.md)): socket authz, `policy edit` defaults, unprivileged spawner
 
 ## Context
 
@@ -37,7 +37,7 @@ recovered after the fact (no ancestor to read `/proc/<pid>/environ` from), so "f
 is *not* separable from "fix who spawns the target". The rework below is the only path, not
 gold-plating.
 
-## Workflow (unchanged from PLAN-bless2)
+## Workflow
 
 **Before each commit: stop, present the diff summary, wait for explicit review + approval.**
 Every commit: compiles, `just test` green (cargo test + clippy `-D warnings` + fmt), the

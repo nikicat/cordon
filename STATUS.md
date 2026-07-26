@@ -185,8 +185,9 @@ today two daemons can't corrupt each other (each loads private maps), but two da
 
 ## Blessing (`cordon bless`) — ✅ B1 done (2026-07-26), sudo-gated
 The runtime, human-authenticated access grant ships: [`DESIGN.md` §16](docs/DESIGN.md)
-(design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (B1 done; B2 ergonomics, B3 the PAM
-upgrade). It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
+(design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md) (milestone spine: B1 done; **B2 =
+usability, planned in [`docs/PLAN-bless3.md`](docs/PLAN-bless3.md) and the next thing to
+build**; B3 the PAM upgrade; B4 ergonomics). It's additive to the rule model: **a blessing is one more `SubjectMatch` predicate**
 (`blessing = "<class>"`), so a blessing rule is an ordinary rule — its action, **object
 scope**, and precedence all reuse the §15 model (scope = the rule's object column; **fully
 customizable in policy**, not blanket).
@@ -209,6 +210,22 @@ production's `Delegate=yes` service cgroup: neither systemd nor real sudo is nee
 `SUDO_UID`/`SUDO_GID` is the entire interface sudo gives the CLI and a nested cgroup is the
 kernel-level property `Delegate=yes` arranges (and the stricter one — the cgroup2 root is
 exempt from "no internal processes").
+
+**Known issues from the real-system run — all planned in
+[`docs/PLAN-bless3.md`](docs/PLAN-bless3.md) (B2), none VM-detectable:**
+- `cordon bless list` is unusable from a user account: the socket is `srwxr-xr-x root:root`
+  and `connect(2)` needs *write*, so every verb is root-only in practice and B1 decision #1
+  ("`BlessList` ungated") is inert. The fix gates `PolicyApply` on uid 0 and opens the
+  socket — tightening authorization, and closing the "no peer-cred check" caveat below.
+- **The blessed shell has no logind session and no environment.** The carrier under
+  `cordond.service` has no `session-N.scope` ancestor, so polkit refuses `run0`/`pkexec`;
+  and `sudo`/`run0` scrub the environment while the CLI restores only
+  `HOME`/`USER`/`LOGNAME`, so GUI apps get no `DISPLAY`. Both because the blessed process is
+  born in the wrong place — parented through a privilege tool, then relocated into the
+  daemon's cgroup. B2 inverts the privilege flow (unprivileged CLI + a `cgroup.procs` fd
+  over `SCM_RIGHTS`), which deletes the whole privilege-drop path.
+- A blessing's object scope must be enumerated, so it drifts against `@secrets` — an
+  "uncordoned" class is sketched in PLAN-bless B4.
 
 **Design change from the original spec** (DESIGN §16.5): the authenticator is **sudo**, not
 PAM-in-the-daemon — PAM proved far heavier than specced (conversation proxying as multi-frame
