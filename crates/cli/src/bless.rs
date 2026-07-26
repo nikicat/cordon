@@ -4,25 +4,26 @@
 //! is the human-presence authenticator, the daemon's mint verb requires peer uid 0,
 //! and joining the root-owned carrier cgroup requires root anyway. The flow:
 //!
-//! 1. Mint via the daemon → a carrier cgroup registered in the kernel's BLESSED map.
-//! 2. Open the carrier's `cgroup.procs` for writing **in the parent, before fork**.
-//! 3. Fork the target; its `pre_exec` writes the child pid into the carrier (still
-//!    root), *then* drops to the sudo invoker, then execs — the target never runs a
-//!    single instruction unblessed, with natural tty/job control/signals/exit code.
+//! 1. Mint via the daemon → a carrier cgroup registered in the kernel's BLESSED map,
+//!    with its `cgroup.procs` handed back **as a descriptor** (`SCM_RIGHTS`) rather than
+//!    a path: the daemon opened it as root, and that is what the kernel checks.
+//! 2. Fork the target; its `pre_exec` writes the child pid through that fd, *then* drops
+//!    to the sudo invoker, then execs — the target never runs a single instruction
+//!    unblessed, with natural tty/job control/signals/exit code.
 //!
 //! No CLI-side cleanup: the daemon GCs the carrier when it empties (its mint grace
 //! covers a CLI that dies before the join).
 
+use crate::Cli;
 use crate::sys::{self, DropTo};
-use crate::{Cli, round_trip};
 use clap::Subcommand;
 use cordon_core::policy::ClassName;
-use cordon_core::proto::{BlessId, Request, Response};
+use cordon_core::proto::{BlessId, CarrierProcs, Request, Response, read_msg_with_fd, write_msg};
 use cordon_core::{Error, Result, config};
 use nix::unistd::{Gid, Uid, User};
 use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// `cordon bless [--class <name>] [-- <command>…]` | `bless list` | `bless revoke <id>`.
@@ -79,24 +80,12 @@ fn mint_and_exec(args: &BlessArgs, cli: &Cli) -> Result<ExitCode> {
         ));
     }
     let socket = crate::resolve_socket(cli)?;
-    let view = match round_trip(
+    let procs = mint(
         &socket,
         &Request::BlessMint {
             class: args.class.clone(),
         },
-    )? {
-        Response::BlessMinted(view) => view,
-        Response::Error { message } => return Err(Error::msg(format!("daemon: {message}"))),
-        other => return Err(Error::msg(format!("unexpected daemon reply: {other:?}"))),
-    };
-
-    // Open the carrier's cgroup.procs before fork — the child's pre_exec only writes
-    // to a ready fd (async-signal-safe), and an open failure surfaces here as a
-    // clean error instead of a half-spawned child.
-    let procs = std::fs::File::options()
-        .write(true)
-        .open(view.cgroup.join("cgroup.procs"))
-        .map_err(|e| Error::msg(format!("open {}/cgroup.procs: {e}", view.cgroup.display())))?;
+    )?;
 
     let invoker = invoker()?;
     let mut cmd = build_command(&args.command, invoker.as_ref())?;
@@ -105,6 +94,33 @@ fn mint_and_exec(args: &BlessArgs, cli: &Cli) -> Result<ExitCode> {
         .status()
         .map_err(|e| Error::msg(format!("spawn blessed command: {e}")))?;
     Ok(ExitCode::from(exit_byte(status.code(), status.signal())))
+}
+
+/// Mint a blessing and take delivery of the carrier's `cgroup.procs`.
+///
+/// The fd — not the path — is the grant: the daemon opened it as root, and cgroup-v2
+/// checks migration permission against the *opener's* credentials, so writing a pid
+/// through it works without privilege (DESIGN §16.4). It also has to be a dedicated
+/// connection rather than [`crate::round_trip`], because ancillary data is lost to any
+/// buffered read.
+fn mint(socket: &Path, req: &Request) -> Result<CarrierProcs> {
+    let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
+        Error::msg(format!(
+            "connect {}: {e} (is cordond running?)",
+            socket.display()
+        ))
+    })?;
+    write_msg(&mut &stream, req)?;
+    match read_msg_with_fd::<Response>(&stream)? {
+        Some((Response::BlessMinted(_view), Some(procs))) => Ok(CarrierProcs(procs)),
+        Some((Response::BlessMinted(view), None)) => Err(Error::msg(format!(
+            "daemon minted {} but passed no cgroup.procs descriptor",
+            view.cgroup.display()
+        ))),
+        Some((Response::Error { message }, _)) => Err(Error::msg(format!("daemon: {message}"))),
+        Some((other, _)) => Err(Error::msg(format!("unexpected daemon reply: {other:?}"))),
+        None => Err(Error::msg("daemon closed the connection without replying")),
+    }
 }
 
 /// The sudo invoker to drop the blessed child to, resolved from `SUDO_UID`/`SUDO_GID`

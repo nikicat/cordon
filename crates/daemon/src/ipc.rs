@@ -16,9 +16,12 @@
 
 use crate::Ctx;
 use cordon_core::backend::{ApplyRequest, BlessOp, ControlMsg};
-use cordon_core::proto::{Request, Response, StatusInfo, read_msg, write_msg};
+use cordon_core::proto::{
+    CarrierProcs, Request, Response, StatusInfo, read_msg, send_msg_with_fd, write_msg,
+};
 use cordon_core::{Error, Result, Uid};
 use std::io::{BufReader, BufWriter};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -33,6 +36,16 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The only uid `authorize` privileges. Named so the gate reads as intent rather than as
 /// a bare zero.
 const ROOT: Uid = Uid(0);
+
+/// What a dispatched request replies with. Almost everything is JSON alone; a mint
+/// additionally hands back the carrier's `cgroup.procs`, which cannot be serialized — it
+/// is a descriptor, and travels as `SCM_RIGHTS` ancillary data beside the same message
+/// (DESIGN §16.4). Modelled as a variant rather than an `Option` tacked onto the response
+/// so the two transports can't be confused at the write site.
+enum Reply {
+    Plain(Response),
+    WithCarrier(Response, CarrierProcs),
+}
 
 impl Ctx {
     /// Bind the socket and accept connections forever, one handler thread each.
@@ -79,16 +92,27 @@ impl Ctx {
         // request on it.
         let peer_uid = peer_uid(&stream)?;
         let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = BufWriter::new(stream);
+        let mut writer = BufWriter::new(stream.try_clone()?);
         while let Some(req) = read_msg::<_, Request>(&mut reader)? {
-            let resp = match authorize(&req, peer_uid) {
+            let replied = match authorize(&req, peer_uid) {
                 Ok(()) => self.dispatch(req),
                 Err(e) => Err(e),
             }
-            .unwrap_or_else(|e| Response::Error {
-                message: e.to_string(),
+            .unwrap_or_else(|e| {
+                Reply::Plain(Response::Error {
+                    message: e.to_string(),
+                })
             });
-            write_msg(&mut writer, &resp)?;
+            match replied {
+                Reply::Plain(resp) => write_msg(&mut writer, &resp)?,
+                // The carrier fd can only travel as ancillary data, so this one reply
+                // goes out with `sendmsg` on the raw socket rather than through the
+                // buffered writer — which is empty here, since `write_msg` flushes every
+                // message it writes.
+                Reply::WithCarrier(resp, procs) => {
+                    send_msg_with_fd(&stream, &resp, procs.0.as_fd())?
+                }
+            }
         }
         Ok(())
     }
@@ -110,7 +134,7 @@ impl Ctx {
             .map_err(Error::msg)
     }
 
-    fn dispatch(&self, req: Request) -> Result<Response> {
+    fn dispatch(&self, req: Request) -> Result<Reply> {
         match req {
             Request::Status => {
                 let objects = self
@@ -120,17 +144,17 @@ impl Ctx {
                     .unwrap()
                     .as_ref()
                     .map(|v| v.objects.len());
-                Ok(Response::Status(StatusInfo {
+                Ok(Reply::Plain(Response::Status(StatusInfo {
                     backend: self.backend,
                     socket: self.socket.clone(),
                     policy: self.policy.clone(),
                     objects,
-                }))
+                })))
             }
 
-            Request::PolicyShow => Ok(Response::PolicyView(
+            Request::PolicyShow => Ok(Reply::Plain(Response::PolicyView(
                 self.control.current.lock().unwrap().clone(),
-            )),
+            ))),
 
             Request::PolicyApply { sources } => {
                 // Hand the fragments to the backend thread (which owns the BPF maps)
@@ -149,23 +173,24 @@ impl Ctx {
                 let outcome = reply_rx.recv_timeout(REPLY_TIMEOUT).map_err(|_| {
                     Error::msg("timed out waiting for the backend to apply the policy")
                 })?;
-                Ok(Response::PolicyApplied {
+                Ok(Reply::Plain(Response::PolicyApplied {
                     applied: outcome.applied,
                     diagnostics: outcome.diagnostics,
-                })
+                }))
             }
 
-            Request::BlessMint { class } => Ok(Response::BlessMinted(
-                self.bless(|reply| BlessOp::Mint { class, reply })?,
-            )),
+            Request::BlessMint { class } => {
+                let (view, procs) = self.bless(|reply| BlessOp::Mint { class, reply })?;
+                Ok(Reply::WithCarrier(Response::BlessMinted(view), procs))
+            }
 
-            Request::BlessList => Ok(Response::Blessings(
+            Request::BlessList => Ok(Reply::Plain(Response::Blessings(
                 self.bless(|reply| BlessOp::List { reply })?,
-            )),
+            ))),
 
             Request::BlessRevoke { id } => {
                 self.bless(|reply| BlessOp::Revoke { id, reply })?;
-                Ok(Response::BlessRevoked { id })
+                Ok(Reply::Plain(Response::BlessRevoked { id }))
             }
         }
     }

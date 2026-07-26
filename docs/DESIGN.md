@@ -1067,6 +1067,26 @@ The entire lock is: **root owns `cgroup.procs`; root writes it only post-auth.**
 cgroup membership the *strongest* subject identity in the system — a same-uid process cannot
 forge it the way it forges ancestry.
 
+> **Delegation by descriptor (B2).** The daemon does not hand back the carrier's *path*; it
+> opens `cgroup.procs` itself, as root, and passes that **descriptor** over `SCM_RIGHTS`.
+> cgroup-v2 checks migration permission against the credentials of whoever **opened** the
+> file (`cgroup_procs_write_permission()` overrides with `of->file->f_cred`) — exactly so
+> delegation-by-fd works — so the holder can join a task to the carrier without ever being
+> root. That is what lets `cordon bless` run unprivileged as an ordinary child of the user's
+> shell, which in turn is what gives the blessed process its natural environment, tty, and
+> logind session (§16.6). Point 1 above is unchanged: the *fd* is delegated, the *directory*
+> is still root-owned, and only the daemon ever opens it — post-auth.
+>
+> **The honest cost:** the fd's holder can move **any task it can name** into the carrier,
+> not just its own child — the check is on the opener, so the writer's own credentials are
+> not consulted. This is not an escalation: the blessing grants only what the class's rules
+> name, DAC still applies to every object, and the holder is the invoking user, who could
+> already run those tasks. But it is a real widening of "who can be blessed" from *this
+> child* to *anything this user can name*, so the descriptor's reach is kept as short as
+> the mechanism allows: it is received **close-on-exec** (`MSG_CMSG_CLOEXEC` — *not* the
+> kernel's default for `SCM_RIGHTS`), so it dies at the `exec` that starts the blessed
+> command and never becomes a standing capability held by the blessed process itself.
+
 > **Mechanism wrinkle.** systemd owns the unified hierarchy (single-writer; no procs in
 > inner nodes). The clean placement is a **systemd transient scope** via the daemon, or a
 > subtree **delegated** to the (root) daemon (`Delegate=yes`); a hand-rolled cgroup outside

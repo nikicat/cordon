@@ -9,7 +9,7 @@
 //! backends were retired with the rule-model migration (DESIGN §15).
 
 use crate::policy::{ClassName, Diagnostic, PolicySource};
-use crate::proto::{BlessId, BlessingView, PolicyView};
+use crate::proto::{BlessId, BlessingView, CarrierProcs, PolicyView};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -127,10 +127,13 @@ pub enum ControlMsg {
 /// error types out of the seam.
 pub enum BlessOp {
     /// Mint a blessing: create + register a carrier cgroup for `class` (`None` → the
-    /// sole declared class).
+    /// sole declared class). The reply carries the carrier's `cgroup.procs` **opened by
+    /// the (root) backend thread** — passing that fd is what lets an unprivileged client
+    /// join, since the kernel checks migration permission against the opener's
+    /// credentials, not the writer's (DESIGN §16.4).
     Mint {
         class: Option<ClassName>,
-        reply: Sender<std::result::Result<BlessingView, String>>,
+        reply: Sender<std::result::Result<(BlessingView, CarrierProcs), String>>,
     },
     /// Snapshot the live blessings.
     List {

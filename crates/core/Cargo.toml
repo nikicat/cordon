@@ -6,6 +6,20 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `socket` + `uio` provide the `sendmsg`/`recvmsg` behind proto's SCM_RIGHTS fd hand-off:
+# the daemon opens the blessing carrier's `cgroup.procs` as root and passes only that fd,
+# so the CLI joins without privilege (DESIGN §16.6). Both ends of the wire need it, hence
+# core rather than a copy in each of daemon and cli. (`uio` is what gates the scatter-
+# gather msghdr calls; `socket` alone stops at getsockopt/setsockopt.)
+nix = { version = "0.31.3", features = ["socket", "uio"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `fs` adds `fcntl`, used only to assert the received descriptor is close-on-exec — a
+# security property that would otherwise fail silently. Test-only, so the shipped binary
+# pulls in no more than it needs.
+nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

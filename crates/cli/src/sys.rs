@@ -1,13 +1,17 @@
 //! The few privileged operations `policy edit` and `bless` need, isolated here. Every
 //! one is a safe `nix` wrapper except the two inherently-unsafe `Command::pre_exec`
-//! registrations — so the whole crate's `unsafe` surface is the two blocks below. Both
-//! serve the same boundary shape: the parent stays root while the child sheds root
+//! registrations — so the whole crate's `unsafe` surface is those two *calls*, one line
+//! each. The hooks they register are ordinary safe code, hoisted into `let` bindings so
+//! the `unsafe` block covers only the operation that is actually unsound to get wrong.
+//!
+//! Both serve the same boundary shape: the parent stays root while the child sheds root
 //! before exec ([`drop_to_on_exec`] for the editor; [`join_cgroup_and_drop_on_exec`]
-//! additionally joins the bless carrier cgroup *first*, while joining still needs root).
+//! additionally joins the bless carrier cgroup *first*, so the target runs zero
+//! instructions unblessed).
 
 use cordon_core::policy::UserName;
+use cordon_core::proto::CarrierProcs;
 use nix::unistd::{Gid, Uid, User};
-use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
@@ -47,18 +51,18 @@ pub fn fchown(fd: impl AsFd, uid: Uid, gid: Gid) -> io::Result<()> {
 /// forked child, before exec, so the editor keeps none of root's authority while the parent
 /// does.
 pub fn drop_to_on_exec(cmd: &mut Command, uid: Uid, gid: Gid) {
-    // SAFETY: the closure runs post-fork / pre-exec in the child. setgroups/setgid/setuid
-    // are async-signal-safe syscalls (nix adds only errno translation, no allocation), so
-    // they're sound in that window. The order is load-bearing: shed supplementary groups and
-    // the gid *before* the uid — once root is surrendered the earlier two would be refused.
-    unsafe {
-        cmd.pre_exec(move || {
-            nix::unistd::setgroups(&[])?;
-            nix::unistd::setgid(gid)?;
-            nix::unistd::setuid(uid)?;
-            Ok(())
-        });
-    }
+    // The order is load-bearing: shed supplementary groups and the gid *before* the uid —
+    // once root is surrendered the earlier two would be refused.
+    let hook = move || -> io::Result<()> {
+        nix::unistd::setgroups(&[])?;
+        nix::unistd::setgid(gid)?;
+        nix::unistd::setuid(uid)?;
+        Ok(())
+    };
+    // SAFETY: `hook` runs post-fork / pre-exec in the child, where only async-signal-safe
+    // operations are sound. setgroups/setgid/setuid are raw syscalls over values captured
+    // before the fork (nix adds errno translation, no allocation), so they qualify.
+    unsafe { cmd.pre_exec(hook) };
 }
 
 /// The identity a blessed child drops to before exec: the sudo invoker, with their
@@ -74,32 +78,32 @@ pub struct DropTo {
 }
 
 /// Arrange for `cmd`, in the forked child, to (1) **join the bless carrier cgroup** by
-/// writing its own pid into `procs` — the already-open `cgroup.procs` fd, opened by the
-/// root parent — and then (2) drop to the invoker per `drop` (`None` ⇒ a true-root
-/// invocation; the child stays root). The join-before-drop order is the boundary:
-/// joining needs root (the carrier is root-owned), and joining before exec is what
-/// makes the target run **zero** instructions unblessed.
-pub fn join_cgroup_and_drop_on_exec(cmd: &mut Command, procs: File, drop: Option<DropTo>) {
-    // SAFETY: the closure runs post-fork / pre-exec in the child, so only
-    // async-signal-safe operations are sound. Everything here qualifies: getpid(2) and
-    // write(2) are raw syscalls, the pid is formatted into a stack buffer (no
-    // allocation), and setgroups/setgid/setuid apply values resolved before the fork
-    // (same discipline as `drop_to_on_exec`, including its groups-gid-uid order).
-    unsafe {
-        cmd.pre_exec(move || {
-            let mut buf = [0u8; U32_DECIMAL_MAX];
-            let text = format_u32(std::process::id(), &mut buf);
-            if nix::unistd::write(&procs, text)? != text.len() {
-                return Err(io::Error::from(nix::errno::Errno::EIO));
-            }
-            if let Some(d) = &drop {
-                nix::unistd::setgroups(&d.groups)?;
-                nix::unistd::setgid(d.gid)?;
-                nix::unistd::setuid(d.uid)?;
-            }
-            Ok(())
-        });
-    }
+/// writing its own pid into `procs` — the `cgroup.procs` descriptor the root daemon
+/// opened and handed over — and then (2) drop to the invoker per `drop` (`None` ⇒ a
+/// true-root invocation; the child stays root). Joining before exec is what makes the
+/// target run **zero** instructions unblessed; the write succeeds regardless of the
+/// child's own credentials because the kernel checks the fd's *opener* (DESIGN §16.4).
+pub fn join_cgroup_and_drop_on_exec(cmd: &mut Command, procs: CarrierProcs, drop: Option<DropTo>) {
+    let hook = move || -> io::Result<()> {
+        let mut buf = [0u8; U32_DECIMAL_MAX];
+        let text = format_u32(std::process::id(), &mut buf);
+        if nix::unistd::write(&procs.0, text)? != text.len() {
+            return Err(io::Error::from(nix::errno::Errno::EIO));
+        }
+        // Same groups-gid-uid order as `drop_to_on_exec`, for the same reason.
+        if let Some(d) = &drop {
+            nix::unistd::setgroups(&d.groups)?;
+            nix::unistd::setgid(d.gid)?;
+            nix::unistd::setuid(d.uid)?;
+        }
+        Ok(())
+    };
+    // SAFETY: `hook` runs post-fork / pre-exec in the child, where only async-signal-safe
+    // operations are sound. Everything it does qualifies: getpid(2) and write(2) are raw
+    // syscalls, the pid is formatted into a stack buffer (no allocation — a `format!` here
+    // could deadlock on an allocator lock another thread held at fork time), and the
+    // credential syscalls apply values resolved before the fork.
+    unsafe { cmd.pre_exec(hook) };
 }
 
 /// Decimal digits of `u32::MAX` — the buffer a [`format_u32`] caller provides.

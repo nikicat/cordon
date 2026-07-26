@@ -21,7 +21,7 @@ use super::seed;
 use aya::Ebpf;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
 use cordon_core::policy::ClassName;
-use cordon_core::proto::{BlessId, BlessingView, Pid};
+use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, Pid};
 use cordon_core::{Error, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -91,14 +91,15 @@ impl Blessings {
         }
     }
 
-    /// Mint a blessing: create the carrier cgroup and register it in `MAP_BLESSED`.
-    /// The caller (CLI, root) execs the target into the returned carrier.
+    /// Mint a blessing: create the carrier cgroup, register it in `MAP_BLESSED`, and
+    /// return it together with its `cgroup.procs` opened for write. The caller execs the
+    /// target into the carrier by writing the child's pid through that fd.
     pub(super) fn mint(
         &mut self,
         ebpf: &mut Ebpf,
         class: Option<ClassName>,
         registry: &BTreeMap<ClassName, ClassId>,
-    ) -> Result<BlessingView> {
+    ) -> Result<(BlessingView, CarrierProcs)> {
         let root = self.root.as_ref().ok_or_else(|| {
             Error::msg("blessing unavailable: the daemon's cgroup was unresolvable at startup")
         })?;
@@ -130,6 +131,23 @@ impl Blessings {
                 return Err(Error::msg(format!("bless: stat fresh carrier: {e}")));
             }
         };
+        // Open `cgroup.procs` here, as root, before handing anything back: this fd *is*
+        // the grant (DESIGN §16.4). cgroup-v2 checks migration permission against the
+        // opener's credentials, so the unprivileged CLI can write its child's pid through
+        // it without ever holding privilege — and never needs the path at all.
+        let procs = match std::fs::File::options()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+        {
+            Ok(f) => CarrierProcs(f.into()),
+            Err(e) => {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(Error::msg(format!(
+                    "bless: open {}/cgroup.procs: {e}",
+                    dir.display()
+                )));
+            }
+        };
         if let Err(e) = seed::blessed_insert(ebpf, cgroup, class_id) {
             let _ = std::fs::remove_dir(&dir);
             return Err(e);
@@ -147,13 +165,16 @@ impl Blessings {
             minted: Instant::now(),
         });
         info!(%id, %class, cgroup = %dir.display(), "blessing minted");
-        Ok(BlessingView {
-            id,
-            class,
-            cgroup: dir,
-            pids: Vec::new(),
-            age: Duration::ZERO,
-        })
+        Ok((
+            BlessingView {
+                id,
+                class,
+                cgroup: dir,
+                pids: Vec::new(),
+                age: Duration::ZERO,
+            },
+            procs,
+        ))
     }
 
     /// Snapshot the live blessings (member pids read fresh from each carrier).

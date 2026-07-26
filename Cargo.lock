@@ -197,6 +197,7 @@ name = "cordon-core"
 version = "0.0.0"
 dependencies = [
  "cordon-bpf-common",
+ "nix",
  "serde",
  "serde_json",
  "thiserror",
