@@ -12,7 +12,15 @@ CLI.
 
 > **Status: B1 + B2 shipped (2026-07-27); the VM smoke is green.** What exists
 > today is specified in DESIGN §16 and summarized in [`STATUS.md`](../STATUS.md); the
-> detailed B1/B2 commit plans have been retired now that they are code. **B3 is next.**
+> detailed B1/B2 commit plans have been retired now that they are code.
+>
+> **Both remaining milestones are deferred behind the core (2026-07-28).** B1+B2 already make
+> `bless` usable, so neither B3 nor B4 blocks anything: the queue is bugs → M3 → M5 → M6, and
+> blessing resumes once the boundary underneath it is sound. **B3 is a nice-to-have**
+> (it *relaxes* the mint gate — no one is locked out meanwhile, and the sudo grace window is
+> an accepted delta, §16.5). **B4 waits on the core by its own logic** — a blanket
+> "uncordoned" class is a skeleton key, and widening the grant surface before M5/M6 close the
+> fail-open and confused-deputy holes gets the order backwards.
 
 Guiding constraints (from §16) — these still bind B3 and B4:
 - **Authorization is the whole feature.** The carrier is forgeable (§8.1); security rests
@@ -43,7 +51,7 @@ Guiding constraints (from §16) — these still bind B3 and B4:
 
 ---
 
-## Milestone B3 — PAM authenticator (replaces the uid-0 gate) ← **next**
+## Milestone B3 — PAM authenticator (replaces the uid-0 gate) ← **deferred, nice to have**
 The upgrade B1 was deliberately shaped to accept: the mint verb is authenticator-agnostic, so
 this adds frames beside it rather than reshaping the IPC. Full design in DESIGN §16.5.
 
@@ -65,7 +73,7 @@ this adds frames beside it rather than reshaping the IPC. Full design in DESIGN 
 
 ---
 
-## Milestone B4 — Ergonomics & observability
+## Milestone B4 — Ergonomics & observability ← **deferred until the core is sound**
 - Rich `cordon bless list` / structured journal; `revoke` polish; optional blessed-shell
   affordance (a prompt marker / hint **derived from cgroup membership**, never an env var
   *carrier* — env is forgeable as a carrier, §16.2; inheriting env into the child is fine).

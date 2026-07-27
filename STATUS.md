@@ -12,9 +12,9 @@ The architecture is the flat **rule model** (DESIGN §15): a root-owned text pol
 (DESIGN §16). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12.
 The earlier owner model was retired in the migration — see *Pre-rule-model history* below.
 
-Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) (M2, M4–M6 ahead; M3 is
-partly landed — the mutation hooks ship, `inode_mkdir`/`bprm_check_security` do not) and
-[docs/PLAN-bless.md](docs/PLAN-bless.md) (B3 next).
+Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) — **finish M3, then M5 and M6**
+(M3 is partly landed: the mutation hooks ship, `inode_mkdir`/`bprm_check_security` do not) —
+and [docs/PLAN-bless.md](docs/PLAN-bless.md), whose B3/B4 are **deferred behind the core**.
 
 ## What's implemented
 
@@ -85,23 +85,35 @@ Environment, cwd, tty, job control and session are inherited by construction.
 
 ## What's left
 
-- **B3 — the PAM authenticator** ([PLAN-bless](docs/PLAN-bless.md)). Replaces the uid-0 gate
-  with "the authenticated peer", so a **non-sudoer can bless their own tools**, and restores
-  "no grace window" by construction (sudo's timestamp cache is one today; the deployment
-  workaround is `Defaults!/usr/bin/cordon timestamp_timeout=0`). B2 did its structural work —
-  the `SCM_RIGHTS` hand-off and the unprivileged CLI already ship — so it reduces to swapping
-  *what proves a human is present*, and it **relaxes** the gate rather than tightening it.
+**Order (set 2026-07-28).** Bugs and doc drift first, then finish **M3**; then **M5** and
+**M6**, which are the must-haves. Blessing work waits — B1+B2 already make `bless` usable, and
+the core boundary is what the remaining holes are in. The rule: *soundness before ergonomics.*
+
+### First — bugs, then finish M3
+
+- **The self-test probe is a root-writable `/tmp` path** (security bug, small fix). `cordond`
+  is uid 0 with no `PrivateTmp=`, and `self_test` uses `create_dir_all` (accepts a
+  pre-existing directory of any owner) plus `std::fs::write` (no `O_NOFOLLOW`), so a local
+  user who pre-creates `/tmp/cordon-selftest.<pid>/` holding a symlink gets root to truncate
+  any root-owned file — `/etc/cordon/policy.toml` included, after which the daemon fails to
+  compile and **the boundary is off entirely**. It runs before `seed_policy`, so cordon is not
+  yet enforcing on itself, and `fs.protected_symlinks` does not cover it. Full analysis and
+  the fix (move the probe under `/run/cordon/`) in
+  [PLAN-rule-model](docs/PLAN-rule-model.md) *Carried-over notes*.
+- **M3 completion** — `inode_mkdir` and `bprm_check_security` (the `execute` action) are the
+  two hooks still missing; `listdir` ≈ "open dir for read" needs its coarseness documented;
+  and `renameat2(RENAME_EXCHANGE)` is **believed, not verified** — the escape refusal for the
+  protected side moving *out* depends on the kernel calling the hook a second time with the
+  pair swapped. The four mutation hooks that ship (§15.5) already carry the hard part.
+
+### Next — the must-haves
+
 - **M5 — fail-safe bpffs pinning**, the last M1 hardening item: pin program + maps + link so
   enforcement survives daemon death (until then it fails **open** on daemon exit). **Must
   ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active): today two
   daemons cannot corrupt each other because each loads private maps, but two daemons sharing
   *pinned* maps would reintroduce a cross-process writer race. Pin the policy maps only —
   a pinned `BLESSED` with a dead daemon means grants that never expire.
-- **B4 — the enumerated-scope gap.** A blessing class's object scope must be listed, so it
-  drifts against `@secrets`: every dir added to one must be added to the other or a blessed
-  session hits a surprise denial. An "uncordoned" class is sketched in PLAN-bless B4.
-- **M2–M4** — subject predicates beyond exe, the rest of the mutation/exec hooks
-  (`inode_mkdir`, `bprm_check_security`), autolearn.
 - **M6 — fixed code as the precondition for a grant**, the `exe`-identity fix, and the
   largest known hole. The invariant: a grant attaches only to a process that runs the code it
   shipped with, so anything executing foreign code *in its own address space* — a JIT, an
@@ -129,7 +141,28 @@ Environment, cwd, tty, job control and session are inherited by construction.
   `allow /usr/bin/aws` (the CLI is Python) and most npm/Electron tooling with it. The taint's
   storage (per-task vs per-`mm`, and whether it survives `clone`) is the open question that
   decides the mechanism; PLAN M6 *Store*.
-- Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
+
+### Deferred — until the core is sound
+
+- **B3 — the PAM authenticator** ([PLAN-bless](docs/PLAN-bless.md)): **nice to have,
+  postponed.** It replaces the uid-0 mint gate with "the authenticated peer", so a
+  **non-sudoer could bless their own tools**, and restores "no grace window" by construction.
+  Nothing depends on it: B1+B2 ship a usable `bless`, and B2 already did the structural work
+  (`SCM_RIGHTS` hand-off, unprivileged CLI), so it stays a swap of *what proves a human is
+  present* whenever it is picked up — and it **relaxes** the gate rather than tightening one.
+  Until then sudo's timestamp cache is an accepted grace window (DESIGN §16.5); the
+  deployment workaround is `Defaults!/usr/bin/cordon timestamp_timeout=0`.
+- **B4 — the enumerated-scope gap.** A blessing class's object scope must be listed, so it
+  drifts against `@secrets`: every dir added to one must be added to the other or a blessed
+  session hits a surprise denial. An "uncordoned" class is sketched in PLAN-bless B4 — but a
+  blanket class is a skeleton key, so it waits until the boundary underneath it is sound.
+- **M2 and M4 are no longer scheduled on their own.** M6 pulls in the parts it needs: M2's
+  **`unsandboxed`** predicate *is* M6's enforcement point (3) (measured, but gated on a Chrome
+  version check — see the browser fact below), and M4's learning machinery is how code sets
+  get built (M6 task 6). The remainder — `uid`/`gid`/`cgroup`, IMA/fsverity, argv0/ancestor,
+  autolearn for objects — is opportunistic, taken when a real policy needs it.
+
+Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
 ## Settled, do not redo
 
