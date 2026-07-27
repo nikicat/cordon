@@ -42,6 +42,7 @@ use cordon_core::policy::{self, ClassName, CompiledPolicy, PolicySource, Severit
 use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
 use std::collections::HashMap;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -290,8 +291,42 @@ fn maybe_poison_offsets(offsets: &mut Offsets) {
 /// the argument index a mutation hook reads is not type-checked, and getting it wrong
 /// fails open in complete silence. This is the only thing that catches that.
 fn self_test(ebpf: &mut Ebpf) -> Result<()> {
-    let probe = std::env::temp_dir().join(format!("cordon-selftest.{}", std::process::id()));
-    std::fs::create_dir_all(&probe)
+    let probe = make_probe(Path::new(PROBE_DIR))?;
+    let outcome = run_self_test(ebpf, &probe);
+    let _ = std::fs::remove_dir_all(&probe);
+    outcome
+}
+
+/// Root-only scratch for the self-test probe. Deliberately **not** `TMPDIR`: the daemon is
+/// uid 0 and this runs *before* `seed_policy`, so cordon is not yet enforcing on itself. In a
+/// world-writable directory a local user pre-creates `cordon-selftest.<pid>/` (pids are
+/// sequential, so guessing is cheap) holding `src -> /etc/cordon/policy.toml`, and root
+/// truncates the policy on the next start — after which the daemon fails to compile and the
+/// boundary is off entirely. `create_dir_all` accepts a pre-existing directory of any owner
+/// and `fs::write` is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW`, and
+/// `fs.protected_symlinks` does not help: it keys on the symlink's *immediate parent* being
+/// sticky and world-writable, which the attacker's own plain directory is not.
+///
+/// `/run` is root-owned `0755`, so nothing unprivileged can plant any component of this path.
+/// That removes the shared namespace outright rather than hardening each open against it.
+const PROBE_DIR: &str = "/run/cordon";
+
+/// Create the probe directory and seed it. `base` is [`PROBE_DIR`] outside tests.
+///
+/// Never reuses a directory it finds: the probe is removed and recreated with `create_dir`,
+/// so anything already sitting on the path — and any symlink inside it — is gone before the
+/// seed writes, which have no `O_NOFOLLOW`. Under [`PROBE_DIR`] nothing unprivileged could
+/// have put it there in the first place; this is the second line, not the first.
+fn make_probe(base: &Path) -> Result<PathBuf> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(base)
+        .map_err(|e| Error::msg(format!("bpf-lsm self-test: mkdir {}: {e}", base.display())))?;
+    let probe = base.join(format!("selftest.{}", std::process::id()));
+    // A previous run that died before its cleanup leaves this behind, and pids are reused.
+    let _ = std::fs::remove_dir_all(&probe);
+    std::fs::create_dir(&probe)
         .map_err(|e| Error::msg(format!("bpf-lsm self-test: mkdir probe: {e}")))?;
     // Seeded *before* the object goes live, or creating them would be denied by our own
     // rule. `over` is the rename-over target: a *positive* destination dentry, which is the
@@ -300,9 +335,7 @@ fn self_test(ebpf: &mut Ebpf) -> Result<()> {
         std::fs::write(probe.join(name), b"x")
             .map_err(|e| Error::msg(format!("bpf-lsm self-test: seed probe {name}: {e}")))?;
     }
-    let outcome = run_self_test(ebpf, &probe);
-    let _ = std::fs::remove_dir_all(&probe);
-    outcome
+    Ok(probe)
 }
 
 /// One hook's expectation: the operation must have been refused with `EPERM`.
@@ -345,7 +378,7 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     // Ordered so each still has something to act on: link is non-destructive, rename would
     // consume `src`, unlink would remove it.
     let src = probe.join("src");
-    let outside = std::env::temp_dir().join(format!("cordon-selftest-out.{}", std::process::id()));
+    let outside = Path::new(PROBE_DIR).join(format!("selftest-out.{}", std::process::id()));
     let opened = std::fs::File::open(probe).map(drop);
     let linked = std::fs::hard_link(&src, &outside);
     let renamed = std::fs::rename(&src, &outside);
@@ -379,4 +412,65 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
 fn map_mut<'a>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut aya::maps::Map> {
     ebpf.map_mut(name)
         .ok_or_else(|| Error::msg(format!("bpf-lsm: map '{name}' missing from object")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe must never inherit a directory it did not create. `cordond` is uid 0 and
+    /// `make_probe` runs *before* `seed_policy`, so cordon is not yet enforcing on itself: a
+    /// probe that reuses a found directory lets whoever could create it aim the seed writes
+    /// — `fs::write`, which is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW` — at any file
+    /// root can reach. `/etc/cordon/policy.toml` is the target that matters, since a policy
+    /// that no longer compiles means the boundary is off entirely.
+    ///
+    /// Driven through a writable `base` because the test is unprivileged. That is the
+    /// *second* line of defence; the first is that [`PROBE_DIR`] is root-only, which the
+    /// test below pins because an unprivileged test cannot exercise it.
+    #[test]
+    fn the_probe_never_reuses_a_directory_it_found() {
+        let base = std::env::temp_dir().join(format!("cordon-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Stands in for /etc/cordon/policy.toml — a file outside the probe that root can write.
+        let victim = base.join("policy.toml");
+        std::fs::write(&victim, b"the live policy").unwrap();
+
+        // Plant the probe directory, with `src` aimed at the victim. `src` is the name the
+        // seed loop writes, so a reused directory redirects that write.
+        let planted = base.join(format!("selftest.{}", std::process::id()));
+        std::fs::create_dir_all(&planted).unwrap();
+        std::os::unix::fs::symlink(&victim, planted.join("src")).unwrap();
+
+        let probe = make_probe(&base).expect("probe creation");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "the live policy",
+            "the seed write followed a planted symlink and truncated the victim"
+        );
+        assert!(
+            !std::fs::symlink_metadata(probe.join("src"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the probe reused the planted directory instead of recreating it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The location *is* the fix: `/run` is root-owned `0755`, so nothing unprivileged can
+    /// plant any component of the probe path, and the reuse hazard above cannot be reached
+    /// at all. Pinned as a constant because an unprivileged test cannot write `/run` —
+    /// moving this back under `TMPDIR` would reopen the hole with every other line intact.
+    #[test]
+    fn the_probe_lives_where_only_root_can_write() {
+        assert!(
+            PROBE_DIR.starts_with("/run/"),
+            "the probe must sit in a root-only directory, got {PROBE_DIR}"
+        );
+    }
 }
