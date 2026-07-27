@@ -1547,12 +1547,15 @@ EOF
     else
         echo "  FAIL: the root-owned leftover was not adopted: $listing"; fail=1
     fi
-    if printf '%s' "$listing" | grep -q '71'; then
+    # Anchor on the id column. `bless list` prints "  <id> class=… pids=[…] cgroup=…", so a
+    # bare `grep 71` also matches any *pid* containing 71 — which in a VM (3-digit pids) trips
+    # roughly whenever the allocator lands there, failing this scenario at random.
+    if printf '%s' "$listing" | grep -q '^71 \|^  71 '; then
         echo "  FAIL: a NON-ROOT-OWNED carrier was adopted — self-bless primitive"; fail=1
     else
         echo "  OK: the planted (user-owned) carrier was ignored"
     fi
-    if printf '%s' "$listing" | grep -q '72'; then
+    if printf '%s' "$listing" | grep -q '^72 \|^  72 '; then
         echo "  OK: a leftover in the user slice (the desktop placement) was adopted"
     else
         echo "  FAIL: the user-slice leftover was not adopted — reconcile does not scan"
