@@ -48,6 +48,9 @@ blessing = "ro"
 [group.object.cloud-creds]
 members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
 
+# `listdir` has no hook of its own yet: a directory open requests `read`, so it is `read`
+# that grants listing here. Do not write `listdir` alone — nothing requests it, so the open
+# falls to default-deny and the rule denies what it looks like it grants (DESIGN §15.5).
 [group.action.ro]
 members = ["read", "listdir"]
 

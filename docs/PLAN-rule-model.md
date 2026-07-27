@@ -136,8 +136,21 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
     would pass with the hook detached; the exec probe therefore gets its own object that
     allows `read` and denies the rest. Its file also needs the x bit, or `may_open(MAY_EXEC)`
     fails with `EACCES` first.
-- Left: `listdir` ≈ "open dir for read" — the coarseness note only; no hook of its own
-  (finer needs the hot `file_permission`).
+- **Done (2026-07-28): the `listdir` limitation is documented** (DESIGN §15.5) — and it is
+  sharper than "coarse". There is no per-`getdents` hook, so listing *is* `file_open` on the
+  directory, and `requested_action` derives only `read`/`write`/`create`: **nothing ever
+  requests `listdir`**, so a rule naming it alone matches no request and the open falls to
+  default-deny. `allow @tools listdir @secrets` therefore *denies* the listing it appears to
+  grant. It fails closed, so this is a usability trap rather than a hole, and the shipped
+  example policies now carry the caution. Making it fire means tagging the request when the
+  opened inode is a directory (`i_mode & S_IFMT`) — one more BTF offset, deliberately not
+  taken, since `read` covers the case correctly today.
+  - Worth considering next: a `cordon policy check` warning on a rule whose action set names
+    `listdir` without `read`. Cheap, userspace-only, and it turns a silent surprise into a
+    lint. Not done here — it is a CLI behaviour change rather than an M3 hook.
+
+**M3 is complete**: every hook in the action↔hook map now fires except `listdir`, which is
+specified above as having no hook by design.
 - `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
   stays opt-in for cost.
 - **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and

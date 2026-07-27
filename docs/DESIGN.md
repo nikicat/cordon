@@ -805,7 +805,7 @@ fixes identity granularity — this axis is where the security actually lives.
 | execute | `bprm_check_security` | exec of a binary — **not implied by `read`**, see below |
 | unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | second program; fire on mutation (cheap) |
 | **link** | **`inode_link`** | **a distinct hook — `rename` does not cover it (see below)** |
-| listdir | `file_open` of a directory (coarse) | no clean per-`getdents` hook; finer needs the hot `file_permission` |
+| listdir | `file_open` of a directory (coarse) | **compiles but never fires** — see below; finer needs the hot `file_permission` |
 
 **The second-name escape — why `link` is not optional.** A *directory* object protects its
 children by **ancestry**: the kernel walks `d_parent` from the opened file up to a
@@ -844,6 +844,18 @@ question — see below:
 verdict — gated because objects resolve **once**, at `policy apply`, and nothing re-checks
 them: `rm -rf ~/.ssh && mkdir ~/.ssh` would otherwise dangle the `PROTECTED` entry and leave
 the path unprotected forever.
+
+**`listdir` does not fire, and the failure is a trap worth naming.** There is no per-`getdents`
+hook, so listing a directory *is* `file_open` on it — and `requested_action` derives only
+`read`/`write`/`create` from `f_mode`/`f_flags`. A directory open therefore requests **`read`**,
+and `listdir` is requested by nothing.
+
+The consequence is not a no-op. A rule that names only `listdir` matches no request, so the
+open falls through to default-deny: `allow @tools listdir @secrets` **denies** the listing it
+looks like it grants. It fails *closed*, so this is a usability trap rather than a hole, but
+policy must currently spell directory listing as `read`. Making it fire means tagging the
+request when the opened inode is a directory (`i_mode & S_IFMT`), which costs one more BTF
+offset — deliberately not done yet, since `read` already covers the case correctly.
 
 **`execute` is its own capability.** An exec *opens* the file (`FMODE_EXEC | FMODE_READ`), so
 `file_open` already refuses to run the contents of an object that denies reads;
