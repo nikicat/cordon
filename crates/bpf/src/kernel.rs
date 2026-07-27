@@ -115,6 +115,17 @@ impl File {
 pub struct Dentry(*const u8);
 
 impl Dentry {
+    /// The nth pointer argument of the LSM hook, for the hooks whose arguments are
+    /// dentries rather than a `struct file` (`inode_link` arg 0 = `old_dentry`,
+    /// `inode_rename` arg 1 = `old_dentry`, `inode_unlink`/`inode_rmdir` arg 1).
+    ///
+    /// The index is the caller's responsibility and is **not** type-checked: reading an
+    /// `inode *` argument as a dentry yields a plausible-but-wrong pointer whose field
+    /// reads fail, which fails *open*. The daemon's self-test exercises every hook for
+    /// exactly this reason.
+    pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Dentry {
+        Dentry(unsafe { ctx.arg(n) })
+    }
     pub fn inode(self) -> Option<Inode> {
         Some(Inode(ptr_at(self.0, offset!(dentry_d_inode))?))
     }
@@ -183,25 +194,60 @@ pub fn caller_exe() -> Option<FileId> {
 #[map]
 static SCRATCH: PerCpuArray<DecisionEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Assemble + push one logged decision to the ring buffer, reconstructing the opened
+/// One logged decision, assembled by the caller and handed to [`emit`] as a unit.
+///
+/// A struct rather than a parameter list for two reasons. BPF passes at most five
+/// arguments in registers and has no call stack for the rest, so a thirteen-argument
+/// `emit` only linked while LLVM happened to inline it — a second call site turned that
+/// into "stack arguments are not supported". And three of these fields are [`FileId`]s
+/// whose order a positional call site could transpose in complete silence, swapping (say)
+/// the object and the leaf in every journal line. Named fields cost nothing and make both
+/// problems structural.
+///
+/// It never actually materializes: [`emit`] is `#[inline(always)]`, so LLVM promotes
+/// these fields straight to registers and the struct costs nothing at runtime. That is
+/// also required — see the note on `emit`.
+pub struct Record {
+    /// The acting task.
+    pub pid: Pid,
+    /// Its real uid; the daemon resolves it to a login name.
+    pub uid: Uid,
+    /// The subject: `mm->exe_file`'s inode.
+    pub exe: FileId,
+    /// The matched protected object's identity.
+    pub object: FileId,
+    /// The affected file's own identity — equals `object` when the rule names the file.
+    /// Also the suppressor and coalesce key, so distinct leaves surface separately.
+    pub leaf: FileId,
+    /// Dense index of the object; the daemon maps it back to the authored path.
+    pub obj: ObjId,
+    /// What was attempted (a single bit here, unlike a rule's mask).
+    pub action: Action,
+    /// Blocked or not — becomes the journal's `deny`/`audit` message word.
+    pub decision: Decision,
+    /// *Why*, which `decision` alone can't say: an explicit `deny` rule, the
+    /// `default-deny` fallthrough, or the structural `escape-deny`.
+    pub policy: Policy,
+    /// Repeats the in-kernel throttle folded into this record.
+    pub suppressed: Suppressed,
+    /// The caller's resolved blessing class; [`ClassId::UNBLESSED`] if none.
+    pub blessing: ClassId,
+    /// Start of the `d_name` walk.
+    pub leaf_dentry: Dentry,
+    /// Stop point of the `d_name` walk (pointer compare).
+    pub object_dentry: Dentry,
+}
+
+/// Assemble + push one logged decision to the ring buffer, reconstructing the affected
 /// file's leaf path (relative to the matched protected object) along the way. Best-effort:
 /// a full ring (or a missing scratch slot) drops the *observation*, never the verdict.
-#[allow(clippy::too_many_arguments)]
-pub fn emit(
-    pid: Pid,
-    uid: Uid,
-    exe: FileId,
-    object: FileId,
-    leaf: FileId,
-    obj: ObjId,
-    action: Action,
-    decision: Decision,
-    policy: Policy,
-    suppressed: Suppressed,
-    blessing: ClassId,
-    file: File,
-    object_dentry: Dentry,
-) {
+///
+/// `#[inline(always)]` is load-bearing, not a hint. Outlined, this becomes a fifth call
+/// frame (hook → decide → consult → emit → memcpy) and the v6.12 verifier gives up
+/// backtracking precision across it: `BPF_PROG_LOAD` fails with `E2BIG` and a `mark_precise:
+/// frame4` storm. Inlined, [`Record`] is scalarized away and the frame disappears with it.
+#[inline(always)]
+pub fn emit(rec: &Record) {
     let Some(ev) = SCRATCH.get_ptr_mut(0) else {
         return;
     };
@@ -209,18 +255,18 @@ pub fn emit(
     // (scalars directly, the path via `fill_comps`) before copying it to the ring. Field
     // writes go straight into map memory — no large stack temporary.
     unsafe {
-        (*ev).exe = exe;
-        (*ev).object = object;
-        (*ev).leaf = leaf;
-        (*ev).obj = obj;
-        (*ev).action = action;
-        (*ev).pid = pid;
-        (*ev).uid = uid;
-        (*ev).decision = decision;
-        (*ev).suppressed = suppressed;
-        (*ev).policy = policy;
-        (*ev).blessing = blessing;
-        let (depth, trunc) = fill_comps(file, object_dentry, &mut (*ev).comps);
+        (*ev).exe = rec.exe;
+        (*ev).object = rec.object;
+        (*ev).leaf = rec.leaf;
+        (*ev).obj = rec.obj;
+        (*ev).action = rec.action;
+        (*ev).pid = rec.pid;
+        (*ev).uid = rec.uid;
+        (*ev).decision = rec.decision;
+        (*ev).suppressed = rec.suppressed;
+        (*ev).policy = rec.policy;
+        (*ev).blessing = rec.blessing;
+        let (depth, trunc) = fill_comps(rec.leaf_dentry, rec.object_dentry, &mut (*ev).comps);
         (*ev).depth = depth;
         (*ev).trunc = trunc as u8;
     }
@@ -240,20 +286,21 @@ pub fn emit(
     entry.submit(0);
 }
 
-/// Fill `comps` with the opened file's path components, **leaf-first**, by walking
-/// `d_name` from `file`'s dentry up to (but not including) `object_dentry` — the matched
+/// Fill `comps` with the affected file's path components, **leaf-first**, by walking
+/// `d_name` from `leaf_dentry` up to (but not including) `object_dentry` — the matched
 /// protected object. Returns `(depth, truncated)`: `depth` valid components, and whether
 /// the path was cut short (deeper than [`PATH_MAX_DEPTH`], a name longer than
 /// [`PATH_NAME_MAX`], or an unreadable component). `comps.get_mut` keeps each write
 /// in-bounds for the verifier; the same bound caps the walk.
+///
+/// Entry is a dentry, not a file, so the mutation hooks (which never see a `struct
+/// file`) reconstruct paths through the same code as `file_open`.
 fn fill_comps(
-    file: File,
+    leaf_dentry: Dentry,
     object_dentry: Dentry,
     comps: &mut [PathComp; PATH_MAX_DEPTH],
 ) -> (u8, bool) {
-    let Some(mut dentry) = file.dentry() else {
-        return (0, false);
-    };
+    let mut dentry = leaf_dentry;
     let mut depth = 0usize;
     for _ in 0..PATH_MAX_DEPTH {
         if dentry == object_dentry {

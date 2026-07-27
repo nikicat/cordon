@@ -37,7 +37,7 @@ use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
     rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, Decision,
-    FileId, ObjId, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS,
+    FileId, ObjId, Pid, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS,
     MAX_RULES_PER_OBJ, NUM_BANKS,
 };
 
@@ -104,48 +104,197 @@ static BLESSED: HashMap<CgroupId, ClassId> = HashMap::with_max_entries(MAX_BLESS
 struct Match {
     obj: ObjId,
     object: FileId,
-    /// The opened file's own `(dev,ino)` — equals `object` when the rule targets the file.
+    /// The affected file's own `(dev,ino)` — equals `object` when the rule targets the file.
     leaf: FileId,
+    /// The affected file's dentry: the start point of the `d_name` walk.
+    leaf_dentry: kernel::Dentry,
     /// The matched object's dentry: the path walk stops here (pointer compare, cheap).
     object_dentry: kernel::Dentry,
 }
 
+/// Lower a decision to an LSM return value, clamped into the range the verifier demands.
+///
+/// An LSM hook must return a value in `[-4095, 0]`, and the verifier requires the exit
+/// register to be *provably* in range. `to_lsm()` only ever yields `0` or `-EPERM`, but
+/// codegen leaves R0 an untracked scalar that the stricter v6.12 verifier rejects ("R0 has
+/// unknown scalar value should have been in [-4095, 0]") though the laxer host kernel
+/// accepts it. `black_box` stops LLVM from proving the bound redundant and eliding it (it
+/// knows `ret ∈ {0,-1}`), so the clamp survives in the object and gives the verifier the
+/// range it needs.
+///
+/// Every program funnels through here — a new hook cannot forget the clamp and then fail
+/// to load only on the pinned CI kernel.
+fn clamped(verdict: Option<Verdict>) -> i32 {
+    // `None` anywhere in a decision flow ⇒ couldn't decide ⇒ fail open.
+    let ret = verdict.unwrap_or(Verdict::Allow).to_lsm();
+    let ret = core::hint::black_box(ret);
+    if ret < -4095 || ret > 0 { 0 } else { ret }
+}
+
 #[lsm(hook = "file_open")]
 pub fn file_open(ctx: LsmContext) -> i32 {
-    // `None` anywhere in the flow ⇒ couldn't decide ⇒ fail open.
-    let ret = decide(&ctx).unwrap_or(Verdict::Allow).to_lsm();
-    // An LSM hook must return a value in `[-4095, 0]`, and the verifier requires the
-    // exit register to be *provably* in range. `to_lsm()` only ever yields `0` or
-    // `-EPERM`, but codegen leaves R0 an untracked scalar that the stricter v6.12
-    // verifier rejects ("R0 has unknown scalar value should have been in [-4095, 0]")
-    // though the laxer host kernel accepts it. `black_box` stops LLVM from proving the
-    // bound redundant and eliding it (it knows `ret ∈ {0,-1}`), so the clamp survives in
-    // the object and gives the verifier the range it needs.
-    let ret = core::hint::black_box(ret);
-    if ret < -4095 || ret > 0 {
-        0
-    } else {
-        ret
+    clamped(decide(&ctx))
+}
+
+// The mutation hooks. Argument positions come from the kernel's LSM prototypes and are
+// **not** type-checked here: reading an `inode *` slot as a dentry yields a pointer whose
+// field reads fail, which fails *open* and silently. `Dentry::from_arg` is called with a
+// literal index at each entry point (never threaded through a shared fn) so the verifier
+// sees a constant offset into the context, and the daemon's self-test exercises every hook
+// so a wrong index fails loudly at startup rather than quietly forever.
+
+/// `inode_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry)`
+#[lsm(hook = "inode_link")]
+pub fn inode_link(ctx: LsmContext) -> i32 {
+    clamped(decide_reparent(
+        kernel::Dentry::from_arg(&ctx, 0),
+        kernel::Dentry::from_arg(&ctx, 2),
+        Action::LINK,
+    ))
+}
+
+/// `inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+///               struct inode *new_dir, struct dentry *new_dentry)`
+#[lsm(hook = "inode_rename")]
+pub fn inode_rename(ctx: LsmContext) -> i32 {
+    clamped(decide_reparent(
+        kernel::Dentry::from_arg(&ctx, 1),
+        kernel::Dentry::from_arg(&ctx, 3),
+        Action::RENAME,
+    ))
+}
+
+/// `inode_unlink(struct inode *dir, struct dentry *dentry)`
+#[lsm(hook = "inode_unlink")]
+pub fn inode_unlink(ctx: LsmContext) -> i32 {
+    clamped(decide_remove(kernel::Dentry::from_arg(&ctx, 1), Action::UNLINK))
+}
+
+/// `inode_rmdir(struct inode *dir, struct dentry *dentry)`
+#[lsm(hook = "inode_rmdir")]
+pub fn inode_rmdir(ctx: LsmContext) -> i32 {
+    clamped(decide_remove(kernel::Dentry::from_arg(&ctx, 1), Action::RMDIR))
+}
+
+/// Settings + the daemon's own-I/O fast path. `None` ⇒ the caller allows: either we can't
+/// read settings (fail open) or this *is* the daemon (never deadlock on its own I/O).
+fn live_bank(pid: Pid) -> Option<Bank> {
+    let settings = settings()?;
+    if pid == settings.daemon_pid {
+        return None;
+    }
+    // Masked to a valid bank — a torn/garbage read can't escape the array, it just
+    // resolves to an empty bucket → fail-open allow.
+    Some(settings.active_bank.masked())
+}
+
+/// `inode_link` / `inode_rename`: a name is being created for an existing inode (and for
+/// rename, the old name goes away). Two questions, in order:
+///
+/// 1. **Escape** — is a protected inode acquiring a name *outside* its object? Refused
+///    unconditionally, with no rule lookup and no subject check. A second name in an
+///    unprotected directory makes the inode readable by every subject, forever, and
+///    silently: `find_object` stops finding the object, so no further event is ever
+///    emitted. No subject is trusted with that — not an allowed exe, not a blessed
+///    session. Blessing grants *read*, not re-parenting.
+/// 2. **Clobber** — is an unprotected inode acquiring a name *inside* an object? That is
+///    an ordinary create/write, so it takes the subject's verdict on the destination
+///    object and honours `audit` (allow+log) exactly like any other write.
+///
+/// An internal shuffle (same object both sides) is neither, and returns early: that is the
+/// atomic-save pattern (write a temp beside the target, rename over it), which has to keep
+/// working inside a protected directory — `ssh` rewriting `known_hosts`, `git` in
+/// `~/.password-store`. It is also why the clobber check can't simply fire on "destination
+/// is protected".
+fn decide_reparent(
+    source: kernel::Dentry,
+    new_dentry: kernel::Dentry,
+    op: Action,
+) -> Option<Verdict> {
+    let pid = kernel::current_pid();
+    let bank = live_bank(pid)?;
+
+    let src = find_object(source, bank);
+    // The destination *directory*. The new dentry is negative — it names a file that does
+    // not exist yet, so `d_inode` is NULL and its own identity is unreadable. Its parent
+    // is the directory receiving the name, which is what we must classify.
+    let dst = find_object(new_dentry.parent()?, bank);
+
+    match (src, dst) {
+        // Nothing protected is moving.
+        (None, None) => Some(Verdict::Allow),
+        // Both sides inside the same object: an internal shuffle, not a re-parenting.
+        (Some(s), Some(d)) if s.obj == d.obj => Some(Verdict::Allow),
+        // ESCAPE. Covers dst unprotected *and* dst a different object (which may have
+        // looser rules). Also catches the object's own directory being moved out, which
+        // would otherwise strand the path unprotected for everything created afterwards.
+        (Some(s), _) => Some(deny_escape(&s, op, pid, bank)),
+        // CLOBBER: a foreign inode taking a name inside the object.
+        (None, Some(d)) => consult(&d, Action::CREATE | Action::WRITE, op, pid, bank),
     }
 }
 
-fn decide(ctx: &LsmContext) -> Option<Verdict> {
-    let settings = settings()?;
-
-    // (1) our own I/O → allow (never deadlock on the daemon's own opens).
+/// `inode_unlink` / `inode_rmdir`: a name is being removed. There is no destination, so
+/// this is an ordinary subject verdict — removing a name is a write to the object. Gating
+/// it matters because destroying the object's own directory dangles its `PROTECTED` entry:
+/// objects resolve once, at `policy apply`, and nothing re-checks them, so `rm -rf` +
+/// `mkdir` would otherwise leave the path permanently unprotected.
+fn decide_remove(dentry: kernel::Dentry, op: Action) -> Option<Verdict> {
     let pid = kernel::current_pid();
-    if pid == settings.daemon_pid {
+    let bank = live_bank(pid)?;
+    let Some(matched) = find_object(dentry, bank) else {
         return Some(Verdict::Allow);
+    };
+    consult(&matched, Action::WRITE, op, pid, bank)
+}
+
+/// Refuse an escape, and journal it best-effort. The verdict deliberately does **not**
+/// depend on being able to log: an unreadable exe or a full ring buffer costs the
+/// observation, never the enforcement.
+///
+/// *Whether* to log still follows the object's own policy, so `{allow,deny}×{log,silent}`
+/// holds here too — a `silence` object refuses the escape silently. The rule lookup
+/// decides logging only; it can never make the escape allowed. Matching on `READ | op` is
+/// what lets an ordinary read rule answer "does this object log?", since policies rarely
+/// name `link`/`rename` explicitly.
+fn deny_escape(matched: &Match, op: Action, pid: Pid, bank: Bank) -> Verdict {
+    if let Some(exe) = kernel::caller_exe() {
+        let policy = match_rule(matched.obj, Action::READ | op, exe, current_class(), bank)
+            .unwrap_or(Policy::DEFAULT_DENY);
+        if !policy.logs() {
+            return Verdict::Deny;
+        }
+        if let Some(suppressed) = kernel::throttle(exe, matched.leaf, op) {
+            kernel::emit(&kernel::Record {
+                pid,
+                uid: kernel::current_uid(),
+                exe,
+                object: matched.object,
+                leaf: matched.leaf,
+                obj: matched.obj,
+                action: op,
+                decision: Decision::DENY,
+                policy: Policy::ESCAPE_DENY,
+                suppressed,
+                blessing: current_class(),
+                leaf_dentry: matched.leaf_dentry,
+                object_dentry: matched.object_dentry,
+            });
+        }
     }
-    // The live double-buffer generation, masked to a valid bank (a torn/garbage read
-    // can't escape the array — it just resolves to an empty bucket → fail-open allow).
-    let bank = settings.active_bank.masked();
+    Verdict::Deny
+}
+
+fn decide(ctx: &LsmContext) -> Option<Verdict> {
+    // (1) settings + our own I/O → allow (never deadlock on the daemon's own opens).
+    let pid = kernel::current_pid();
+    let bank = live_bank(pid)?;
 
     // file_open(struct file *file): arg 0.
     let file = kernel::File::from_arg(ctx, 0);
 
     // (2) most-specific protected object, or unprotected → allow.
-    let Some(matched) = find_object(file, bank) else {
+    let Some(matched) = find_object(file.dentry()?, bank) else {
         return Some(Verdict::Allow);
     };
 
@@ -156,10 +305,32 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
         return Some(Verdict::Allow);
     }
 
-    // (4)/(5) caller subject → first matching rule, else default-deny (a distinct cause from
-    // an explicit `deny`, so the journal can tell "no rule" apart from "you blocked it"). The
-    // subject is the exe plus the caller's resolved blessing class (DESIGN §16.3), the latter
-    // read once here from its cgroup; both are matched per-rule by `subject_matches`.
+    // (4)/(5) subject match → verdict → journal. `file_open` logs exactly the action it
+    // matched on; the mutation hooks pass a wider `requested` than they log (§15.5).
+    consult(&matched, requested, requested, pid, bank)
+}
+
+/// The shared decision tail: caller subject → first matching rule → verdict → journal.
+///
+/// `requested` is the mask matched against rules; `logged` is what the journal and the
+/// suppressor record. They differ only where an operation is gated by a broader capability
+/// than the one it is named for. Keeping this in one place means deny/log semantics cannot
+/// drift apart per hook.
+///
+/// **Five arguments is the ceiling**: BPF passes at most five in registers and has no
+/// stack for the rest, so a sixth turns this from a subprogram call into a link error.
+/// Fold anything further into [`Match`].
+fn consult(
+    matched: &Match,
+    requested: Action,
+    logged: Action,
+    pid: Pid,
+    bank: Bank,
+) -> Option<Verdict> {
+    // First matching rule, else default-deny (a distinct cause from an explicit `deny`, so
+    // the journal can tell "no rule" apart from "you blocked it"). The subject is the exe
+    // plus the caller's resolved blessing class (DESIGN §16.3), the latter read once here
+    // from its cgroup; both are matched per-rule by `subject_matches`.
     let exe = kernel::caller_exe()?;
     let class = current_class();
     let policy =
@@ -168,36 +339,36 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
     // The per-rule policy is the only enforcement level (no global mode): a denying
     // policy blocks outright.
     let blocked = policy.denies();
-    // Emit only when the policy logs *and* the suppressor (keyed on the opened file, so
+    // Emit only when the policy logs *and* the suppressor (keyed on the affected file, so
     // distinct leaves surface) lets this one through — a tight repeat-open burst collapses
     // to its first event + a folded `suppressed` count.
     if policy.logs() {
-        if let Some(suppressed) = kernel::throttle(exe, matched.leaf, requested) {
+        if let Some(suppressed) = kernel::throttle(exe, matched.leaf, logged) {
             let decision = if blocked {
                 Decision::DENY
             } else {
                 Decision::AUDIT
             };
             // `emit` assembles the record off-stack (per-CPU scratch) and reconstructs the
-            // opened file's path relative to the protected object (DESIGN §15.10 flow B) —
-            // no `bpf_d_path` here, so it walks `d_name` from the leaf to `object_dentry`.
-            // The uid is read only on the logged path, so the unprotected majority pays
-            // nothing for it.
-            kernel::emit(
+            // affected file's path relative to the protected object (DESIGN §15.10 flow B)
+            // — no `bpf_d_path` here, so it walks `d_name` from the leaf to
+            // `object_dentry`. The uid is read only on the logged path, so the unprotected
+            // majority pays nothing for it.
+            kernel::emit(&kernel::Record {
                 pid,
-                kernel::current_uid(),
+                uid: kernel::current_uid(),
                 exe,
-                matched.object,
-                matched.leaf,
-                matched.obj,
-                requested,
+                object: matched.object,
+                leaf: matched.leaf,
+                obj: matched.obj,
+                action: logged,
                 decision,
                 policy,
                 suppressed,
-                class,
-                file,
-                matched.object_dentry,
-            );
+                blessing: class,
+                leaf_dentry: matched.leaf_dentry,
+                object_dentry: matched.object_dentry,
+            });
         }
     }
     Some(if blocked {
@@ -207,17 +378,20 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
     })
 }
 
-/// Walk the opened file's dentry ancestors; return the first (deepest, hence
-/// most-specific) one whose (dev, ino) is a protected object in the active `bank`. The
-/// opened file's own identity (`leaf`) is computed only on a match, so the unprotected
-/// majority pays nothing extra for it.
-fn find_object(file: kernel::File, bank: Bank) -> Option<Match> {
-    let leaf_dentry = file.dentry()?;
+/// Walk `leaf_dentry`'s ancestors; return the first (deepest, hence most-specific) one
+/// whose (dev, ino) is a protected object in the active `bank`. The leaf's own identity is
+/// computed only on a match, so the unprotected majority pays nothing extra for it.
+///
+/// Entry is a dentry so every hook shares one resolver: `file_open` passes the opened
+/// file's dentry, the mutation hooks pass the dentry their arguments carry directly. Note
+/// the leaf is tested *first*, which is why a rule naming a file matches that inode by any
+/// name, while a rule naming a directory protects children only by ancestry (DESIGN §15.5).
+fn find_object(leaf_dentry: kernel::Dentry, bank: Bank) -> Option<Match> {
     let mut dentry = leaf_dentry;
     for _ in 0..MAX_ANCESTORS {
         let id = FileId::new(dentry.super_block()?.dev()?, dentry.inode()?.ino()?);
         if let Some(obj) = protected_obj(bank, id) {
-            // The opened file's own id: reuse `id` if the file *is* the object, else read it.
+            // The leaf's own id: reuse `id` if the leaf *is* the object, else read it.
             let leaf = if dentry == leaf_dentry {
                 id
             } else {
@@ -230,6 +404,7 @@ fn find_object(file: kernel::File, bank: Bank) -> Option<Match> {
                 obj,
                 object: id,
                 leaf,
+                leaf_dentry,
                 object_dentry: dentry,
             });
         }

@@ -254,15 +254,31 @@ impl Policy {
     /// default-deny ("you have no rule for this") apart from an explicit `deny` rule ("you
     /// chose to block this"). Blocks + logs exactly like [`DENY`](Policy::DENY).
     pub const DEFAULT_DENY: Policy = Policy(4);
+    /// Synthetic effect the kernel applies when a protected inode would acquire a name
+    /// **outside its object** — a hardlink or rename out (DESIGN §15.5). Like
+    /// [`DEFAULT_DENY`](Policy::DEFAULT_DENY) it is never authored or stored in a
+    /// [`CompiledRule`]; unlike every other cause it comes from no rule *at all*, because
+    /// the escape is refused unconditionally: a second name in an unprotected directory
+    /// makes the inode readable by every subject, permanently, and silently (the ancestor
+    /// walk stops finding the object, so nothing is ever logged again). A distinct cause
+    /// so the journal reads "this was structurally refused", not "a rule of yours blocked
+    /// it" — the two want very different fixes.
+    pub const ESCAPE_DENY: Policy = Policy(5);
 
     /// Whether this policy blocks the access (the `deny` half of `{allow,deny}×{log,silent}`).
     pub const fn denies(self) -> bool {
-        matches!(self, Policy::DENY | Policy::SILENCE | Policy::DEFAULT_DENY)
+        matches!(
+            self,
+            Policy::DENY | Policy::SILENCE | Policy::DEFAULT_DENY | Policy::ESCAPE_DENY
+        )
     }
     /// Whether a decision under this policy emits a record (the `log` half) rather than
     /// staying silent.
     pub const fn logs(self) -> bool {
-        matches!(self, Policy::AUDIT | Policy::DENY | Policy::DEFAULT_DENY)
+        matches!(
+            self,
+            Policy::AUDIT | Policy::DENY | Policy::DEFAULT_DENY | Policy::ESCAPE_DENY
+        )
     }
 }
 
@@ -276,6 +292,7 @@ impl core::fmt::Display for Policy {
             Policy::DENY => "deny",
             Policy::SILENCE => "silence",
             Policy::DEFAULT_DENY => "default-deny",
+            Policy::ESCAPE_DENY => "escape-deny",
             _ => "unknown",
         })
     }
