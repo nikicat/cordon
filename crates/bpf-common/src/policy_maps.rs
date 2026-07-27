@@ -171,9 +171,10 @@ bitflags! {
     /// The set of actions a rule covers, as a bitset — one bit per LSM-mediated
     /// operation (DESIGN §15.5). A rule carries a *mask* (not one action) so e.g.
     /// `action = ["read","write"]` is a single [`CompiledRule`]; the kernel matches
-    /// when the requested action's bit is set (`intersects`). M1 enforces only
-    /// `READ`/`WRITE`/`CREATE` (all derivable at `file_open` from `f_mode`/`f_flags`);
-    /// the rest compile but don't fire until their hooks land (M3).
+    /// when the requested action's bit is set (`intersects`). `READ`/`WRITE`/`CREATE`
+    /// are derivable at `file_open` from `f_mode`/`f_flags`; `LINK`/`RENAME`/`UNLINK`/
+    /// `RMDIR` fire at the mutation hooks (§15.5). `EXECUTE`/`LISTDIR`/`MKDIR` still
+    /// compile but don't fire — their hooks haven't landed.
     ///
     /// `#[repr(transparent)]` is load-bearing: it's read byte-for-byte out of the
     /// `RULES` map inside [`CompiledRule`] (`repr(C)`), so the ABI must be exactly the
@@ -193,6 +194,7 @@ bitflags! {
         const MKDIR   = 1 << 6;
         const RMDIR   = 1 << 7;
         const RENAME  = 1 << 8;
+        const LINK    = 1 << 9;
     }
 }
 
@@ -200,7 +202,7 @@ bitflags! {
 /// match the policy authoring vocabulary. `no_std`: `core::fmt`, no allocation.
 impl core::fmt::Display for Action {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        const NAMED: [(Action, &str); 9] = [
+        const NAMED: [(Action, &str); 10] = [
             (Action::READ, "read"),
             (Action::WRITE, "write"),
             (Action::CREATE, "create"),
@@ -210,6 +212,7 @@ impl core::fmt::Display for Action {
             (Action::MKDIR, "mkdir"),
             (Action::RMDIR, "rmdir"),
             (Action::RENAME, "rename"),
+            (Action::LINK, "link"),
         ];
         if self.is_empty() {
             return write!(f, "none");
@@ -431,9 +434,10 @@ mod tests {
         assert!(!rw.intersects(Action::CREATE));
         assert!(Action::all().contains(rw));
         assert!(Action::all().contains(Action::RENAME));
+        assert!(Action::all().contains(Action::LINK));
         assert!(Action::empty().is_empty());
-        // `*` (all defined actions) is exactly the nine bits, no more.
-        assert_eq!(Action::all().bits(), 0b1_1111_1111);
+        // `*` (all defined actions) is exactly the ten bits, no more.
+        assert_eq!(Action::all().bits(), 0b11_1111_1111);
     }
 
     #[test]

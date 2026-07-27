@@ -144,6 +144,7 @@ pub enum ActionName {
     Mkdir,
     Rmdir,
     Rename,
+    Link,
 }
 
 impl ActionName {
@@ -160,6 +161,7 @@ impl ActionName {
             "mkdir" => ActionName::Mkdir,
             "rmdir" => ActionName::Rmdir,
             "rename" => ActionName::Rename,
+            "link" => ActionName::Link,
             _ => return None,
         })
     }
@@ -177,6 +179,7 @@ impl ActionName {
             ActionName::Mkdir => Action::MKDIR,
             ActionName::Rmdir => Action::RMDIR,
             ActionName::Rename => Action::RENAME,
+            ActionName::Link => Action::LINK,
         }
     }
 }
@@ -737,6 +740,13 @@ mod tests {
         assert_eq!(ActionName::parse("nope"), None);
         assert_eq!(ActionName::Write.bit(), bpf::Action::WRITE);
         assert_eq!(PolicyName::Silence.lower(), bpf::Policy::SILENCE);
+        // The mutation-hook actions round-trip: authored name → bit → journal name.
+        // `link` is the newest and the one with no `file_open` fallback, so a missing
+        // arm here would surface as `action=read` on a `ln` denial (DESIGN §15.5).
+        assert_eq!(ActionName::parse("link"), Some(ActionName::Link));
+        assert_eq!(ActionName::Link.bit(), bpf::Action::LINK);
+        assert_eq!(bpf::Action::LINK.to_string(), "link");
+        assert_eq!(bpf::Action::RENAME.to_string(), "rename");
     }
 
     /// The shipped example policy must always parse + resolve (group refs, action
