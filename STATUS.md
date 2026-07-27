@@ -9,7 +9,7 @@
 The architecture is the flat **rule model** (DESIGN §15): a root-owned text policy of
 `(who, where, action, policy)` rules, compiled in userspace, enforced **in-kernel** by the
 `bpf-lsm` backend. **M1 is complete and VM-validated**, as is **blessing B1 + B2**
-(DESIGN §16). The suite is 27 `bpf-lsm-smoke.sh` scenarios, green on the CI-pinned v6.12.
+(DESIGN §16). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12.
 The earlier owner model was retired in the migration — see *Pre-rule-model history* below.
 
 Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) (M2, M4–M6 ahead; M3 is

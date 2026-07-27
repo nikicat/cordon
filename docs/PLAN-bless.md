@@ -10,7 +10,7 @@ new pieces are a carrier (a per-invocation root-owned cgroup), a tiny runtime in
 (`BLESSED: cgroup_id → ClassId`), a root-gated mint path in the daemon, and the `cordon bless`
 CLI.
 
-> **Status: B1 + B2 shipped (2026-07-27); 27/27 VM smoke scenarios green.** What exists
+> **Status: B1 + B2 shipped (2026-07-27); the VM smoke is green.** What exists
 > today is specified in DESIGN §16 and summarized in [`STATUS.md`](../STATUS.md); the
 > detailed B1/B2 commit plans have been retired now that they are code. **B3 is next.**
 
@@ -38,8 +38,8 @@ Guiding constraints (from §16) — these still bind B3 and B4:
 > `session-3.scope` and confirmed logind saw the session, without ever asking *where the
 > user's processes actually are* (under the delegated `user@UID.service`, with no session
 > scope above them). A probe that builds its own premise proves only that the premise is
-> self-consistent. Smoke scenarios 26–27 now cover the placement rule and fail when it
-> regresses; the script is deleted.
+> self-consistent. The `bless_placement` and `bless_reconcile_ownership` smoke scenarios
+> now cover the placement rule and fail when it regresses; the script is deleted.
 
 ---
 
