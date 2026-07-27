@@ -1630,12 +1630,108 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario: inode_mkdir ---------------------------------------------------
+# `rmdir` was gated and `mkdir` was not, so a subject that could not remove a directory
+# inside an object could still add one. The new dentry is negative, so the verdict comes
+# from the *parent* — which is what this checks, on both polarities, in one policy.
+scenario_mkdir() {
+    echo "### scenario: mkdir inside a protected object takes the parent's verdict"
+    ws_new
+    mkdir -p "$VAULT/locked"
+    write_policy <<EOF
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = ["read", "write", "create"]
+policy = "allow"
+[[rule]]
+who = "*"
+where = "$VAULT/locked"
+action = "*"
+policy = "deny"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # A writable object must keep working — this hook must not break legitimate structure.
+    expect_allow "mkdir inside an object that allows create/write" \
+        mkdir "$VAULT/allowed" || fail=1
+    # The gap this hook closes: nested, more specific, denying.
+    expect_deny "mkdir inside a denying nested object" \
+        mkdir "$VAULT/locked/evil" || fail=1
+    [ -d "$VAULT/locked/evil" ] && { echo "  FAIL: the directory was created anyway"; fail=1; } \
+        || echo "  OK: no directory appeared under the denied object"
+    daemon_stop; return $fail
+}
+
+# Swap two names via `renameat2(RENAME_EXCHANGE)`. Exits non-zero when the kernel refuses,
+# and 3 when the syscall is unavailable — which the scenario's preflight separates from a
+# deny, since "the helper is broken" and "the boundary refused" both look like failure.
+exchange() {
+    python3 -c '
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if not hasattr(libc, "renameat2"):
+    sys.exit(3)
+AT_FDCWD, RENAME_EXCHANGE = -100, 2
+sys.exit(0 if libc.renameat2(AT_FDCWD, sys.argv[1].encode(), AT_FDCWD,
+                             sys.argv[2].encode(), RENAME_EXCHANGE) == 0 else 1)
+' "$1" "$2"
+}
+
+# --- scenario: renameat2(RENAME_EXCHANGE) ------------------------------------
+# An exchange re-parents *both* inodes and destroys neither, so the destroy check — which
+# gives the destination object a `write` floor — does not cover it. The protected side
+# leaving is an escape, but only if the hook is asked about that side at all:
+# `security_inode_rename` calls it a second time with the pair swapped when RENAME_EXCHANGE
+# is set. This scenario is what verifies that second call, rather than believing it. On a
+# *writable* object the first call sees nothing but an allowed clobber, so if the kernel
+# made only that one call the secret would walk out of its object.
+scenario_rename_exchange() {
+    echo "### scenario: renameat2(RENAME_EXCHANGE) — a protected inode cannot be swapped out"
+    ws_new
+    command -v python3 >/dev/null || { echo "  SKIP: python3 unavailable (needed for renameat2)"; return 0; }
+    local outside="$TMP/outside"; echo "OUTSIDE" > "$outside"
+    # Preflight while nothing is enforcing: an unavailable syscall must not read as a deny.
+    echo A > "$TMP/xa"; echo B > "$TMP/xb"
+    if ! exchange "$TMP/xa" "$TMP/xb"; then
+        echo "  SKIP: renameat2(RENAME_EXCHANGE) unavailable on this kernel/libc"; return 0
+    fi
+    grep -q B "$TMP/xa" || { echo "  FAIL: preflight exchange did not swap the inodes"; return 1; }
+    # Deliberately permissive: `write` must be *allowed* on the vault, or the destroy and
+    # clobber checks would refuse the exchange for an unrelated reason and prove nothing.
+    write_policy <<EOF
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = ["read", "write", "create"]
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # The case only the swapped call can catch.
+    expect_deny "exchange moving a protected inode out (unprotected side passed first)" \
+        exchange "$outside" "$SECRET" || fail=1
+    grep -q TOPSECRET "$SECRET" && echo "  OK: the protected inode stayed in its object" \
+        || { echo "  FAIL: the secret was swapped out of the vault"; fail=1; }
+    grep -q OUTSIDE "$outside" && echo "  OK: the outside name kept its own inode" \
+        || { echo "  FAIL: the vault's inode is now reachable outside the object"; fail=1; }
+    # The mirror image, which the *first* call already refuses via the escape check.
+    expect_deny "exchange moving a protected inode out (protected side passed first)" \
+        exchange "$SECRET" "$outside" || fail=1
+    # An exchange wholly inside the object is an internal shuffle and must keep working.
+    expect_allow "exchange of two names inside the same object" \
+        exchange "$SECRET" "$VAULT/other" || fail=1
+    daemon_stop; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
 scenario_selftest_negative || rc=1
 scenario_per_action        || rc=1
 scenario_rename_over       || rc=1
+scenario_rename_exchange   || rc=1
+scenario_mkdir             || rc=1
 scenario_subject_group     || rc=1
 scenario_object_group      || rc=1
 scenario_deny_wins         || rc=1

@@ -828,7 +828,7 @@ restricts only linking files the caller does not own, and here the adversary *is
 So the invariant is not "gate rename" but **a protected inode must not acquire a name
 outside its object** — which needs `inode_link` *and* `inode_rename`.
 
-**Shipped (2026-07-27).** Both hooks, plus `inode_unlink`/`inode_rmdir`, share one resolver
+**Shipped.** Both hooks, plus `inode_unlink`/`inode_rmdir`/`inode_mkdir`, share one resolver
 over `find_object`. Four cases. `dst` is the destination **directory**
 (`new_dentry.parent()`); `target` is the destination **dentry itself**, which is a distinct
 question — see below:
@@ -844,6 +844,12 @@ question — see below:
 verdict — gated because objects resolve **once**, at `policy apply`, and nothing re-checks
 them: `rm -rf ~/.ssh && mkdir ~/.ssh` would otherwise dangle the `PROTECTED` entry and leave
 the path unprotected forever.
+
+`inode_mkdir` is the mirror of `rmdir` and the one hook whose dentry is **negative**: there is
+no inode yet, so it matches nothing itself and the verdict comes from its **parent**, like the
+clobber arm above. Adding a name inside an object is an ordinary `create`/`write` on it. Note
+this does *not* cover the `rm -rf` case above — once the object's own directory is gone there
+is no protected ancestor left to find, which is exactly why `rmdir` is the hook that closes it.
 
 **Why escape consults no rule.** An escape publishes the inode to *every* subject,
 permanently, and silently — afterwards `find_object` misses, so nothing is ever logged

@@ -42,7 +42,9 @@ readable by everything, permanently and unlogged. The **escape** (a protected in
 name outside its object) is refused unconditionally, with no rule lookup and no blessing
 exemption; **clobber** and **destroy** are ordinary writes and take the subject's verdict, so
 `audit` objects keep working. An internal rename short-circuits, which is what keeps
-atomic-save alive inside a protected dir. All five programs share `find_object`, so entry is
+atomic-save alive inside a protected dir. `inode_mkdir` joins them by classifying off the
+*parent*, since a to-be-created dentry is negative and matches nothing itself. Every mutation
+program shares `find_object`, so entry is
 a dentry rather than a `struct file`. A rename **over** an existing name is a fourth case,
 classified off the destination *dentry* rather than its directory: it destroys that inode and
 `inode_rename` is the only hook the kernel fires for it, so without it `mv anything secret`
@@ -89,22 +91,13 @@ Environment, cwd, tty, job control and session are inherited by construction.
 **M6**, which are the must-haves. Blessing work waits — B1+B2 already make `bless` usable, and
 the core boundary is what the remaining holes are in. The rule: *soundness before ergonomics.*
 
-### First — bugs, then finish M3
+### First — finish M3
 
-- **The self-test probe is a root-writable `/tmp` path** (security bug, small fix). `cordond`
-  is uid 0 with no `PrivateTmp=`, and `self_test` uses `create_dir_all` (accepts a
-  pre-existing directory of any owner) plus `std::fs::write` (no `O_NOFOLLOW`), so a local
-  user who pre-creates `/tmp/cordon-selftest.<pid>/` holding a symlink gets root to truncate
-  any root-owned file — `/etc/cordon/policy.toml` included, after which the daemon fails to
-  compile and **the boundary is off entirely**. It runs before `seed_policy`, so cordon is not
-  yet enforcing on itself, and `fs.protected_symlinks` does not cover it. Full analysis and
-  the fix (move the probe under `/run/cordon/`) in
-  [PLAN-rule-model](docs/PLAN-rule-model.md) *Carried-over notes*.
-- **M3 completion** — `inode_mkdir` and `bprm_check_security` (the `execute` action) are the
-  two hooks still missing; `listdir` ≈ "open dir for read" needs its coarseness documented;
-  and `renameat2(RENAME_EXCHANGE)` is **believed, not verified** — the escape refusal for the
-  protected side moving *out* depends on the kernel calling the hook a second time with the
-  pair swapped. The four mutation hooks that ship (§15.5) already carry the hard part.
+- **M3 completion** — `bprm_check_security` (the `execute` action) is the one hook still
+  missing, and it is the first to need a **new BTF offset** (`linux_binprm -> file`); every
+  hook so far is handed a dentry the existing offsets already cover. `listdir` ≈ "open dir for
+  read" still needs its coarseness documented. `inode_mkdir` now ships, and
+  `RENAME_EXCHANGE` is **verified** rather than believed (see *Durable kernel facts*).
 
 ### Next — the must-haves
 
@@ -210,6 +203,14 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
   supported"). And inlining is not merely a linkage workaround: outlining `emit` added a
   fifth call frame and the v6.12 verifier rejected the whole object with `E2BIG` and a
   `mark_precise: frame4` storm. `consult` sits exactly at the five-arg ceiling.
+- **`RENAME_EXCHANGE` fires `inode_rename` twice** (verified 2026-07-28 in the VM, not
+  reasoned from the source): `security_inode_rename` calls the hook once with the pair
+  **swapped** before the ordinary call. Both directions therefore reach the escape check,
+  which is the only reason an exchange cannot walk a protected inode out of its object. It
+  matters *only* where the object allows write — otherwise the destroy or clobber check
+  refuses first and hides whether the second call happened at all. The `rename_exchange`
+  scenario is built around that case; do not "simplify" it to a denying object, which would
+  make it pass without testing anything.
 - At the mutation hooks the **trusted context argument is a dentry**, not a `file`. The
   verifier range-checks offsets applied to trusted pointers against `.rodata`, so the
   `dentry_d_*` offsets must stay real in `maybe_poison_offsets` or the failure-path test

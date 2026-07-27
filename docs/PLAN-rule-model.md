@@ -24,12 +24,14 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
 
 Numbering is identity, not schedule. The queue:
 
-1. **Known bugs** — the root-writable `/tmp` self-test probe below (*Carried-over notes*) is a
-   local escalation that can switch the boundary off; it is small and it goes first.
+1. ~~**Known bugs**~~ — **done.** The self-test probe ran in a world-writable `TMPDIR` and
+   reused any directory it found, so a planted symlink got root to truncate the policy and
+   switch the boundary off. It lives in root-only `/run/cordon` now.
 2. **Docs** — keep DESIGN/STATUS/plan in step with what ships, since these files are the
    resume point.
-3. **Finish M3** — `inode_mkdir`, `bprm_check_security`, and verifying `RENAME_EXCHANGE`. The
-   hard part (the four mutation hooks) already ships; this closes the set.
+3. **Finish M3** ← **here** — `inode_mkdir`, `bprm_check_security`, and verifying
+   `RENAME_EXCHANGE`. The hard part (the four mutation hooks) already ships; this closes the
+   set.
 4. **M5**, then **M6** — the two must-haves. M5 is small and bounded and removes a
    fail-**open**; M6 is the largest known hole and the longest job, so it goes last of the
    two and starts with its userspace-only tasks.
@@ -109,7 +111,17 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
 ## Milestone 3 — Mutation + exec hooks ← **finish this first (after the bugs)**
 - **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir` — the
   second-name escape, clobber, and destroy. Design + rationale in DESIGN §15.5.
-- Left: `inode_mkdir` and `bprm_check_security` (the `execute` action).
+- **Done (2026-07-28): `inode_mkdir`.** `rmdir` was gated and `mkdir` was not, so a subject
+  that could not remove a directory inside an object could still add one. The new dentry is
+  **negative**, so `find_object` on it misses on the first step and the verdict comes from the
+  *parent* — the same shape as the clobber arm of `decide_reparent`. It is an ordinary
+  create/write on the parent object, so `audit` still observes rather than blocks. This is not
+  the `rm -rf ~/.ssh && mkdir ~/.ssh` case: that one is closed by `inode_rmdir` refusing the
+  removal, since once the object's own directory is gone there is no protected ancestor left
+  for this hook to find.
+- Left: `bprm_check_security` (the `execute` action). Needs a new BTF offset
+  (`linux_binprm -> file`), unlike every hook so far — the mutation hooks all hand over a
+  dentry the existing offsets already cover.
 - `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
   stays opt-in for cost.
 - **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and
@@ -118,10 +130,17 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
   `rm secret` is refused. `find_object` now runs on the destination dentry first and takes
   that object's `write` verdict; the daemon self-test and a `bpf-lsm-smoke.sh` scenario both
   cover it, the latter also pinning that atomic-save still works. DESIGN §15.5.
-- Verify `renameat2(RENAME_EXCHANGE)`. The destroy check gives the destination object a
-  `write` floor, but an exchange re-parents both inodes rather than destroying one, so the
-  protected side moving *out* still wants the unconditional escape refusal — which depends on
-  the kernel calling the hook a second time with the pair swapped. Believed, not verified.
+- **Done (2026-07-28): `renameat2(RENAME_EXCHANGE)` verified.** An exchange re-parents both
+  inodes and destroys neither, so the destroy check's `write` floor does not cover it; the
+  protected side leaving needs the unconditional escape refusal, which requires the kernel to
+  ask about *that* side. It does: `security_inode_rename` calls the hook a second time with
+  the pair swapped when `RENAME_EXCHANGE` is set. Now measured rather than believed, by the
+  `rename_exchange` smoke scenario. The load-bearing case is an object that **allows write**
+  and the unprotected name passed *first* — then the first call sees only an ordinary
+  permitted clobber, and the swapped call is the sole thing standing between the secret and a
+  name outside its object. The scenario preflights the syscall against two unprotected files,
+  because an unavailable `renameat2` would otherwise read as a deny and pass for the wrong
+  reason. An exchange wholly inside one object stays allowed (internal shuffle).
 
 ## Milestone 4 — Autolearn (the zones layer) ← **not scheduled; its machinery lands as M6 task 6**
 - Separate `learned.db` (SQLite); `zones` config = where learning may propose rules.
@@ -548,25 +567,6 @@ cookie-DB measurement, not on any of the above.
 
 ## Carried-over notes (still live)
 Loose ends left by shipped work, none of them a milestone of their own:
-- **The self-test probe is a root-writable `/tmp` path (security bug, small fix).** ← **first
-  in the queue** — it is the one item here that is a live escalation rather than a rough edge.
-  `self_test` builds `$TMPDIR/cordon-selftest.<pid>` and now seeds a file inside it with
-  `std::fs::write`, which is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW` — and
-  `create_dir_all` accepts a pre-existing directory of any owner. `cordond` is uid 0 and no
-  unit sets `PrivateTmp=`, so a local user who pre-creates `/tmp/cordon-selftest.<N>/`
-  (mode 0755, theirs) holding `src -> /etc/cordon/policy.toml` gets root to truncate the
-  policy on the next start with that pid — after which the daemon fails to compile and the
-  boundary is off entirely. Any root-owned file works; the pid guess is the only cost, and
-  pids are sequential. `fs.protected_symlinks` does **not** cover this: `may_follow_link()`
-  keys on the symlink's *immediate parent* being sticky and world-writable, and here that
-  parent is the attacker's own plain directory, so the check returns before comparing uids.
-  (Planting the top-level probe path itself as a symlink *is* blocked — that one sits
-  directly in sticky `/tmp`.) The write also runs before `seed_policy`, so cordon is not yet
-  enforcing on itself. Fix: put the probe under `/run/cordon/` (root-only, removes the shared
-  namespace outright); if it must stay in `TMPDIR`, use `std::fs::create_dir` so a planted
-  directory fails `EEXIST` and open the seed file `O_NOFOLLOW|O_EXCL` via
-  `OpenOptionsExt::custom_flags`. `PrivateTmp=yes` on the unit is worth adding regardless, but
-  as defence in depth — it misses the dev unit and any non-systemd start.
 - **`MAX_RULES_PER_OBJ = 32`** — raise toward 64 if a verifier log demands it; `cordon policy
   check` errors when a compiled bucket exceeds it.
 - **Per-object default deferred.** A protected object with no matching rule falls to the

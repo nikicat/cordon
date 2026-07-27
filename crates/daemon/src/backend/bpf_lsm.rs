@@ -55,12 +55,13 @@ use tracing::{error, info, warn};
 /// `file_open` decides reads/writes/creates; the four mutation hooks make a *directory*
 /// object sound, since a directory protects its children only by ancestry and a second
 /// name (hardlink or rename) is an ancestry that avoids it (DESIGN §15.5).
-const HOOKS: [&str; 5] = [
+const HOOKS: &[&str] = &[
     "file_open",
     "inode_link",
     "inode_rename",
     "inode_unlink",
     "inode_rmdir",
+    "inode_mkdir",
 ];
 
 /// Test-only env var: forces deliberately wrong field offsets so the self-test's
@@ -119,7 +120,7 @@ impl Backend for BpfLsmBackend {
 
         // Attach (maps still empty ⇒ allow-all, transient), then PROVE they enforce
         // before trusting them — a wrong-offset silent no-op must abort loudly.
-        for hook in HOOKS {
+        for &hook in HOOKS {
             let program: &mut Lsm = ebpf
                 .program_mut(hook)
                 .ok_or_else(|| {
@@ -388,6 +389,9 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     // dentry's own lookup refuses — which is the whole point of the case. Last, because if
     // it is wrongly allowed it consumes `src`.
     let clobbered = std::fs::rename(&src, probe.join("over"));
+    // A *negative* dentry inside the object: `inode_mkdir` classifies off the parent, which
+    // no other probe here exercises (every other one starts from a positive dentry).
+    let made = std::fs::create_dir(probe.join("sub"));
 
     // Clean up the probe entries (the real seed also clears, but don't rely on it).
     let _ = seed::protected_remove(ebpf, bank, id);
@@ -403,6 +407,7 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
         "rename over a protected name (inode_rename, destroy)",
         clobbered,
     )?;
+    expect_denied("mkdir inside the object (inode_mkdir)", made)?;
     Ok(())
 }
 
