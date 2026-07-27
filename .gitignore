@@ -9,3 +9,9 @@
 /cordon-audit.toml
 /cordon-audit.policy.toml
 /cordond.service
+# Claude Code. `settings.local.json` is per-machine (a personal permission
+# allowlist); the un-suffixed `.claude/settings.json` is the shared one and stays
+# trackable, like .vscode/settings.json. Worktrees are nested checkouts carrying
+# their own .git and target/ — 1.5G at last look, and never committable.
+/.claude/settings.local.json
+/.claude/worktrees/
