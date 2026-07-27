@@ -461,7 +461,7 @@ impl Session {
 ///   has no single file to open, so the user must name a fragment.
 /// - **A bare name** (no `/`, e.g. `nb`) when the policy is a conf.d directory → the fragment
 ///   `<root>/<name>.toml` (`.toml` appended when the name carries no extension). The
-///   convenient form: `cordon policy edit nb` edits `…/conf.d/nb.toml`.
+///   convenient form: `cordon policy edit local` edits `…/conf.d/local.toml`.
 /// - **Anything with a path separator / absolute** → taken literally.
 fn resolve_target(file: Option<&Path>, policy_root: &Path) -> Result<PathBuf> {
     match file {
@@ -482,7 +482,7 @@ fn resolve_target(file: Option<&Path>, policy_root: &Path) -> Result<PathBuf> {
     }
 }
 
-/// A single-component relative path like `nb` or `nb.toml` (no separators) — a fragment
+/// A single-component relative path like `local` or `local.toml` (no separators) — a fragment
 /// *name* rather than a path to a particular file.
 fn is_bare_name(p: &Path) -> bool {
     !p.as_os_str().is_empty()
@@ -861,7 +861,7 @@ mod tests {
             user: user.map(UserName::new),
             system,
         };
-        let invoker = || Ok(UserName::new("nb"));
+        let invoker = || Ok(UserName::new("alice"));
         // An explicit target never consults the invoker — proven by a resolver that panics.
         let no_invoker = || panic!("the invoker must not be resolved for an explicit target");
 
@@ -880,7 +880,7 @@ mod tests {
         // Bare: the invoker's own tier.
         assert!(matches!(
             args(None, None, false).resolve(invoker).unwrap(),
-            EditTarget::User(u) if u.as_str() == "nb"
+            EditTarget::User(u) if u.as_str() == "alice"
         ));
         // …and a failure to resolve one is the caller's error, not a silent system edit.
         assert!(
@@ -905,7 +905,7 @@ mod tests {
         assert!(invoker_uid(root, None).is_err());
         assert!(invoker_uid(root, Some("0")).is_err());
         // A malformed SUDO_UID is loud, not silently ignored.
-        assert!(invoker_uid(root, Some("nb")).is_err());
+        assert!(invoker_uid(root, Some("not-a-number")).is_err());
     }
 
     /// A save must never quietly change what an admin chose: an existing file keeps its
@@ -960,27 +960,33 @@ mod tests {
         assert!(args.next().is_none());
     }
 
+    /// `include_fragment` branches on `is_dir()`, so the shapes have to be **real**: an
+    /// earlier version of this test named `/etc/cordon/conf.d` and passed only on a machine
+    /// where cordon happened to be installed, failing on any clean checkout.
     #[test]
     fn user_tier_path_conventions() {
-        let confd = Path::new("/etc/cordon/conf.d");
-        let nb = UserName::new("nb");
+        let base = std::env::temp_dir().join(format!("cordon-tiers-{}", std::process::id()));
+        let confd = base.join("conf.d");
+        let file = base.join("policy.toml");
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let alice = UserName::new("alice");
+
         // user file is a `users/` sibling of the policy, outside conf.d…
         assert_eq!(
-            convention_user_path(confd, &nb),
-            PathBuf::from("/etc/cordon/users/nb.toml")
+            convention_user_path(&confd, &alice),
+            base.join("users/alice.toml")
         );
         // …and the scaffolded include goes in a conf.d fragment (so it loads).
-        assert_eq!(
-            include_fragment(confd),
-            PathBuf::from("/etc/cordon/conf.d/00-users.toml")
-        );
+        assert_eq!(include_fragment(&confd), confd.join("00-users.toml"));
         // single-file policy: the include is appended to that file itself.
-        let file = Path::new("/etc/cordon/policy.toml");
         assert_eq!(
-            convention_user_path(file, &nb),
-            PathBuf::from("/etc/cordon/users/nb.toml")
+            convention_user_path(&file, &alice),
+            base.join("users/alice.toml")
         );
-        assert_eq!(include_fragment(file), file);
+        assert_eq!(include_fragment(&file), file);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1030,12 +1036,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // bare name → <dir>/<name>.toml; existing extension kept; a path is literal.
         assert_eq!(
-            resolve_target(Some(Path::new("nb")), &dir).unwrap(),
-            dir.join("nb.toml")
+            resolve_target(Some(Path::new("local")), &dir).unwrap(),
+            dir.join("local.toml")
         );
         assert_eq!(
-            resolve_target(Some(Path::new("nb.toml")), &dir).unwrap(),
-            dir.join("nb.toml")
+            resolve_target(Some(Path::new("local.toml")), &dir).unwrap(),
+            dir.join("local.toml")
         );
         assert_eq!(
             resolve_target(Some(Path::new("/etc/cordon/x.toml")), &dir).unwrap(),
@@ -1043,9 +1049,11 @@ mod tests {
         );
         // no argument on a directory → must name a fragment.
         assert!(resolve_target(None, &dir).is_err());
-        std::fs::remove_dir_all(&dir).ok();
-        // no argument on a single-file policy → that file.
-        let file = PathBuf::from("/etc/cordon/policy.toml");
+        // no argument on a single-file policy → that file. A real file, not a path that
+        // merely happens not to be a directory on this machine.
+        let file = dir.join("policy.toml");
+        std::fs::write(&file, "").unwrap();
         assert_eq!(resolve_target(None, &file).unwrap(), file);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
