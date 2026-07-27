@@ -106,14 +106,54 @@ why cordon assigns identity to the *object* instead and lets subjects stay anony
   from observed evidence, not from a modal prompt) and **identity resting on a code
   signature**, which is the same question [PLAN-rule-model](PLAN-rule-model.md) M6 is chewing
   on.
-- **Chrome's app-bound encryption** (Windows, 2024) was shipped *because* infostealers were
-  reading the cookie DB — evidence the threat is real and unaddressed at the OS layer. On
-  Linux Chrome uses the login keyring, reachable over D-Bus by any process at your uid, so the
-  file gate is the only control actually available there.
+- **Windows has the right shape twice, pointed at the wrong verb both times.** *Controlled
+  Folder Access* is almost exactly this design — designated folders, an app allowlist — but
+  gates **writes only**, because it was built against ransomware; a scraper reads, so CFA
+  never sees it. *WDAC/AppLocker* is genuinely default-deny and, with DLL-level enforcement,
+  is the closest shipping analogue to M6's fixed-code invariant (an unsigned DLL cannot load
+  into a signed process) — but it governs **what may execute**, not what a running program may
+  read, and consumer machines effectively never run it in enforcement. *Credential Guard*
+  shows Microsoft can do hard isolation when a target matters enough (VBS puts LSA secrets in
+  VTL1, out of reach of admin) and that it was done per-target, not as a general mechanism.
+- **Chrome's app-bound encryption** (Windows, 2024) is the piece of prior art that tried
+  *this* architecture and is therefore the most instructive. Shipped because infostealers were
+  reading the cookie DB — the threat is real and unaddressed at the OS layer — it replaced
+  DPAPI's user-bound key (any process at your uid could decrypt: our problem, with encryption
+  that does not move the trust boundary) with a **privileged SYSTEM service that validates the
+  calling executable before returning the key**. That is insight 2, implemented at scale by
+  someone else. **It was bypassed within months**, by injecting into Chrome and asking as an
+  authorized process, by abusing the elevation service, and by simply running elevated. Google
+  has kept hardening since and the current state is not verified here — but the lesson is
+  stable and is the strongest external argument for M6: *a privileged broker that
+  authenticates by executable identity is only as strong as its code-identity story, and
+  injection into the authorized process defeats it.* Our `allow /usr/bin/ssh read ~/.ssh` is
+  structurally the same grant and fails the same way, which is why M6 is not an optional
+  hardening pass. On Linux Chrome uses the login keyring, reachable over D-Bus by any process
+  at your uid, so the file gate is the only control available there at all.
+- **Per-app file gating exists commercially** — ThreatLocker's Storage Control and Ringfencing,
+  AppGuard, and the previous generation of HIPS products (Comodo, Online Armor) which a decade
+  ago let you write "only firefox.exe may read this path". The category is largely dead, and it
+  died of **prompt fatigue and rule-management burden**, not of being wrong. Same verdict as
+  TCC, from a second direction, and the same reason audit→admit→enforce is the interesting part
+  of this design rather than the enforcement primitive.
+- **EDR behavioural detection** (CrowdStrike, SentinelOne, Defender for Endpoint) is the
+  mainstream commercial answer and is not signature-based: it flags a process opening
+  `Login Data`, archiving, then egressing. But it races exfiltration rather than bounding it —
+  it kills the process *after* the read. A boundary and a detector are different products; we
+  are the former, and the journal is not a detector.
+
+**The approach actually winning is orthogonal: make the loot worthless.** Device Bound
+Session Credentials tie a session cookie to a TPM key so a stolen cookie will not
+authenticate elsewhere, and a passkey's private key never leaves the secure element. That is
+the strongest structural answer to *credential* theft on any OS, and it is complementary
+rather than competitive — it covers session secrets and does nothing for `~/.aws/credentials`,
+SSH keys, `.env` files, or a password store, which is most of what `@secrets` names. Where a
+secret *can* be made non-exfiltratable, prefer that over gating it.
 
 The gap this project targets is therefore specific: **object-first default-deny for same-uid
-desktop programs.** Android proves the enforcement works, TCC proves the model is usable, and
-neither exists for Linux desktop.
+desktop programs.** Android proves the enforcement works, TCC proves the model is usable,
+Windows shows the two halves shipping separately and never joined, and none of it exists for
+Linux desktop.
 
 ## 4. Architecture
 
