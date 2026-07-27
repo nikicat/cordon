@@ -134,7 +134,7 @@ impl Ctx {
         Ok(())
     }
 
-    /// The unprivileged half of the mint handshake (DESIGN §16.5, PLAN-bless3 decision #7).
+    /// The unprivileged half of the mint handshake (DESIGN §16.5).
     ///
     /// Register a nonce, hand it to the requester, and block until a **uid-0** peer
     /// approves it on a *different* connection. Only then mint, and send the carrier's
@@ -322,7 +322,7 @@ fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
         Request::PolicyApply { .. } => Err(Error::msg(
             "applying policy requires root — invoke via `sudo cordon policy apply`",
         )),
-        // Reads stay open, the parity `BlessList` was specced with (B1 decision #1).
+        // Reads stay open, the parity `BlessList` was specced with (DESIGN §16.5).
         // `BlessRequest` joins them: asking is not minting — the request is inert until a
         // uid-0 peer approves it. `BlessRevoke` is ownership-checked in the backend, which
         // is where the live table is; this gate only decides who may speak the verb.

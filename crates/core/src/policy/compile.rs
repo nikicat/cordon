@@ -606,7 +606,7 @@ mod tests {
 
     /// A blessing predicate is one unit of subject specificity, so it outranks a `who="*"`
     /// catch-all on the same object — the basis of a blessing `allow` beating a catch-all
-    /// `deny` (PLAN-bless B1 decision #5).
+    /// `deny` (DESIGN §16.3).
     #[test]
     fn blessed_allow_outranks_wildcard_deny() {
         let text = r#"

@@ -8,7 +8,8 @@ Language: **Rust**. Policy: a **root-owned text file** compiled to in-kernel BPF
 > **Reading guide.** **§15 is the current architecture** — the flat *rule model*,
 > implemented in M1 (see [`PLAN-rule-model.md`](PLAN-rule-model.md) for the milestones).
 > **§16 specifies *blessing*** — the runtime, human-authenticated access grant
-> (`cordon bless`), shipped sudo-gated in B1; milestones in [`PLAN-bless.md`](PLAN-bless.md).
+> (`cordon bless`), shipped through B2 — unprivileged CLI, elevation-gated mint; remaining
+> milestones in [`PLAN-bless.md`](PLAN-bless.md).
 > §1–§14 are the foundational design and its evolution: the v1 **owner model** (owners /
 > TOFU / interactive prompts) and the **fanotify** backend they describe were **retired**
 > in the rule-model migration and no longer exist in the code. Those sections are kept for
@@ -1231,6 +1232,49 @@ is not cordon's business, and deliberately so — B1 hardcoded `sudo`, B2 made i
    class vanished are adopted **inert** (GC only — a live process tree is never killed because
    policy changed under it). Only **root-owned** directories are adopted: re-registering is a
    *grant*, so it is held to the same trust check as placement in step 4.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as user's shell
+    participant C as cordon bless<br/>(uid 1000)
+    participant H as bless-helper<br/>(uid 0, via $CORDON_SUDO)
+    participant D as cordond (root)
+    participant K as kernel<br/>(cgroups + BPF maps)
+    participant B as blessed command
+
+    S->>C: cordon bless --class ro -- aws s3 ls
+    Note over S,C: ordinary child: env, cwd, tty,<br/>job control, session all inherited
+
+    C->>D: connect
+    Note over C: SO_PEERCRED on the DAEMON end → uid 0 ✓<br/>else refuse: the nonce must not go to<br/>whoever happens to answer this path
+    C->>D: BlessRequest{class} · connection stays open
+    Note over D: SO_PEERCRED → uid 1000, pid<br/>/proc/pid/cgroup → deepest of<br/>session-N.scope, else user-1000.slice<br/>(root-owned, or fall back to our own cgroup)
+    D-->>C: BlessPending{nonce}
+
+    C->>H: spawn $CORDON_SUDO cordon --socket S bless-helper --nonce=N
+    Note over H: sudo / run0 → PAM →<br/>human presence proven
+    H->>D: BlessApprove{nonce}
+    Note over D: SO_PEERCRED → uid 0 ✓<br/>(the boundary — never the client's<br/>choice of elevation tool)
+
+    D->>K: mkdir user-1000.slice/cordon-bless-1.ro<br/>open cgroup.procs (as root)
+    D->>K: BLESSED[cgroup_id] = ClassId(ro)
+    D-->>C: BlessMinted{view} + fd (SCM_RIGHTS, CLOEXEC)
+    D-->>H: BlessApproved
+    H-->>C: exits
+
+    C->>C: fork
+    C->>B: pre_exec: write pid → fd, exec (fd closes)
+    Note over B: never runs unblessed —<br/>no privilege drop needed,<br/>it was never root
+
+    B->>K: open ~/.aws/credentials
+    K-->>B: cgroup_id → class ro → rule allows
+    Note over B: run0/polkit work here: the cgroup still<br/>carries user-1000.slice, so logind can<br/>attribute the process and find an agent
+
+    B->>B: exits
+    K-->>D: cgroup.events: populated 0
+    D->>K: BLESSED remove + rmdir carrier
+```
 
 > **Why placement is not "put it in the session scope".** That was the first shape tried, and
 > it is wrong on any desktop: the requester is not *in* the session scope, only the session

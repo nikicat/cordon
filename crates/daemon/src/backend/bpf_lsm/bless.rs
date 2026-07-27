@@ -516,30 +516,80 @@ fn valid_class_dirname(class: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The daemon's own cgroup directory — the carrier root. From the unified-hierarchy
-/// (`0::`) line of `/proc/self/cgroup`, joined under the standard cgroup2 mount.
-// ponytail: this and `usable_session_scope` both do "read /proc/<pid>/cgroup, take the
-// 0:: line, resolve it against the mount" and diverge only in whose pid and what happens
-// next. Worth one `cgroup_of(pid) -> Result<CgroupPath>` — and `CgroupPath` (or at least a
-// newtype for the raw listing `text`) would stop the `&str` that is really a multi-line
-// /proc file from looking like any other string. Left alone until a third caller shows
-// which shape the seam wants; see STATUS "Deferred refactors".
-fn carrier_root() -> Result<PathBuf> {
-    let text = std::fs::read_to_string("/proc/self/cgroup")
-        .map_err(|e| Error::msg(format!("/proc/self/cgroup: {e}")))?;
-    let rel = cgroup_v2_path(&text)
-        .ok_or_else(|| Error::msg("/proc/self/cgroup has no unified-hierarchy (0::) line"))?;
-    Ok(under_cgroup_root(rel))
+/// A process's unified-hierarchy cgroup — the `0::<path>` line of `/proc/<pid>/cgroup`,
+/// and any ancestor of it ([`CgroupPath::placement`]).
+///
+/// The path is **relative to the cgroup2 mount** despite its leading slash — `/` alone
+/// *is* the root — so it reaches the filesystem only through [`CgroupPath::under`], never
+/// a bare `join`, which would discard the base. That is the whole reason this is a type:
+/// as a `&Path` it is indistinguishable from an absolute one, and the two joins that need
+/// the distinction used to spell it out separately.
+#[derive(Debug, PartialEq, Eq)]
+struct CgroupPath(PathBuf);
+
+impl CgroupPath {
+    fn new(path: impl Into<PathBuf>) -> CgroupPath {
+        CgroupPath(path.into())
+    }
+
+    /// The unified-hierarchy line of a whole `/proc/<pid>/cgroup` listing. `None` on a
+    /// pure-v1 (or otherwise cgroup2-less) listing; hybrid ones carry both and this takes
+    /// the `0::` one. Parsing lives here so the multi-line `/proc` text never travels as a
+    /// `&str` past its one reader.
+    fn parse(listing: &str) -> Option<CgroupPath> {
+        listing
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .map(CgroupPath::new)
+    }
+
+    /// Resolve against the cgroup2 mount.
+    fn under(&self, mount: &Path) -> PathBuf {
+        mount.join(self.0.strip_prefix("/").unwrap_or(&self.0))
+    }
+
+    /// Where in the requester's ancestry a carrier may live so the blessed process stays
+    /// **attributable to its user** — the property polkit ultimately needs.
+    ///
+    /// Two shapes, tried in that order, both `root:root` on systemd:
+    ///
+    /// 1. **`session-N.scope`** — a tty or login session. Deepest and most precise: logind
+    ///    reads an exact session id straight from the cgroup.
+    /// 2. **`user-<uid>.slice`** — a desktop session. On a modern systemd the terminal does
+    ///    *not* live in the session scope; it lives under the **delegated**
+    ///    `user@UID.service/app.slice/app-*.scope`, and there is no session scope anywhere
+    ///    in its ancestry. What still works there is `cg_path_get_owner_uid`, which keys on
+    ///    this `user-<uid>.slice` component to attribute the process to a user, from which
+    ///    logind falls back to that user's *display* session. That is exactly how an
+    ///    ordinary unblessed shell on such a desktop resolves, so matching it is the goal.
+    ///
+    /// Anything below those two is out: `user@UID.service` and everything under it is
+    /// delegated to the user, so a carrier there would sit in a directory its own
+    /// beneficiary can `rmdir` — see [`carrier_parent`] for why that matters.
+    ///
+    /// Pure path work so the rule is testable without a cgroup hierarchy; the ownership
+    /// check that makes it *safe* is [`carrier_parent`]'s.
+    fn placement(&self) -> Option<CgroupPath> {
+        named_ancestor(&self.0, "session-", ".scope")
+            .or_else(|| named_ancestor(&self.0, "user-", ".slice"))
+            .map(CgroupPath::new)
+    }
 }
 
-/// The unified-hierarchy path from a `/proc/<pid>/cgroup` listing: the `0::<path>`
-/// line's path part. It is **relative to the cgroup2 mount** despite the leading slash —
-/// `/` alone *is* the root — so joining it onto [`cgroup_root`] goes through
-/// [`under_cgroup_root`] rather than `join`, which would discard the base.
-fn cgroup_v2_path(text: &str) -> Option<&Path> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .map(Path::new)
+/// The unified-hierarchy cgroup of `pid`, or a short reason it is unavailable. The one
+/// place `/proc/<pid>/cgroup` is read.
+fn cgroup_of(pid: Pid) -> std::result::Result<CgroupPath, &'static str> {
+    let listing =
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|_| "cgroup unreadable")?;
+    CgroupPath::parse(&listing).ok_or("no unified-hierarchy (0::) line in the cgroup listing")
+}
+
+/// The daemon's own cgroup directory — the carrier root. Its own pid rather than `self`
+/// so it goes through [`cgroup_of`]; `/proc/<tgid>/cgroup` *is* `/proc/self/cgroup`.
+fn carrier_root() -> Result<PathBuf> {
+    cgroup_of(Pid(std::process::id()))
+        .map(|cgroup| cgroup.under(cgroup_root()))
+        .map_err(|reason| Error::msg(format!("/proc/self/cgroup: {reason}")))
 }
 
 /// Whether a leftover carrier directory may be adopted by [`Blessings::reconcile`] — the
@@ -550,14 +600,9 @@ fn adoptable(owner: Uid) -> bool {
     owner == Uid(0)
 }
 
-/// Resolve a `/proc/<pid>/cgroup` path against the cgroup2 mount.
-fn under_cgroup_root(rel: &Path) -> PathBuf {
-    cgroup_root().join(rel.strip_prefix("/").unwrap_or(rel))
-}
-
 /// Where a blessing's carrier should live: **inside the requester's own user subtree**
-/// ([`placement_rel`]), falling back to `fallback` (the daemon's cgroup) when there isn't a
-/// usable parent.
+/// ([`CgroupPath::placement`]), falling back to `fallback` (the daemon's cgroup) when
+/// there isn't a usable parent.
 ///
 /// This is what makes a blessed shell a usable shell. logind attributes a process to a user
 /// — and thence to a session — purely from its cgroup path, and polkit needs that
@@ -593,9 +638,7 @@ fn carrier_parent(pid: Pid, fallback: &Path) -> PathBuf {
 fn usable_session_scope(pid: Pid) -> std::result::Result<PathBuf, &'static str> {
     // A requester that exited between connecting and here has no cgroup to read. The mint
     // will fail on its own shortly; meanwhile the daemon's cgroup is the safe placement.
-    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .map_err(|_| "requester's cgroup unreadable")?;
-    resolve_placement(&text, cgroup_root(), owner_uid)
+    resolve_placement(&cgroup_of(pid)?, cgroup_root(), owner_uid)
 }
 
 /// The placement decision itself, with its two filesystem facts injected: where the cgroup
@@ -604,14 +647,14 @@ fn usable_session_scope(pid: Pid) -> std::result::Result<PathBuf, &'static str> 
 /// testable without a cgroup hierarchy or root, in the same shape as
 /// `SocketPath::for_client`'s `exists`.
 fn resolve_placement(
-    cgroup_text: &str,
+    cgroup: &CgroupPath,
     cgroup_mount: &Path,
     owner: impl Fn(&Path) -> Option<Uid>,
 ) -> std::result::Result<PathBuf, &'static str> {
-    let rel = cgroup_v2_path(cgroup_text)
-        .and_then(placement_rel)
-        .ok_or("requester's cgroup has no session scope or user slice")?;
-    let parent = cgroup_mount.join(rel.strip_prefix("/").unwrap_or(rel));
+    let parent = cgroup
+        .placement()
+        .ok_or("requester's cgroup has no session scope or user slice")?
+        .under(cgroup_mount);
     match owner(&parent) {
         Some(Uid(0)) => Ok(parent),
         Some(_) => Err("chosen parent is not root-owned"),
@@ -626,15 +669,15 @@ fn owner_uid(path: &Path) -> Option<Uid> {
 }
 
 /// Every directory a carrier could have been created in. Reconcile's search space, and it
-/// must stay the exact mirror of what [`placement_rel`] can choose: the daemon's own
-/// cgroup, plus **every `user-*.slice` and every `session-*.scope` within it**.
+/// must stay the exact mirror of what [`CgroupPath::placement`] can choose: the daemon's
+/// own cgroup, plus **every `user-*.slice` and every `session-*.scope` within it**.
 ///
 /// A carrier this misses is a carrier nothing ever reaps: it lingers with its members
 /// running, a non-empty child keeps systemd from removing the enclosing slice or scope at
 /// logout, and — worse — the id allocator never advances past it, so the *next* mint
 /// computes the same `cordon-bless-<id>.<class>` name under the same parent and fails
-/// `EEXIST` forever. That is not hypothetical: widening `placement_rel` to the user slice
-/// without widening this function did exactly that.
+/// `EEXIST` forever. That is not hypothetical: widening `CgroupPath::placement` to the
+/// user slice without widening this function did exactly that.
 fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![daemon_cgroup.to_path_buf()];
     let children = |dir: PathBuf, keep: fn(&str) -> bool| -> Vec<PathBuf> {
@@ -661,32 +704,6 @@ fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     roots.sort();
     roots.dedup();
     roots
-}
-
-/// Where in the requester's ancestry a carrier may live so the blessed process stays
-/// **attributable to its user** — the property polkit ultimately needs.
-///
-/// Two shapes, tried in that order, both `root:root` on systemd:
-///
-/// 1. **`session-N.scope`** — a tty or login session. Deepest and most precise: logind
-///    reads an exact session id straight from the cgroup.
-/// 2. **`user-<uid>.slice`** — a desktop session. On a modern systemd the terminal does
-///    *not* live in the session scope; it lives under the **delegated**
-///    `user@UID.service/app.slice/app-*.scope`, and there is no session scope anywhere in
-///    its ancestry. What still works there is `cg_path_get_owner_uid`, which keys on this
-///    `user-<uid>.slice` component to attribute the process to a user, from which logind
-///    falls back to that user's *display* session. That is exactly how an ordinary
-///    unblessed shell on such a desktop resolves, so matching it is the goal.
-///
-/// Anything below those two is out: `user@UID.service` and everything under it is
-/// delegated to the user, so a carrier there would sit in a directory its own beneficiary
-/// can `rmdir` — see [`carrier_parent`] for why that matters.
-///
-/// Pure path work so the rule is testable without a cgroup hierarchy; the ownership check
-/// that makes it *safe* is [`carrier_parent`]'s.
-fn placement_rel(cgroup_path: &Path) -> Option<&Path> {
-    named_ancestor(cgroup_path, "session-", ".scope")
-        .or_else(|| named_ancestor(cgroup_path, "user-", ".slice"))
 }
 
 /// The deepest ancestor whose final component matches `<prefix>…<suffix>`. Note
@@ -821,24 +838,24 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_v2_path_finds_the_unified_line() {
+    fn cgroup_path_parses_the_unified_line() {
         // Hybrid listing: v1 controllers + the unified line.
         let text =
             "12:pids:/user.slice\n1:name=systemd:/init.scope\n0::/system.slice/cordond.service\n";
         assert_eq!(
-            cgroup_v2_path(text),
-            Some(Path::new("/system.slice/cordond.service"))
+            CgroupPath::parse(text),
+            Some(CgroupPath::new("/system.slice/cordond.service"))
         );
         // Pure v2 at the root — relative to the mount, so it resolves to the mount itself.
-        assert_eq!(cgroup_v2_path("0::/\n"), Some(Path::new("/")));
-        assert_eq!(under_cgroup_root(Path::new("/")), cgroup_root());
+        assert_eq!(CgroupPath::parse("0::/\n"), Some(CgroupPath::new("/")));
+        assert_eq!(CgroupPath::new("/").under(cgroup_root()), cgroup_root());
         assert_eq!(
-            under_cgroup_root(Path::new("/user.slice/session-3.scope")),
+            CgroupPath::new("/user.slice/session-3.scope").under(cgroup_root()),
             cgroup_root().join("user.slice/session-3.scope"),
             "the leading slash must not make `join` discard the mount"
         );
         // No unified hierarchy at all.
-        assert_eq!(cgroup_v2_path("12:pids:/user.slice\n"), None);
+        assert_eq!(CgroupPath::parse("12:pids:/user.slice\n"), None);
     }
 
     /// Where a carrier goes, from the cgroup shapes that actually occur.
@@ -850,36 +867,30 @@ mod tests {
     /// cannot attribute the process to a user at all and polkit therefore refuses.
     #[test]
     fn placement_covers_the_cgroup_shapes_that_actually_occur() {
-        // A `fn`, not a closure: the result borrows from the argument, and closure
-        // lifetime elision can't express that.
-        fn rel(p: &str) -> Option<&Path> {
-            placement_rel(Path::new(p))
-        }
+        let rel = |p: &str| CgroupPath::new(p).placement();
+        let scope = |p: &str| Some(CgroupPath::new(p));
 
         // tty / login session: the session scope is deepest and most precise.
-        let scope = Path::new("/user.slice/user-1000.slice/session-3.scope");
-        assert_eq!(
-            rel("/user.slice/user-1000.slice/session-3.scope"),
-            Some(scope)
-        );
+        let session = "/user.slice/user-1000.slice/session-3.scope";
+        assert_eq!(rel(session), scope(session));
         assert_eq!(
             rel("/user.slice/user-1000.slice/session-3.scope/cordon-bless-1.ro"),
-            Some(scope)
+            scope(session)
         );
 
         // Desktop: no session scope in the ancestry at all. The user slice is what keeps
         // the process attributable, and it is the *only* root-owned option here.
-        let slice = Path::new("/user.slice/user-1000.slice");
+        let slice = "/user.slice/user-1000.slice";
         assert_eq!(
             rel("/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-term.scope"),
-            Some(slice)
+            scope(slice)
         );
-        assert_eq!(rel("/user.slice/user-1000.slice"), Some(slice));
+        assert_eq!(rel(slice), scope(slice));
 
         // A session scope wins over the user slice when both are present (more precise).
         assert_eq!(
             rel("/user.slice/user-1000.slice/session-12.scope/app.slice/x.service"),
-            Some(Path::new("/user.slice/user-1000.slice/session-12.scope"))
+            scope("/user.slice/user-1000.slice/session-12.scope")
         );
 
         // Nothing user-attributable ⇒ no placement, so the carrier falls back.
@@ -902,32 +913,32 @@ mod tests {
     #[test]
     fn placement_requires_a_root_owned_parent() {
         let mount = Path::new("/fake/cgroup");
-        let desktop = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-t.scope\n";
+        let desktop =
+            CgroupPath::new("/user.slice/user-1000.slice/user@1000.service/app.slice/app-t.scope");
         let root_owned = |_: &Path| Some(Uid(0));
 
         assert_eq!(
-            resolve_placement(desktop, mount, root_owned),
+            resolve_placement(&desktop, mount, root_owned),
             Ok(mount.join("user.slice/user-1000.slice"))
         );
         // A parent the requester's own user owns is refused: they could rmdir an empty
         // carrier and mkdir a replacement onto a recycled inode still live in BLESSED.
         assert_eq!(
-            resolve_placement(desktop, mount, |_| Some(Uid(1000))),
+            resolve_placement(&desktop, mount, |_| Some(Uid(1000))),
             Err("chosen parent is not root-owned")
         );
         // Gone between the cgroup read and the stat.
         assert_eq!(
-            resolve_placement(desktop, mount, |_| None),
+            resolve_placement(&desktop, mount, |_| None),
             Err("chosen parent vanished")
         );
         // Nothing user-attributable at all ⇒ the caller falls back to its own cgroup.
         assert_eq!(
-            resolve_placement("0::/system.slice/cordond.service\n", mount, root_owned),
-            Err("requester's cgroup has no session scope or user slice")
-        );
-        // A cgroup listing with no unified-hierarchy line.
-        assert_eq!(
-            resolve_placement("12:pids:/user.slice\n", mount, root_owned),
+            resolve_placement(
+                &CgroupPath::new("/system.slice/cordond.service"),
+                mount,
+                root_owned
+            ),
             Err("requester's cgroup has no session scope or user slice")
         );
     }
@@ -939,15 +950,12 @@ mod tests {
     fn an_unreadable_requester_falls_back() {
         let fallback = Path::new("/some/daemon/cgroup");
         assert_eq!(carrier_parent(Pid(0), fallback), fallback);
-        assert_eq!(
-            usable_session_scope(Pid(0)),
-            Err("requester's cgroup unreadable")
-        );
+        assert_eq!(usable_session_scope(Pid(0)), Err("cgroup unreadable"));
     }
 
     /// **Regression test.** Reconcile's search space must cover every parent
-    /// [`placement_rel`] can choose — they are two halves of one rule, and widening
-    /// placement to the user slice without widening this left desktop carriers
+    /// [`CgroupPath::placement`] can choose — they are two halves of one rule, and
+    /// widening placement to the user slice without widening this left desktop carriers
     /// unreachable: never reaped, and the id allocator never advancing past them, so the
     /// next mint collided on the same directory name and failed `EEXIST` forever.
     ///
@@ -972,8 +980,10 @@ mod tests {
             "/user.slice/user-1000.slice/session-3.scope",                            // tty
             "/user.slice/user-1000.slice",
         ] {
-            let rel = placement_rel(Path::new(requester)).expect("a placement");
-            let parent = root.join(rel.strip_prefix("/").unwrap());
+            let parent = CgroupPath::new(requester)
+                .placement()
+                .expect("a placement")
+                .under(&root);
             assert!(
                 roots.contains(&parent),
                 "placement picks {parent:?} for a requester in {requester}, \
