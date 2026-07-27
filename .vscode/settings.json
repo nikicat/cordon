@@ -1,0 +1,21 @@
+{
+  // ── Single-window rust-analyzer setup for the WHOLE cordon project ───────────
+  // The root is a HOST (stable) Cargo workspace (core, daemon, cli, bpf-common).
+  // crates/bpf is a SEPARATE, `exclude`d eBPF workspace — pinned nightly + target
+  // bpfel-unknown-none + build-std=core (crates/bpf/{rust-toolchain,.cargo/config}.toml).
+  //
+  // Listing BOTH manifests makes rust-analyzer load them as two linked projects in
+  // this one window. RA invokes cargo per-project in that project's own directory,
+  // so each picks up its own toolchain/target/sysroot/proc-macro server: stable+host
+  // for the root, nightly+bpfel for crates/bpf. That's what lets aya-ebpf, its
+  // `lsm`/`map` proc-macros, and the no_std `core` resolve here without a 2nd window.
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "crates/bpf/Cargo.toml"
+  ],
+
+  // Analyze ALL feature-gated code. Host files behind non-default features
+  // (e.g. crates/daemon/src/backend/bpf_lsm.rs → #[cfg(feature = "bpf-lsm")]) are
+  // otherwise dropped from the module tree entirely — no completions/hover, greyed.
+  "rust-analyzer.cargo.features": "all"
+}
