@@ -232,9 +232,11 @@ ergonomics, no logind/polkit):
 5. Carrier placement in the requester's session scope, gated on root ownership; reconcile
    scans session scopes too and adopts only root-owned leftovers.
 
-Its B0 spike (`packaging/test/bless-b2-derisk.sh`) confirmed both kernel/systemd assumptions
-on a real host; keep it as the "will bless work on this machine" check, since session-scope
-ownership is distro-dependent.
+Its B0 spike confirmed the two kernel/systemd assumptions on a real host, but the **script is
+retired** (see PLAN-bless3 B0): one of its answers was true and irrelevant, so it would have
+passed on a machine where blessing's polkit integration does not work. Smoke scenarios 26 and
+27 cover the placement rules it was standing in for, and unlike the spike they fail when the
+rule regresses.
 
 ---
 

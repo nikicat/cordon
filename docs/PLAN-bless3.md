@@ -107,15 +107,34 @@ DESIGN §15.8 records `0660` + a `cordon` group as the multi-user deployment pos
 
 ## Part B — the spawn rework
 
-### B0. Derisk spike — ✅ **both assumptions confirmed on the host (2026-07-26)**
+### B0. Derisk spike — ✅ ran 2026-07-26, **script retired 2026-07-27**
 
-Run via `sudo bash packaging/test/bless-b2-derisk.sh`. Results:
+`packaging/test/bless-b2-derisk.sh` is deleted. It answered its two questions and then
+became actively misleading: assumption 2 below is *true and irrelevant*, so the script
+would have passed on a machine where blessing's polkit integration does not work at all.
+The scenarios it was standing in for now live in the smoke suite (26 and 27), and the
+question it should have asked is answered there.
+
+**The lesson worth keeping**, because it cost a full cycle: the spike **constructed** the
+world that made its answer come out yes. It `mkdir`ed a cgroup under `session-3.scope`, put
+a process in it, and confirmed logind saw the session — without ever asking *where the
+user's processes actually are*. They are under the delegated
+`user@1000.service/app.slice/app-*.scope`, with no session scope in their ancestry, so the
+rule the spike green-lit sent every desktop blessing to the daemon's cgroup and `run0` went
+on failing. A probe that builds its own premise proves only that the premise is
+self-consistent. See the commit that fixed placement, and the mutation-tested smoke
+scenarios that now fail if the rule regresses.
+
+Results as recorded at the time:
 
 1. **fd delegation works.** An unprivileged process wrote its own pid into a root-owned
    `cgroup.procs` received over `SCM_RIGHTS` and landed in the cgroup — the kernel checks
    migration permission against the *opener's* credentials, as expected. `cordon bless`
    therefore never needs to be root.
-2. **A child of `session-N.scope` keeps the user's session.** From inside
+2. **A child of `session-N.scope` keeps the user's session** — true, but it turned out not
+   to be the question that mattered: a desktop requester is never *in* a session scope. What
+   the carrier actually needs is to stay under `user-<uid>.slice`, which is what logind reads
+   to attribute a process to a user at all. From inside
    `session-3.scope/cordon-derisk`, logind reported `3 - nb (1000)` — the invoker's own
    login session. The same probe under `cordond.service/<child>` reported *"Caller does not
    belong to any known session"*, which is precisely today's polkit failure. `session-3.scope`
@@ -127,8 +146,9 @@ Run via `sudo bash packaging/test/bless-b2-derisk.sh`. Results:
    — and so reported a false failure. The assertion now checks for the invoking user's own
    session id + uid directly.)*
 
-Both commits 4 and 5 are therefore buildable as written. The original assumptions and their
-fallbacks are kept below for the record.
+Both commits 4 and 5 were therefore buildable as written — commit 5's *rule* still needed
+correcting afterwards, as above. The original assumptions and their fallbacks are kept below
+for the record.
 
 1. **Does an fd passed over `SCM_RIGHTS` actually let an unprivileged process join a
    root-owned cgroup?** Expected yes: `cgroup_procs_write_permission()` overrides with
