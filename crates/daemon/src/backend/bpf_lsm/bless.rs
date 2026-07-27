@@ -313,7 +313,10 @@ impl Blessings {
         let Some(root) = self.root.clone() else {
             return;
         };
-        for found in carrier_roots(&root).iter().flat_map(|dir| scan(dir)) {
+        for found in carrier_roots(&root, cgroup_root())
+            .iter()
+            .flat_map(|dir| scan(dir))
+        {
             // One stat serves both checks: who owns it, and its inode — which on cgroup2
             // *is* the id `bpf_get_current_cgroup_id()` reports.
             let meta = match std::fs::metadata(&found.dir) {
@@ -546,14 +549,18 @@ fn under_cgroup_root(rel: &Path) -> PathBuf {
     cgroup_root().join(rel.strip_prefix("/").unwrap_or(rel))
 }
 
-/// Where a blessing's carrier should live: **the requester's own logind session scope**,
-/// falling back to `fallback` (the daemon's cgroup) when there isn't a usable one.
+/// Where a blessing's carrier should live: **inside the requester's own user subtree**
+/// ([`placement_rel`]), falling back to `fallback` (the daemon's cgroup) when there isn't a
+/// usable parent.
 ///
-/// This is what makes a blessed shell a usable shell. polkit resolves a caller's session
-/// from its cgroup, so a carrier under `cordond.service` has no `session-N.scope`
-/// ancestor and every `run0`/`pkexec` inside it fails with "interactive authentication has
-/// not been enabled". Created under the requester's own scope instead, the blessed process
-/// keeps the session it was already in.
+/// This is what makes a blessed shell a usable shell. logind attributes a process to a user
+/// — and thence to a session — purely from its cgroup path, and polkit needs that
+/// attribution to find an authentication agent. A carrier under `cordond.service` has
+/// neither a `session-N.scope` nor a `user-<uid>.slice` in its ancestry, so logind reports
+/// *"Caller does not belong to any known session and doesn't own any suitable session"* and
+/// every `run0`/`pkexec` inside it fails with "interactive authentication has not been
+/// enabled". Created inside the requester's own subtree, the blessed process resolves
+/// exactly as an unblessed one there would.
 ///
 /// **Refuses any parent that is not root-owned**, which is a real check rather than
 /// belt-and-braces. A user-writable parent lets the invoker `rmdir` an empty carrier and
@@ -583,25 +590,27 @@ fn usable_session_scope(pid: Pid) -> std::result::Result<PathBuf, &'static str> 
     let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .map_err(|_| "requester's cgroup unreadable")?;
     let rel = cgroup_v2_path(&text)
-        .and_then(session_scope_rel)
-        .ok_or("requester is in no logind session scope")?;
+        .and_then(placement_rel)
+        .ok_or("requester's cgroup has no session scope or user slice")?;
     let scope = under_cgroup_root(rel);
     match std::fs::metadata(&scope) {
         Ok(meta) if std::os::unix::fs::MetadataExt::uid(&meta) == 0 => Ok(scope),
-        Ok(_) => Err("session scope is not root-owned"),
-        Err(_) => Err("session scope vanished"),
+        Ok(_) => Err("chosen parent is not root-owned"),
+        Err(_) => Err("chosen parent vanished"),
     }
 }
 
-/// Every directory a carrier could have been created in — the daemon's own cgroup plus
-/// each live logind session scope. Reconcile's search space.
+/// Every directory a carrier could have been created in. Reconcile's search space, and it
+/// must stay the exact mirror of what [`placement_rel`] can choose: the daemon's own
+/// cgroup, plus **every `user-*.slice` and every `session-*.scope` within it**.
 ///
-/// Without the session scopes, a carrier left by a restart would linger with its members
-/// still running: nothing would ever reap it, and a non-empty child keeps systemd from
-/// removing the session scope at logout. The walk is bounded to exactly the shape
-/// [`carrier_parent`] can produce (`user.slice/user-*.slice/session-*.scope`) rather than
-/// a recursive sweep of the whole hierarchy.
-fn carrier_roots(daemon_cgroup: &Path) -> Vec<PathBuf> {
+/// A carrier this misses is a carrier nothing ever reaps: it lingers with its members
+/// running, a non-empty child keeps systemd from removing the enclosing slice or scope at
+/// logout, and — worse — the id allocator never advances past it, so the *next* mint
+/// computes the same `cordon-bless-<id>.<class>` name under the same parent and fails
+/// `EEXIST` forever. That is not hypothetical: widening `placement_rel` to the user slice
+/// without widening this function did exactly that.
+fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![daemon_cgroup.to_path_buf()];
     let children = |dir: PathBuf, keep: fn(&str) -> bool| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -612,13 +621,14 @@ fn carrier_roots(daemon_cgroup: &Path) -> Vec<PathBuf> {
             .map(|e| e.path())
             .collect()
     };
-    let user_slice = cgroup_root().join("user.slice");
-    for per_user in children(user_slice, |n| {
+    for per_user in children(cgroup_root.join("user.slice"), |n| {
         n.starts_with("user-") && n.ends_with(".slice")
     }) {
-        roots.extend(children(per_user, |n| {
+        // The slice itself is the desktop placement — a terminal has no session scope.
+        roots.extend(children(per_user.clone(), |n| {
             n.starts_with("session-") && n.ends_with(".scope")
         }));
+        roots.push(per_user);
     }
     // The daemon's own cgroup *is* a session scope when cordond is started from a login
     // shell rather than the unit, so it can turn up twice. A duplicate would adopt every
@@ -628,17 +638,40 @@ fn carrier_roots(daemon_cgroup: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// The `session-N.scope` prefix of a cgroup path, if it has one — e.g.
-/// `/user.slice/user-1000.slice/session-3.scope/app.service` →
-/// `/user.slice/user-1000.slice/session-3.scope`.
+/// Where in the requester's ancestry a carrier may live so the blessed process stays
+/// **attributable to its user** — the property polkit ultimately needs.
 ///
-/// Pure path work so the placement rule is testable without a cgroup hierarchy; the
-/// ownership check that makes it *safe* is [`carrier_parent`]'s.
-fn session_scope_rel(cgroup_path: &Path) -> Option<&Path> {
-    cgroup_path.ancestors().find(|p| {
+/// Two shapes, tried in that order, both `root:root` on systemd:
+///
+/// 1. **`session-N.scope`** — a tty or login session. Deepest and most precise: logind
+///    reads an exact session id straight from the cgroup.
+/// 2. **`user-<uid>.slice`** — a desktop session. On a modern systemd the terminal does
+///    *not* live in the session scope; it lives under the **delegated**
+///    `user@UID.service/app.slice/app-*.scope`, and there is no session scope anywhere in
+///    its ancestry. What still works there is `cg_path_get_owner_uid`, which keys on this
+///    `user-<uid>.slice` component to attribute the process to a user, from which logind
+///    falls back to that user's *display* session. That is exactly how an ordinary
+///    unblessed shell on such a desktop resolves, so matching it is the goal.
+///
+/// Anything below those two is out: `user@UID.service` and everything under it is
+/// delegated to the user, so a carrier there would sit in a directory its own beneficiary
+/// can `rmdir` — see [`carrier_parent`] for why that matters.
+///
+/// Pure path work so the rule is testable without a cgroup hierarchy; the ownership check
+/// that makes it *safe* is [`carrier_parent`]'s.
+fn placement_rel(cgroup_path: &Path) -> Option<&Path> {
+    named_ancestor(cgroup_path, "session-", ".scope")
+        .or_else(|| named_ancestor(cgroup_path, "user-", ".slice"))
+}
+
+/// The deepest ancestor whose final component matches `<prefix>…<suffix>`. Note
+/// `user-1000.slice` matches `("user-", ".slice")` while the enclosing `user.slice` does
+/// not — the hyphen is load-bearing.
+fn named_ancestor<'a>(path: &'a Path, prefix: &str, suffix: &str) -> Option<&'a Path> {
+    path.ancestors().find(|p| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("session-") && n.ends_with(".scope"))
+            .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
     })
 }
 
@@ -783,18 +816,23 @@ mod tests {
         assert_eq!(cgroup_v2_path("12:pids:/user.slice\n"), None);
     }
 
-    /// Where a carrier goes, as pure string work. The blessed process must land under the
-    /// requester's `session-N.scope` — that ancestor is the whole reason polkit can still
-    /// resolve a session inside a blessed shell.
+    /// Where a carrier goes, from the cgroup shapes that actually occur.
+    ///
+    /// The desktop row is the one that matters and the one an earlier version of this got
+    /// wrong: on a modern systemd a terminal is **not** in the session scope — it is under
+    /// the delegated `user@UID.service`, with no session scope anywhere above it. Placing
+    /// only-if-session-scope sent those blessings to the daemon's cgroup, where logind
+    /// cannot attribute the process to a user at all and polkit therefore refuses.
     #[test]
-    fn session_scope_is_found_at_any_depth() {
+    fn placement_covers_the_cgroup_shapes_that_actually_occur() {
         // A `fn`, not a closure: the result borrows from the argument, and closure
         // lifetime elision can't express that.
         fn rel(p: &str) -> Option<&Path> {
-            session_scope_rel(Path::new(p))
+            placement_rel(Path::new(p))
         }
+
+        // tty / login session: the session scope is deepest and most precise.
         let scope = Path::new("/user.slice/user-1000.slice/session-3.scope");
-        // The requester is the scope itself, or anywhere beneath it.
         assert_eq!(
             rel("/user.slice/user-1000.slice/session-3.scope"),
             Some(scope)
@@ -803,19 +841,30 @@ mod tests {
             rel("/user.slice/user-1000.slice/session-3.scope/cordon-bless-1.ro"),
             Some(scope)
         );
+
+        // Desktop: no session scope in the ancestry at all. The user slice is what keeps
+        // the process attributable, and it is the *only* root-owned option here.
+        let slice = Path::new("/user.slice/user-1000.slice");
+        assert_eq!(
+            rel("/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-term.scope"),
+            Some(slice)
+        );
+        assert_eq!(rel("/user.slice/user-1000.slice"), Some(slice));
+
+        // A session scope wins over the user slice when both are present (more precise).
         assert_eq!(
             rel("/user.slice/user-1000.slice/session-12.scope/app.slice/x.service"),
             Some(Path::new("/user.slice/user-1000.slice/session-12.scope"))
         );
-        // No session ⇒ no placement. A service, the user manager (which is *delegated*,
-        // so it must never be chosen), and the cgroup root all fall back.
+
+        // Nothing user-attributable ⇒ no placement, so the carrier falls back.
         assert_eq!(rel("/system.slice/cordond.service"), None);
-        assert_eq!(
-            rel("/user.slice/user-1000.slice/user@1000.service/app.slice"),
-            None
-        );
+        assert_eq!(rel("/system.slice/cordond.service/cordon-bless-3.ro"), None);
         assert_eq!(rel("/"), None);
-        // Near-misses must not match: the prefix and the suffix are both required.
+
+        // Near-misses. `user.slice` has no hyphen and must NOT match: it is the shared
+        // parent of every user, so a carrier there would be attributable to nobody.
+        assert_eq!(rel("/user.slice"), None);
         assert_eq!(rel("/user.slice/session-3.slice"), None);
         assert_eq!(rel("/user.slice/mysession-3.scope"), None);
     }
@@ -843,7 +892,7 @@ mod tests {
                 owner, 0,
                 "chose a parent that is not root-owned: {chosen:?}"
             );
-            assert!(session_scope_rel(&chosen).is_some(), "chose {chosen:?}");
+            assert!(placement_rel(&chosen).is_some(), "chose {chosen:?}");
         }
 
         // A pid that cannot exist has no cgroup to read: fall back, with a reason, rather
@@ -857,33 +906,50 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    /// Reconcile's search space includes the daemon's own cgroup, contains only session
-    /// scopes besides it, and lists nothing twice — a duplicate would adopt every leftover
-    /// carrier twice, which happens for real when cordond is started from a login shell
-    /// (its own cgroup *is* then a session scope, found both ways).
+    /// **Regression test.** Reconcile's search space must cover every parent
+    /// [`placement_rel`] can choose — they are two halves of one rule, and widening
+    /// placement to the user slice without widening this left desktop carriers
+    /// unreachable: never reaped, and the id allocator never advancing past them, so the
+    /// next mint collided on the same directory name and failed `EEXIST` forever.
+    ///
+    /// Asserted as that pairing rather than as a list of paths, so the two cannot drift
+    /// apart again: for each shape a requester can be in, whatever placement picks must be
+    /// somewhere reconcile looks.
     #[test]
-    fn carrier_roots_are_the_daemon_cgroup_plus_session_scopes_deduped() {
-        let daemon = std::env::temp_dir().join(format!("cordon-roots-{}", std::process::id()));
-        let roots = carrier_roots(&daemon);
-        assert!(roots.contains(&daemon));
-        for extra in roots.iter().filter(|r| **r != daemon) {
-            let name = extra.file_name().unwrap().to_str().unwrap();
+    fn reconcile_scans_every_parent_placement_can_choose() {
+        let root = std::env::temp_dir().join(format!("cordon-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let user_slice = root.join("user.slice/user-1000.slice");
+        std::fs::create_dir_all(user_slice.join("session-3.scope")).unwrap();
+        std::fs::create_dir_all(user_slice.join("user@1000.service/app.slice")).unwrap();
+        let daemon = root.join("system.slice/cordond.service");
+        std::fs::create_dir_all(&daemon).unwrap();
+
+        let roots = carrier_roots(&daemon, &root);
+
+        // Every requester shape → its placement → must be covered.
+        for requester in [
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-term.scope", // desktop
+            "/user.slice/user-1000.slice/session-3.scope",                            // tty
+            "/user.slice/user-1000.slice",
+        ] {
+            let rel = placement_rel(Path::new(requester)).expect("a placement");
+            let parent = root.join(rel.strip_prefix("/").unwrap());
             assert!(
-                name.starts_with("session-") && name.ends_with(".scope"),
-                "unexpected reconcile root: {extra:?}"
+                roots.contains(&parent),
+                "placement picks {parent:?} for a requester in {requester}, \
+                 but reconcile never scans it — that carrier would leak and \
+                 block the next mint. roots={roots:?}"
             );
         }
+        // The fallback parent is covered too.
+        assert!(roots.contains(&daemon));
+        // …and nothing is scanned twice (the daemon's cgroup can also be a session scope).
         let mut unique = roots.clone();
         unique.dedup();
         assert_eq!(unique, roots, "reconcile would scan a directory twice");
 
-        // The case that motivates the dedup: cordond started from a tty, so its own
-        // cgroup is a session scope the walk also finds.
-        if let Some(scope) = roots.iter().find(|r| **r != daemon).cloned() {
-            let roots = carrier_roots(&scope);
-            let hits = roots.iter().filter(|r| **r == scope).count();
-            assert_eq!(hits, 1, "the daemon's cgroup was listed twice: {scope:?}");
-        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Adoption is a *grant*, so it is gated on the same trust question placement asks:

@@ -1190,14 +1190,24 @@ is not cordon's business, and deliberately so — B1 hardcoded `sudo`, B2 made i
 3. The CLI spawns `$CORDON_SUDO cordon bless-helper --nonce=…`. The human authenticates to
    whatever that tool is; the helper reaches the daemon as uid 0 and approves (§16.5).
 4. The daemon validates `NAME` against the compiled class registry and creates a fresh
-   root-owned cgroup `cordon-bless-<id>.<class>` **in the requester's own `session-N.scope`**
-   — read from that connection's `SO_PEERCRED` pid, so the blessed process keeps a session
-   polkit can resolve and `run0`/`pkexec` keep working inside it. A parent that is not
-   root-owned is refused (`user@UID.service` is delegated to the user; a user-owned parent
-   would let the invoker rmdir an empty carrier and mkdir a replacement onto a recycled inode
-   — a cgroup id — that is still registered), falling back to the daemon's own cgroup. It
-   registers `BLESSED[cgroup_id] = ClassId(NAME)` and sends the carrier's **`cgroup.procs`
-   descriptor** back down the requester's connection (§16.4).
+   root-owned cgroup `cordon-bless-<id>.<class>` **inside the requester's own user subtree**,
+   located from that connection's `SO_PEERCRED` pid. logind attributes a process to a user —
+   and thence to a session, which is what polkit needs to find an auth agent — purely from
+   the cgroup path, so the carrier must keep one of the two components it reads:
+   - `session-N.scope` when the requester is in one (a tty or login session): most precise,
+     an exact session id;
+   - otherwise `user-<uid>.slice`. **This is the common desktop case**: on a modern systemd a
+     terminal lives under the *delegated* `user@UID.service/app.slice/app-*.scope` with no
+     session scope anywhere above it, and `cg_path_get_owner_uid` keys on the user slice to
+     resolve the user, from which logind falls back to that user's display session — exactly
+     how an ordinary unblessed shell there resolves.
+
+   A parent that is not root-owned is refused (`user@UID.service` and everything below it is
+   delegated to the user; a user-owned parent would let the invoker rmdir an empty carrier and
+   mkdir a replacement onto a recycled inode — a cgroup id — that is still registered),
+   falling back to the daemon's own cgroup, where the blessing still *works* but the blessed
+   shell loses polkit. The daemon registers `BLESSED[cgroup_id] = ClassId(NAME)` and sends the
+   carrier's **`cgroup.procs` descriptor** back down the requester's connection (§16.4).
 5. **The CLI is the spawner, unprivileged throughout.** It forks, and the child's `pre_exec`
    writes its own pid through that descriptor — joining *before* `exec`, so the target runs
    zero instructions unblessed — then execs. No privilege drop, because there was never any
@@ -1221,6 +1231,13 @@ is not cordon's business, and deliberately so — B1 hardcoded `sudo`, B2 made i
    class vanished are adopted **inert** (GC only — a live process tree is never killed because
    policy changed under it). Only **root-owned** directories are adopted: re-registering is a
    *grant*, so it is held to the same trust check as placement in step 4.
+
+> **Why placement is not "put it in the session scope".** That was the first shape tried, and
+> it is wrong on any desktop: the requester is not *in* the session scope, only the session
+> leader is. A rule that keyed on the session scope alone sent every desktop blessing to the
+> daemon's cgroup — where logind cannot attribute the process at all — and the failure looked
+> exactly like the bug it was meant to fix. What the carrier needs is not the session; it is
+> to remain somewhere logind can still say *whose* the process is.
 
 > **Apply-time remap (correctness keystone).** `policy apply` recompiles, and `ClassId`s are
 > dense and name-sorted — so they *renumber*. Every apply therefore re-points live `BLESSED`

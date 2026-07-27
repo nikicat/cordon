@@ -115,6 +115,10 @@
 #                       carriers are adopted. Two populated leftovers are planted in a
 #                       session scope, one root-owned and one chowned to a user; exactly
 #                       the first comes back in `bless list`, and the refusal is journaled.
+#                       A third, root-owned, is planted directly in the *user slice* — the
+#                       desktop placement — because reconcile missing that location does not
+#                       just leak the carrier: the id allocator never advances past it, so
+#                       the next mint recomputes the same name and fails EEXIST forever.
 #
 # The bless scenarios run the daemon in a NESTED cgroup, reproducing production's
 # `Delegate=yes` service cgroup without needing systemd (the carrier root is then a
@@ -1352,40 +1356,108 @@ while True: s.accept()
     return $fail
 }
 
-# --- scenario 26: the carrier lands in the requester's session scope ---------
-# The fix that makes a blessed shell usable: polkit resolves a caller's session from its
-# cgroup, so a carrier under cordond.service has no session-N.scope ancestor and every
-# run0/pkexec inside it fails. The daemon therefore reads the REQUESTER's pid from
-# SO_PEERCRED and creates the carrier under that process's own session scope.
+# --- scenario 26: the carrier lands where the user is still attributable ------
+# The fix that makes a blessed shell usable. logind attributes a process to a user — and
+# thence to a session, which is what polkit needs to find an auth agent — purely from its
+# cgroup path: `cg_path_get_owner_uid` keys on a `user-<uid>.slice` component, and
+# `cg_path_get_session` on a `session-N.scope` one. A carrier under cordond.service has
+# NEITHER, so logind says "doesn't own any suitable session" and every run0/pkexec inside
+# the blessed shell fails.
 #
-# logind isn't here to create those scopes, but it doesn't have to be: a session scope is
-# just a root-owned cgroup directory in the shape systemd would make, and everything under
-# test is kernel mechanics (which cgroup the mkdir happens in, and who owns the parent).
-# The one thing this cannot show is polkit then being satisfied, which is a systemd
-# property rather than cordon code — that stays a host check.
+# So the daemon reads the REQUESTER's pid from SO_PEERCRED and creates the carrier inside
+# that process's own user subtree. This exercises the shapes that actually occur, because
+# an earlier version of this test only built the tty shape and so passed while the real
+# desktop case was broken:
 #
-# Both directions matter. Root-owned parent: use it. User-owned parent: REFUSE and fall
-# back, because an invoker who can rmdir an empty carrier and mkdir a replacement could
-# land on a recycled inode — i.e. a cgroup id still registered in BLESSED — and self-bless.
-scenario_bless_session_scope() {
-    echo "### scenario: the carrier is created in the requester's session scope"
+#   a) DESKTOP — the terminal is under the *delegated* user@UID.service/app.slice, with no
+#      session scope anywhere above it. This is the common case and the one that regressed.
+#   b) TTY — the requester is in a session-N.scope; the carrier goes there (more precise).
+#   c) NO USER SUBTREE — a requester under system.slice falls back to the daemon's cgroup.
+#   d) USER-OWNED parent — refused; an invoker who can rmdir an empty carrier and mkdir a
+#      replacement could land on a recycled inode, i.e. a cgroup id still in BLESSED.
+#
+# The assertion in (a) and (b) is the property logind consumes, not just a path: the
+# carrier's cgroup must still contain `user-<uid>.slice`.
+# Build a fake user subtree in the shapes a real desktop and a real tty produce, and set
+# the P_* globals naming each requester cgroup. `user-N.slice` is root-owned as systemd
+# leaves it; `user@N.service` is chowned to the user, because it is *delegated* — that is
+# precisely why a carrier may not live there. Returns 1 (with a SKIP) if it can't be built.
+placement_tree_make() { # $1 uid
+    P_USLICE="/sys/fs/cgroup/user.slice/user-$1.slice"
+    P_DESKTOP="$P_USLICE/user@$1.service/app.slice/app-terminal.scope"
+    P_TTY="$P_USLICE/session-99.scope"
+    P_ROGUE="$P_USLICE/session-98.scope"     # user-owned: must be refused
+    mkdir -p "$P_DESKTOP" "$P_TTY" "$P_ROGUE" 2>/dev/null || {
+        echo "  SKIP: cannot build a user subtree under /sys/fs/cgroup"; return 1
+    }
+    chown -R "$1:$1" "$P_USLICE/user@$1.service"   # delegated, as systemd does
+    chown "$1:$1" "$P_ROGUE"
+}
+
+placement_tree_clean() {
+    rmdir "$P_USLICE"/*/cordon-bless-* "$P_USLICE"/cordon-bless-* 2>/dev/null
+    rmdir "$P_DESKTOP" "$(dirname "$P_DESKTOP")" "$(dirname "$(dirname "$P_DESKTOP")")" \
+          "$P_TTY" "$P_ROGUE" "$P_USLICE" 2>/dev/null
+}
+
+# Bless from inside $1, leaving the blessed child alive; echoes its carrier's cgroup path
+# (mount-relative, as /proc/self/cgroup reports it).
+#
+# Runs in a command substitution, i.e. a subshell — so the pid to reap later travels
+# through a file rather than a variable, which would never reach the caller.
+bless_from() { # $1 requester cgroup  $2 uid  $3 cordon binary  $4 marker prefix
+    rm -f "$4" "$4.cg" "$4.pid"
+    sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$1" \
+        setpriv --reuid "$2" --regid "$2" --clear-groups \
+        env CORDON_SUDO="$CORDON_SUDO" CORDON_CONFIG="$CORDON_CONFIG" \
+        "$3" bless --class ro -- /bin/sh -c "cat /proc/self/cgroup > '$4.cg'; touch '$4'; sleep 5" &
+    echo $! > "$4.pid"
+    for _ in $(seq 1 60); do [ -e "$4" ] && break; sleep 0.1; done
+    [ -e "$4" ] || return 1
+    sed -n 's/^0:://p' "$4.cg"
+}
+
+# Reap the blessed tree started by `bless_from` and wait for the carrier to drain.
+end_bless() { # $1 marker prefix
+    local pid; pid="$(cat "$1.pid" 2>/dev/null)"
+    [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }
+    bless_drained >/dev/null 2>&1
+}
+
+# One placement case: bless from $1 and require the carrier's parent to be exactly $2.
+expect_placement() { # $1 requester cgroup  $2 expected parent (mount-relative)  $3 label
+    local marker="$P_READY/$(basename "$1")" got
+    got="$(bless_from "$1" "$P_UID" "$P_CORDON" "$marker")" || {
+        echo "  FAIL: $3 — the blessed child never started"; end_bless "$marker"; return 1
+    }
+    end_bless "$marker"
+    case "$got" in
+        "$2"/cordon-bless-*) echo "  OK: $3" ;;
+        *) echo "  FAIL: $3 — carrier at ${got:-<none>}, expected under $2"; return 1 ;;
+    esac
+}
+
+# --- scenario 26: the carrier lands where the user is still attributable ------
+# The fix that makes a blessed shell usable. logind attributes a process to a user — and
+# thence to a session, which is what polkit needs to find an auth agent — purely from its
+# cgroup path: `cg_path_get_owner_uid` keys on a `user-<uid>.slice` component, and
+# `cg_path_get_session` on a `session-N.scope` one. A carrier under cordond.service has
+# NEITHER, so logind says "doesn't own any suitable session" and every run0/pkexec inside
+# the blessed shell fails.
+#
+# So the daemon reads the REQUESTER's pid from SO_PEERCRED and creates the carrier inside
+# that process's own user subtree. All four shapes that occur are covered, because an
+# earlier version of this test built only the tty one and so passed while the real desktop
+# case was broken.
+scenario_bless_placement() {
+    echo "### scenario: the carrier lands where logind can still attribute the user"
     ws_new
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; daemon_stop; return 0; }
     cgroup2_ready || { daemon_stop; return 0; }
-    local buid=4248
-    local cordon; cordon="$(unpriv_cordon)"
-    # Somewhere the unprivileged blessed child can drop its readiness marker; $TMP itself
-    # is root-owned, and a marker that silently fails to appear would make the waits below
-    # pass on a timeout instead of on the thing they are waiting for.
-    local ready="$TMP/ready"; mkdir -p "$ready"; chown "$buid:$buid" "$ready"
-    local uslice="/sys/fs/cgroup/user.slice/user-$buid.slice"
-    local good="$uslice/session-99.scope"     # root-owned, as logind makes them
-    local bad="$uslice/session-98.scope"      # user-owned: must be refused
-    if ! mkdir -p "$good" "$bad" 2>/dev/null; then
-        echo "  SKIP: cannot create session scopes under /sys/fs/cgroup"; daemon_stop; return 0
-    fi
-    chown "$buid:$buid" "$bad"
-    session_cleanup() { rmdir "$good"/cordon-bless-* "$bad"/cordon-bless-* "$good" "$bad" "$uslice" 2>/dev/null; }
+    P_UID=4248
+    P_CORDON="$(unpriv_cordon)"
+    P_READY="$TMP/ready"; mkdir -p "$P_READY"; chown "$P_UID:$P_UID" "$P_READY"
+    placement_tree_make "$P_UID" || { daemon_stop; return 0; }
     write_policy <<EOF
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -1397,49 +1469,29 @@ action = "read"
 policy = "allow"
 EOF
     daemon_start
-    if ! started; then session_cleanup; return 1; fi
-    fake_sudo_start || { echo "  SKIP: cannot build the elevation stand-in"; session_cleanup; daemon_stop; return 0; }
+    if ! started; then placement_tree_clean; return 1; fi
+    fake_sudo_start || { echo "  SKIP: cannot build the elevation stand-in"; placement_tree_clean; daemon_stop; return 0; }
     local fail=0
+    local slice="/user.slice/user-$P_UID.slice"
 
-    # Run the unprivileged CLI from *inside* a scope: join as root, then drop — the child
-    # inherits the cgroup, which is exactly how a logind session hands one over.
-    bless_from_scope() { # $1 scope  $2 marker file
-        sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$1" \
-            setpriv --reuid "$buid" --regid "$buid" --clear-groups \
-            env CORDON_SUDO="$CORDON_SUDO" CORDON_CONFIG="$CORDON_CONFIG" \
-            "$cordon" bless --class ro -- /bin/sh -c "touch '$2'; sleep 5" &
-    }
-
-    bless_from_scope "$good" "$ready/in-session"
-    local blessed=$!
-    for _ in $(seq 1 50); do [ -e "$ready/in-session" ] && break; sleep 0.1; done
-    [ -e "$ready/in-session" ] || { echo "  FAIL: the blessed child never started"; fail=1; }
-    if ls -d "$good"/cordon-bless-* >/dev/null 2>&1; then
-        echo "  OK: the carrier was created in the requester's session scope ($(basename "$(ls -d "$good"/cordon-bless-*)"))"
-    else
-        echo "  FAIL: no carrier under $good — placement regression?"
-        echo "        daemon cgroup holds: $(ls -d "$(bless_root)"/cordon-bless-* 2>/dev/null || echo none)"
-        sed 's/^/  daemon| /' "$LOG"; fail=1
-    fi
-    kill "$blessed" 2>/dev/null; wait "$blessed" 2>/dev/null
-
-    # The refusal: a user-owned parent is never used, however plausible its name.
-    bless_from_scope "$bad" "$ready/in-bad"
-    local rejected=$!
-    for _ in $(seq 1 50); do [ -e "$ready/in-bad" ] && break; sleep 0.1; done
-    [ -e "$ready/in-bad" ] || { echo "  FAIL: the fallback blessed child never started"; fail=1; }
-    if ls -d "$bad"/cordon-bless-* >/dev/null 2>&1; then
-        echo "  FAIL: a carrier was created under a USER-OWNED parent (inode-recycling hazard)"; fail=1
-    elif ls -d "$(bless_root)"/cordon-bless-* >/dev/null 2>&1; then
-        echo "  OK: a user-owned session scope is refused; the carrier fell back to the daemon's cgroup"
-    else
-        echo "  FAIL: no carrier anywhere for the fallback case"; sed 's/^/  daemon| /' "$LOG"; fail=1
-    fi
-    kill "$rejected" 2>/dev/null; wait "$rejected" 2>/dev/null
+    # The desktop shape: no session scope anywhere above the requester. This is the common
+    # case and the one that regressed — the carrier must still land in the user slice.
+    expect_placement "$P_DESKTOP" "$slice" \
+        "desktop requester (delegated user@.service, no session scope) → the user slice" || fail=1
+    # A tty login has a session scope, which is more precise, so it wins.
+    expect_placement "$P_TTY" "$slice/session-99.scope" \
+        "tty requester → its own session-99.scope" || fail=1
+    # Nothing user-attributable at all ⇒ the daemon's cgroup.
+    expect_placement "$DCGROUP" "${DCGROUP#/sys/fs/cgroup}" \
+        "requester with no user subtree → the daemon's cgroup" || fail=1
+    # A user-owned parent is refused however plausible its name: its owner could rmdir an
+    # empty carrier and mkdir a replacement onto a recycled inode still live in BLESSED.
+    expect_placement "$P_ROGUE" "${DCGROUP#/sys/fs/cgroup}" \
+        "user-owned session scope is refused → falls back to the daemon's cgroup" || fail=1
 
     fake_sudo_stop
     daemon_stop
-    session_cleanup
+    placement_tree_clean
     return $fail
 }
 
@@ -1461,15 +1513,20 @@ scenario_bless_reconcile_ownership() {
     if ! mkdir -p "$scope" 2>/dev/null; then
         echo "  SKIP: cannot create a session scope under /sys/fs/cgroup"; daemon_stop; return 0
     fi
+    # Both placements must be scanned. The user slice is the desktop one, and reconcile
+    # missing it does not merely leak the carrier: the id allocator never advances past it,
+    # so the next mint recomputes the same directory name and fails EEXIST forever.
     local ours="$scope/cordon-bless-70.ro" theirs="$scope/cordon-bless-71.ro"
-    mkdir -p "$ours" "$theirs"
+    local desktop="$uslice/cordon-bless-72.ro"
+    mkdir -p "$ours" "$theirs" "$desktop"
     chown "$buid:$buid" "$theirs"          # as if planted by that user
     # Populated, or reconcile just removes them as empty leftovers.
     sleep 30 & local a=$!; echo $a > "$ours/cgroup.procs"
     sleep 30 & local b=$!; echo $b > "$theirs/cgroup.procs"
+    sleep 30 & local c=$!; echo $c > "$desktop/cgroup.procs"
     reconcile_cleanup() {
-        kill $a $b 2>/dev/null; wait $a $b 2>/dev/null
-        rmdir "$ours" "$theirs" "$scope" "$uslice" 2>/dev/null
+        kill $a $b $c 2>/dev/null; wait $a $b $c 2>/dev/null
+        rmdir "$ours" "$theirs" "$desktop" "$scope" "$uslice" 2>/dev/null
     }
     write_policy <<EOF
 [group.subject.blessed-ro]
@@ -1494,6 +1551,13 @@ EOF
         echo "  FAIL: a NON-ROOT-OWNED carrier was adopted — self-bless primitive"; fail=1
     else
         echo "  OK: the planted (user-owned) carrier was ignored"
+    fi
+    if printf '%s' "$listing" | grep -q '72'; then
+        echo "  OK: a leftover in the user slice (the desktop placement) was adopted"
+    else
+        echo "  FAIL: the user-slice leftover was not adopted — reconcile does not scan"
+        echo "        where placement puts desktop carriers; it would leak and then block"
+        echo "        every later mint on EEXIST. listing: $listing"; fail=1
     fi
     if log_has 'not root-owned; ignored'; then
         echo "  OK: the refusal is journaled"
@@ -1532,7 +1596,7 @@ scenario_bless_journal     || rc=1
 scenario_bless_unprivileged || rc=1
 scenario_socket_authz      || rc=1
 scenario_bless_rejects_fake_daemon || rc=1
-scenario_bless_session_scope || rc=1
+scenario_bless_placement || rc=1
 scenario_bless_reconcile_ownership || rc=1
 
 echo

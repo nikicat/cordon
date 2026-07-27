@@ -158,17 +158,21 @@ that is not theirs.
 So the daemon is the rendezvous, and the session is read from the one peer that cannot lie
 about it — the unprivileged CLI itself:
 
+0. The CLI checks the **daemon** is root (`SO_PEERCRED`) before saying anything. Skipping
+   this makes the nonce a bearer token handed to whoever answers the socket — see decision
+   #13.
 1. The CLI connects **as the user** and sends `BlessRequest{class}`. The daemon derives the
-   session scope from *that* connection's `SO_PEERCRED` pid and replies with a single-use
-   `nonce`. The connection stays open.
-2. The CLI spawns the helper under `$CORDON_SUDO`; the human authenticates.
+   carrier's placement from *that* connection's `SO_PEERCRED` pid and replies with a
+   single-use `nonce`. The connection stays open.
+2. The CLI spawns the helper under `$CORDON_SUDO`, passing the same `--socket`; the human
+   authenticates.
 3. The helper connects **as root** and sends `BlessApprove{nonce}`. The daemon mints, and
    sends the `cgroup.procs` fd back down the *requester's* still-open connection.
 
 The helper never touches the fd, there is no rendezvous socket to protect, and the placement
 decision rests on kernel-attested credentials rather than anything a client asserts. The
-nonce is single-use with a short TTL and is bound to the requesting connection; it need not
-be secret, since approving it requires uid 0 regardless.
+nonce is single-use with a short TTL and is bound to the requesting connection; it must be
+**unguessable** but need not be secret, since approving it requires uid 0 regardless.
 
 ```mermaid
 sequenceDiagram
@@ -183,28 +187,30 @@ sequenceDiagram
     S->>C: cordon bless --class ro -- aws s3 ls
     Note over S,C: ordinary child: env, cwd, tty,<br/>job control, session all inherited
 
+    C->>D: connect
+    Note over C: SO_PEERCRED on the DAEMON end → uid 0 ✓<br/>else refuse: the nonce must not go to<br/>whoever happens to answer this path
     C->>D: BlessRequest{class} · connection stays open
-    Note over D: SO_PEERCRED → uid 1000, pid<br/>/proc/pid/cgroup → session-3.scope<br/>(unforgeable — parent must be root-owned)
-    D-->>C: Pending{nonce}
+    Note over D: SO_PEERCRED → uid 1000, pid<br/>/proc/pid/cgroup → deepest of<br/>session-N.scope, else user-1000.slice<br/>(root-owned, or fall back to our own cgroup)
+    D-->>C: BlessPending{nonce}
 
-    C->>H: spawn $CORDON_SUDO cordon bless-helper --nonce N
+    C->>H: spawn $CORDON_SUDO cordon --socket S bless-helper --nonce=N
     Note over H: sudo / run0 → PAM →<br/>human presence proven
     H->>D: BlessApprove{nonce}
     Note over D: SO_PEERCRED → uid 0 ✓<br/>(the boundary — never the client's<br/>choice of elevation tool)
 
-    D->>K: mkdir session-3.scope/cordon-bless-1.ro<br/>open cgroup.procs (as root)
+    D->>K: mkdir user-1000.slice/cordon-bless-1.ro<br/>open cgroup.procs (as root)
     D->>K: BLESSED[cgroup_id] = ClassId(ro)
-    D-->>C: BlessMinted{view} + fd (SCM_RIGHTS)
-    D-->>H: Ok
+    D-->>C: BlessMinted{view} + fd (SCM_RIGHTS, CLOEXEC)
+    D-->>H: BlessApproved
     H-->>C: exits
 
     C->>C: fork
-    C->>B: pre_exec: write pid → fd, close fd, exec
+    C->>B: pre_exec: write pid → fd, exec (fd closes)
     Note over B: never runs unblessed —<br/>no privilege drop needed,<br/>it was never root
 
     B->>K: open ~/.aws/credentials
     K-->>B: cgroup_id → class ro → rule allows
-    Note over B: run0/polkit work here:<br/>logind still resolves session 3
+    Note over B: run0/polkit work here: the cgroup still<br/>carries user-1000.slice, so logind can<br/>attribute the process and find an agent
 
     B->>B: exits
     K-->>D: cgroup.events: populated 0

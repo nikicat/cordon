@@ -220,8 +220,9 @@ verifies the daemon is root, sends `BlessRequest` and holds the connection open;
 parks a single-use 128-bit nonce and blocks. The CLI spawns
 `$CORDON_SUDO cordon bless-helper --nonce=…`, the human authenticates, and *that* helper
 reaches the daemon as **uid 0** — which is the entire proof of human presence. The daemon
-then mints a per-invocation **root-owned cgroup** carrier (`cordon-bless-<id>.<class>`) **in
-the requester's own `session-N.scope`**, registers it in the tiny unbanked
+then mints a per-invocation **root-owned cgroup** carrier (`cordon-bless-<id>.<class>`) **inside
+the requester's own user subtree** — its `session-N.scope` when it has one, else its
+`user-<uid>.slice`, which is what a desktop terminal actually has — registers it in the tiny unbanked
 `BLESSED: cgroup_id → ClassId` map, and passes the carrier's **`cgroup.procs` descriptor**
 back over `SCM_RIGHTS`. The CLI forks and `pre_exec` writes the child's pid through that
 descriptor before `exec` — so the target never runs unblessed, while the CLI never holds
