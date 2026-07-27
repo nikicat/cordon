@@ -119,9 +119,25 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
   the `rm -rf ~/.ssh && mkdir ~/.ssh` case: that one is closed by `inode_rmdir` refusing the
   removal, since once the object's own directory is gone there is no protected ancestor left
   for this hook to find.
-- Left: `bprm_check_security` (the `execute` action). Needs a new BTF offset
-  (`linux_binprm -> file`), unlike every hook so far — the mutation hooks all hand over a
-  dentry the existing offsets already cover.
+- **Done (2026-07-28): `bprm_check_security`** — the `execute` action, and the first hook to
+  need a new BTF offset (`linux_binprm -> file`); every other hook is handed a dentry the
+  existing offsets already cover. Since that offset is applied to the hook's **trusted**
+  context pointer, it must stay *real* under `maybe_poison_offsets` — the verifier
+  range-checks trusted-pointer math against `.rodata` at load, so poisoning it would turn the
+  failure-path test into a load failure.
+  - **`execute` is not implied by `read`.** The exec open is an ordinary `file_open`
+    (`FMODE_EXEC | FMODE_READ`), so an object denying reads already refuses to run its
+    contents; this hook adds the converse — readable but not runnable.
+  - Expressing that needs an explicit `deny`, not a narrower `allow`: copy-down puts the
+    parent's rules in the child's bucket too, so a child rule that does not *match the
+    action* falls through to them. The smoke scenario is built that way.
+  - The self-test needs a **second object** for it. Under the deny-all probe rule the exec
+    *open* is refused by `file_open` and the verdict never reaches this hook, so the probe
+    would pass with the hook detached; the exec probe therefore gets its own object that
+    allows `read` and denies the rest. Its file also needs the x bit, or `may_open(MAY_EXEC)`
+    fails with `EACCES` first.
+- Left: `listdir` ≈ "open dir for read" — the coarseness note only; no hook of its own
+  (finer needs the hot `file_permission`).
 - `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
   stays opt-in for cost.
 - **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and

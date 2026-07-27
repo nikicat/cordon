@@ -93,11 +93,11 @@ the core boundary is what the remaining holes are in. The rule: *soundness befor
 
 ### First — finish M3
 
-- **M3 completion** — `bprm_check_security` (the `execute` action) is the one hook still
-  missing, and it is the first to need a **new BTF offset** (`linux_binprm -> file`); every
-  hook so far is handed a dentry the existing offsets already cover. `listdir` ≈ "open dir for
-  read" still needs its coarseness documented. `inode_mkdir` now ships, and
-  `RENAME_EXCHANGE` is **verified** rather than believed (see *Durable kernel facts*).
+- **M3 completion** — every hook now ships: `inode_mkdir` and `bprm_check_security` (the
+  `execute` action) landed, and `RENAME_EXCHANGE` is **verified** rather than believed (see
+  *Durable kernel facts*). What is left is `listdir` ≈ "open dir for read", which is a
+  documentation note about coarseness rather than a hook — a finer one needs the hot
+  `file_permission`.
 
 ### Next — the must-haves
 

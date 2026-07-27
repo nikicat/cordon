@@ -802,7 +802,7 @@ fixes identity granularity — this axis is where the security actually lives.
 | action | LSM hook | notes |
 |---|---|---|
 | read / write / create | `file_open` | one program; `f_flags`/`f_mode` already encode RDONLY/WRONLY/RDWR/`O_CREAT` — three actions free at open time |
-| execute | `bprm_check_security` | exec of a binary |
+| execute | `bprm_check_security` | exec of a binary — **not implied by `read`**, see below |
 | unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | second program; fire on mutation (cheap) |
 | **link** | **`inode_link`** | **a distinct hook — `rename` does not cover it (see below)** |
 | listdir | `file_open` of a directory (coarse) | no clean per-`getdents` hook; finer needs the hot `file_permission` |
@@ -844,6 +844,15 @@ question — see below:
 verdict — gated because objects resolve **once**, at `policy apply`, and nothing re-checks
 them: `rm -rf ~/.ssh && mkdir ~/.ssh` would otherwise dangle the `PROTECTED` entry and leave
 the path unprotected forever.
+
+**`execute` is its own capability.** An exec *opens* the file (`FMODE_EXEC | FMODE_READ`), so
+`file_open` already refuses to run the contents of an object that denies reads;
+`bprm_check_security` adds the converse — an object may be **readable and not runnable**. The
+subject is the process *performing* the exec, since at that hook the caller is still its old
+image. Note the interaction with copy-down: a narrower `allow` on a child does **not** remove
+a capability the parent granted, because a child rule that doesn't match the requested action
+falls through to the parent's. "Readable but not runnable" is therefore written as an explicit
+`deny` on `execute`, not as an `allow` that omits it.
 
 `inode_mkdir` is the mirror of `rmdir` and the one hook whose dentry is **negative**: there is
 no inode yet, so it matches nothing itself and the verdict comes from its **parent**, like the

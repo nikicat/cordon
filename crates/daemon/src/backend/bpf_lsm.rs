@@ -42,7 +42,7 @@ use cordon_core::policy::{self, ClassName, CompiledPolicy, PolicySource, Severit
 use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
 use std::collections::HashMap;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -62,6 +62,7 @@ const HOOKS: &[&str] = &[
     "inode_unlink",
     "inode_rmdir",
     "inode_mkdir",
+    "bprm_check_security",
 ];
 
 /// Test-only env var: forces deliberately wrong field offsets so the self-test's
@@ -262,8 +263,9 @@ fn maybe_poison_offsets(offsets: &mut Offsets) {
         // bounds-checks that math against `.rodata` and rejects an out-of-range value at
         // *load*, which is a different (also loud) guard — but one that would abort before
         // the self-test could run, turning this failure-path test into a load failure.
-        // The trusted arg is `file` at `file_open` and a *dentry* at the mutation hooks,
-        // so the `dentry_d_*` offsets are trusted-pointer math too and must stay real.
+        // The trusted arg is `file` at `file_open`, a *dentry* at the mutation hooks, and
+        // the `linux_binprm` at `bprm_check_security`, so `dentry_d_*` and `binprm_file`
+        // are trusted-pointer math too and must stay real.
         //
         // Poisoning `sb_s_dev`/`inode_i_*` alone still yields a complete silent no-op:
         // `find_object`'s very first read is `dentry.super_block()?.dev()?`, so every walk
@@ -277,6 +279,7 @@ fn maybe_poison_offsets(offsets: &mut Offsets) {
             dentry_d_sb: offsets.dentry_d_sb,
             dentry_d_parent: offsets.dentry_d_parent,
             dentry_d_name_name: offsets.dentry_d_name_name,
+            binprm_file: offsets.binprm_file,
             ..Offsets::POISON
         };
     }
@@ -332,10 +335,14 @@ fn make_probe(base: &Path) -> Result<PathBuf> {
     // Seeded *before* the object goes live, or creating them would be denied by our own
     // rule. `over` is the rename-over target: a *positive* destination dentry, which is the
     // one shape `link` can never produce.
-    for name in ["src", "over"] {
+    for name in ["src", "over", "exe"] {
         std::fs::write(probe.join(name), b"x")
             .map_err(|e| Error::msg(format!("bpf-lsm self-test: seed probe {name}: {e}")))?;
     }
+    // `exe` must carry the x bit or `do_open_execat`'s `may_open(MAY_EXEC)` refuses with
+    // EACCES *before* `bprm_check_security` runs, and the probe would prove nothing.
+    std::fs::set_permissions(probe.join("exe"), std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| Error::msg(format!("bpf-lsm self-test: chmod probe exe: {e}")))?;
     Ok(probe)
 }
 
@@ -374,6 +381,29 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     )?;
     seed::rule_count_insert(ebpf, bank, obj, 1)?;
 
+    // A second object, for `execute` alone. It cannot be proven under the deny-all rule
+    // above: an exec *opens* the file first, so `file_open` would refuse it and the verdict
+    // would never reach `bprm_check_security` — the probe would pass with the hook detached.
+    // So this object allows the read and denies the rest; the only thing that can then
+    // refuse the exec is the bprm hook itself. It nests inside the probe directory, and
+    // `find_object` takes the deepest match, so this file's own rules win.
+    let exec_obj = ObjId(1);
+    let exec_path = probe.join("exe");
+    let exec_id = proc::file_id(&exec_path)
+        .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve exec probe FileId"))?;
+    seed::protected_insert(ebpf, bank, exec_id, exec_obj)?;
+    seed::rules_set(
+        ebpf,
+        rule_slot(bank, exec_obj, 0),
+        CompiledRule::new(SubjectMatch::ANY, Action::READ, Policy::ALLOW),
+    )?;
+    seed::rules_set(
+        ebpf,
+        rule_slot(bank, exec_obj, 1),
+        CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
+    )?;
+    seed::rule_count_insert(ebpf, bank, exec_obj, 2)?;
+
     // One operation per attached hook. `outside` is in the same directory as the probe so
     // link/rename really reach the LSM hook instead of failing `EXDEV` at the VFS layer.
     // Ordered so each still has something to act on: link is non-destructive, rename would
@@ -392,6 +422,9 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     // A *negative* dentry inside the object: `inode_mkdir` classifies off the parent, which
     // no other probe here exercises (every other one starts from a positive dentry).
     let made = std::fs::create_dir(probe.join("sub"));
+    // The exec probe: its object allows `read`, so reaching a refusal here means the verdict
+    // came from `bprm_check_security` and not from the open.
+    let executed = std::process::Command::new(&exec_path).status().map(drop);
 
     // Clean up the probe entries (the real seed also clears, but don't rely on it).
     let _ = seed::protected_remove(ebpf, bank, id);
@@ -408,6 +441,7 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
         clobbered,
     )?;
     expect_denied("mkdir inside the object (inode_mkdir)", made)?;
+    expect_denied("exec of a protected binary (bprm_check_security)", executed)?;
     Ok(())
 }
 

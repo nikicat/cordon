@@ -1630,6 +1630,41 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario: bprm_check_security -------------------------------------------
+# `execute` is its own capability. The exec *open* is an ordinary `file_open`, so an object
+# that denies reads already refuses to run its contents; what this hook adds is the converse
+# — readable but not runnable. Expressing that needs an explicit `deny`, not a narrower
+# `allow`: copy-down puts the parent's rules in the child's bucket too, and a child rule that
+# doesn't *match the action* simply falls through to them.
+scenario_execute() {
+    echo "### scenario: execute is a capability distinct from read"
+    ws_new
+    # `bash`, not `true`: `command -v true` resolves to the shell *builtin* and copies
+    # nothing. Invoked below as `-c :` so the copy exits immediately instead of going
+    # interactive. Same idiom as `mk_exe`.
+    cp "$(command -v bash)" "$VAULT/runnable"
+    cp "$(command -v bash)" "$VAULT/readonly"
+    write_policy <<EOF
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = ["read", "execute"]
+policy = "allow"
+[[rule]]
+who = "*"
+where = "$VAULT/readonly"
+action = "execute"
+policy = "deny"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    expect_allow "exec a binary the object grants execute on" "$VAULT/runnable" -c ':' || fail=1
+    expect_deny  "exec a binary the policy denies execute on" "$VAULT/readonly" -c ':' || fail=1
+    # The point of the hook: the same file is still perfectly readable.
+    expect_allow "…and that same binary is still readable" cat "$VAULT/readonly" || fail=1
+    daemon_stop; return $fail
+}
+
 # --- scenario: inode_mkdir ---------------------------------------------------
 # `rmdir` was gated and `mkdir` was not, so a subject that could not remove a directory
 # inside an object could still add one. The new dentry is negative, so the verdict comes
@@ -1732,6 +1767,7 @@ scenario_per_action        || rc=1
 scenario_rename_over       || rc=1
 scenario_rename_exchange   || rc=1
 scenario_mkdir             || rc=1
+scenario_execute           || rc=1
 scenario_subject_group     || rc=1
 scenario_object_group      || rc=1
 scenario_deny_wins         || rc=1
