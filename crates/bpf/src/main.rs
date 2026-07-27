@@ -189,23 +189,36 @@ fn live_bank(pid: Pid) -> Option<Bank> {
 }
 
 /// `inode_link` / `inode_rename`: a name is being created for an existing inode (and for
-/// rename, the old name goes away). Two questions, in order:
+/// rename, the old name goes away). Three questions, in order:
 ///
-/// 1. **Escape** — is a protected inode acquiring a name *outside* its object? Refused
+/// 1. **Destroy** — is the destination name *already taken*, by an inode inside a protected
+///    object? Only `rename` can be — `link`'s target is always negative — and `vfs_rename`
+///    unlinks that inode. This hook is the *only* one the kernel fires for it:
+///    `inode_unlink` is reachable solely from `vfs_unlink`, and `do_renameat2`'s own target
+///    check is DAC-only `may_delete()`. Unclassified, `mv anything secret` would do exactly
+///    what `rm secret` is refused, and the `PROTECTED` entry it dangles is permanent, since
+///    objects resolve once. It takes the destroyed side's own `write` verdict — the most
+///    specific object in play on the destination (§15.6) — and it is asked *before* the
+///    internal shuffle below, because a more-specific object nested inside the one being
+///    shuffled within is precisely what that short-circuit would otherwise swallow.
+/// 2. **Escape** — is a protected inode acquiring a name *outside* its object? Refused
 ///    unconditionally, with no rule lookup and no subject check. A second name in an
 ///    unprotected directory makes the inode readable by every subject, forever, and
 ///    silently: `find_object` stops finding the object, so no further event is ever
 ///    emitted. No subject is trusted with that — not an allowed exe, not a blessed
 ///    session. Blessing grants *read*, not re-parenting.
-/// 2. **Clobber** — is an unprotected inode acquiring a name *inside* an object? That is
+/// 3. **Clobber** — is an unprotected inode acquiring a name *inside* an object? That is
 ///    an ordinary create/write, so it takes the subject's verdict on the destination
 ///    object and honours `audit` (allow+log) exactly like any other write.
 ///
-/// An internal shuffle (same object both sides) is neither, and returns early: that is the
-/// atomic-save pattern (write a temp beside the target, rename over it), which has to keep
-/// working inside a protected directory — `ssh` rewriting `known_hosts`, `git` in
-/// `~/.password-store`. It is also why the clobber check can't simply fire on "destination
-/// is protected".
+/// An internal shuffle (same object both sides) is none of the three, and returns early:
+/// that is the atomic-save pattern (write a temp beside the target, rename over it), which
+/// has to keep working inside a protected directory — `ssh` rewriting `known_hosts`, `git`
+/// in `~/.password-store`. It is also why the clobber check can't simply fire on
+/// "destination is protected". Note that (1) does not break it: an atomic save is a rename
+/// over a name in an object the subject may already *write*, so the destroy verdict is that
+/// same `allow` and the shuffle proceeds. It bites only where the destination carries a
+/// tighter rule of its own, which is the case worth biting on.
 fn decide_reparent(
     source: kernel::Dentry,
     new_dentry: kernel::Dentry,
@@ -214,10 +227,21 @@ fn decide_reparent(
     let pid = kernel::current_pid();
     let bank = live_bank(pid)?;
 
+    // (1) DESTROY. `find_object` on the destination *itself*: `None` for every `link` and
+    // for a rename onto a free name (both negative, so `Dentry::inode` yields `None` on the
+    // first step of the walk), `Some` exactly when this rename is about to unlink something
+    // that a protected object covers. A refusal ends the operation here.
+    if let Some(target) = find_object(new_dentry, bank) {
+        if let Verdict::Deny = consult(&target, Action::WRITE, op, pid, bank)? {
+            return Some(Verdict::Deny);
+        }
+    }
+
     let src = find_object(source, bank);
-    // The destination *directory*. The new dentry is negative — it names a file that does
-    // not exist yet, so `d_inode` is NULL and its own identity is unreadable. Its parent
-    // is the directory receiving the name, which is what we must classify.
+    // The destination *directory* — the one receiving the name, which is what the escape
+    // and clobber questions are about. Distinct from the destination dentry classified
+    // above: `~/.ssh/authorized_keys` and `~/.ssh` can be protected by different rules, or
+    // only one of them protected at all.
     let dst = find_object(new_dentry.parent()?, bank);
 
     match (src, dst) {

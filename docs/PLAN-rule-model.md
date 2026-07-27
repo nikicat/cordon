@@ -89,16 +89,16 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
 - Left: `inode_mkdir` and `bprm_check_security` (the `execute` action).
 - `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
   stays opt-in for cost.
-- **Gate a positive `new_dentry` (security gap, do first).** `decide_reparent` classifies the
-  source and `new_dentry.parent()`, never `new_dentry` itself — right for `inode_link` (its
-  target is always negative), wrong for `inode_rename`, where rename-over destroys a positive
-  target inode with no verdict of its own and dangles its `PROTECTED` entry. `mv anything
-  secret` thus does what `rm secret` is refused. Run `find_object(new_dentry)` when
-  `d_inode != NULL` and take that object's `write` verdict *before* the internal-shuffle
-  short-circuit; add a rename-over case to the daemon self-test. This also settles
-  `renameat2(RENAME_EXCHANGE)` — the protected inode sits on the *destination* side, the hook
-  has no `flags` argument, and the second swapped call that would cover it is believed, not
-  verified. Rationale and both exploit shapes in DESIGN §15.5.
+- **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and
+  `new_dentry.parent()` but never `new_dentry` itself, so rename-over destroyed a protected
+  inode with no verdict and dangled its `PROTECTED` entry — `mv anything secret` did what
+  `rm secret` is refused. `find_object` now runs on the destination dentry first and takes
+  that object's `write` verdict; the daemon self-test and a `bpf-lsm-smoke.sh` scenario both
+  cover it, the latter also pinning that atomic-save still works. DESIGN §15.5.
+- Verify `renameat2(RENAME_EXCHANGE)`. The destroy check gives the destination object a
+  `write` floor, but an exchange re-parents both inodes rather than destroying one, so the
+  protected side moving *out* still wants the unconditional escape refusal — which depends on
+  the kernel calling the hook a second time with the pair swapped. Believed, not verified.
 
 ## Milestone 4 — Autolearn (the zones layer)
 - Separate `learned.db` (SQLite); `zones` config = where learning may propose rules.

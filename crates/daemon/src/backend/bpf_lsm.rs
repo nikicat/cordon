@@ -293,9 +293,13 @@ fn self_test(ebpf: &mut Ebpf) -> Result<()> {
     let probe = std::env::temp_dir().join(format!("cordon-selftest.{}", std::process::id()));
     std::fs::create_dir_all(&probe)
         .map_err(|e| Error::msg(format!("bpf-lsm self-test: mkdir probe: {e}")))?;
-    // Seeded *before* the object goes live, or creating it would be denied by our own rule.
-    std::fs::write(probe.join("src"), b"x")
-        .map_err(|e| Error::msg(format!("bpf-lsm self-test: seed probe file: {e}")))?;
+    // Seeded *before* the object goes live, or creating them would be denied by our own
+    // rule. `over` is the rename-over target: a *positive* destination dentry, which is the
+    // one shape `link` can never produce.
+    for name in ["src", "over"] {
+        std::fs::write(probe.join(name), b"x")
+            .map_err(|e| Error::msg(format!("bpf-lsm self-test: seed probe {name}: {e}")))?;
+    }
     let outcome = run_self_test(ebpf, &probe);
     let _ = std::fs::remove_dir_all(&probe);
     outcome
@@ -346,6 +350,11 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     let linked = std::fs::hard_link(&src, &outside);
     let renamed = std::fs::rename(&src, &outside);
     let unlinked = std::fs::remove_file(&src);
+    // Rename *over* an existing name, both sides inside the object. The pair-of-directories
+    // classification calls this an internal shuffle and allows it, so only the destination
+    // dentry's own lookup refuses — which is the whole point of the case. Last, because if
+    // it is wrongly allowed it consumes `src`.
+    let clobbered = std::fs::rename(&src, probe.join("over"));
 
     // Clean up the probe entries (the real seed also clears, but don't rely on it).
     let _ = seed::protected_remove(ebpf, bank, id);
@@ -357,6 +366,10 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     expect_denied("hardlink out (inode_link)", linked)?;
     expect_denied("rename out (inode_rename)", renamed)?;
     expect_denied("unlink (inode_unlink)", unlinked)?;
+    expect_denied(
+        "rename over a protected name (inode_rename, destroy)",
+        clobbered,
+    )?;
     Ok(())
 }
 
