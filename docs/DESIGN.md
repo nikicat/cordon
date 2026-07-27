@@ -63,6 +63,58 @@ Enabling simplification: we **never confine the adversary**. We protect the
    disambiguates the interpreter case but is best-effort (evadable by double-fork), so it
    raises cost, it isn't a boundary.
 
+### 3.1 What the incumbents actually do to a scraper
+
+Insight 3 is checkable, so check it. Against the in-scope adversary — a scraper running at
+your uid that copies `~/.aws/credentials` and Chrome's cookie DB — **stock AppArmor and
+SELinux do essentially nothing**, with enforcement fully on and no denial logged:
+
+- **Fedora/RHEL targeted policy** runs the login session as `unconfined_t` and labels
+  everything in `$HOME` `user_home_t`. `unconfined_t` reads `user_home_t`. Confined user
+  domains (`user_u`, `staff_u`, `xguest_u`) exist, are opt-in, and are rarely deployed; even
+  under `staff_u` one user app is not separated from another's data by default.
+- **Ubuntu's AppArmor** ships profiles for daemons and a handful of apps. Anything else —
+  `curl`, a pip install, a binary you downloaded — has no profile, and **unprofiled means
+  unconfined**.
+
+This is not an oversight, it is the model: confinement is a property of the *program*, and
+the default for an unknown program is none. A scraper is definitionally an unprofiled
+program, so the entire class sits outside the deployment. That is insight 3 restated as an
+observation rather than a claim. Both systems *can* express "only Firefox reads the cookie
+DB" — it is a policy-coverage gap, not a capability limit — but expressing it means confining
+the user, retyping the object, and writing a domain for every legitimate reader.
+
+Credit where due: containing a compromised *service* is what they were built for and they do
+it well — `httpd_t` cannot read `user_home_t`, so an nginx or mysqld exploit does not become a
+home-directory sweep. Note that where a browser profile does ship it runs in the **opposite
+direction** to what we want: it protects the system from Firefox, not Firefox's cookie DB from
+everything else.
+
+**Android is the counterexample, and it is SELinux.** Per-app uids + per-app domains +
+default-deny is this exact protection, working, at scale. The mechanism is therefore proven;
+what Android has and a desktop does not is an **install-time identity assignment step**.
+Desktop programs arrive by tarball, pip, npm, `curl | sh`, so no such step exists — which is
+why cordon assigns identity to the *object* instead and lets subjects stay anonymous.
+
+**Prior art that does solve it, and what to take from each:**
+
+- **Flatpak / snap** genuinely confine (a Flatpak cannot see `~/.ssh`; file access goes
+  through portals) but are gated on packaging, and a scraper will not arrive as a Flatpak.
+- **macOS TCC** is the closest existing thing to this design: object-side gating, per-app
+  grants, prompt on first access. Mainstream and effective. Its two failure modes are ours to
+  avoid — **consent fatigue** (§15.10's audit→admit→enforce exists partly for this: admit
+  from observed evidence, not from a modal prompt) and **identity resting on a code
+  signature**, which is the same question [PLAN-rule-model](PLAN-rule-model.md) M6 is chewing
+  on.
+- **Chrome's app-bound encryption** (Windows, 2024) was shipped *because* infostealers were
+  reading the cookie DB — evidence the threat is real and unaddressed at the OS layer. On
+  Linux Chrome uses the login keyring, reachable over D-Bus by any process at your uid, so the
+  file gate is the only control actually available there.
+
+The gap this project targets is therefore specific: **object-first default-deny for same-uid
+desktop programs.** Android proves the enforcement works, TCC proves the model is usable, and
+neither exists for Linux desktop.
+
 ## 4. Architecture
 
 ### Core
@@ -737,7 +789,8 @@ So the invariant is not "gate rename" but **a protected inode must not acquire a
 outside its object** — which needs `inode_link` *and* `inode_rename`.
 
 **Shipped (2026-07-27).** Both hooks, plus `inode_unlink`/`inode_rmdir`, share one resolver
-over `find_object`. Three cases:
+over `find_object`. Three cases, where `dst` is the destination **directory**
+(`new_dentry.parent()` — see the gap below for why that is not the whole story):
 
 | | condition | verdict |
 |---|---|---|
@@ -783,11 +836,39 @@ the *real* object and the path reconstruction walked the *real* dentry chain. Ov
 presents the underlying dentry to `security_file_open`, so it is mediated and needs no
 `sb_mount` gating.
 
-Still open, and out of reach of these hooks: `renameat2(RENAME_EXCHANGE)` puts the protected
-inode on the *destination* side, and the `inode_rename` hook carries no `flags` argument
-(only `path_rename` does). The kernel is believed to call the hook a second time with the
-pair swapped, which would cover it — **verify before relying on it**; if it does not hold,
-gate `new_dentry` too when it is positive.
+**Known gap: rename-over destroys the destination object unmediated.** `decide_reparent`
+classifies exactly two dentries — the source, and `new_dentry.parent()`. The destination
+dentry's *own* identity is never passed to `find_object`. That is correct for `inode_link`
+(`do_linkat` looks the target up with `LOOKUP_CREATE`, so `link(2)` returns `EEXIST` before
+`vfs_link` and the new dentry is always negative) and **wrong for `inode_rename`**:
+`rename(2)` over an existing file passes a *positive* `new_dentry` whose inode `vfs_rename`
+then destroys. Only `security_inode_rename` fires for that — `security_inode_unlink` is
+reachable solely from `vfs_unlink`, and `do_renameat2`'s own target check is `may_delete()`,
+which is DAC-only. So the clobbered inode receives no verdict, and since objects resolve once
+its `PROTECTED` entry dangles exactly as `rm -rf` would have. The `inode_unlink` gate above is
+therefore bypassable by its sibling syscall: `rm secret` is refused (`decide_remove` tests the
+leaf first), `mv anything secret` is allowed. Two shapes:
+
+- **the destination is an object whose parent is not** — `deny * * ~/.ssh/authorized_keys`
+  with no rule on `~/.ssh`: both walks miss, the `(None, None)` arm allows, the protected
+  inode is destroyed and the attacker's inode owns the name for every subject, forever.
+- **the destination is a nested, more specific object** — `mv ~/.aws/tmp ~/.aws/.danger-token`
+  against the shipped example policy short-circuits as an internal shuffle (both sides resolve
+  to `~/.aws`), destroying the `silence` object so the path falls back to the looser ancestor's
+  `allow read,write`. The general defect is the same one the clobber row has in weaker form:
+  the verdict comes from the destination *directory*, never from the destination's own,
+  more-specific rules.
+
+Not a regression — before these hooks rename-over was equally unmediated — but it defeats a
+control this same change ships, and the fix is small: when `new_dentry` is positive, run
+`find_object` on it and treat a hit as a destroy, taking *that* object's `write` verdict,
+evaluated **before** the internal-shuffle short-circuit. Branching on `d_inode == NULL`
+distinguishes positive from negative without the `flags` argument the hook does not carry,
+which also closes `renameat2(RENAME_EXCHANGE)` — it puts the protected inode on the
+*destination* side, and the kernel is only *believed* to call the hook a second time with the
+pair swapped (**verify before relying on it**; gating a positive `new_dentry` makes the
+question moot). The startup self-test covers rename-*out* only, so extend it with a
+rename-*over*-the-probe case or the gap can silently reopen.
 
 `file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
 is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewhere), so

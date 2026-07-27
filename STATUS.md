@@ -43,7 +43,12 @@ name outside its object) is refused unconditionally, with no rule lookup and no 
 exemption; **clobber** and **destroy** are ordinary writes and take the subject's verdict, so
 `audit` objects keep working. An internal rename short-circuits, which is what keeps
 atomic-save alive inside a protected dir. All five programs share `find_object`, so entry is
-a dentry rather than a `struct file`. DESIGN §15.5.
+a dentry rather than a `struct file`. DESIGN §15.5. **One known gap**, found in review and
+not yet fixed: only the destination *directory* is classified, so a rename **over** a
+positive `new_dentry` destroys that inode with no verdict and dangles its `PROTECTED` entry —
+`mv anything secret` does what `rm secret` is refused. Not a regression (rename-over was
+unmediated before these hooks) but it defeats the `inode_unlink` gate. DESIGN §15.5 has both
+exploit shapes; the fix is an M3 task.
 
 **Volume control**, because tools re-open one config hundreds of times per run (helm: 464×
 `~/.kube/config`): an in-kernel LRU suppressor keyed by `(exe, ObjId, action, leaf)` emits at
@@ -99,8 +104,15 @@ Environment, cwd, tty, job control and session are inherited by construction.
   session hits a surprise denial. An "uncordoned" class is sketched in PLAN-bless B4.
 - **M2–M4** — subject predicates beyond exe, the rest of the mutation/exec hooks
   (`inode_mkdir`, `bprm_check_security`), autolearn.
-- **M6 — code identity as a subject predicate**, the `exe`-identity fix, and the largest
-  known hole. `exe` is `mm->exe_file`: what was exec'd, not what is running.
+- **M6 — fixed code as the precondition for a grant**, the `exe`-identity fix, and the
+  largest known hole. The invariant: a grant attaches only to a process that runs the code it
+  shipped with, so anything executing foreign code *in its own address space* — a JIT, an
+  interpreter running a script, a preloaded library — is not grantable. `exec` and the process
+  boundary are what make that reachable: `ssh`'s `ProxyCommand` and `git`'s hooks spawn a new
+  exe and lose the grant, a browser's renderers are separate sandboxed processes, but
+  `python script.py` never is. Three enforcement points — an attestation lint in `policy
+  check`, the runtime taint, and M2's `unsandboxed` predicate for privilege-separated apps.
+  `exe` is `mm->exe_file`: what was exec'd, not what is running.
   `LD_PRELOAD=evil.so ssh -V` runs attacker code with ssh's identity and inherits its
   grants, so **every static `allow` is a confused-deputy grant**. No M2 predicate closes it,
   IMA exe-hash least of all — the exe genuinely *is* ssh, unmodified. Nor can it be detected
@@ -113,7 +125,12 @@ Environment, cwd, tty, job control and session are inherited by construction.
   policy surface, user flows and rejected alternatives in
   [PLAN-rule-model](docs/PLAN-rule-model.md) M6. Until it ships the deployment answer is
   `bless`: a per-invocation grant has no standing exe rule to inject into, so the lever is
-  the ratio of static `allow` rules to blessings.
+  the ratio of static `allow` rules to blessings — and `bless` is the deliberate escape hatch
+  from the invariant, not an instance of it, since it proves human presence rather than code
+  identity. Expect the invariant to make static `allow` rules **rare**: it retires
+  `allow /usr/bin/aws` (the CLI is Python) and most npm/Electron tooling with it. The taint's
+  storage (per-task vs per-`mm`, and whether it survives `clone`) is the open question that
+  decides the mechanism; PLAN M6 *Store*.
 - Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
 ## Settled, do not redo
