@@ -589,15 +589,34 @@ fn usable_session_scope(pid: Pid) -> std::result::Result<PathBuf, &'static str> 
     // will fail on its own shortly; meanwhile the daemon's cgroup is the safe placement.
     let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .map_err(|_| "requester's cgroup unreadable")?;
-    let rel = cgroup_v2_path(&text)
+    resolve_placement(&text, cgroup_root(), owner_uid)
+}
+
+/// The placement decision itself, with its two filesystem facts injected: where the cgroup
+/// hierarchy is mounted, and who owns a candidate parent. Injected rather than probed so
+/// the rule — including the ownership refusal, which is the security-relevant half — is
+/// testable without a cgroup hierarchy or root, in the same shape as
+/// `SocketPath::for_client`'s `exists`.
+fn resolve_placement(
+    cgroup_text: &str,
+    cgroup_mount: &Path,
+    owner: impl Fn(&Path) -> Option<Uid>,
+) -> std::result::Result<PathBuf, &'static str> {
+    let rel = cgroup_v2_path(cgroup_text)
         .and_then(placement_rel)
         .ok_or("requester's cgroup has no session scope or user slice")?;
-    let scope = under_cgroup_root(rel);
-    match std::fs::metadata(&scope) {
-        Ok(meta) if std::os::unix::fs::MetadataExt::uid(&meta) == 0 => Ok(scope),
-        Ok(_) => Err("chosen parent is not root-owned"),
-        Err(_) => Err("chosen parent vanished"),
+    let parent = cgroup_mount.join(rel.strip_prefix("/").unwrap_or(rel));
+    match owner(&parent) {
+        Some(Uid(0)) => Ok(parent),
+        Some(_) => Err("chosen parent is not root-owned"),
+        None => Err("chosen parent vanished"),
     }
+}
+
+fn owner_uid(path: &Path) -> Option<Uid> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| Uid(std::os::unix::fs::MetadataExt::uid(&m)))
 }
 
 /// Every directory a carrier could have been created in. Reconcile's search space, and it
@@ -869,41 +888,55 @@ mod tests {
         assert_eq!(rel("/user.slice/mysession-3.scope"), None);
     }
 
-    /// Placement never returns somewhere unsafe. The security half is the ownership gate:
-    /// a user-writable parent lets the invoker `rmdir` an empty carrier and `mkdir` a
-    /// replacement, and a cgroup id is a recycled inode number, so that replacement could
-    /// land on an id still live in `BLESSED`.
-    ///
-    /// Asserted as an **invariant** rather than a fixed path on purpose — where the test
-    /// runner itself sits is environment-dependent (a GUI terminal lands under
-    /// `user@1000.service/app.slice`, with no session scope at all; a tty login lands in a
-    /// root-owned `session-N.scope`), and a test that only holds on one of those would
-    /// pass here and fail on a login shell or in CI.
+    /// The placement decision end to end, with the filesystem injected — so the
+    /// ownership refusal, which is the security-relevant half, is asserted without needing
+    /// a cgroup hierarchy or root. The previous version of this called the real
+    /// `carrier_parent` against `/proc` and `/sys` and could only assert an invariant,
+    /// because what it exercised depended on where the test runner happened to sit.
     #[test]
-    fn placement_is_the_fallback_or_a_root_owned_scope() {
-        let base = std::env::temp_dir().join(format!("cordon-parent-{}", std::process::id()));
-        let fallback = base.join("daemon-cgroup");
-        std::fs::create_dir_all(&fallback).unwrap();
+    fn placement_requires_a_root_owned_parent() {
+        let mount = Path::new("/fake/cgroup");
+        let desktop = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-t.scope\n";
+        let root_owned = |_: &Path| Some(Uid(0));
 
-        let chosen = carrier_parent(Pid(std::process::id()), &fallback);
-        if chosen != fallback {
-            let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&chosen).unwrap());
-            assert_eq!(
-                owner, 0,
-                "chose a parent that is not root-owned: {chosen:?}"
-            );
-            assert!(placement_rel(&chosen).is_some(), "chose {chosen:?}");
-        }
+        assert_eq!(
+            resolve_placement(desktop, mount, root_owned),
+            Ok(mount.join("user.slice/user-1000.slice"))
+        );
+        // A parent the requester's own user owns is refused: they could rmdir an empty
+        // carrier and mkdir a replacement onto a recycled inode still live in BLESSED.
+        assert_eq!(
+            resolve_placement(desktop, mount, |_| Some(Uid(1000))),
+            Err("chosen parent is not root-owned")
+        );
+        // Gone between the cgroup read and the stat.
+        assert_eq!(
+            resolve_placement(desktop, mount, |_| None),
+            Err("chosen parent vanished")
+        );
+        // Nothing user-attributable at all ⇒ the caller falls back to its own cgroup.
+        assert_eq!(
+            resolve_placement("0::/system.slice/cordond.service\n", mount, root_owned),
+            Err("requester's cgroup has no session scope or user slice")
+        );
+        // A cgroup listing with no unified-hierarchy line.
+        assert_eq!(
+            resolve_placement("12:pids:/user.slice\n", mount, root_owned),
+            Err("requester's cgroup has no session scope or user slice")
+        );
+    }
 
-        // A pid that cannot exist has no cgroup to read: fall back, with a reason, rather
-        // than fail the mint.
-        assert_eq!(carrier_parent(Pid(0), &fallback), fallback);
+    /// The one ambient path left, and it is deterministic everywhere: pid 0 is never a
+    /// process, so `/proc/0/cgroup` cannot be read and placement falls back rather than
+    /// failing the mint.
+    #[test]
+    fn an_unreadable_requester_falls_back() {
+        let fallback = Path::new("/some/daemon/cgroup");
+        assert_eq!(carrier_parent(Pid(0), fallback), fallback);
         assert_eq!(
             usable_session_scope(Pid(0)),
             Err("requester's cgroup unreadable")
         );
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// **Regression test.** Reconcile's search space must cover every parent

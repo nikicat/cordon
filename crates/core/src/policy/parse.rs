@@ -374,14 +374,14 @@ mod tests {
     #[test]
     fn parses_includes() {
         let p = parse(
-            "[[include]]\nuser = \"nb\"\npath = \"/etc/cordon/users/nb.toml\"\n\
-             [[include]]\nuser = \"al\"\npath = \"/etc/cordon/users/al.toml\"\n",
+            "[[include]]\nuser = \"alice\"\npath = \"/etc/cordon/users/alice.toml\"\n\
+             [[include]]\nuser = \"bob\"\npath = \"/etc/cordon/users/bob.toml\"\n",
         )
         .unwrap();
         assert_eq!(p.includes().len(), 2);
-        assert_eq!(p.includes()[0].user().as_str(), "nb");
-        assert_eq!(p.includes()[0].path(), "/etc/cordon/users/nb.toml");
-        assert_eq!(p.includes()[1].user().as_str(), "al");
+        assert_eq!(p.includes()[0].user().as_str(), "alice");
+        assert_eq!(p.includes()[0].path(), "/etc/cordon/users/alice.toml");
+        assert_eq!(p.includes()[1].user().as_str(), "bob");
         // a policy with no include directive has an empty list.
         assert!(
             parse("rules = '''\nallow /b read /x\n'''\n")

@@ -699,7 +699,7 @@ mod tests {
         // A system fragment that includes a user file → two sources, tagged by tier.
         let dir = std::env::temp_dir().join(format!("cordon-inc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let user_file = dir.join("nb.toml");
+        let user_file = dir.join("alice.toml");
         std::fs::write(
             &user_file,
             "rules = '''\nallow /usr/bin/x read ~/.aws\n'''\n",
@@ -710,7 +710,7 @@ mod tests {
             &sys_file,
             format!(
                 "rules = '''\naudit * read /etc/cordon\n'''\n\
-                 [[include]]\nuser = \"nb\"\npath = \"{}\"\n",
+                 [[include]]\nuser = \"alice\"\npath = \"{}\"\n",
                 user_file.display()
             ),
         )
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert!(matches!(sources[0].origin, SourceOrigin::System));
         match &sources[1].origin {
-            SourceOrigin::User { user } => assert_eq!(user.as_str(), "nb"),
+            SourceOrigin::User { user } => assert_eq!(user.as_str(), "alice"),
             other => panic!("expected user tier, got {other:?}"),
         }
         // A missing included file is tolerated (empty slot, not an error).

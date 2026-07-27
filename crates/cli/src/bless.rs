@@ -256,28 +256,46 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// The confused-deputy guard, exercised against the attacker's actual precondition: a
-    /// socket that a *non-root* local process left listening where the client looks.
-    ///
-    /// The test suite runs unprivileged, so a listener it binds itself has exactly the
-    /// ownership a squatter's would. `request_and_approve` must bail on the peer's uid
-    /// **before** it writes anything — sending `BlessRequest` would already be too late,
-    /// since the next step hands the reply's nonce to a process about to become root.
+    /// The confused-deputy guard. A socketpair's peer is this very process, so the check
+    /// sees our own uid — which makes the expected verdict a function of how the suite is
+    /// run, and asserting it that way is the point: an earlier version asserted "refused"
+    /// unconditionally and would have failed under `sudo cargo test` or a root container.
     #[test]
-    fn a_non_root_daemon_is_refused_before_any_request_is_sent() {
+    fn the_daemon_end_must_be_root() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let peer_is_root = peer_uid(&ours).unwrap() == ROOT;
+        let verdict = require_root_daemon(&ours, Path::new("/socketpair"));
+        assert_eq!(
+            verdict.is_err(),
+            !peer_is_root,
+            "a {} peer should have been {}",
+            if peer_is_root { "root" } else { "non-root" },
+            if peer_is_root { "accepted" } else { "refused" }
+        );
+        if let Err(e) = verdict {
+            assert!(e.to_string().contains("not root"), "unclear refusal: {e}");
+        }
+    }
+
+    /// …and the guard fires **before** anything is written. Sending `BlessRequest` would
+    /// already be too late: the next step hands the reply's nonce to a process about to
+    /// become root. Only meaningful when the suite is unprivileged, since a root peer is
+    /// legitimately accepted and the flow would then block waiting for a real daemon.
+    #[test]
+    fn a_non_root_daemon_learns_nothing() {
         let dir = std::env::temp_dir().join(format!("cordon-fakedaemon-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cordon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        if peer_uid(&UnixStream::connect(&path).unwrap()).unwrap() == ROOT {
+            std::fs::remove_dir_all(&dir).ok();
+            return; // running as root: this listener is a legitimate daemon end
+        }
 
-        let err = request_and_approve(&path, None).expect_err("a non-root peer must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("not root"), "unexpected refusal: {msg}");
+        assert!(request_and_approve(&path, None).is_err());
 
-        // Nothing was written: the guard fires before the request, so a squatter never
-        // even learns a bless was attempted, let alone gets to answer it. By now the
-        // client has hung up, so an empty read is EOF rather than a would-block — either
-        // way what matters is that zero bytes arrived.
+        // By now the client has hung up, so an empty read is EOF rather than a
+        // would-block — either way what matters is that zero bytes arrived.
         listener.set_nonblocking(true).unwrap();
         let (peer, _) = listener.accept().expect("the client did connect");
         peer.set_nonblocking(true).unwrap();
