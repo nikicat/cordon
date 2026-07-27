@@ -24,8 +24,9 @@ use super::map_mut;
 use aya::Ebpf;
 use aya::maps::{Array, HashMap as BpfHashMap};
 use cordon_bpf_common::{
-    Bank, BankedFile, BankedObj, CompiledRule, FileId, MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES,
-    MAP_SETTINGS, MAX_OBJECTS, ObjId, Pid, Settings, rule_slot,
+    Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, FileId, MAP_BLESSED,
+    MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES, MAP_SETTINGS, MAX_OBJECTS, ObjId, Pid, Settings,
+    rule_slot,
 };
 use cordon_core::policy::CompiledPolicy;
 use cordon_core::{Error, Result};
@@ -122,6 +123,25 @@ pub(super) fn rule_count_remove(ebpf: &mut Ebpf, bank: Bank, obj: ObjId) -> Resu
             .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_RULE_COUNT}: {e}")))?;
     map.remove(&BankedObj::new(bank, obj))
         .map_err(|e| Error::msg(format!("bpf-lsm: remove rule count: {e}")))
+}
+
+/// Register a live blessing: the carrier cgroup's id → its class. `MAP_BLESSED` is
+/// **unbanked** (blessings are runtime state, not policy — an apply remaps values in
+/// place by class name rather than re-seeding a generation).
+pub(super) fn blessed_insert(ebpf: &mut Ebpf, cgroup: CgroupId, class: ClassId) -> Result<()> {
+    let mut map: BpfHashMap<_, CgroupId, ClassId> =
+        BpfHashMap::try_from(map_mut(ebpf, MAP_BLESSED)?)
+            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_BLESSED}: {e}")))?;
+    map.insert(cgroup, class, 0)
+        .map_err(|e| Error::msg(format!("bpf-lsm: insert blessed: {e}")))
+}
+
+pub(super) fn blessed_remove(ebpf: &mut Ebpf, cgroup: CgroupId) -> Result<()> {
+    let mut map: BpfHashMap<_, CgroupId, ClassId> =
+        BpfHashMap::try_from(map_mut(ebpf, MAP_BLESSED)?)
+            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_BLESSED}: {e}")))?;
+    map.remove(&cgroup)
+        .map_err(|e| Error::msg(format!("bpf-lsm: remove blessed: {e}")))
 }
 
 pub(super) fn rules_set(ebpf: &mut Ebpf, index: u32, rule: CompiledRule) -> Result<()> {

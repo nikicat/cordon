@@ -25,6 +25,10 @@ Restart=on-failure
 RestartSec=1
 # CAP_BPF loads the program + maps; CAP_MAC_ADMIN is required to load an LSM program.
 AmbientCapabilities=CAP_BPF CAP_MAC_ADMIN
+# The bless carrier cgroups (`cordon-bless-<id>.<class>`) are created under the
+# daemon's own cgroup; Delegate=yes hands the subtree to the daemon so systemd
+# doesn't fight its mkdir/rmdir there.
+Delegate=yes
 
 [Install]
 WantedBy=basic.target

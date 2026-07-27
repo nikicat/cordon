@@ -8,8 +8,9 @@
 //! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
 //! backends were retired with the rule-model migration (DESIGN §15).
 
-use crate::policy::{Diagnostic, PolicySource};
-use crate::proto::PolicyView;
+use crate::Uid;
+use crate::policy::{ClassName, Diagnostic, PolicySource};
+use crate::proto::{BlessId, BlessingView, CarrierProcs, Pid, PolicyView};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -83,33 +84,79 @@ impl Shutdown {
     }
 }
 
-/// The control-plane handle the daemon hands the backend thread: a channel of
-/// `cordon policy apply` requests to honor, and a slot to publish the effective
-/// policy into for `cordon policy show`. The IPC side holds the matching
-/// [`ControlSender`].
+/// The control-plane handle the daemon hands the backend thread: **one** channel of
+/// control messages (`policy apply` + bless ops) to honor, and a slot to publish the
+/// effective policy into for `cordon policy show`. One channel, not two, on purpose:
+/// an apply renumbers `ClassId`s and remaps the live blessings, so strict ordering
+/// between applies and bless ops is what keeps a mint from racing the remap. The IPC
+/// side holds the matching [`ControlSender`].
 pub struct PolicyControl {
-    pub apply_rx: Receiver<ApplyRequest>,
+    pub msg_rx: Receiver<ControlMsg>,
     pub current: Arc<Mutex<Option<PolicyView>>>,
 }
 
-/// The IPC side of [`PolicyControl`]: send applies, read the current policy.
+/// The IPC side of [`PolicyControl`]: send control messages, read the current policy.
 #[derive(Clone)]
 pub struct ControlSender {
-    pub apply_tx: Sender<ApplyRequest>,
+    pub msg_tx: Sender<ControlMsg>,
     pub current: Arc<Mutex<Option<PolicyView>>>,
 }
 
 /// Create a connected [`PolicyControl`] / [`ControlSender`] pair.
 pub fn control() -> (PolicyControl, ControlSender) {
-    let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel();
     let current = Arc::new(Mutex::new(None));
     (
         PolicyControl {
-            apply_rx,
+            msg_rx,
             current: Arc::clone(&current),
         },
-        ControlSender { apply_tx, current },
+        ControlSender { msg_tx, current },
     )
+}
+
+/// One control-plane message to the backend thread (which owns the BPF maps — every
+/// map write funnels through this single channel, preserving the single-writer
+/// discipline).
+pub enum ControlMsg {
+    Apply(ApplyRequest),
+    Bless(BlessOp),
+}
+
+/// A blessing operation (DESIGN §16). Replies are `Result<_, String>`: the failure is
+/// only ever shown to the human on the CLI end, and `String` keeps the backend's
+/// error types out of the seam.
+pub enum BlessOp {
+    /// Mint a blessing: create + register a carrier cgroup for `class` (`None` → the
+    /// sole declared class). The reply carries the carrier's `cgroup.procs` **opened by
+    /// the (root) backend thread** — passing that fd is what lets an unprivileged client
+    /// join, since the kernel checks migration permission against the opener's
+    /// credentials, not the writer's (DESIGN §16.4).
+    Mint {
+        class: Option<ClassName>,
+        /// The **requester's** kernel-attested uid, recorded on the blessing so they can
+        /// later revoke what they minted without needing root ([`Self::Revoke`]).
+        owner: Uid,
+        /// The **requester's** kernel-attested pid. The daemon reads its cgroup to place
+        /// the carrier in that process's own logind session scope, so the blessed command
+        /// keeps a session polkit will resolve. Attested, never asserted: a client-supplied
+        /// pid would let a caller aim the carrier at *another* user's session.
+        requester: Pid,
+        reply: Sender<std::result::Result<(BlessingView, CarrierProcs), String>>,
+    },
+    /// Snapshot the live blessings.
+    List {
+        reply: Sender<std::result::Result<Vec<BlessingView>, String>>,
+    },
+    /// Kill a blessing's carrier and unregister it. `by` is the caller's kernel-attested
+    /// uid: root revokes anything, anyone else only what they minted. The check lives here
+    /// rather than in the IPC `authorize` gate because it needs the live table — the gate
+    /// answers "may this uid speak this verb", ownership answers "is this one yours".
+    Revoke {
+        id: BlessId,
+        by: Uid,
+        reply: Sender<std::result::Result<(), String>>,
+    },
 }
 
 /// One `policy apply`: the policy fragments to compile + a one-shot reply channel for

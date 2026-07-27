@@ -6,7 +6,7 @@
 //! point a diagnostic at the offending source line. Semantic validation — `@ref`
 //! resolution, cycles, paths — is [`super::resolve`]'s job.
 
-use super::{LineIndex, PolicyName, Pos, UserName};
+use super::{ClassName, GroupName, LineIndex, PolicyName, Pos, UserName};
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -118,20 +118,31 @@ struct IncludeDef {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Groups {
     #[serde(default)]
-    pub(crate) subject: BTreeMap<String, Spanned<GroupDef>>,
+    pub(crate) subject: BTreeMap<GroupName, Spanned<GroupDef>>,
     #[serde(default)]
-    pub(crate) object: BTreeMap<String, Spanned<GroupDef>>,
+    pub(crate) object: BTreeMap<GroupName, Spanned<GroupDef>>,
     #[serde(default)]
-    pub(crate) action: BTreeMap<String, Spanned<GroupDef>>,
+    pub(crate) action: BTreeMap<GroupName, Spanned<GroupDef>>,
 }
 
-/// A named group. M1 supports only `members` (a list of leaf tokens / nested `@ref`s);
-/// the conjunctive subject form (`exe = … argv0 = …`, DESIGN §15.4) lands in M2 and is
-/// rejected here by `deny_unknown_fields` until then.
+/// A named group. The usual form is `members` (a list of leaf tokens / nested `@ref`s). A
+/// **subject** group may instead carry a single `blessing = "<class>"` predicate (DESIGN
+/// §16.3) — declaring a blessing class referenced as `@<group>`; [`super::resolve`] rejects
+/// `blessing` on an object/action group and rejects mixing it with `members`. The other
+/// conjunctive subject predicates (`exe = … argv0 = …`, DESIGN §15.4) land in M2 and stay
+/// rejected by `deny_unknown_fields` until then.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupDef {
-    pub(crate) members: Vec<String>,
+    /// Member tokens (`@ref`/`*`/leaf), each lexed to a [`Token`] at deserialize time —
+    /// they follow the same grammar as a rule field, so groups nest recursively.
+    #[serde(default)]
+    pub(crate) members: Vec<Token>,
+    /// A blessing class this (subject) group matches (DESIGN §16.3); mutually exclusive with
+    /// `members`. `None` for an ordinary member-list group. Deserializes transparently from
+    /// the TOML string into the [`ClassName`] newtype.
+    #[serde(default)]
+    pub(crate) blessing: Option<ClassName>,
 }
 
 /// One `[[rule]]`: who/where/action are each a single token or a list (groups,
@@ -146,36 +157,29 @@ pub(crate) struct RuleDef {
     pub(crate) policy: PolicyName,
 }
 
-/// A field that may be written as a bare string or a list of strings. (Not
-/// `Spanned`: `toml::Spanned` does not survive `#[serde(untagged)]`, which buffers the
-/// input — so token-level positions aren't available; rule/group spans are.)
+/// A rule field that may be written as a bare value or a list — each lexed to a [`Token`]
+/// at deserialize time (via [`Token`]'s `Deserialize`). (Not `Spanned`: `toml::Spanned`
+/// does not survive `#[serde(untagged)]`, which buffers the input — so token-level
+/// positions aren't available; rule/group spans are.)
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub(crate) enum OneOrMany {
-    One(String),
-    Many(Vec<String>),
+    One(Token),
+    Many(Vec<Token>),
 }
 
 impl OneOrMany {
-    /// The raw tokens, as a slice (a single value is a one-element slice).
-    pub(crate) fn tokens(&self) -> &[String] {
+    /// The tokens, as a slice (a single value is a one-element slice).
+    pub(crate) fn tokens(&self) -> &[Token] {
         match self {
-            OneOrMany::One(s) => std::slice::from_ref(s),
+            OneOrMany::One(t) => std::slice::from_ref(t),
             OneOrMany::Many(v) => v,
         }
     }
 
-    /// The tokens, lexically classified for [`super::resolve`].
+    /// The tokens as an owned list, for [`ParsedRule`].
     pub(crate) fn classified(&self) -> Vec<Token> {
-        self.tokens().iter().map(|s| Token::classify(s)).collect()
-    }
-}
-
-impl GroupDef {
-    /// Group members, lexically classified (members follow the same token grammar as a
-    /// rule field, so `@ref`/`*`/leaf nest recursively).
-    pub(crate) fn classified(&self) -> Vec<Token> {
-        self.members.iter().map(|s| Token::classify(s)).collect()
+        self.tokens().to_vec()
     }
 }
 
@@ -189,14 +193,38 @@ impl GroupDef {
 /// A token whose first character is `@` is always a group ref (so an exe/object whose
 /// leading component is literally `@name` can't be named — an acceptable limit, same
 /// as treating `*` as the wildcard).
+/// A raw, axis-polymorphic **leaf** token — an exe path, an object path, or an action name;
+/// which it is gets decided per-axis in [`super::resolve`] (→ a `PathBuf` or an [`ActionName`]
+/// there). An **alias**, not a newtype: every string is a valid leaf, so there's no invariant
+/// to enforce at this lexical layer — the alias just names the role; the real domain types are
+/// assigned downstream where the invariant lives.
+pub(crate) type RawLeaf = String;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {
     /// `*` — wildcard (axis-specific: any subject / all actions; rejected for `where`).
     Wildcard,
     /// `@name` — a reference to a same-axis group.
-    Group(String),
-    /// A literal leaf: an exe/object path or an action name.
-    Leaf(String),
+    Group(GroupName),
+    /// A literal leaf: an exe/object path or an action name (see [`RawLeaf`]).
+    Leaf(RawLeaf),
+    /// A blessing class (DESIGN §16.3), **synthesized** by [`super::resolve`] when a `@ref`
+    /// resolves to a `blessing = "<class>"` group — never produced by lexing (a blessing is
+    /// not a surface token, so [`classify`](Token::classify) never returns it). The subject
+    /// axis turns it into a blessing predicate; the object/action axes reject it.
+    Blessing(ClassName),
+}
+
+impl<'de> serde::Deserialize<'de> for Token {
+    /// Lex a TOML string into a [`Token`] at deserialize time (the `@ref`/`*`/leaf split is
+    /// purely lexical, so it is axis-independent and can run here) — so the raw policy
+    /// surfaces (`members`, a rule field) hold `Token`s, not bare strings.
+    fn deserialize<D>(de: D) -> std::result::Result<Token, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Token::classify(&String::deserialize(de)?))
+    }
 }
 
 impl Token {
@@ -204,7 +232,7 @@ impl Token {
         if raw == "*" {
             Token::Wildcard
         } else if let Some(name) = raw.strip_prefix('@') {
-            Token::Group(name.to_string())
+            Token::Group(GroupName::new(name))
         } else {
             Token::Leaf(raw.to_string())
         }
@@ -346,14 +374,14 @@ mod tests {
     #[test]
     fn parses_includes() {
         let p = parse(
-            "[[include]]\nuser = \"nb\"\npath = \"/etc/cordon/users/nb.toml\"\n\
-             [[include]]\nuser = \"al\"\npath = \"/etc/cordon/users/al.toml\"\n",
+            "[[include]]\nuser = \"alice\"\npath = \"/etc/cordon/users/alice.toml\"\n\
+             [[include]]\nuser = \"bob\"\npath = \"/etc/cordon/users/bob.toml\"\n",
         )
         .unwrap();
         assert_eq!(p.includes().len(), 2);
-        assert_eq!(p.includes()[0].user().as_str(), "nb");
-        assert_eq!(p.includes()[0].path(), "/etc/cordon/users/nb.toml");
-        assert_eq!(p.includes()[1].user().as_str(), "al");
+        assert_eq!(p.includes()[0].user().as_str(), "alice");
+        assert_eq!(p.includes()[0].path(), "/etc/cordon/users/alice.toml");
+        assert_eq!(p.includes()[1].user().as_str(), "bob");
         // a policy with no include directive has an empty list.
         assert!(
             parse("rules = '''\nallow /b read /x\n'''\n")

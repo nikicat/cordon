@@ -6,8 +6,27 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `socket` + `uio` provide the `sendmsg`/`recvmsg` behind proto's SCM_RIGHTS fd hand-off:
+# the daemon opens the blessing carrier's `cgroup.procs` as root and passes only that fd,
+# so the CLI joins without privilege (DESIGN §16.6). Both ends of the wire need it, hence
+# core rather than a copy in each of daemon and cli. (`uio` is what gates the scatter-
+# gather msghdr calls; `socket` alone stops at getsockopt/setsockopt.)
+nix = { version = "0.31.3", features = ["socket", "uio"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `fs` adds `fcntl`, used only to assert the received descriptor is close-on-exec — a
+# security property that would otherwise fail silently. Test-only, so the shipped binary
+# pulls in no more than it needs.
+nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
+
 [dependencies]
 serde = { workspace = true }
+# The blessing nonce (DESIGN §16.5) — the tree's only randomness, and it must be
+# unguessable. A thin wrapper over `getrandom(2)`: no descriptor to open, so it can't be
+# defeated by exhausted fds or a missing /dev, and it blocks correctly on an unseeded pool
+# rather than handing back weak bytes. `libc` is its only dependency here, already present.
+getrandom = "0.4.3"
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

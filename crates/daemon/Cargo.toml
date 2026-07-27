@@ -27,9 +27,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# nix `poll` drives the bpf-lsm ring-buffer reader; its safe wrappers avoid
-# hand-rolled `unsafe`. (Unused without the `bpf-lsm` feature.)
-nix = { version = "0.31.3", features = ["poll"] }
+# nix `poll` drives the bpf-lsm ring-buffer reader; `socket` provides the IPC server's
+# `SO_PEERCRED` read (std's `peer_cred()` is still unstable). Safe wrappers over
+# hand-rolled `unsafe`.
+nix = { version = "0.31.3", features = ["poll", "socket"] }
 # bpf-lsm backend (userspace control plane): the aya loader + the map/record types shared
 # with the eBPF program. Optional + Linux-only — pulled in only by the (default) `bpf-lsm`
 # feature, and only on Linux (the one target the backend compiles on).

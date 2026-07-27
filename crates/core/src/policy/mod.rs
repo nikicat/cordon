@@ -254,6 +254,77 @@ impl fmt::Display for UserName {
     }
 }
 
+/// The name of a `[group.{subject,object,action}.NAME]` group — the key into a group
+/// namespace, referenced by `@NAME` (DESIGN §15.7). A newtype so a group identifier can't
+/// be confused with the policy layer's other strings (paths, leaves, class names); used as
+/// the `Groups` map key, in [`super::resolve`]'s cycle stack, and as a `Token::Group`
+/// payload. (De)serialized transparently from/to a TOML table key / string.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GroupName(String);
+
+impl GroupName {
+    pub fn new(name: impl Into<String>) -> GroupName {
+        GroupName(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for GroupName {
+    fn from(s: &str) -> GroupName {
+        GroupName(s.to_string())
+    }
+}
+
+impl From<String> for GroupName {
+    fn from(s: String) -> GroupName {
+        GroupName(s)
+    }
+}
+
+impl fmt::Display for GroupName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The name of a **blessing class** (DESIGN §16.3) as authored in policy — the string in a
+/// `[group.subject.*] blessing = "<name>"` predicate and in `cordon bless --class <name>`. A
+/// newtype (like [`UserName`]) so it can't be mixed up with the policy layer's other strings
+/// (group names, paths, tokens); the compiler assigns each distinct one a dense
+/// [`cordon_bpf_common::ClassId`]. (De)serialized transparently from/to a TOML/JSON string.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClassName(String);
+
+impl ClassName {
+    pub fn new(name: impl Into<String>) -> ClassName {
+        ClassName(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ClassName {
+    type Err = std::convert::Infallible;
+    /// Any string is a candidate class name; whether the policy actually declares it is
+    /// checked against the compiled registry. Lets `--class` parse straight into this newtype.
+    fn from_str(s: &str) -> std::result::Result<ClassName, Self::Err> {
+        Ok(ClassName::new(s))
+    }
+}
+
+impl fmt::Display for ClassName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Resolve which home directory `~` expands against for a policy: the home of its
 /// `user =` header (looked up in `/etc/passwd`), or `fallback` (the daemon/CLI `$HOME`)
 /// when the policy names no user. Errors if the named account has no `/etc/passwd`
@@ -434,6 +505,9 @@ where
     R: FnMut(&Path) -> Option<bpf::FileId>,
 {
     let mut rules = Vec::new();
+    // Declared blessing classes, merged across fragments (a class declared in two fragments
+    // collapses to one); `BTreeSet` keeps them sorted so the compiler's `ClassId`s are stable.
+    let mut blessing_classes = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
     for src in sources {
         let resolved = parse(&src.text).and_then(|parsed| match &src.origin {
@@ -458,11 +532,18 @@ where
             }
         });
         match resolved {
-            Ok(r) => rules.extend(r.rules),
+            Ok(r) => {
+                rules.extend(r.rules);
+                blessing_classes.extend(r.blessing_classes);
+            }
             Err(e) => errors.push(Diagnostic::error(None, format!("{}: {e}", src.name))),
         }
     }
-    let mut compiled = compile(&ResolvedPolicy { rules }, resolve_fileid);
+    let resolved = ResolvedPolicy {
+        rules,
+        blessing_classes: blessing_classes.into_iter().collect(),
+    };
+    let mut compiled = compile(&resolved, resolve_fileid);
     // Surface per-fragment parse/resolve errors ahead of the compile diagnostics.
     compiled.diagnostics.splice(0..0, errors);
     compiled
@@ -618,7 +699,7 @@ mod tests {
         // A system fragment that includes a user file → two sources, tagged by tier.
         let dir = std::env::temp_dir().join(format!("cordon-inc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let user_file = dir.join("nb.toml");
+        let user_file = dir.join("alice.toml");
         std::fs::write(
             &user_file,
             "rules = '''\nallow /usr/bin/x read ~/.aws\n'''\n",
@@ -629,7 +710,7 @@ mod tests {
             &sys_file,
             format!(
                 "rules = '''\naudit * read /etc/cordon\n'''\n\
-                 [[include]]\nuser = \"nb\"\npath = \"{}\"\n",
+                 [[include]]\nuser = \"alice\"\npath = \"{}\"\n",
                 user_file.display()
             ),
         )
@@ -639,7 +720,7 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert!(matches!(sources[0].origin, SourceOrigin::System));
         match &sources[1].origin {
-            SourceOrigin::User { user } => assert_eq!(user.as_str(), "nb"),
+            SourceOrigin::User { user } => assert_eq!(user.as_str(), "alice"),
             other => panic!("expected user tier, got {other:?}"),
         }
         // A missing included file is tolerated (empty slot, not an error).

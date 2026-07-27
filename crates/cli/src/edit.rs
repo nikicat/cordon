@@ -27,7 +27,7 @@ use cordon_core::proto::{Request, Response};
 use cordon_core::{Error, Result, config};
 use nix::unistd::{Gid, Uid};
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
@@ -155,18 +155,93 @@ enum Prompt {
     Quit,
 }
 
-/// What `cordon policy edit` opens — built at the CLI boundary from the mutually-exclusive
-/// `FILE` argument and `--user` flag.
+/// What `cordon policy edit` opens.
 pub(crate) enum EditTarget {
-    /// A system-tier policy file: the default path, a conf.d fragment name, or a path.
-    File(Option<PathBuf>),
+    /// A system-tier policy file: the configured path (`--system`), a conf.d fragment
+    /// name, or a path (`FILE`).
+    System(Option<PathBuf>),
     /// The user-tier policy a system `[[include]]` binds to this user.
     User(UserName),
 }
 
+/// The mutually-exclusive ways to name what to edit (clap-enforced). **Naming nothing
+/// edits your own tier** — the common case, and the reason `sudo cordon policy edit` no
+/// longer means "edit the system policy".
+#[derive(clap::Args, Clone, Debug)]
+pub struct EditTargetArgs {
+    /// Policy file to edit, system tier (for a conf.d directory, name a fragment,
+    /// e.g. `local` → `…/conf.d/local.toml`).
+    pub file: Option<PathBuf>,
+    /// Edit the user-tier policy a system `[[include]]` binds to this user (its rules
+    /// are confined to that user's home).
+    #[arg(long, conflicts_with = "file")]
+    pub user: Option<UserName>,
+    /// Edit the *system* policy at the configured path, rather than your own user tier.
+    #[arg(long, conflicts_with_all = ["file", "user"])]
+    pub system: bool,
+}
+
+impl EditTargetArgs {
+    /// Which policy these flags name. `invoker` is consulted only for the bare form, so
+    /// naming a target explicitly never depends on resolving one.
+    fn resolve(self, invoker: impl FnOnce() -> Result<UserName>) -> Result<EditTarget> {
+        Ok(match self {
+            EditTargetArgs { system: true, .. } => EditTarget::System(None),
+            EditTargetArgs {
+                user: Some(user), ..
+            } => EditTarget::User(user),
+            EditTargetArgs {
+                file: Some(file), ..
+            } => EditTarget::System(Some(file)),
+            _ => EditTarget::User(invoker()?),
+        })
+    }
+}
+
+/// The account whose tier a bare `cordon policy edit` opens: under `sudo` the invoking
+/// user, unprivileged the caller themselves (which is also what the future
+/// edit-without-sudo path wants — STATUS §(8) roadmap).
+fn invoking_user() -> Result<UserName> {
+    let uid = invoker_uid(
+        Uid::from_raw(config::euid()),
+        std::env::var("SUDO_UID").ok().as_deref(),
+    )?;
+    let (name, _home) = sys::user_identity(uid)
+        .ok_or_else(|| Error::msg(format!("uid {uid} has no passwd entry")))?;
+    Ok(name)
+}
+
+/// The uid behind [`invoking_user`]. Real root with no `SUDO_UID` (a root login, a cron
+/// job) has no "own tier": name the target rather than silently editing the system policy.
+fn invoker_uid(euid: Uid, sudo_uid: Option<&str>) -> Result<Uid> {
+    if !euid.is_root() {
+        return Ok(euid);
+    }
+    let no_invoker = || {
+        Error::msg(
+            "running as root with no invoking user — name what to edit: \
+             `--system` for the system policy, or `--user NAME` for a user tier",
+        )
+    };
+    let uid = Uid::from_raw(
+        sudo_uid
+            .ok_or_else(no_invoker)?
+            .parse::<u32>()
+            .map_err(|_| Error::msg(format!("invalid SUDO_UID: {:?}", sudo_uid.unwrap())))?,
+    );
+    if uid.is_root() {
+        return Err(no_invoker());
+    }
+    Ok(uid)
+}
+
 /// `cordon policy edit`. Returns the process exit code.
-pub fn run(target: EditTarget, root_editor: RootEditor, cli: &Cli) -> ExitCode {
-    match Session::open(target, root_editor, cli).and_then(Session::edit_loop) {
+pub fn run(target: EditTargetArgs, root_editor: RootEditor, cli: &Cli) -> ExitCode {
+    match target
+        .resolve(invoking_user)
+        .and_then(|t| Session::open(t, root_editor, cli))
+        .and_then(Session::edit_loop)
+    {
         Ok(code) => code,
         Err(e) => {
             eprintln!("cordon: {e}");
@@ -207,7 +282,7 @@ impl Session {
     fn open(target: EditTarget, root_editor: RootEditor, cli: &Cli) -> Result<Session> {
         let policy_root = crate::policy_path(None, cli)?;
         let (target, target_origin, scaffold) = match target {
-            EditTarget::File(file) => (
+            EditTarget::System(file) => (
                 resolve_target(file.as_deref(), &policy_root)?,
                 SourceOrigin::System,
                 None,
@@ -271,8 +346,7 @@ impl Session {
     fn edit_loop(self) -> Result<ExitCode> {
         loop {
             self.run_editor()?;
-            let edited = fs::read_to_string(&self.tmp.file)
-                .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+            let edited = read_edited(&self.tmp.file)?;
             // An unchanged buffer is a no-op — *unless* we still owe an include registration
             // (a `--user` bootstrap), where even an untouched-but-valid file should be
             // registered and applied.
@@ -387,7 +461,7 @@ impl Session {
 ///   has no single file to open, so the user must name a fragment.
 /// - **A bare name** (no `/`, e.g. `nb`) when the policy is a conf.d directory → the fragment
 ///   `<root>/<name>.toml` (`.toml` appended when the name carries no extension). The
-///   convenient form: `cordon policy edit nb` edits `…/conf.d/nb.toml`.
+///   convenient form: `cordon policy edit local` edits `…/conf.d/local.toml`.
 /// - **Anything with a path separator / absolute** → taken literally.
 fn resolve_target(file: Option<&Path>, policy_root: &Path) -> Result<PathBuf> {
     match file {
@@ -408,7 +482,7 @@ fn resolve_target(file: Option<&Path>, policy_root: &Path) -> Result<PathBuf> {
     }
 }
 
-/// A single-component relative path like `nb` or `nb.toml` (no separators) — a fragment
+/// A single-component relative path like `local` or `local.toml` (no separators) — a fragment
 /// *name* rather than a path to a particular file.
 fn is_bare_name(p: &Path) -> bool {
     !p.as_os_str().is_empty()
@@ -593,25 +667,40 @@ impl Scaffold {
             self.user.as_str(),
             self.path.display().to_string(),
         ));
-        atomic_write(&self.fragment, &text)
+        install_atomically(&self.fragment, &text)
     }
 }
 
-/// Write `text` to `path` atomically (sibling temp + rename), creating parents — for the
-/// scaffolded system fragment. Mode 0644 to match the other root-owned policy fragments.
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
+/// Mode for a policy file this command **creates**. An existing file keeps whatever mode
+/// it has ([`install_atomically`]), so this only ever applies to a first write. `0644`
+/// root-owned matches the rest of the tree and is what an unprivileged `cordon policy
+/// check` needs to read; the file holds rules — paths and exe names — not credentials, and
+/// the daemon already serves a summary of them to any local user (DESIGN §15.8).
+const NEW_POLICY_MODE: u32 = 0o644;
+
+/// Write `text` to `path` atomically: sibling staging file → fsync → rename, creating
+/// parent directories, cleaning the staging file up on either failure.
+///
+/// **An existing file keeps its mode.** Both callers write root-owned policy files that an
+/// admin may have tightened deliberately, and a save must not quietly widen (or narrow)
+/// what they chose; only a file being created for the first time takes
+/// [`NEW_POLICY_MODE`].
+fn install_atomically(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
             .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
     }
+    let mode = fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(NEW_POLICY_MODE);
     let fname = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "fragment".to_string());
+        .unwrap_or_else(|| "policy".to_string());
     let staging = path.with_file_name(format!(".{fname}.cordon-{}.tmp", std::process::id()));
-    if let Err(e) = write_staging(&staging, text, 0o644) {
+    if let Err(e) = write_staging(&staging, text, mode) {
         let _ = fs::remove_file(&staging);
         return Err(Error::msg(format!("write {}: {e}", path.display())));
     }
@@ -677,41 +766,28 @@ impl TempEdit {
                 .open(&tmp.file)
                 .map_err(|e| Error::msg(format!("create temp file: {e}")))?;
             f.write_all(seed.as_bytes())?;
-        }
-        if let EditorAs::User { uid, gid, .. } = editor_as {
-            for p in [&tmp.dir, &tmp.file] {
-                sys::chown(p, *uid, *gid)
-                    .map_err(|e| Error::msg(format!("chown {}: {e}", p.display())))?;
+            // Hand the file to the invoking user via its **fd**, while the dir is still
+            // root-owned 0700 (so the fd is still the one we created). `fchown` acts on the
+            // open inode, not a name, so — unlike a path `chown` — a same-uid attacker can't
+            // redirect it through a symlink once the dir becomes theirs (arbitrary-chown TOCTOU).
+            if let EditorAs::User { uid, gid, .. } = editor_as {
+                sys::fchown(&f, *uid, *gid)
+                    .map_err(|e| Error::msg(format!("chown temp file: {e}")))?;
             }
+        }
+        // The dir last, by path — a root-created entry in the sticky tmpdir, so its own path
+        // can't be swapped — chowned so the dropped editor can enter it.
+        if let EditorAs::User { uid, gid, .. } = editor_as {
+            sys::chown(&tmp.dir, *uid, *gid)
+                .map_err(|e| Error::msg(format!("chown {}: {e}", tmp.dir.display())))?;
         }
         Ok(tmp)
     }
 
-    /// Atomically install `text` at `target` (write a sibling temp, fsync, rename),
-    /// preserving the existing file's mode (else 0600 for a new root-owned policy).
+    /// Install the edited text at `target`. The temp copy is user-owned while the editor
+    /// runs; only this validated string crosses back, and it lands atomically.
     fn commit(&self, target: &Path, text: &str) -> Result<()> {
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
-        }
-        let mode = fs::metadata(target)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let fname = target
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "policy".to_string());
-        let staging = target.with_file_name(format!(".{fname}.cordon-{}.tmp", std::process::id()));
-        if let Err(e) = write_staging(&staging, text, mode) {
-            let _ = fs::remove_file(&staging);
-            return Err(Error::msg(format!("write {}: {e}", target.display())));
-        }
-        fs::rename(&staging, target).map_err(|e| {
-            let _ = fs::remove_file(&staging);
-            Error::msg(format!("install {}: {e}", target.display()))
-        })
+        install_atomically(target, text)
     }
 }
 
@@ -736,6 +812,31 @@ fn write_staging(staging: &Path, text: &str, mode: u32) -> io::Result<()> {
     fs::set_permissions(staging, Permissions::from_mode(mode))
 }
 
+/// Read the edited temp copy back for validation, **without following a symlink**. The temp
+/// dir is owned by the invoking user while the editor runs, so a same-uid attacker could
+/// replace the file with a symlink to a root-only file (e.g. `/etc/shadow`) — this read runs
+/// as root, so following it would leak that file's contents (into the policy, or, on a parse
+/// failure, the diagnostics). `O_NOFOLLOW` makes a symlinked final component fail the open,
+/// and the regular-file check rejects a fifo/device swap; `O_NONBLOCK` keeps a fifo swap from
+/// stalling the open before that check. A legitimate editor's atomic save renames a *regular*
+/// file into place, which `O_NOFOLLOW` still accepts.
+fn read_edited(path: &Path) -> Result<String> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(Error::msg(
+            "edited file is not a regular file — refusing to read it back",
+        ));
+    }
+    let mut edited = String::new();
+    f.read_to_string(&mut edited)
+        .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+    Ok(edited)
+}
+
 /// Read the current policy file into a [`Seed`], or a template for a not-yet-existing one.
 fn read_seed(target: &Path) -> Result<Seed> {
     match fs::read_to_string(target) {
@@ -750,6 +851,98 @@ fn read_seed(target: &Path) -> Result<Seed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The target table. The headline is the **last** row: naming nothing edits your own
+    /// tier, so `sudo cordon policy edit` no longer means "edit the system policy".
+    #[test]
+    fn edit_target_resolution() {
+        let args = |file: Option<&str>, user: Option<&str>, system: bool| EditTargetArgs {
+            file: file.map(PathBuf::from),
+            user: user.map(UserName::new),
+            system,
+        };
+        let invoker = || Ok(UserName::new("alice"));
+        // An explicit target never consults the invoker — proven by a resolver that panics.
+        let no_invoker = || panic!("the invoker must not be resolved for an explicit target");
+
+        assert!(matches!(
+            args(None, None, true).resolve(no_invoker).unwrap(),
+            EditTarget::System(None)
+        ));
+        assert!(matches!(
+            args(Some("local"), None, false).resolve(no_invoker).unwrap(),
+            EditTarget::System(Some(p)) if p == Path::new("local")
+        ));
+        assert!(matches!(
+            args(None, Some("someone"), false).resolve(no_invoker).unwrap(),
+            EditTarget::User(u) if u.as_str() == "someone"
+        ));
+        // Bare: the invoker's own tier.
+        assert!(matches!(
+            args(None, None, false).resolve(invoker).unwrap(),
+            EditTarget::User(u) if u.as_str() == "alice"
+        ));
+        // …and a failure to resolve one is the caller's error, not a silent system edit.
+        assert!(
+            args(None, None, false)
+                .resolve(|| Err(Error::msg("no invoker")))
+                .is_err()
+        );
+    }
+
+    /// Who "your own tier" means. Root with no invoker has no answer — it must say so
+    /// rather than fall back to the system policy.
+    #[test]
+    fn invoker_uid_prefers_sudo_then_self() {
+        let root = Uid::from_raw(0);
+        let nb = Uid::from_raw(1000);
+        // Unprivileged: the caller themselves, SUDO_UID irrelevant.
+        assert_eq!(invoker_uid(nb, None).unwrap(), nb);
+        assert_eq!(invoker_uid(nb, Some("0")).unwrap(), nb);
+        // Under sudo: the invoking user.
+        assert_eq!(invoker_uid(root, Some("1000")).unwrap(), nb);
+        // Real root, and root-sudo-ing-to-root: no "own tier".
+        assert!(invoker_uid(root, None).is_err());
+        assert!(invoker_uid(root, Some("0")).is_err());
+        // A malformed SUDO_UID is loud, not silently ignored.
+        assert!(invoker_uid(root, Some("not-a-number")).is_err());
+    }
+
+    /// A save must never quietly change what an admin chose: an existing file keeps its
+    /// mode, and only a brand-new one takes the default. Both policy writes — the edited
+    /// file and the scaffolded `[[include]]` fragment — go through here, and the fragment
+    /// path used to hardcode 0644, so a tightened `/etc/cordon/policy.toml` was widened by
+    /// a first bare `policy edit`.
+    #[test]
+    fn install_preserves_an_existing_mode_and_defaults_a_new_file() {
+        let dir = std::env::temp_dir().join(format!("cordon-install-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let fresh = dir.join("new.toml");
+        install_atomically(&fresh, "# new\n").unwrap();
+        assert_eq!(
+            mode_of(&fresh),
+            NEW_POLICY_MODE,
+            "a new file takes the default"
+        );
+
+        let tightened = dir.join("tight.toml");
+        install_atomically(&tightened, "# first\n").unwrap();
+        fs::set_permissions(&tightened, Permissions::from_mode(0o600)).unwrap();
+        install_atomically(&tightened, "# second\n").unwrap();
+        assert_eq!(
+            mode_of(&tightened),
+            0o600,
+            "an existing mode survives a rewrite"
+        );
+        assert_eq!(fs::read_to_string(&tightened).unwrap(), "# second\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn editor_command_splits_program_and_args() {
@@ -767,27 +960,74 @@ mod tests {
         assert!(args.next().is_none());
     }
 
+    /// `include_fragment` branches on `is_dir()`, so the shapes have to be **real**: an
+    /// earlier version of this test named `/etc/cordon/conf.d` and passed only on a machine
+    /// where cordon happened to be installed, failing on any clean checkout.
     #[test]
     fn user_tier_path_conventions() {
-        let confd = Path::new("/etc/cordon/conf.d");
-        let nb = UserName::new("nb");
+        let base = std::env::temp_dir().join(format!("cordon-tiers-{}", std::process::id()));
+        let confd = base.join("conf.d");
+        let file = base.join("policy.toml");
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let alice = UserName::new("alice");
+
         // user file is a `users/` sibling of the policy, outside conf.d…
         assert_eq!(
-            convention_user_path(confd, &nb),
-            PathBuf::from("/etc/cordon/users/nb.toml")
+            convention_user_path(&confd, &alice),
+            base.join("users/alice.toml")
         );
         // …and the scaffolded include goes in a conf.d fragment (so it loads).
-        assert_eq!(
-            include_fragment(confd),
-            PathBuf::from("/etc/cordon/conf.d/00-users.toml")
-        );
+        assert_eq!(include_fragment(&confd), confd.join("00-users.toml"));
         // single-file policy: the include is appended to that file itself.
-        let file = Path::new("/etc/cordon/policy.toml");
         assert_eq!(
-            convention_user_path(file, &nb),
-            PathBuf::from("/etc/cordon/users/nb.toml")
+            convention_user_path(&file, &alice),
+            base.join("users/alice.toml")
         );
-        assert_eq!(include_fragment(file), file);
+        assert_eq!(include_fragment(&file), file);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn read_edited_reads_a_regular_file() {
+        let dir = std::env::temp_dir().join(format!("cordon-re-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("policy.toml");
+        std::fs::write(&f, "rules = '''\n'''\n").unwrap();
+        assert_eq!(read_edited(&f).unwrap(), "rules = '''\n'''\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Vuln-2 regression: a same-uid attacker who owns the temp dir swaps the file for a
+    /// symlink to a root-only file. The privileged read-back must refuse to follow it, so the
+    /// target's contents never surface (into the policy or the diagnostics).
+    #[test]
+    fn read_edited_refuses_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("cordon-re-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "TOP-SECRET").unwrap();
+        let link = dir.join("policy.toml");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let err = read_edited(&link).unwrap_err();
+        assert!(
+            !format!("{err}").contains("TOP-SECRET"),
+            "symlinked file contents must not surface"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// …and a directory/fifo/device swapped in for the file is rejected by the regular-file
+    /// check rather than read.
+    #[test]
+    fn read_edited_refuses_a_non_regular_file() {
+        let dir = std::env::temp_dir().join(format!("cordon-re-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let notfile = dir.join("policy.toml");
+        std::fs::create_dir(&notfile).unwrap();
+        assert!(read_edited(&notfile).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -796,12 +1036,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // bare name → <dir>/<name>.toml; existing extension kept; a path is literal.
         assert_eq!(
-            resolve_target(Some(Path::new("nb")), &dir).unwrap(),
-            dir.join("nb.toml")
+            resolve_target(Some(Path::new("local")), &dir).unwrap(),
+            dir.join("local.toml")
         );
         assert_eq!(
-            resolve_target(Some(Path::new("nb.toml")), &dir).unwrap(),
-            dir.join("nb.toml")
+            resolve_target(Some(Path::new("local.toml")), &dir).unwrap(),
+            dir.join("local.toml")
         );
         assert_eq!(
             resolve_target(Some(Path::new("/etc/cordon/x.toml")), &dir).unwrap(),
@@ -809,9 +1049,11 @@ mod tests {
         );
         // no argument on a directory → must name a fragment.
         assert!(resolve_target(None, &dir).is_err());
-        std::fs::remove_dir_all(&dir).ok();
-        // no argument on a single-file policy → that file.
-        let file = PathBuf::from("/etc/cordon/policy.toml");
+        // no argument on a single-file policy → that file. A real file, not a path that
+        // merely happens not to be a directory on this machine.
+        let file = dir.join("policy.toml");
+        std::fs::write(&file, "").unwrap();
         assert_eq!(resolve_target(None, &file).unwrap(), file);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,0 +1,340 @@
+# cordon B2 — usable blessing (milestone B2 of [PLAN-bless.md](PLAN-bless.md)): socket authz, `policy edit` defaults, unprivileged spawner
+
+> **Status: ✅ done (2026-07-27).** All seven commits shipped; 27 VM smoke scenarios green on
+> the pinned v6.12. What each commit landed is recorded inline below. The host checks in
+> *Verification* are what close the milestone out, since the VM has no logind.
+
+## Context
+
+B1 shipped and is validated at three tiers (unit, 23 VM scenarios, a real-system run on
+this workstation). The host run exposed three problems that unit tests and the VM
+structurally could not: the VM has no unprivileged users talking to the socket, no
+`sudoedit` ergonomics, and no logind/polkit at all.
+
+1. **`cordon bless list` is unusable from a user account.** Two independent blockers:
+   `config.rs:155` resolves the socket by euid (root → `/run/cordon.sock`, user →
+   `$XDG_RUNTIME_DIR/cordon.sock`), so a user looks in the wrong place for a *system*
+   daemon; and the socket is `srwxr-xr-x root:root`, while `connect(2)` on a Unix socket
+   needs **write** — so every verb is root-only in practice and B1 decision #1 ("BlessList
+   ungated, parity with `PolicyShow`") is inert.
+2. **`sudo cordon policy edit` edits the system policy by default**, but the common case is
+   editing your own user tier.
+3. **The blessed shell is barely usable.** Confirmed on the host, two distinct causes:
+   - **No logind session.** The carrier lives at `system.slice/cordond.service/…`, which has
+     no `session-N.scope` ancestor and is outside `user@1000.service`. polkit resolves the
+     session from the caller's cgroup, so `run0`/`pkexec` fail with *"requires interactive
+     authentication. However, interactive authentication has not been enabled by the calling
+     program."*
+   - **The environment is scrubbed.** `sudo`/`run0` reset the environment;
+     `crates/cli/src/bless.rs` restores only `HOME`/`USER`/`LOGNAME`, so the blessed shell has
+     no `DISPLAY`/`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` and GUI apps
+     fail with `cannot open display`. DESIGN §16.5 specified "the caller's full environment
+     and cwd"; that requirement fell through the gap when we moved to CLI-as-spawner.
+
+**Root cause of (3):** the blessed process is *born in the wrong place* — parented through a
+privilege tool (under `run0`, a transient systemd unit, so there is not even a parent chain
+back to the user's shell) and then relocated into the daemon's cgroup. What it should be is
+an ordinary child of the user's shell that merely carries a blessing.
+
+**This matters for the design, not just ergonomics:** under `run0` the environment cannot be
+recovered after the fact (no ancestor to read `/proc/<pid>/environ` from), so "fix the env"
+is *not* separable from "fix who spawns the target". The rework below is the only path, not
+gold-plating.
+
+## Workflow
+
+**Before each commit: stop, present the diff summary, wait for explicit review + approval.**
+Every commit: compiles, `just test` green (cargo test + clippy `-D warnings` + fmt), the
+existing smoke scenarios stay green. VM runs via `packaging/test/run-bpf-lsm-vm.sh`
+(CI-pinned v6.12 by default).
+
+Part A (commits 1–2) is independent and mechanical. Part B (the spawn rework) opens with a
+**derisk spike** that can invalidate its design — do not write the commits before it lands.
+
+---
+
+## Part A — small, independent
+
+### Commit 1 — `fix(ipc): gate policy apply on root, open the socket to unprivileged readers` ✅ *done*
+
+The fix that *tightens* security rather than trading it away. Before this, `PolicyApply` was
+protected **only** by socket DAC — the handler was ungated, so "whoever can reach the socket
+can apply" was literally true. Moving that protection into `authorize()` is what lets the
+socket mode stop carrying security weight:
+
+- `crates/daemon/src/ipc.rs`: `authorize()` requires uid 0 for `PolicyApply` as well as
+  `BlessMint`/`BlessRevoke`. Reads (`Status`, `PolicyShow`, `BlessList`) stay open. The match
+  is **exhaustive** (no `_` arm), so a new verb must choose a side. Table test extended.
+- `crates/daemon/src/ipc.rs`: `chmod` the socket to **0666** right after `bind` (before the
+  accept loop), so any local user can connect. Widening after `bind` has no window: until
+  then the mode is `0777 & ~umask`, which is narrower.
+- `crates/core/src/config.rs` / `crates/cli/src/main.rs`: `Config.socket` became
+  **`SocketPath::{Configured, Default}`** — the provenance travels *with* the path instead of
+  in a parallel bool, because it changes what the value means. `SocketPath::for_client`
+  falls back to `/run/cordon.sock` when a *default* per-user socket has nothing listening (so
+  an unprivileged `cordon bless list` finds the system daemon) and never redirects a
+  configured path (a typo must be reported as written). Pure, table-tested.
+- Closed the "the socket has no peer-cred check yet" caveat in `STATUS.md` and DESIGN §15.8.
+- VM: smoke **scenario 24** — as a non-root uid, `status`/`policy show`/`bless list` succeed
+  and `policy apply` is refused naming root; the socket is asserted `0666`.
+
+**Decision (settled): 0666.** It makes `PolicyShow` world-readable, which discloses protected
+*paths* to any local account — the intent on a single-user workstation, per B1 decision #1.
+DESIGN §15.8 records `0660` + a `cordon` group as the multi-user deployment posture (same
+`authorize` table, narrower reach); it is not built.
+
+### Commit 2 — `feat(cli): `policy edit` defaults to the invoker's user tier` ✅ *done*
+
+- The three ways to name a target became one clap group, `edit::EditTargetArgs`
+  (`FILE` / `--user NAME` / `--system`, mutually exclusive), with a `resolve()` that yields
+  the `EditTarget` domain type — so no bool triple reaches a hand-written signature.
+  `EditTarget::File` was renamed `System` now that `--system` names it explicitly.
+- Bare `cordon policy edit` resolves the invoker → that user's tier (the existing `--user`
+  self-bootstrapping path already handles "no `[[include]]` yet"). The invoker is
+  `SUDO_UID` under sudo and the caller's own euid unprivileged — the latter is what the
+  STATUS §(8) "edit without sudo" roadmap wants, for free.
+- Real root with no `SUDO_UID` has no "own tier": errors naming `--system`/`--user` rather
+  than silently editing the system policy. `resolve()` consults the invoker **only** for the
+  bare form (proven by a test whose resolver panics if called).
+- Tests: the target-resolution table and the `invoker_uid` table (sudo / unprivileged /
+  root-without-invoker / root-sudo-ing-to-root / malformed `SUDO_UID`).
+- **Breaking UX change** — `sudo cordon policy edit` means something different afterwards.
+  Called out in `README.md` and `STATUS.md` §(10).
+- Smoke scenarios 16/17 pass an explicit FILE, so they keep covering the system-tier path
+  unchanged.
+
+---
+
+## Part B — the spawn rework
+
+### B0. Derisk spike — ✅ ran 2026-07-26, **script retired 2026-07-27**
+
+`packaging/test/bless-b2-derisk.sh` is deleted. It answered its two questions and then
+became actively misleading: assumption 2 below is *true and irrelevant*, so the script
+would have passed on a machine where blessing's polkit integration does not work at all.
+The scenarios it was standing in for now live in the smoke suite (26 and 27), and the
+question it should have asked is answered there.
+
+**The lesson worth keeping**, because it cost a full cycle: the spike **constructed** the
+world that made its answer come out yes. It `mkdir`ed a cgroup under `session-3.scope`, put
+a process in it, and confirmed logind saw the session — without ever asking *where the
+user's processes actually are*. They are under the delegated
+`user@1000.service/app.slice/app-*.scope`, with no session scope in their ancestry, so the
+rule the spike green-lit sent every desktop blessing to the daemon's cgroup and `run0` went
+on failing. A probe that builds its own premise proves only that the premise is
+self-consistent. See the commit that fixed placement, and the mutation-tested smoke
+scenarios that now fail if the rule regresses.
+
+Results as recorded at the time:
+
+1. **fd delegation works.** An unprivileged process wrote its own pid into a root-owned
+   `cgroup.procs` received over `SCM_RIGHTS` and landed in the cgroup — the kernel checks
+   migration permission against the *opener's* credentials, as expected. `cordon bless`
+   therefore never needs to be root.
+2. **A child of `session-N.scope` keeps the user's session** — true, but it turned out not
+   to be the question that mattered: a desktop requester is never *in* a session scope. What
+   the carrier actually needs is to stay under `user-<uid>.slice`, which is what logind reads
+   to attribute a process to a user at all. From inside
+   `session-3.scope/cordon-derisk`, logind reported `3 - nb (1000)` — the invoker's own
+   login session. The same probe under `cordond.service/<child>` reported *"Caller does not
+   belong to any known session"*, which is precisely today's polkit failure. `session-3.scope`
+   is `root:root`, so the inode-recycling hijack does not apply, and systemd left the
+   directory alone.
+
+   *(The spike's first version compared against a bogus "baseline" — a `setpriv`'d child of
+   the root script inherits the **script's** cgroup, i.e. root's sudo session, not the user's
+   — and so reported a false failure. The assertion now checks for the invoking user's own
+   session id + uid directly.)*
+
+Both commits 4 and 5 were therefore buildable as written — commit 5's *rule* still needed
+correcting afterwards, as above. The original assumptions and their fallbacks are kept below
+for the record.
+
+1. **Does an fd passed over `SCM_RIGHTS` actually let an unprivileged process join a
+   root-owned cgroup?** Expected yes: `cgroup_procs_write_permission()` overrides with
+   `of->file->f_cred` — the credentials of the process that **opened** the file — precisely
+   to make delegation-by-fd work. Test: root opens `cgroup.procs`, passes the fd to an
+   unprivileged process, which writes its own pid.
+2. **Does a process in `session-N.scope/<child>` keep its logind session** (so polkit/`run0`
+   work)? Test on the host: `mkdir` a root-owned cgroup under `session-3.scope`, move a
+   shell into it, run `run0 true`. Also watch whether systemd cleans the directory —
+   session scopes are **not** `Delegate=yes`.
+
+If (1) fails, Part B collapses to "ship the environment over IPC" (DESIGN §16.5's original
+shape). If (2) fails, the carrier stays under the daemon and the session problem needs a
+different answer (a systemd transient scope in the user's session, i.e. the original B1
+design, at the cost of a D-Bus dependency).
+
+### The handshake (why two connections, not a rendezvous socket)
+
+The obvious shape — the root helper mints and forwards the fd to the unprivileged parent
+over a socket in `$XDG_RUNTIME_DIR` — has a hole. The daemon must place the carrier in the
+**invoker's** session scope, but under `run0` the helper runs in a *transient systemd unit*,
+so its peer creds say nothing about the user's session. Having the helper *claim* a pid is
+worse: a caller could name another user's process and get a carrier created inside that
+user's session scope, then join it via the fd — appearing, to polkit, to be in a session
+that is not theirs.
+
+So the daemon is the rendezvous, and the session is read from the one peer that cannot lie
+about it — the unprivileged CLI itself:
+
+0. The CLI checks the **daemon** is root (`SO_PEERCRED`) before saying anything. Skipping
+   this makes the nonce a bearer token handed to whoever answers the socket — see decision
+   #13.
+1. The CLI connects **as the user** and sends `BlessRequest{class}`. The daemon derives the
+   carrier's placement from *that* connection's `SO_PEERCRED` pid and replies with a
+   single-use `nonce`. The connection stays open.
+2. The CLI spawns the helper under `$CORDON_SUDO`, passing the same `--socket`; the human
+   authenticates.
+3. The helper connects **as root** and sends `BlessApprove{nonce}`. The daemon mints, and
+   sends the `cgroup.procs` fd back down the *requester's* still-open connection.
+
+The helper never touches the fd, there is no rendezvous socket to protect, and the placement
+decision rests on kernel-attested credentials rather than anything a client asserts. The
+nonce is single-use with a short TTL and is bound to the requesting connection; it must be
+**unguessable** but need not be secret, since approving it requires uid 0 regardless.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as user's shell
+    participant C as cordon bless<br/>(uid 1000)
+    participant H as bless-helper<br/>(uid 0, via $CORDON_SUDO)
+    participant D as cordond (root)
+    participant K as kernel<br/>(cgroups + BPF maps)
+    participant B as blessed command
+
+    S->>C: cordon bless --class ro -- aws s3 ls
+    Note over S,C: ordinary child: env, cwd, tty,<br/>job control, session all inherited
+
+    C->>D: connect
+    Note over C: SO_PEERCRED on the DAEMON end → uid 0 ✓<br/>else refuse: the nonce must not go to<br/>whoever happens to answer this path
+    C->>D: BlessRequest{class} · connection stays open
+    Note over D: SO_PEERCRED → uid 1000, pid<br/>/proc/pid/cgroup → deepest of<br/>session-N.scope, else user-1000.slice<br/>(root-owned, or fall back to our own cgroup)
+    D-->>C: BlessPending{nonce}
+
+    C->>H: spawn $CORDON_SUDO cordon --socket S bless-helper --nonce=N
+    Note over H: sudo / run0 → PAM →<br/>human presence proven
+    H->>D: BlessApprove{nonce}
+    Note over D: SO_PEERCRED → uid 0 ✓<br/>(the boundary — never the client's<br/>choice of elevation tool)
+
+    D->>K: mkdir user-1000.slice/cordon-bless-1.ro<br/>open cgroup.procs (as root)
+    D->>K: BLESSED[cgroup_id] = ClassId(ro)
+    D-->>C: BlessMinted{view} + fd (SCM_RIGHTS, CLOEXEC)
+    D-->>H: BlessApproved
+    H-->>C: exits
+
+    C->>C: fork
+    C->>B: pre_exec: write pid → fd, exec (fd closes)
+    Note over B: never runs unblessed —<br/>no privilege drop needed,<br/>it was never root
+
+    B->>K: open ~/.aws/credentials
+    K-->>B: cgroup_id → class ro → rule allows
+    Note over B: run0/polkit work here: the cgroup still<br/>carries user-1000.slice, so logind can<br/>attribute the process and find an agent
+
+    B->>B: exits
+    K-->>D: cgroup.events: populated 0
+    D->>K: BLESSED remove + rmdir carrier
+```
+
+### Commit 3 — `feat(bless): daemon hands back the carrier's cgroup.procs fd` ✅ *done*
+
+- `crates/core/src/proto.rs`: the `BlessMinted` reply gains an **out-of-band fd**. The wire
+  stays newline-JSON; the fd rides as `SCM_RIGHTS` ancillary data on the same `sendmsg`.
+  New `send_msg_with_fd` / `read_msg_with_fd` helpers beside `write_msg`/`read_msg`.
+- `crates/daemon/src/backend/bpf_lsm/bless.rs`: `mint` opens `<carrier>/cgroup.procs` for
+  write and returns the `OwnedFd` alongside the `BlessingView`; `ipc.rs` passes it to the
+  peer and closes its copy.
+- **Security note to document:** the holder can move *any* task it names into that carrier,
+  not just its own child (the permission check uses the opener's creds). Since blessing only
+  grants what the class's rules name and DAC still applies, and the holder is the invoking
+  user, this is not an escalation — but it is a real property and belongs in DESIGN §16.4.
+  The CLI closes the fd immediately after the join.
+- Tests: fd round-trip over a socketpair; mint failure paths still clean up the carrier.
+
+### Commit 4 — `feat(bless): unprivileged spawner — natural env, cwd, tty, session` ✅ *done*
+
+The inversion. `cordon bless` runs **as the user**, a direct child of their shell:
+
+- `crates/cli/src/bless.rs`: no root requirement. Send `BlessRequest{class}`, keep the
+  connection open, spawn `$CORDON_SUDO cordon bless-helper --nonce N`, then block reading the
+  `cgroup.procs` fd off that same connection (see *The handshake* above). Then fork,
+  `pre_exec` writes the child's pid into the fd, exec.
+- **Everything the privilege drop existed for disappears**: no `setgroups`/`setgid`/`setuid`,
+  no `SUDO_UID` parsing, no passwd lookup, no `HOME`/`USER`/`LOGNAME` fixups, no
+  passwd-shell resolution (`$SHELL` is correct again, because we were never re-parented
+  through sudo). `DropTo` and `Invoker` are deleted; `join_cgroup_and_drop_on_exec` becomes
+  `join_cgroup_on_exec`. Environment, cwd, tty, job control and session are inherited
+  because nothing ever moved them.
+- New hidden `bless-helper` subcommand: runs root (via whatever elevation) and sends exactly
+  one `BlessApprove{nonce}`. It never spawns anything and never touches the fd.
+- `$CORDON_SUDO` (default `sudo`) is the **testability seam**: the VM has no sudo, so the
+  smoke sets it to a no-op wrapper. Not a security hole — a faked elevation simply produces
+  a non-root helper and the daemon's `authorize()` refuses the mint. Security lives in the
+  daemon-side uid check, never in the client's choice of elevation. Document that.
+- Tests: helper/parent handshake over a socketpair; peer-uid rejection; exit-status mapping
+  (kept from B1).
+
+### Commit 5 — `feat(bless): create the carrier in the invoker's session subtree` ✅ *done*
+
+Only if B0(2) passed.
+
+- The daemon learns the peer's session cgroup from `SO_PEERCRED`'s pid
+  (`/proc/<pid>/cgroup`), walks up to the `session-N.scope` ancestor, and creates the carrier
+  there instead of under its own cgroup.
+- **Refuse and fall back** to the daemon's own cgroup when the chosen parent is not
+  `root`-owned: a user-writable parent lets the invoker `rmdir` an empty carrier and `mkdir`
+  a replacement, and cgroup ids are recycled kernfs inode numbers — so within the GC window
+  they could land a cgroup still registered in `BLESSED` and self-bless. `user@UID.service`
+  is delegated (owned by the user) and must never be used; `session-N.scope` is `root:root`
+  and is the target. Pure `carrier_parent()` + unit tests over a tempdir fake.
+- Reconcile must scan the new locations as well as the old.
+
+### Commit 6 — `test(bless): VM + host coverage for the new spawn model` ✅ *done (absorbed into 3–5)*
+
+**Absorbed rather than separate:** every commit had to keep the smoke green to be reviewable,
+so each carried its own scenarios. The suite went 23 → 27: scenario 23 rewritten for the
+unprivileged path (+ faked elevation refused), 24 socket authorization, 25 the anti-hijack
+guard, 26 session placement (both directions), 27 reconcile adoption (both directions).
+Original plan below.
+
+- Smoke: replace scenario 23's `SUDO_UID` simulation with the **real** unprivileged path —
+  run `cordon bless` as a non-root uid with `$CORDON_SUDO` set to a root no-op wrapper, and
+  assert the child runs as that uid, keeps its environment (a canary variable set before the
+  call survives into the blessed child — the regression test for this whole milestone), and
+  still gets the blessed read.
+- Add: unprivileged `cordon bless list` works (commit 1); a faked elevation is refused by the
+  daemon (commit 4's security property).
+- Session placement is **not VM-testable** (no logind) — host-only, recorded in the plan's
+  verification section.
+
+### Commit 7 — `docs(bless): record B2` ✅ *done*
+
+DESIGN §16.4 (fd-delegation property), §16.5 (the elevation is now client-side; the daemon's
+uid gate is the boundary), §16.6 (new lifecycle); PLAN-bless B2 marked done; `STATUS.md`;
+`README.md` (`cordon bless` no longer needs a literal `sudo` prefix from the user).
+
+## Locked micro-decisions (veto at review if wrong)
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Socket mode | **0666**, with `PolicyApply` moved behind the uid-0 gate (0660+group is the documented multi-user alternative) — ✅ shipped |
+| 2 | `policy edit` default | The invoker's tier; `--system` for the system policy; error if there is no invoker — ✅ shipped |
+| 3 | Join mechanism | `SCM_RIGHTS` fd from the daemon; the CLI never needs root — ✅ shipped |
+| 4 | Elevation | Client-side `$CORDON_SUDO` (default `sudo`); security is the daemon's uid-0 check, never the client's choice — ✅ shipped |
+| 5 | Carrier parent | The invoker's `session-N.scope` **if root-owned**, else fall back to the daemon's cgroup — ✅ shipped; reconcile applies the same check before adopting |
+| 6 | Env/cwd/tty | Inherited by construction (never re-parented) — nothing is shipped or restored — ✅ shipped |
+| 7 | Rendezvous | **The daemon itself**: request (uid 1000) → nonce → approve (uid 0) → fd back on the requester's connection. No rendezvous socket — ✅ shipped |
+| 8 | Session source | The **unprivileged** peer's `SO_PEERCRED` pid — never a client-asserted pid, which would let a caller target another user's session — ✅ shipped |
+| 9 | Revoke gate | Once mint is unprivileged (commit 4), `BlessRevoke` accepts uid 0 **or the uid that requested the blessing** — otherwise a user who just blessed unprivileged would need sudo to revoke it. The daemon already holds the requester's peer uid for the session lookup; record it on the `Blessing` row |
+
+| 13 | Client-side daemon check | ✅ shipped, from a security review of commit 4. `cordon bless` requires `SO_PEERCRED` uid 0 on the **daemon** end before sending, and passes the same `--socket` to the helper. Without it the nonce is a bearer token: a squatter at the client's socket path could park its own request on the real daemon, answer the victim with that nonce, and spend the human's authentication on the attacker's request |
+| 14 | Descriptor lifetime | ✅ shipped. The carrier fd is received `MSG_CMSG_CLOEXEC` — *not* the kernel's default for `SCM_RIGHTS` — so it dies at the blessed command's `exec` instead of becoming a standing capability inside it |
+
+## Verification
+
+- Per commit: `just test`; commits 3–6 also get a VM run.
+- Final VM: all smoke scenarios green (23 + the new ones) on pinned v6.12.
+- **Host-only, required before calling B2 done** (the VM cannot reach any of it): a blessed
+  shell in which `run0 true` succeeds, `gedit` opens a window, `echo $DISPLAY` is non-empty,
+  and `cordon bless list` works unprivileged.

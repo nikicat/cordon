@@ -5,12 +5,12 @@
 //! the in-kernel maps; `policy show` and `status` read the effective policy. There are
 //! no per-object owner mutations — the owner model was retired with the rule model.
 
+mod bless;
 mod edit;
 mod sys;
 
 use clap::{Parser, Subcommand};
-use cordon_core::policy::UserName;
-use cordon_core::proto::{Request, Response, read_msg, write_msg};
+use cordon_core::proto::{Nonce, Pid, Request, Response, read_msg, write_msg};
 use cordon_core::{Config, Error, Result, policy};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -46,6 +46,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
+    /// Run a command under a fresh blessing; also `bless list` / `bless revoke <id>`.
+    /// Runs as you — no `sudo` prefix; the human-presence check is a helper it spawns.
+    Bless(bless::BlessArgs),
+    /// Internal: approve a pending blessing. `cordon bless` spawns this under
+    /// `$CORDON_SUDO` so it reaches the daemon as root — which *is* the proof a human
+    /// authenticated (DESIGN §16.5). Never invoked by hand; hidden from `--help`.
+    #[command(hide = true)]
+    BlessHelper {
+        #[arg(long)]
+        nonce: Nonce,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -63,18 +74,15 @@ enum PolicyCmd {
         /// Policy file (default: the configured `policy` path).
         file: Option<PathBuf>,
     },
-    /// Edit the policy in `$EDITOR`, then validate + apply + save in one step — the
+    /// Edit a policy in `$EDITOR`, then validate + apply + save in one step — the
     /// sudoedit analog. The editor runs as the invoking user (never root); the result is
     /// compiled and pushed to the daemon, and the root-owned file is written only once the
     /// daemon accepts it. Run via `sudo` for a root-owned policy.
+    ///
+    /// With nothing named, edits **your own user tier**; `--system` edits the system policy.
     Edit {
-        /// Policy file to edit (default: the configured `policy` path; for a conf.d
-        /// directory, name a fragment, e.g. `local` → `…/conf.d/local.toml`).
-        file: Option<PathBuf>,
-        /// Edit the user-tier policy a system `[[include]]` binds to this user (its rules
-        /// are confined to that user's home). Mutually exclusive with FILE.
-        #[arg(long, conflicts_with = "file")]
-        user: Option<UserName>,
+        #[command(flatten)]
+        target: edit::EditTargetArgs,
         /// Launch the editor as root when there is no unprivileged invoker (e.g. a root
         /// login without sudo). Off by default — running an editor as root re-opens the
         /// same-uid escalation this command exists to avoid.
@@ -100,33 +108,33 @@ fn main() -> ExitCode {
     // daemon only via the shared `PolicyApply` path, so it routes here rather than through
     // the single-request round-trip below.
     if let Cmd::Policy {
-        cmd:
-            PolicyCmd::Edit {
-                file,
-                user,
-                allow_root_editor,
-            },
+        cmd: PolicyCmd::Edit {
+            target,
+            allow_root_editor,
+        },
     } = &cli.cmd
     {
-        // `--user` and FILE are mutually exclusive (clap-enforced), so one selects the target.
-        let target = match user {
-            Some(u) => edit::EditTarget::User(u.clone()),
-            None => edit::EditTarget::File(file.clone()),
-        };
-        return edit::run(
-            target,
-            edit::RootEditor::from_flag(*allow_root_editor),
+        let root_editor = edit::RootEditor::from_flag(*allow_root_editor);
+        return edit::run(target.clone(), root_editor, &cli);
+    }
+
+    // `bless` drives its own flow (mint → fork into the carrier → drop → exec); its
+    // `list`/`revoke` subcommands come back through `run_request` like any other.
+    if let Cmd::Bless(args) = &cli.cmd {
+        return bless::run(args, &cli);
+    }
+
+    // The approval half of the bless handshake: one request, and what makes it count is
+    // the uid it arrives from, not anything it says.
+    if let Cmd::BlessHelper { nonce } = &cli.cmd {
+        return run_request(
+            &Request::BlessApprove {
+                nonce: nonce.clone(),
+            },
             &cli,
         );
     }
 
-    let socket = match resolve_socket(&cli) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let req = match build_request(&cli) {
         Ok(r) => r,
         Err(e) => {
@@ -134,7 +142,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let resp = match round_trip(&socket, &req) {
+    run_request(&req, &cli)
+}
+
+/// Send one request to the daemon and render the reply (honoring `--json`) — the
+/// shared tail of every daemon-bound command.
+fn run_request(req: &Request, cli: &Cli) -> ExitCode {
+    let socket = match resolve_socket(cli) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cordon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let resp = match round_trip(&socket, req) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cordon: {e}");
@@ -172,6 +193,8 @@ fn build_request(cli: &Cli) -> Result<Request> {
             PolicyCmd::Check { .. } => unreachable!("check is handled locally"),
             PolicyCmd::Edit { .. } => unreachable!("edit is handled locally"),
         },
+        Cmd::Bless(_) => unreachable!("bless is handled locally"),
+        Cmd::BlessHelper { .. } => unreachable!("bless-helper is handled locally"),
     }
 }
 
@@ -260,6 +283,32 @@ fn render(resp: &Response) {
             }
         }
         Response::PolicyView(None) => println!("(no policy loaded)"),
+        Response::Blessings(list) => {
+            if list.is_empty() {
+                println!("(no live blessings)");
+            }
+            for b in list {
+                let pids: Vec<String> = b.pids.iter().map(Pid::to_string).collect();
+                println!(
+                    "  {} class={} age={}s pids=[{}] cgroup={}",
+                    b.id,
+                    b.class,
+                    b.age.as_secs(),
+                    pids.join(","),
+                    b.cgroup.display(),
+                );
+            }
+        }
+        Response::BlessRevoked { id } => println!("revoked: {id}"),
+        // `bless-helper` succeeding is silent on purpose — it is spawned mid-command, not
+        // run by a human, and its whole output is its exit status.
+        Response::BlessApproved => {}
+        // Both halves of the mint hand-off are consumed inside `bless`'s own connection
+        // (they carry a descriptor and a handshake state this renderer has no use for), so
+        // reaching here at all means a client got its protocol wrong.
+        Response::BlessPending { .. } | Response::BlessMinted(_) => {
+            eprintln!("cordon: unexpected mid-handshake reply outside `cordon bless`")
+        }
         Response::Error { message } => eprintln!("cordon: error: {message}"),
     }
 }
@@ -288,12 +337,16 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `--socket` wins; otherwise the socket from the config file (or its default).
+/// `--socket` wins; otherwise the socket from the config file, or — when that is only
+/// the per-euid default and nothing is listening there — the system daemon's, so an
+/// unprivileged `cordon` finds `cordond` (`SocketPath::for_client`).
 fn resolve_socket(cli: &Cli) -> Result<PathBuf> {
     if let Some(s) = cli.socket.clone() {
         return Ok(s);
     }
-    Ok(Config::load(cli.config.as_deref())?.socket)
+    Ok(Config::load(cli.config.as_deref())?
+        .socket
+        .for_client(|p| p.exists()))
 }
 
 fn round_trip(socket: &Path, req: &Request) -> Result<Response> {

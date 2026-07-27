@@ -25,14 +25,36 @@ pub struct Ino(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Pid(pub u32);
 
-/// The caller's **real** user id, captured in-kernel from
-/// `bpf_get_current_uid_gid()` (its low 32 bits) and carried in [`crate::DecisionEvent`]
-/// so the daemon can name the user on the audit line and collapse a path under that
-/// user's home to `~`. `u32` to match the kernel/passwd width. `Ord` so a uid can be
+/// A **real** user id — always kernel-attested, never client-asserted. Two capture
+/// sites, one type: the eBPF program reads `bpf_get_current_uid_gid()` (low 32 bits) into
+/// [`crate::DecisionEvent`], so the daemon can name the user on the audit line and
+/// collapse a path under that user's home to `~`; the IPC server reads `SO_PEERCRED` to
+/// authorize a request. `u32` to match the kernel/passwd width. `Ord` so a uid can be
 /// range-checked against the regular-account window (`cordon_core`'s `REGULAR_UID_RANGE`).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Uid(pub u32);
+
+/// Render the bare number — for the journal's `user=` fallback when passwd has no name for
+/// the uid, and for the `owner=` field on a minted blessing (recorded through `Display` via
+/// the `%` sigil — see [`SuppressedTotal`]'s note on `tracing`'s sealed `Value`). Having it
+/// is what keeps callers from reaching past the newtype with `.0` just to log one.
+impl core::fmt::Display for Uid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A cgroup-v2 id, as returned by `bpf_get_current_cgroup_id()` — the kernel-assigned,
+/// per-directory unique handle for a cgroup. The `cgroup` subject predicate
+/// ([`crate::SubjectMatch::cgroup`], M2) matches it directly, and it is the key of
+/// [`crate::policy_maps::MAP_BLESSED`] (`cgroup → ClassId`, DESIGN §16.3): a
+/// **per-invocation** blessed cgroup's id resolves to the [`ClassId`](crate::ClassId) it
+/// was minted with. `u64` to match the helper's width; a newtype so it can't be confused
+/// with an [`Ino`]/[`Nanos`]/raw count.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CgroupId(pub u64);
 
 /// How many identical opens the in-kernel suppressor folded into one emit since the last
 /// ring record for a `(exe, leaf, action)` key (M1 §1g): `0` on a first occurrence,
@@ -184,6 +206,7 @@ mod user {
     unsafe impl aya::Pod for Ino {}
     unsafe impl aya::Pod for Pid {}
     unsafe impl aya::Pod for Uid {}
+    unsafe impl aya::Pod for CgroupId {}
     unsafe impl aya::Pod for Suppressed {}
     unsafe impl aya::Pod for Nanos {}
     unsafe impl aya::Pod for Decision {}

@@ -10,7 +10,7 @@
 //! protected object and the caller's executable are matched by [`FileId`].
 
 use crate::ids::{Bank, Decision, Dev, Ino, Nanos, Pid, Suppressed, Uid};
-use crate::policy_maps::{Action, ObjId};
+use crate::policy_maps::{Action, ClassId, ObjId};
 
 // ---- map names ------------------------------------------------------------
 // The program defines these maps; the loader resolves them by name. (The rule-table
@@ -130,54 +130,59 @@ impl core::ops::Deref for PathComp {
     }
 }
 
-/// ## Leaf path (DESIGN §15.10 flow B)
-/// `bpf_d_path` is unavailable at `file_open`, so the kernel reconstructs the opened
-/// file's path *relative to the matched protected object* by walking `d_name` up the
-/// dentry chain: [`comps`](Self::comps) holds the component names **leaf-first**
-/// (`comps[0]` = the opened file's own name, `comps[1]` = its parent, …),
-/// [`depth`](Self::depth) of them, and [`trunc`](Self::trunc) marks a name/depth overflow.
-/// The daemon reverses + joins them onto the object's known path → the full opened path.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct DecisionEvent {
-    /// The caller's executable identity (the subject that hit the rule).
-    pub exe: FileId,
-    /// The matched protected object's inode identity (the rule's `where`).
-    pub object: FileId,
-    /// The **opened file's own** inode identity — the per-file key the suppressor and the
-    /// daemon coalesce on, so distinct files under one audited root surface separately
-    /// (DESIGN §15.10 flow B). Equals `object` when the rule targets the file directly.
-    pub leaf: FileId,
-    /// The matched protected object's id.
-    pub obj: ObjId,
-    /// The requested action(s) at this access (`read`/`write`/`create`).
-    pub action: Action,
-    /// Thread-group id (userspace pid) of the caller.
-    pub pid: Pid,
-    /// The caller's **real** uid — the daemon resolves it to a login name for the audit
-    /// line and, for a regular user, collapses a path under that user's home to `~`.
-    pub uid: Uid,
-    /// How it was handled (`DENY` blocked / `AUDIT` allowed-and-logged).
-    pub decision: Decision,
-    /// How many identical decisions the in-kernel suppressor folded into this one since
-    /// the previous emit for the same `(exe, leaf, action)` (M1 §1g). `0` on a first
-    /// occurrence; nonzero means a repeat burst was collapsed — the daemon adds it to
-    /// the coalesced record so the true volume is visible.
-    pub suppressed: Suppressed,
-    /// The matched policy — the cause, for the log: an authored `audit`/`deny`, or the
-    /// synthetic `DEFAULT_DENY` when no rule matched (vs an explicit `deny`).
-    pub policy: crate::policy_maps::Policy,
-    /// Number of valid entries in [`comps`](Self::comps) (`0` ⇒ the object *is* the
-    /// opened file, or reconstruction read nothing).
-    pub depth: u8,
-    /// `1` if the path was truncated (deeper than [`PATH_MAX_DEPTH`] or a name longer than
-    /// [`PATH_NAME_MAX`]) — the daemon renders a leading `…/` so it never reads as exact.
-    pub trunc: u8,
-    /// Trailing pad so the record's size is a multiple of its 8-byte alignment (the `u64`
-    /// in [`FileId`]) with no implicit padding the kernel might leave uninitialized.
-    pub _pad: [u8; 5],
-    /// Leaf-first path components ([`PathComp`]), `depth` of them valid.
-    pub comps: [PathComp; PATH_MAX_DEPTH],
+padded_pod! {
+    /// ## Leaf path (DESIGN §15.10 flow B)
+    /// `bpf_d_path` is unavailable at `file_open`, so the kernel reconstructs the opened
+    /// file's path *relative to the matched protected object* by walking `d_name` up the
+    /// dentry chain: [`comps`](Self::comps) holds the component names **leaf-first**
+    /// (`comps[0]` = the opened file's own name, `comps[1]` = its parent, …),
+    /// [`depth`](Self::depth) of them, and [`trunc`](Self::trunc) marks a name/depth overflow.
+    /// The daemon reverses + joins them onto the object's known path → the full opened path.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct DecisionEvent {
+        /// The caller's executable identity (the subject that hit the rule).
+        pub exe: FileId,
+        /// The matched protected object's inode identity (the rule's `where`).
+        pub object: FileId,
+        /// The **opened file's own** inode identity — the per-file key the suppressor and the
+        /// daemon coalesce on, so distinct files under one audited root surface separately
+        /// (DESIGN §15.10 flow B). Equals `object` when the rule targets the file directly.
+        pub leaf: FileId,
+        /// The matched protected object's id.
+        pub obj: ObjId,
+        /// The requested action(s) at this access (`read`/`write`/`create`).
+        pub action: Action,
+        /// Thread-group id (userspace pid) of the caller.
+        pub pid: Pid,
+        /// The caller's **real** uid — the daemon resolves it to a login name for the audit
+        /// line and, for a regular user, collapses a path under that user's home to `~`.
+        pub uid: Uid,
+        /// How it was handled (`DENY` blocked / `AUDIT` allowed-and-logged).
+        pub decision: Decision,
+        /// How many identical decisions the in-kernel suppressor folded into this one since
+        /// the previous emit for the same `(exe, leaf, action)` (M1 §1g). `0` on a first
+        /// occurrence; nonzero means a repeat burst was collapsed — the daemon adds it to
+        /// the coalesced record so the true volume is visible.
+        pub suppressed: Suppressed,
+        /// The caller's resolved **blessing class** (DESIGN §16.3), or [`ClassId::UNBLESSED`]
+        /// when the caller is in no blessed cgroup. Carried so the journal can mark a
+        /// bless-mediated access with its class (the daemon resolves the id back to the policy
+        /// name); blessings are loud. Placed among the `u32` scalars (before the `u8`
+        /// `policy`/`depth`/`trunc`) to keep the record interior-padding-free.
+        pub blessing: ClassId,
+        /// The matched policy — the cause, for the log: an authored `audit`/`deny`, or the
+        /// synthetic `DEFAULT_DENY` when no rule matched (vs an explicit `deny`).
+        pub policy: crate::policy_maps::Policy,
+        /// Number of valid entries in [`comps`](Self::comps) (`0` ⇒ the object *is* the
+        /// opened file, or reconstruction read nothing).
+        pub depth: u8,
+        /// `1` if the path was truncated (deeper than [`PATH_MAX_DEPTH`] or a name longer than
+        /// [`PATH_NAME_MAX`]) — the daemon renders a leading `…/` so it never reads as exact.
+        pub trunc: u8,
+        /// Leaf-first path components ([`PathComp`]), `depth` of them valid.
+        pub comps: [PathComp; PATH_MAX_DEPTH],
+    }
 }
 
 impl DecisionEvent {
@@ -196,6 +201,7 @@ impl DecisionEvent {
         decision: Decision,
         policy: crate::policy_maps::Policy,
         suppressed: Suppressed,
+        blessing: ClassId,
     ) -> DecisionEvent {
         DecisionEvent {
             exe,
@@ -208,30 +214,32 @@ impl DecisionEvent {
             decision,
             suppressed,
             policy,
+            blessing,
             depth: 0,
             trunc: 0,
-            _pad: [0; 5],
             comps: [PathComp::EMPTY; PATH_MAX_DEPTH],
+            _pad: [0; Self::PAD],
         }
     }
 }
 
-/// The in-kernel suppressor key ([`MAP_SUPPRESS`]): one decision identity. Keyed on the
-/// **opened file** (`leaf`), not the protected object, so distinct files under one audited
-/// root each get their own throttle window (DESIGN §15.10 flow B). The explicit `_pad`
-/// keeps it padding-free (16 + 16 + 4 + 4 = 40, align 8) and **zeroed** — a BPF hash-map
-/// key hashes its whole byte span, so an uninitialized pad byte would split one logical
-/// key across buckets.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SuppressKey {
-    /// The caller's executable identity.
-    pub exe: FileId,
-    /// The opened file's inode identity.
-    pub leaf: FileId,
-    /// The requested action(s) for this open.
-    pub action: Action,
-    pub _pad: [u8; 4],
+padded_pod! {
+    /// The in-kernel suppressor key ([`MAP_SUPPRESS`]): one decision identity. Keyed on the
+    /// **opened file** (`leaf`), not the protected object, so distinct files under one audited
+    /// root each get their own throttle window (DESIGN §15.10 flow B). The `padded_pod!` `_pad`
+    /// keeps it padding-free (16 + 16 + 4 + 4 = 40, align 8) and **zeroed** — a BPF hash-map
+    /// key hashes its whole byte span, so an uninitialized pad byte would split one logical
+    /// key across buckets.
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub struct SuppressKey {
+        /// The caller's executable identity.
+        pub exe: FileId,
+        /// The opened file's inode identity.
+        pub leaf: FileId,
+        /// The requested action(s) for this open.
+        pub action: Action,
+    }
 }
 
 impl SuppressKey {
@@ -240,21 +248,22 @@ impl SuppressKey {
             exe,
             leaf,
             action,
-            _pad: [0; 4],
+            _pad: [0; Self::PAD],
         }
     }
 }
 
-/// The in-kernel suppressor value ([`MAP_SUPPRESS`]): when this key last emitted, and
-/// how many identical decisions have been suppressed since (folded into the next emit).
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct SuppressVal {
-    /// `bpf_ktime_get_ns()` at the last *emitted* decision for this key.
-    pub last_ns: Nanos,
-    /// Decisions suppressed since `last_ns` (carried into the next [`DecisionEvent`]).
-    pub suppressed: Suppressed,
-    pub _pad: [u8; 4],
+padded_pod! {
+    /// The in-kernel suppressor value ([`MAP_SUPPRESS`]): when this key last emitted, and
+    /// how many identical decisions have been suppressed since (folded into the next emit).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct SuppressVal {
+        /// `bpf_ktime_get_ns()` at the last *emitted* decision for this key.
+        pub last_ns: Nanos,
+        /// Decisions suppressed since `last_ns` (carried into the next [`DecisionEvent`]).
+        pub suppressed: Suppressed,
+    }
 }
 
 impl SuppressVal {
@@ -262,7 +271,7 @@ impl SuppressVal {
         SuppressVal {
             last_ns,
             suppressed,
-            _pad: [0; 4],
+            _pad: [0; Self::PAD],
         }
     }
 }

@@ -14,7 +14,7 @@
 //! generations, and `Settings.active_bank` picks the live one, so `cordon policy apply`
 //! publishes a whole new table with one atomic flip (DESIGN §15.8).
 
-use crate::ids::{Bank, Dev, Ino};
+use crate::ids::{Bank, CgroupId, Dev, Ino, Uid};
 use crate::maps::FileId;
 use bitflags::bitflags;
 
@@ -42,6 +42,18 @@ pub const MAP_RULES: &str = "RULES";
 /// [`MAP_RULES`] (its slot is otherwise zero-padded to `MAX_RULES_PER_OBJ`).
 pub const MAP_RULE_COUNT: &str = "RULE_COUNT";
 
+/// `HashMap<u64 /*cgroup_id*/, ClassId>` — the runtime **blessing** indirection
+/// (DESIGN §16.3): a live blessed cgroup's id → the [`ClassId`] it was minted with. The
+/// kernel resolves the caller's class once per decision (`BLESSED[current_cgroup_id]`,
+/// or [`ClassId::UNBLESSED`] when absent) and a rule's `blessing` predicate matches that.
+///
+/// **Not banked** (unlike the three rule maps): it is per-`cordon bless` runtime state,
+/// single-writer (the daemon's backend thread writes at mint, clears at GC), so a bless
+/// never recompiles policy and a `policy apply` never disturbs a live bless. Also **not
+/// pinned** (M5): a pinned `BLESSED` with a dead daemon = grants that never expire — it
+/// fails closed on daemon death and is rebuilt by startup reconciliation (PLAN-bless B1d).
+pub const MAP_BLESSED: &str = "BLESSED";
+
 /// The number of rule-table generations the maps hold for the atomic double-buffer
 /// swap. Two: one active (the kernel reads it), one inactive (an apply fills it, then
 /// flips). Sizes the banked [`MAP_RULES`] array and the `bank` dimension of every key.
@@ -59,6 +71,12 @@ pub const MAX_RULES_PER_OBJ: usize = 32;
 /// [`ObjId`] space; the daemon rejects a compiled policy with more objects than this.
 pub const MAX_OBJECTS: usize = 1024;
 
+/// Maximum number of live blessings ([`MAP_BLESSED`] entries) at once — one per active
+/// `cordon bless` invocation. On a personal box concurrent blessings are few; the daemon
+/// refuses a new mint past this. (Distinct from the policy-class *count*: many invocations
+/// can share one [`ClassId`].)
+pub const MAX_BLESSED: usize = 1024;
+
 /// A protected object's id — a dense `u32` index assigned by the compiler, used to
 /// address the object's slot in [`MAP_RULES`]/[`MAP_RULE_COUNT`]. Distinct from
 /// [`FileId`]: the `(dev,ino)` is the *kernel's* key into [`MAP_PROTECTED`], the
@@ -67,18 +85,48 @@ pub const MAX_OBJECTS: usize = 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ObjId(pub u32);
 
-/// A [`MAP_PROTECTED`] key: a protected object's inode identity within one bank. The
-/// explicit `_pad` is **load-bearing**: `FileId` is 8-aligned, so [`Bank`] (a `u32`)
-/// at offset 16 would leave 4 trailing *implicit* padding bytes — and a BPF `HashMap`
-/// hashes the whole key, padding included (uninitialized padding → mismatched
-/// lookups). Making the gap an explicit, always-zeroed field keeps the 24-byte key
-/// padding-free.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct BankedFile {
-    pub file: FileId,
-    pub bank: Bank,
-    pub _pad: [u8; 4],
+/// A **blessing class** id — a dense `u32` the compiler assigns to each named blessing
+/// class declared in policy (`[group.subject.*] blessing = "<name>"`, DESIGN §16.3), and
+/// the value stored in [`MAP_BLESSED`] for a live blessed cgroup. A rule's
+/// [`SubjectMatch::blessing`] names the class it requires; the kernel matches it against
+/// the caller's resolved class.
+///
+/// [`UNBLESSED`](ClassId::UNBLESSED) (`0`) is the sentinel a process in *no* blessed
+/// cgroup resolves to. The compiler never assigns it to a named class, so no concrete
+/// `blessing` predicate ever equals it — an unblessed caller matches only blessing-wildcard
+/// rules ([`SubjectFlags::BLESSING_ANY`]).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct ClassId(pub u32);
+
+impl ClassId {
+    /// The "not in any blessed cgroup" sentinel (`0`). What `BLESSED.get(cgroup)` resolving
+    /// to nothing means, and never a class the compiler assigns — so a concrete `blessing`
+    /// predicate can't accidentally match an unblessed caller.
+    pub const UNBLESSED: ClassId = ClassId(0);
+}
+
+/// The raw class id, for the journal's `blessing=` field (the daemon resolves it back to
+/// the policy name; `0`/[`UNBLESSED`](ClassId::UNBLESSED) renders as no class). `no_std`.
+impl core::fmt::Display for ClassId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+padded_pod! {
+    /// A [`MAP_PROTECTED`] key: a protected object's inode identity within one bank. The
+    /// trailing `_pad` is **load-bearing**: `FileId` is 8-aligned, so [`Bank`] (a `u32`)
+    /// at offset 16 would leave 4 trailing *implicit* padding bytes — and a BPF `HashMap`
+    /// hashes the whole key, padding included (uninitialized padding → mismatched lookups).
+    /// `padded_pod!` makes the gap an explicit, always-zeroed field (and asserts no interior
+    /// gap), keeping the 24-byte key padding-free.
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub struct BankedFile {
+        pub file: FileId,
+        pub bank: Bank,
+    }
 }
 
 impl BankedFile {
@@ -86,7 +134,7 @@ impl BankedFile {
         BankedFile {
             file,
             bank,
-            _pad: [0; 4],
+            _pad: [0; Self::PAD],
         }
     }
 }
@@ -230,59 +278,110 @@ impl core::fmt::Display for Policy {
     }
 }
 
-/// A subject predicate: a conjunction of cheap-to-check fields the kernel ANDs
-/// against the caller (DESIGN §15.4). `flags` marks which fields are wildcards
-/// (`who = "*"` sets all three) — a wildcard field is skipped, never compared. M1
-/// fills only `exe`; `uid`/`cgroup` are reserved (always wildcard) until M2.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SubjectMatch {
-    /// The caller's executable identity `(dev,ino)`. Compared unless `FLAG_EXE_ANY`.
-    pub exe: FileId,
-    /// The caller's cgroup id. Compared unless `FLAG_CGROUP_ANY` (M2).
-    pub cgroup: u64,
-    /// The caller's uid. Compared unless `FLAG_UID_ANY` (M2).
-    pub uid: u32,
-    /// Which predicates are wildcards (skip the compare).
-    pub flags: u32,
+bitflags! {
+    /// Which subject predicates are **wildcards** — a set bit means "match any, skip the
+    /// compare." `who = "*"` sets all of them; a concrete predicate *clears* its bit. The
+    /// kernel ANDs only the non-wildcard predicates (DESIGN §15.4 + the §16.3 `blessing`),
+    /// and the compiler counts the *cleared* bits as the rule's subject specificity (§15.6),
+    /// so a 5th predicate bit extends both for free.
+    ///
+    /// `#[repr(transparent)]` over `u32` (same rationale as [`Action`]): it's read
+    /// byte-for-byte out of `RULES` inside [`CompiledRule`], and bitflags 2.x admits unknown
+    /// bits so every pattern is valid → the `aya::Pod` impl below is sound.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct SubjectFlags: u32 {
+        /// `exe` is a wildcard (M1 default for `who = "*"`).
+        const EXE_ANY      = 1 << 0;
+        /// `uid` is a wildcard (always, until M2).
+        const UID_ANY      = 1 << 1;
+        /// `cgroup` is a wildcard (always, until M2).
+        const CGROUP_ANY   = 1 << 2;
+        /// `blessing` is a wildcard (the default; cleared only by a blessing rule, B1).
+        const BLESSING_ANY = 1 << 3;
+    }
+}
+
+padded_pod! {
+    /// A subject predicate: a conjunction of cheap-to-check fields the kernel ANDs
+    /// against the caller (DESIGN §15.4 + the §16.3 `blessing` predicate).
+    /// [`flags`](Self::flags) ([`SubjectFlags`]) marks which fields are wildcards. M1 fills
+    /// only `exe`; `uid`/`cgroup` are reserved (always wildcard) until M2; `blessing` is set
+    /// only by a rule referencing a blessing class (PLAN-bless B1), wildcard otherwise. It is
+    /// a map *value* (it rides inside [`CompiledRule`]), so its `_pad` is for initialization
+    /// soundness, not key hashing — see the [`padded_pod!`]/`layout` module docs.
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct SubjectMatch {
+        /// The caller's executable identity `(dev,ino)`. Compared unless [`SubjectFlags::EXE_ANY`].
+        pub exe: FileId,
+        /// The caller's cgroup id. Compared unless [`SubjectFlags::CGROUP_ANY`] (M2).
+        pub cgroup: CgroupId,
+        /// The caller's uid. Compared unless [`SubjectFlags::UID_ANY`] (M2).
+        pub uid: Uid,
+        /// The blessing class this rule requires (DESIGN §16.3). Compared against the caller's
+        /// resolved class (`BLESSED[cgroup]`, or [`ClassId::UNBLESSED`]) unless
+        /// [`SubjectFlags::BLESSING_ANY`].
+        pub blessing: ClassId,
+        /// Which predicates are wildcards (skip the compare).
+        pub flags: SubjectFlags,
+    }
 }
 
 impl SubjectMatch {
-    pub const FLAG_EXE_ANY: u32 = 1 << 0;
-    pub const FLAG_UID_ANY: u32 = 1 << 1;
-    pub const FLAG_CGROUP_ANY: u32 = 1 << 2;
-
-    /// Matches any caller (`who = "*"`): every predicate is a wildcard.
+    /// Matches any caller (`who = "*"`): every predicate is a wildcard — including
+    /// `blessing`, so a `*` catch-all matches blessed and unblessed callers alike.
     pub const ANY: SubjectMatch = SubjectMatch {
         exe: FileId::new(Dev(0), Ino(0)),
-        cgroup: 0,
-        uid: 0,
-        flags: Self::FLAG_EXE_ANY | Self::FLAG_UID_ANY | Self::FLAG_CGROUP_ANY,
+        cgroup: CgroupId(0),
+        uid: Uid(0),
+        blessing: ClassId::UNBLESSED,
+        flags: SubjectFlags::all(),
+        _pad: [0; Self::PAD],
     };
 
-    /// A subject that matches exactly one executable (by `(dev,ino)`), any uid/cgroup.
+    /// A subject that matches exactly one executable (by `(dev,ino)`), any uid/cgroup/blessing.
     pub const fn exe(exe: FileId) -> SubjectMatch {
         SubjectMatch {
             exe,
-            cgroup: 0,
-            uid: 0,
-            flags: Self::FLAG_UID_ANY | Self::FLAG_CGROUP_ANY,
+            cgroup: CgroupId(0),
+            uid: Uid(0),
+            blessing: ClassId::UNBLESSED,
+            // Everything wildcard except the concrete `exe`.
+            flags: SubjectFlags::all().difference(SubjectFlags::EXE_ANY),
+            _pad: [0; Self::PAD],
+        }
+    }
+
+    /// A subject that matches any caller in blessing class `class` (DESIGN §16.3) — the
+    /// `@blessed-*` predicate: exe/uid/cgroup wildcard, `blessing` concrete. Composes with
+    /// [`exe`](Self::exe) under conjunction in the compiler (PLAN-bless B1c).
+    pub const fn blessed(class: ClassId) -> SubjectMatch {
+        SubjectMatch {
+            exe: FileId::new(Dev(0), Ino(0)),
+            cgroup: CgroupId(0),
+            uid: Uid(0),
+            blessing: class,
+            // Everything wildcard except the concrete `blessing`.
+            flags: SubjectFlags::all().difference(SubjectFlags::BLESSING_ANY),
+            _pad: [0; Self::PAD],
         }
     }
 }
 
-/// One pre-resolved rule in an object's bucket: a subject predicate, the actions it
-/// covers, and the effect. The compiler sorts each bucket most-specific-object-first
-/// then `deny > allow`, so the kernel applies the **first** rule whose action and
-/// subject match. `_pad` keeps the layout deterministic (no uninitialized bytes) when
-/// the loader memcpys these into the packed [`MAP_RULES`] array.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct CompiledRule {
-    pub subject: SubjectMatch,
-    pub action_mask: Action,
-    pub policy: Policy,
-    pub _pad: [u8; 3],
+padded_pod! {
+    /// One pre-resolved rule in an object's bucket: a subject predicate, the actions it
+    /// covers, and the effect. The compiler sorts each bucket most-specific-object-first
+    /// then `deny > allow`, so the kernel applies the **first** rule whose action and
+    /// subject match. The `padded_pod!` `_pad` keeps the layout deterministic (no
+    /// uninitialized bytes) when the loader memcpys these into the packed [`MAP_RULES`] array.
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CompiledRule {
+        pub subject: SubjectMatch,
+        pub action_mask: Action,
+        pub policy: Policy,
+    }
 }
 
 impl CompiledRule {
@@ -291,7 +390,7 @@ impl CompiledRule {
             subject,
             action_mask,
             policy,
-            _pad: [0; 3],
+            _pad: [0; Self::PAD],
         }
     }
 }
@@ -308,9 +407,11 @@ mod user {
     // `Decision`; that's a memory-safety statement, not a claim every value is
     // semantically meaningful.)
     unsafe impl aya::Pod for ObjId {}
+    unsafe impl aya::Pod for ClassId {}
     unsafe impl aya::Pod for BankedFile {}
     unsafe impl aya::Pod for BankedObj {}
     unsafe impl aya::Pod for Action {}
+    unsafe impl aya::Pod for SubjectFlags {}
     unsafe impl aya::Pod for Policy {}
     unsafe impl aya::Pod for SubjectMatch {}
     unsafe impl aya::Pod for CompiledRule {}
@@ -347,20 +448,33 @@ mod tests {
 
     #[test]
     fn subject_wildcards() {
-        assert_eq!(
-            SubjectMatch::ANY.flags & SubjectMatch::FLAG_EXE_ANY,
-            SubjectMatch::FLAG_EXE_ANY
-        );
+        // `*` is wildcard on every predicate, including blessing.
+        assert!(SubjectMatch::ANY.flags.contains(SubjectFlags::EXE_ANY));
+        assert!(SubjectMatch::ANY.flags.contains(SubjectFlags::BLESSING_ANY));
+
+        // A concrete exe clears EXE_ANY but stays blessing-wildcard (an exe rule is
+        // unconcerned with blessing) and unblessed-sentinel.
         let s = SubjectMatch::exe(FileId::new(Dev(7), Ino(9)));
-        assert_eq!(s.flags & SubjectMatch::FLAG_EXE_ANY, 0); // exe is matched, not wildcard
+        assert!(!s.flags.contains(SubjectFlags::EXE_ANY)); // exe is matched, not wildcard
+        assert!(s.flags.contains(SubjectFlags::BLESSING_ANY));
         assert_eq!(s.exe, FileId::new(Dev(7), Ino(9)));
+        assert_eq!(s.blessing, ClassId::UNBLESSED);
+
+        // A blessing rule clears BLESSING_ANY and names a concrete class, exe stays wildcard.
+        let b = SubjectMatch::blessed(ClassId(3));
+        assert!(b.flags.contains(SubjectFlags::EXE_ANY));
+        assert!(!b.flags.contains(SubjectFlags::BLESSING_ANY));
+        assert_eq!(b.blessing, ClassId(3));
     }
 
     #[test]
     fn compiled_rule_layout_is_padded() {
-        // 32 (SubjectMatch) + 4 (Action) + 1 (Policy) + 3 (pad) = 40, 8-aligned.
-        assert_eq!(core::mem::size_of::<SubjectMatch>(), 32);
-        assert_eq!(core::mem::size_of::<CompiledRule>(), 40);
+        // SubjectMatch: 16 (exe) + 8 (cgroup) + 4 (uid) + 4 (blessing) + 4 (flags) +
+        // 4 (pad) = 40, 8-aligned, no implicit padding.
+        assert_eq!(core::mem::size_of::<SubjectMatch>(), 40);
+        assert_eq!(core::mem::align_of::<SubjectMatch>(), 8);
+        // CompiledRule: 40 (SubjectMatch) + 4 (Action) + 1 (Policy) + 3 (pad) = 48, 8-aligned.
+        assert_eq!(core::mem::size_of::<CompiledRule>(), 48);
         assert_eq!(core::mem::align_of::<CompiledRule>(), 8);
     }
 

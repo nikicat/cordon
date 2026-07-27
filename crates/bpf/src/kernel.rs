@@ -20,14 +20,15 @@
 //! ([`FileId`]).
 
 use aya_ebpf::helpers::{
-    bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-    bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
+    bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task,
+    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+    bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{LruHashMap, PerCpuArray, RingBuf};
 use cordon_bpf_common::{
-    Action, Decision, DecisionEvent, Dev, FileId, Ino, Nanos, ObjId, Offsets, PathComp, Pid,
-    Policy, Suppressed, Uid, SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
+    Action, CgroupId, ClassId, Decision, DecisionEvent, Dev, FileId, Ino, Nanos, ObjId, Offsets,
+    PathComp, Pid, Policy, Suppressed, Uid, SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
 };
 
 /// Running-kernel field offsets, injected into `.rodata` by the daemon
@@ -70,6 +71,15 @@ pub fn current_pid() -> Pid {
 /// high 32 are the gid). The daemon names the user from it on the audit line.
 pub fn current_uid() -> Uid {
     Uid(bpf_get_current_uid_gid() as u32)
+}
+
+/// The current task's cgroup-v2 id (`bpf_get_current_cgroup_id`) — the blessing carrier
+/// (DESIGN §16.3). The daemon registers a blessed cgroup's id in `BLESSED`; the decision
+/// flow resolves the caller's class from this. A general helper, but validated callable from
+/// the `file_open` LSM hook on the pinned kernel (PLAN-bless B1b verifier check).
+pub fn current_cgroup_id() -> CgroupId {
+    // SAFETY: an argless helper returning a scalar id — no pointers, always callable.
+    CgroupId(unsafe { bpf_get_current_cgroup_id() })
 }
 
 /// A `struct file *`.
@@ -188,6 +198,7 @@ pub fn emit(
     decision: Decision,
     policy: Policy,
     suppressed: Suppressed,
+    blessing: ClassId,
     file: File,
     object_dentry: Dentry,
 ) {
@@ -208,6 +219,7 @@ pub fn emit(
         (*ev).decision = decision;
         (*ev).suppressed = suppressed;
         (*ev).policy = policy;
+        (*ev).blessing = blessing;
         let (depth, trunc) = fill_comps(file, object_dentry, &mut (*ev).comps);
         (*ev).depth = depth;
         (*ev).trunc = trunc as u8;

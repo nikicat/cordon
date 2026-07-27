@@ -36,8 +36,9 @@ use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
-    rule_slot, Action, Bank, BankedFile, BankedObj, CompiledRule, Decision, FileId, ObjId, Policy,
-    Settings, SubjectMatch, MAX_OBJECTS, MAX_RULES_PER_OBJ, NUM_BANKS,
+    rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, Decision,
+    FileId, ObjId, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS,
+    MAX_RULES_PER_OBJ, NUM_BANKS,
 };
 
 /// The hook's verdict. The kernel wants a raw return (`0` allow / negative errno
@@ -89,6 +90,13 @@ static RULE_COUNT: HashMap<BankedObj, u32> =
 /// The one-element control record (daemon pid + live bank).
 #[map]
 static SETTINGS: Array<Settings> = Array::with_max_entries(1, 0);
+
+/// Live blessings (DESIGN §16.3): a blessed cgroup's id → its [`ClassId`]. Written by the
+/// daemon at `cordon bless` mint, cleared at GC — **unbanked** runtime state, so a bless
+/// never recompiles policy and a `policy apply` never disturbs a live bless. Empty until the
+/// daemon writes it, so absent a bless every caller resolves to [`ClassId::UNBLESSED`].
+#[map]
+static BLESSED: HashMap<CgroupId, ClassId> = HashMap::with_max_entries(MAX_BLESSED as u32, 0);
 
 /// The matched protected object, plus what leaf-path reconstruction needs: the opened
 /// file's own identity (`leaf`, the suppressor/coalesce key) and the matched object's
@@ -148,10 +156,14 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
         return Some(Verdict::Allow);
     }
 
-    // (4)/(5) caller exe → first matching rule, else default-deny (a distinct cause from
-    // an explicit `deny`, so the journal can tell "no rule" apart from "you blocked it").
+    // (4)/(5) caller subject → first matching rule, else default-deny (a distinct cause from
+    // an explicit `deny`, so the journal can tell "no rule" apart from "you blocked it"). The
+    // subject is the exe plus the caller's resolved blessing class (DESIGN §16.3), the latter
+    // read once here from its cgroup; both are matched per-rule by `subject_matches`.
     let exe = kernel::caller_exe()?;
-    let policy = match_rule(matched.obj, requested, exe, bank).unwrap_or(Policy::DEFAULT_DENY);
+    let class = current_class();
+    let policy =
+        match_rule(matched.obj, requested, exe, class, bank).unwrap_or(Policy::DEFAULT_DENY);
 
     // The per-rule policy is the only enforcement level (no global mode): a denying
     // policy blocks outright.
@@ -182,6 +194,7 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
                 decision,
                 policy,
                 suppressed,
+                class,
                 file,
                 matched.object_dentry,
             );
@@ -248,9 +261,16 @@ fn requested_action(file: kernel::File) -> Option<Action> {
 }
 
 /// Scan object `obj`'s pre-sorted bucket in the active `bank` and return the first
-/// rule's policy whose action mask intersects `requested` and whose subject matches
-/// `exe`. `None` ⇒ no matching rule (the caller applies default-deny).
-fn match_rule(obj: ObjId, requested: Action, exe: FileId, bank: Bank) -> Option<Policy> {
+/// rule's policy whose action mask intersects `requested` and whose subject matches the
+/// caller (`exe` + blessing `class`). `None` ⇒ no matching rule (the caller applies
+/// default-deny).
+fn match_rule(
+    obj: ObjId,
+    requested: Action,
+    exe: FileId,
+    class: ClassId,
+    bank: Bank,
+) -> Option<Policy> {
     let count = rule_count(bank, obj).unwrap_or(0);
     for i in 0..MAX_RULES_PER_OBJ {
         if i as u32 >= count {
@@ -258,18 +278,36 @@ fn match_rule(obj: ObjId, requested: Action, exe: FileId, bank: Bank) -> Option<
         }
         // `Array::get` is bounds-checked (safe in aya); a stray index yields `None`.
         let rule: CompiledRule = *RULES.get(rule_slot(bank, obj, i as u32))?;
-        if rule.action_mask.intersects(requested) && subject_matches(rule.subject, exe) {
+        if rule.action_mask.intersects(requested) && subject_matches(rule.subject, exe, class) {
             return Some(rule.policy);
         }
     }
     None
 }
 
-/// Whether a subject predicate matches the caller. M1 matches on `exe` only (honoring
-/// the wildcard flag); `uid`/`cgroup` matching is M2 (DESIGN §15.4) — the compiler
-/// never emits non-wildcard `uid`/`cgroup` yet, so exe-or-any is complete for M1.
-fn subject_matches(subject: SubjectMatch, exe: FileId) -> bool {
-    subject.flags & SubjectMatch::FLAG_EXE_ANY != 0 || subject.exe == exe
+/// Whether a subject predicate matches the caller: each non-wildcard predicate must equal
+/// the caller's value (ANDed). M1 matches on `exe`; the `blessing` class (DESIGN §16.3) is
+/// matched here too — a blessing rule clears `BLESSING_ANY` and names a class, so it fires
+/// only for a caller in a blessed cgroup of that class. `uid`/`cgroup` matching is M2 (the
+/// compiler never emits non-wildcard `uid`/`cgroup` yet, so they stay wildcard).
+fn subject_matches(subject: SubjectMatch, exe: FileId, class: ClassId) -> bool {
+    let exe_ok = subject.flags.contains(SubjectFlags::EXE_ANY) || subject.exe == exe;
+    let blessing_ok =
+        subject.flags.contains(SubjectFlags::BLESSING_ANY) || subject.blessing == class;
+    exe_ok && blessing_ok
+}
+
+/// The caller's blessing class (DESIGN §16.3), resolved once per decision from its cgroup
+/// via `BLESSED`, or [`ClassId::UNBLESSED`] when the cgroup is not a live blessing. Absent
+/// any bless, `BLESSED` is empty so this is always `UNBLESSED` — every rule's blessing axis
+/// is wildcard then, so the match is unchanged from M1.
+fn current_class() -> ClassId {
+    blessed_class(kernel::current_cgroup_id()).unwrap_or(ClassId::UNBLESSED)
+}
+
+/// The class a cgroup is blessed with, if it is a live blessing.
+fn blessed_class(cgroup: CgroupId) -> Option<ClassId> {
+    unsafe { BLESSED.get(&cgroup).copied() }
 }
 
 // ---- safe wrappers over the policy-map lookups ----------------------------

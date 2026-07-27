@@ -14,10 +14,14 @@ mod proc;
 
 use clap::Parser;
 use cordon_core::backend::{BackendKind, ControlSender, Shutdown, control};
+use cordon_core::config::SocketPath;
+use cordon_core::proto::Nonce;
 use cordon_core::{Config, config};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::{Mutex, mpsc};
 use tracing::{error, info};
 
 /// Shared daemon state + the IPC server behavior over it (the `impl` lives in
@@ -28,6 +32,11 @@ pub struct Ctx {
     pub backend: BackendKind,
     pub socket: PathBuf,
     pub policy: PathBuf,
+    /// Blessing requests awaiting a root approval, by nonce (DESIGN §16.5). The value
+    /// releases the connection thread parked in `serve_bless_request`; that thread owns
+    /// its entry and removes it on every exit path, so there is no reaper and no TTL
+    /// sweep — a nonce lives exactly as long as someone is waiting on it.
+    pub pending: Mutex<HashMap<Nonce, mpsc::Sender<()>>>,
 }
 
 #[derive(Parser, Debug)]
@@ -81,7 +90,7 @@ fn init_tracing() {
 fn run(args: Args) -> cordon_core::Result<()> {
     let mut cfg = Config::load(args.config.as_deref())?;
     if let Some(s) = args.socket {
-        cfg.socket = s;
+        cfg.socket = SocketPath::Configured(s);
     }
     if let Some(b) = args.backend {
         cfg.backend = b.parse()?;
@@ -93,7 +102,7 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let backend = backend::select(&cfg)?;
     info!(
         backend = backend.name(),
-        socket = %cfg.socket.display(),
+        socket = %cfg.socket.path().display(),
         policy = %cfg.policy.display(),
         privilege = if config::is_root() { "root" } else { "user (NOT a boundary)" },
         "cordond started",
@@ -115,8 +124,9 @@ fn run(args: Args) -> cordon_core::Result<()> {
     let ctx = Arc::new(Ctx {
         control: control_sender,
         backend: cfg.backend,
-        socket: cfg.socket,
+        socket: cfg.socket.into(),
         policy: cfg.policy,
+        pending: Mutex::new(HashMap::new()),
     });
 
     let serve_result = ctx.serve();

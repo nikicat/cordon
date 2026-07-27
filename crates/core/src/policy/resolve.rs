@@ -8,22 +8,26 @@
 //! names (`*` → all). Paths get `~`-expanded and lexically normalized here; inode
 //! resolution is deferred to [`super::compile`].
 
-use super::parse::{GroupDef, ParsedPolicy, Token};
-use super::{ActionName, Pos, expand_path};
+use super::parse::{GroupDef, Groups, ParsedPolicy, Token};
+use super::{ActionName, ClassName, GroupName, Pos, expand_path};
 use crate::{Error, Result};
 use cordon_bpf_common as bpf;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use toml::Spanned;
 
-/// A subject after group expansion, before inode resolution (M1: exe or wildcard;
-/// M2 extends to conjunctive predicates — DESIGN §15.4).
+/// A subject after group expansion, before inode resolution (M1: exe, wildcard, or a
+/// blessing class; M2 extends to conjunctive predicates — DESIGN §15.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubjectSpec {
     /// `who = "*"` — any caller.
     Any,
     /// A concrete executable path, resolved to a `(dev,ino)` by [`super::compile`].
     Exe(PathBuf),
+    /// `@<group>` where the group declares `blessing = "<class>"` (DESIGN §16.3) — matches a
+    /// caller in a blessed cgroup of that class. [`super::compile`] maps the class name to a
+    /// dense [`bpf::ClassId`].
+    Blessed(ClassName),
 }
 
 /// One rule with all groups expanded: a cross-product of `subjects × objects`, each
@@ -43,12 +47,20 @@ pub struct ResolvedRule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPolicy {
     pub rules: Vec<ResolvedRule>,
+    /// The blessing classes this policy **declares** (a `[group.subject.*] blessing = "…"`
+    /// predicate, DESIGN §16.3), sorted + deduped. The authoritative class vocabulary —
+    /// [`super::compile`] assigns each a dense [`bpf::ClassId`] and builds the registry the
+    /// daemon/CLI validate `cordon bless --class` against. A class may be declared without a
+    /// rule referencing it (it then grants nothing).
+    pub blessing_classes: Vec<ClassName>,
 }
 
 /// Resolve every rule. Hard-errors (with a `line:col` prefix) on a cycle, an unknown
-/// `@ref`, a bad action name, a non-absolute path, or an empty axis — the policy is
-/// structurally unusable until fixed.
+/// `@ref`, a bad action name, a non-absolute path, an empty axis, or a misplaced/ambiguous
+/// `blessing` group — the policy is structurally unusable until fixed.
 pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
+    let blessing_classes = declared_classes(&parsed.groups)?;
+
     let mut rules = Vec::with_capacity(parsed.rules.len());
     for rule in &parsed.rules {
         let pos = rule.pos;
@@ -75,7 +87,40 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
             pos: Some(pos),
         });
     }
-    Ok(ResolvedPolicy { rules })
+    Ok(ResolvedPolicy {
+        rules,
+        blessing_classes,
+    })
+}
+
+/// Collect the declared blessing classes (DESIGN §16.3) and validate the `blessing` predicate
+/// is well-placed: it lives only on a **subject** group, and is mutually exclusive with
+/// `members`. Returns the distinct class names, sorted (so [`super::compile`] assigns stable
+/// [`bpf::ClassId`]s). Errors point at the offending group's source line.
+fn declared_classes(groups: &Groups) -> Result<Vec<ClassName>> {
+    // `blessing` is a subject predicate — reject it in the object/action namespaces.
+    for (axis, ns) in [("object", &groups.object), ("action", &groups.action)] {
+        if let Some((name, g)) = ns.iter().find(|(_, g)| g.get_ref().blessing.is_some()) {
+            let _ = g;
+            return Err(Error::msg(format!(
+                "group @{name} in the {axis} namespace has a `blessing` predicate, which is \
+                 only valid on a subject group"
+            )));
+        }
+    }
+    let mut classes = BTreeSet::new();
+    for (name, g) in &groups.subject {
+        if let Some(class) = &g.get_ref().blessing {
+            if !g.get_ref().members.is_empty() {
+                return Err(Error::msg(format!(
+                    "subject group @{name} mixes a `blessing` predicate with `members` — a \
+                     blessing class group declares only `blessing`"
+                )));
+            }
+            classes.insert(class.clone());
+        }
+    }
+    Ok(classes.into_iter().collect())
 }
 
 fn resolve_subjects(
@@ -97,6 +142,9 @@ fn resolve_subjects(
             match tok {
                 Token::Wildcard => push_unique(&mut out, SubjectSpec::Any),
                 Token::Leaf(s) => push_unique(&mut out, SubjectSpec::Exe(expand_path(s, home)?)),
+                Token::Blessing(class) => {
+                    push_unique(&mut out, SubjectSpec::Blessed(class.clone()))
+                }
                 Token::Group(_) => unreachable!("group tokens are consumed by expand_axis"),
             }
             Ok(())
@@ -130,6 +178,10 @@ fn resolve_objects(
                     push_unique(&mut out, expand_path(s, home)?);
                     Ok(())
                 }
+                Token::Blessing(_) => Err(at(
+                    p,
+                    "a blessing group is a subject predicate; it can't appear in `where`",
+                )),
                 Token::Group(_) => unreachable!("group tokens are consumed by expand_axis"),
             }
         },
@@ -155,6 +207,12 @@ fn resolve_actions(tokens: &[Token], parsed: &ParsedPolicy, pos: Pos) -> Result<
                         .ok_or_else(|| at(p, format!("unknown action: {s:?}")))?;
                     mask |= name.bit();
                 }
+                Token::Blessing(_) => {
+                    return Err(at(
+                        p,
+                        "a blessing group is a subject predicate; it can't appear in `action`",
+                    ));
+                }
                 Token::Group(_) => unreachable!("group tokens are consumed by expand_axis"),
             }
             Ok(())
@@ -165,14 +223,16 @@ fn resolve_actions(tokens: &[Token], parsed: &ParsedPolicy, pos: Pos) -> Result<
 
 /// Recursively expand a token list for one axis. `@group` refs recurse (cycle-checked
 /// against `stack` of group names); every non-group token is handed to `leaf` with the
-/// position of its enclosing rule/group, for axis-specific interpretation.
+/// position of its enclosing rule/group, for axis-specific interpretation. A `@ref` to a
+/// `blessing = "…"` group (DESIGN §16.3) is a leaf, not a member list: it synthesizes a
+/// [`Token::Blessing`] handed to `leaf` (which the subject axis accepts, others reject).
 fn expand_axis<F>(
     tokens: &[Token],
-    groups: &BTreeMap<String, Spanned<GroupDef>>,
+    groups: &BTreeMap<GroupName, Spanned<GroupDef>>,
     axis: &str,
     parsed: &ParsedPolicy,
     enclosing: Pos,
-    stack: &mut Vec<String>,
+    stack: &mut Vec<GroupName>,
     leaf: &mut F,
 ) -> Result<()>
 where
@@ -182,7 +242,11 @@ where
         match tok {
             Token::Group(name) => {
                 if stack.iter().any(|s| s == name) {
-                    let chain = stack.join(" -> @");
+                    let chain = stack
+                        .iter()
+                        .map(GroupName::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" -> @");
                     let gpos = groups
                         .get(name)
                         .map(|g| parsed.lines.pos(g.span().start))
@@ -193,9 +257,15 @@ where
                     .get(name)
                     .ok_or_else(|| at(enclosing, format!("unknown {axis} group: @{name}")))?;
                 let gpos = parsed.lines.pos(g.span().start);
+                // A blessing-class group is a subject predicate, not a member list: emit a
+                // synthesized `Blessing` leaf and don't recurse (it has no members).
+                if let Some(class) = &g.get_ref().blessing {
+                    leaf(&Token::Blessing(class.clone()), gpos)?;
+                    continue;
+                }
                 stack.push(name.clone());
                 expand_axis(
-                    &g.get_ref().classified(),
+                    &g.get_ref().members,
                     groups,
                     axis,
                     parsed,
@@ -364,5 +434,139 @@ mod tests {
             r.rules[0].subjects,
             vec![SubjectSpec::Exe(PathBuf::from("/usr/bin/ssh"))]
         );
+    }
+
+    // ---- blessing (DESIGN §16.3 / PLAN-bless B1c) ----
+
+    /// A subject group with `blessing = "…"` is a class declaration: `@<group>` in `who`
+    /// resolves to a blessing predicate (not an exe), and the class is collected.
+    #[test]
+    fn blessing_group_resolves_to_predicate() {
+        let text = r#"
+            [group.subject.blessed-ro]
+            blessing = "ro"
+            [[rule]]
+            who = "@blessed-ro"
+            where = "/x"
+            action = "read"
+            policy = "allow"
+        "#;
+        let r = resolve_text(text).unwrap();
+        assert_eq!(
+            r.rules[0].subjects,
+            vec![SubjectSpec::Blessed(ClassName::new("ro"))]
+        );
+        assert_eq!(r.blessing_classes, vec![ClassName::new("ro")]);
+    }
+
+    /// A blessing class may be declared without any rule referencing it — it still appears
+    /// in the registry (it grants nothing until a rule names it).
+    #[test]
+    fn declared_class_without_a_rule_is_collected() {
+        let text = r#"
+            [group.subject.blessed-rw]
+            blessing = "rw"
+            [[rule]]
+            who = "*"
+            where = "/x"
+            action = "read"
+            policy = "deny"
+        "#;
+        let r = resolve_text(text).unwrap();
+        assert_eq!(r.rules[0].subjects, vec![SubjectSpec::Any]);
+        assert_eq!(r.blessing_classes, vec![ClassName::new("rw")]);
+    }
+
+    /// Two declarations of the same class collapse to one; distinct classes are sorted.
+    #[test]
+    fn declared_classes_dedup_and_sort() {
+        let text = r#"
+            [group.subject.a]
+            blessing = "rw"
+            [group.subject.b]
+            blessing = "ro"
+            [group.subject.c]
+            blessing = "rw"
+            [[rule]]
+            who = "@a"
+            where = "/x"
+            action = "read"
+            policy = "allow"
+        "#;
+        let r = resolve_text(text).unwrap();
+        assert_eq!(
+            r.blessing_classes,
+            vec![ClassName::new("ro"), ClassName::new("rw")]
+        );
+    }
+
+    /// `blessing` is a subject predicate — placing it on an object group is rejected.
+    #[test]
+    fn rejects_blessing_on_object_group() {
+        let text = r#"
+            [group.object.bad]
+            blessing = "ro"
+            [[rule]]
+            who = "*"
+            where = "@bad"
+            action = "read"
+            policy = "allow"
+        "#;
+        let err = format!("{}", resolve_text(text).unwrap_err());
+        assert!(err.contains("only valid on a subject group"), "got: {err}");
+    }
+
+    /// …and on an action group.
+    #[test]
+    fn rejects_blessing_on_action_group() {
+        let text = r#"
+            [group.action.bad]
+            blessing = "ro"
+            [[rule]]
+            who = "*"
+            where = "/x"
+            action = "@bad"
+            policy = "allow"
+        "#;
+        let err = format!("{}", resolve_text(text).unwrap_err());
+        assert!(err.contains("only valid on a subject group"), "got: {err}");
+    }
+
+    /// A blessing group can't also carry `members` — it declares only the class.
+    #[test]
+    fn rejects_blessing_mixed_with_members() {
+        let text = r#"
+            [group.subject.bad]
+            blessing = "ro"
+            members = ["/usr/bin/cat"]
+            [[rule]]
+            who = "@bad"
+            where = "/x"
+            action = "read"
+            policy = "allow"
+        "#;
+        let err = format!("{}", resolve_text(text).unwrap_err());
+        assert!(
+            err.contains("mixes a `blessing` predicate with `members`"),
+            "got: {err}"
+        );
+    }
+
+    /// A blessing group lives in the **subject** namespace, so referencing it from `where`
+    /// (the object axis) can't reach it — namespace separation rejects the misuse as an
+    /// unknown object group, the same way any cross-namespace `@ref` is caught.
+    #[test]
+    fn blessing_group_cannot_appear_in_where() {
+        let text = r#"
+            [group.subject.b]
+            blessing = "ro"
+            [[rule]]
+            who = "*"
+            where = "@b"
+            action = "read"
+            policy = "allow"
+        "#;
+        let err = format!("{}", resolve_text(text).unwrap_err());
+        assert!(err.contains("unknown object group: @b"), "got: {err}");
     }
 }
