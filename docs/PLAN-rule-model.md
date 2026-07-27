@@ -20,9 +20,32 @@ Guiding constraints (from §15):
 
 The milestones are sequenced so each is shippable and VM-validated on its own.
 
+## Order of work (set 2026-07-28)
+
+Numbering is identity, not schedule. The queue:
+
+1. **Known bugs** — the root-writable `/tmp` self-test probe below (*Carried-over notes*) is a
+   local escalation that can switch the boundary off; it is small and it goes first.
+2. **Docs** — keep DESIGN/STATUS/plan in step with what ships, since these files are the
+   resume point.
+3. **Finish M3** — `inode_mkdir`, `bprm_check_security`, and verifying `RENAME_EXCHANGE`. The
+   hard part (the four mutation hooks) already ships; this closes the set.
+4. **M5**, then **M6** — the two must-haves. M5 is small and bounded and removes a
+   fail-**open**; M6 is the largest known hole and the longest job, so it goes last of the
+   two and starts with its userspace-only tasks.
+
+**M2 and M4 are not scheduled on their own.** M6 pulls in the parts it needs — M2's
+`unsandboxed` predicate *is* M6 enforcement point (3), and M4's learning machinery is how code
+sets get built (M6 task 6) — so those land as M6 tasks. The rest of M2/M4 is opportunistic.
+Blessing's B3/B4 are deferred behind all of this; see [`PLAN-bless.md`](PLAN-bless.md).
+
+*Why this order:* soundness before ergonomics. M5 and M6 are the two ways the boundary is
+currently unsound — it stops enforcing when the daemon dies, and a grant can be hijacked by
+`LD_PRELOAD` — and no ergonomic win is worth having on top of either.
+
 ---
 
-## Milestone 2 — Subject predicates beyond exe
+## Milestone 2 — Subject predicates beyond exe ← **not scheduled; M6 takes what it needs**
 - Add `uid`/`gid`, `cgroup` matching to `SubjectMatch` + kernel checks (cheap helpers).
 - **IMA/fsverity** content identity: match via `bpf_ima_inode_hash`/`bpf_ima_file_hash`
   (needs `CONFIG_IMA`/policy); userspace records expected hashes. Survives upgrades, resists
@@ -83,7 +106,7 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
 > the policy as a whole — keep `exe`-only the default and opt into argv/ancestor where a
 > dir's opener is an interpreter.
 
-## Milestone 3 — Mutation + exec hooks
+## Milestone 3 — Mutation + exec hooks ← **finish this first (after the bugs)**
 - **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir` — the
   second-name escape, clobber, and destroy. Design + rationale in DESIGN §15.5.
 - Left: `inode_mkdir` and `bprm_check_security` (the `execute` action).
@@ -100,7 +123,7 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
   protected side moving *out* still wants the unconditional escape refusal — which depends on
   the kernel calling the hook a second time with the pair swapped. Believed, not verified.
 
-## Milestone 4 — Autolearn (the zones layer)
+## Milestone 4 — Autolearn (the zones layer) ← **not scheduled; its machinery lands as M6 task 6**
 - Separate `learned.db` (SQLite); `zones` config = where learning may propose rules.
 - `cordon learn [--for ZONE] [--ttl T]` (bounded window) → ring events become candidate
   rules; **generalize** (per-file → subtree), **confidence** (seen N), **dedup**; record the
@@ -108,7 +131,11 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
 - `cordon learn review` → diff of proposals → `promote` writes them into the text policy.
 - Learned rules are **lower precedence** and never override a hand-written deny.
 
-## Milestone 5 — Fail-safe pinning (orthogonal, already parked)
+## Milestone 5 — Fail-safe pinning ← **must-have, after M3**
+
+> No longer parked. Until it ships, enforcement fails **open** the moment the daemon dies —
+> which makes every other guarantee in this document conditional on a process staying alive.
+
 - Pin program + maps + link to bpffs so the compiled policy keeps enforcing across daemon
   restarts; adopt-existing-pins on startup; explicit teardown. (DESIGN §4.)
 - **Singleton guard (required with pinning).** Today two daemons can't corrupt the rule
@@ -120,7 +147,7 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
 
 ---
 
-## Milestone 6 — Fixed code as the precondition for a grant
+## Milestone 6 — Fixed code as the precondition for a grant ← **must-have, after M5**
 
 > **The invariant.** A grant attaches only to a process that runs *the code it shipped with*.
 > A process that executes foreign code **in its own address space** — a JIT, an interpreter
@@ -521,7 +548,8 @@ cookie-DB measurement, not on any of the above.
 
 ## Carried-over notes (still live)
 Loose ends left by shipped work, none of them a milestone of their own:
-- **The self-test probe is a root-writable `/tmp` path (security bug, small fix).**
+- **The self-test probe is a root-writable `/tmp` path (security bug, small fix).** ← **first
+  in the queue** — it is the one item here that is a live escalation rather than a rough edge.
   `self_test` builds `$TMPDIR/cordon-selftest.<pid>` and now seeds a file inside it with
   `std::fs::write`, which is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW` — and
   `create_dir_all` accepts a pre-existing directory of any owner. `cordond` is uid 0 and no

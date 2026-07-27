@@ -755,7 +755,7 @@ The flat **rule model** — `(who, where, action, policy)`, in the SELinux/AppAr
 — is cordon's architecture, **shipped in M1**. It subsumes the v1 owner model's owners,
 explicit rules, and TOFU (§5) into one concept, enforced uniformly in-kernel. This section
 is the design; milestone-by-milestone status is in
-[`PLAN-rule-model.md`](PLAN-rule-model.md) (M1 done; M2–M5 ahead).
+[`PLAN-rule-model.md`](PLAN-rule-model.md) (M1 done, M3 partly; M5 and M6 are the must-haves).
 
 ### 15.1 Why
 The owner entity is reducible to allow-rules: `owner_match` ≡ "an allow rule exists for
@@ -1103,7 +1103,7 @@ reconstructs the opened file's path by walking `d_name` (no `bpf_d_path` at `fil
 and the suppressor keys on the opened file, so each leaf surfaces with its real `path=` —
 the same mechanism M4 autolearn needs to collapse per-file opens into a subtree rule.*
 
-### 15.11 Phasing (M1–M5; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
+### 15.11 Phasing (M1–M6; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
 1. **Rule core** — **done.** Text policy + compiler (groups/precedence resolved in
    userspace) → flat maps; open-time read/write/create via `f_flags`/`f_mode`; the per-rule
    `policy` the only enforcement level (no global mode — `audit` observes, `deny` enforces);
@@ -1114,15 +1114,25 @@ the same mechanism M4 autolearn needs to collapse per-file opens into a subtree 
 3. **Mutation + exec hooks** — unlink/mkdir/rmdir/rename + `bprm_check_security` as a
    second program (closes the rename-out-of-zone bypass).
 4. **Autolearn** (separate sqlite db) + review/promote, scoped to zones.
-5. **Fail-safe pinning** (orthogonal, already parked) so the compiled policy keeps
-   enforcing across daemon restarts (must ship with a singleton guard — see the plan).
+5. **Fail-safe pinning** so the compiled policy keeps enforcing across daemon restarts —
+   until it ships, enforcement fails **open** on daemon exit (must ship with a singleton
+   guard — see the plan).
+6. **Fixed code as the precondition for a grant** — `exe` is `mm->exe_file`, the file that
+   was exec'd, not the code that runs, so `LD_PRELOAD` hijacks any static `allow`. A sticky
+   load-time taint plus an attestation lint make the subject `exe AND untainted`. The largest
+   known hole; full design in the plan.
+
+Numbering is identity, not schedule: the working order is **bugs → finish 3 → 5 → 6**, with 2
+and 4 contributing the pieces 6 needs rather than shipping on their own.
 
 ## 16. Blessing — runtime, authenticated access grants
 
-**Status: B1 implemented (2026-07-26), sudo-gated.** The predicate, carrier, daemon verbs
-and CLI ship and are VM-validated; the authenticator is **sudo**, not PAM-in-the-daemon
+**Status: B1 + B2 implemented (2026-07-27), sudo-gated.** The predicate, carrier, daemon verbs
+and CLI ship and are VM-validated, and B2 made the CLI unprivileged (the `cgroup.procs`
+hand-off over `SCM_RIGHTS`); the authenticator is **sudo**, not PAM-in-the-daemon
 (§16.5 — the substitution is confined to *how the human proves presence*; everything else
-below is as specified). Milestones in [`PLAN-bless.md`](PLAN-bless.md).
+below is as specified). The remaining milestones (B3, B4) are **deferred behind the core** —
+see [`PLAN-bless.md`](PLAN-bless.md).
 
 ### 16.1 The gap it fills
 The rule model (§15) keys the subject on `exe` (plus the §15.4 predicates). That is exactly
