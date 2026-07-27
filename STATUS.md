@@ -163,6 +163,17 @@ Environment, cwd, tty, job control and session are inherited by construction.
   object and the *real* dentry chain. Overlayfs hands `security_file_open` the underlying
   dentry, so no `sb_mount` gating is needed. Do not re-derive this from first principles; the
   `f_path`-is-the-overlay-path argument predicts the opposite and is wrong here.
+- **Browsers really do separate the JS from the secrets** (measured 2026-07-27 on
+  7.1.5-zen1-1-zen; Firefox 153.0, Chrome 150.0.7871.46 headless). Firefox is clean: the
+  parent holds `cookies.sqlite`/`key4.db`/`formhistory`/`places` and **no** content process
+  holds any of them, with all 18 at `Seccomp 2` in a namespace each. Chrome splits the loot —
+  `Login Data`/`Web Data` in the browser process, **`Cookies` in the network service** — and
+  that service is only on the right side of an `unsandboxed` test because Linux runs it
+  `--service-sandbox-type=none`; it is sandboxed on Windows/macOS, so this can break. Every
+  web-JS process is excluded in both, by both signals. Use the conjunction
+  `Seccomp == 0 && ns/user == init`: Chrome's renderer zygotes are `Seccomp 0` in the
+  *sandboxed* namespace, so either signal alone lets them through. Details and the caveats in
+  [PLAN-rule-model](docs/PLAN-rule-model.md) M2.
 - **BPF passes at most five arguments in registers**, with no call stack for the rest, so a
   wider fn must be `#[inline(always)]` or it fails to *link* ("stack arguments are not
   supported"). And inlining is not merely a linkage workaround: outlining `emit` added a

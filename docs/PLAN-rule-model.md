@@ -40,9 +40,40 @@ The milestones are sequenced so each is shippable and VM-validated on its own.
   and `cred->user_ns != &init_user_ns` (Chrome's layer-1 namespace sandbox). Two derefs,
   BTF-resolved like the existing `file → inode → sb` chain, one more `SubjectFlags` bit —
   §15.4 notes a fifth predicate bit extends matching and specificity for free. Strictly
-  fail-safe: it only ever *narrows* an `exe` grant, so an attacker who declines to sandbox
-  themselves still fails the `exe` check. **Measure which process opens the cookie DB first**
-  — see M6 *Honest limits*.
+  fail-safe against an *attacker*: it only ever narrows an `exe` grant, so someone who
+  declines to sandbox themselves still fails the `exe` check.
+
+  **Measured 2026-07-27** (7.1.5-zen1-1-zen, Firefox 153.0, Chrome 150.0.7871.46, Chrome
+  headless), by holding the profile's DBs and reading `/proc/PID/{status,ns/user}`:
+
+  | | holds the secrets | `Seccomp` | `ns/user` |
+  |---|---|---|---|
+  | firefox parent | `cookies.sqlite`, `key4.db`, `formhistory`, `places` | 0 | init |
+  | firefox fork server (`-contentproc`) | — | 0 | init |
+  | firefox content ×18 | — | 2 | **one namespace each** |
+  | chrome browser | `Login Data`, `Web Data` | 0 | init |
+  | chrome `network.mojom.NetworkService` | **`Cookies`** | 0 | init |
+  | chrome `storage.mojom.StorageService` | — | 2 | sandboxed |
+  | chrome renderers ×4 | — | 2 | sandboxed (shared) |
+  | chrome gpu-process, zygote (`--no-zygote-sandbox`) | — | 0 | init |
+  | chrome renderer zygotes | — | 0 | sandboxed |
+
+  Four conclusions, and only the first is the security property:
+
+  1. **Every process that runs web JS is excluded, in both browsers, by both signals
+     independently.** That is what the predicate is for and it holds.
+  2. **It is a superset, not an identification.** Chrome's GPU process and outer zygote are
+     also unsandboxed. They run no web content so this is not a failure, but do not write
+     "the predicate identifies the process holding the grant" — it doesn't.
+  3. **Require the conjunction, `Seccomp == 0 && ns/user == init`.** The signals are not
+     redundant: Chrome's renderer zygotes are `Seccomp 0` in the *sandboxed* namespace, and
+     only the AND excludes them.
+  4. **Chrome's cookies work by luck.** They are held by the network service, which on Linux
+     runs `--service-sandbox-type=none`; Chrome already sandboxes it on Windows and macOS.
+     If `NetworkServiceSandbox` lands on Linux this predicate stops Chrome reading its own
+     cookies — a false positive that **breaks the browser**, which is a worse failure mode
+     than the taint's (a password prompt). Needs a version check and a documented fallback
+     before this ships enforcing. Re-measure headful too; the GPU row may differ.
 - Compiler + TOML extended to author predicate conjunctions (Appendix A shows the object form).
 
 > *Audit signal:* this is **targeted, not universal**. In the first run almost every opener
@@ -425,14 +456,15 @@ file_open(~/.ssh/id_ed25519)
 - **Browsers are where the JIT taint genuinely bites**, because unlike an interpreter a
   browser has a stable identity and a legitimate need for its own profile directory (the
   cookie DB is the single highest-value scraper target on a desktop). Enforcement point (3)
-  is the answer: the grant attaches to the unsandboxed browser/parent process, and the
-  JIT-running renderers are excluded by one-way sandbox state they cannot shed. The subject
-  group is then `code = "arbitrary"` for the renderer side and the sandbox predicate carries
-  the separation — **which process actually opens the cookie DB must be measured, not
-  derived**; modern Chrome moved cookie handling into a sandboxed network-service utility
-  process, which would put it on the wrong side of the predicate. Audit the profile directory
-  and read the argv off the events before designing against a guess (§15.10, and the same
-  discipline the overlayfs finding earned).
+  is the answer: the grant attaches to the unsandboxed side, and the JIT-running renderers
+  are excluded by one-way sandbox state they cannot shed. **Measured, not assumed** — the
+  table under M2's `unsandboxed` bullet has the numbers. The guess this replaces was that
+  Chrome's cookie DB had moved to a *sandboxed* network service and would land on the wrong
+  side of the predicate; it has indeed moved there, but on Linux that service runs
+  unsandboxed, so it lands on the right side by luck rather than by design. That is the
+  fragile part of the whole enforcement point, and it is Chrome-specific: Firefox's split is
+  clean, with the parent holding every secret DB and all 18 content processes seccomped into
+  their own namespaces.
 - **ROP** maps nothing and loads nothing — it chains fragments of already-mapped, already
   legitimate code — so no hook fires and the process stays untainted. The defences are
   compiler- and CPU-level (CFI, shadow stacks / Intel CET), not LSM-level.
