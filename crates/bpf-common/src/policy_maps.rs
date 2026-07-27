@@ -173,7 +173,7 @@ bitflags! {
     /// `action = ["read","write"]` is a single [`CompiledRule`]; the kernel matches
     /// when the requested action's bit is set (`intersects`). `READ`/`WRITE`/`CREATE`
     /// are derivable at `file_open` from `f_mode`/`f_flags`; `LINK`/`RENAME`/`UNLINK`/
-    /// `RMDIR` fire at the mutation hooks (§15.5). `EXECUTE`/`LISTDIR`/`MKDIR` still
+    /// `RMDIR`/`MKDIR` fire at the mutation hooks (§15.5). `EXECUTE`/`LISTDIR` still
     /// compile but don't fire — their hooks haven't landed.
     ///
     /// `#[repr(transparent)]` is load-bearing: it's read byte-for-byte out of the

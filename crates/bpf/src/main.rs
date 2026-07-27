@@ -176,6 +176,12 @@ pub fn inode_rmdir(ctx: LsmContext) -> i32 {
     clamped(decide_remove(kernel::Dentry::from_arg(&ctx, 1), Action::RMDIR))
 }
 
+/// `inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)`
+#[lsm(hook = "inode_mkdir")]
+pub fn inode_mkdir(ctx: LsmContext) -> i32 {
+    clamped(decide_create(kernel::Dentry::from_arg(&ctx, 1), Action::MKDIR))
+}
+
 /// Settings + the daemon's own-I/O fast path. `None` ⇒ the caller allows: either we can't
 /// read settings (fail open) or this *is* the daemon (never deadlock on its own I/O).
 fn live_bank(pid: Pid) -> Option<Bank> {
@@ -270,6 +276,27 @@ fn decide_remove(dentry: kernel::Dentry, op: Action) -> Option<Verdict> {
         return Some(Verdict::Allow);
     };
     consult(&matched, Action::WRITE, op, pid, bank)
+}
+
+/// `inode_mkdir`: a new directory name is appearing inside a (possibly protected) parent.
+///
+/// The dentry is **negative** — no inode exists yet — so `find_object` on it would miss on
+/// the first step of the walk. The object comes from the parent instead, exactly as the
+/// clobber arm of [`decide_reparent`] takes `new_dentry.parent()`. Adding a name inside an
+/// object is an ordinary create/write on it: the subject's verdict, honouring `audit`.
+///
+/// Gated for symmetry with `inode_rmdir`. Removing a directory inside the object is a write;
+/// adding one is too, and leaving it ungated lets a subject that may not touch the object
+/// grow structure inside it. Note this is *not* the `rm -rf ~/.ssh && mkdir ~/.ssh` case —
+/// that one is closed by `inode_rmdir` refusing the removal, since after the object's own
+/// directory is gone there is no protected ancestor left for this hook to find.
+fn decide_create(dentry: kernel::Dentry, op: Action) -> Option<Verdict> {
+    let pid = kernel::current_pid();
+    let bank = live_bank(pid)?;
+    let Some(matched) = find_object(dentry.parent()?, bank) else {
+        return Some(Verdict::Allow);
+    };
+    consult(&matched, Action::CREATE | Action::WRITE, op, pid, bank)
 }
 
 /// Refuse an escape, and journal it best-effort. The verdict deliberately does **not**

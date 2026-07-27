@@ -1630,6 +1630,39 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- scenario: inode_mkdir ---------------------------------------------------
+# `rmdir` was gated and `mkdir` was not, so a subject that could not remove a directory
+# inside an object could still add one. The new dentry is negative, so the verdict comes
+# from the *parent* — which is what this checks, on both polarities, in one policy.
+scenario_mkdir() {
+    echo "### scenario: mkdir inside a protected object takes the parent's verdict"
+    ws_new
+    mkdir -p "$VAULT/locked"
+    write_policy <<EOF
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = ["read", "write", "create"]
+policy = "allow"
+[[rule]]
+who = "*"
+where = "$VAULT/locked"
+action = "*"
+policy = "deny"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # A writable object must keep working — this hook must not break legitimate structure.
+    expect_allow "mkdir inside an object that allows create/write" \
+        mkdir "$VAULT/allowed" || fail=1
+    # The gap this hook closes: nested, more specific, denying.
+    expect_deny "mkdir inside a denying nested object" \
+        mkdir "$VAULT/locked/evil" || fail=1
+    [ -d "$VAULT/locked/evil" ] && { echo "  FAIL: the directory was created anyway"; fail=1; } \
+        || echo "  OK: no directory appeared under the denied object"
+    daemon_stop; return $fail
+}
+
 # Swap two names via `renameat2(RENAME_EXCHANGE)`. Exits non-zero when the kernel refuses,
 # and 3 when the syscall is unavailable — which the scenario's preflight separates from a
 # deny, since "the helper is broken" and "the boundary refused" both look like failure.
@@ -1698,6 +1731,7 @@ scenario_selftest_negative || rc=1
 scenario_per_action        || rc=1
 scenario_rename_over       || rc=1
 scenario_rename_exchange   || rc=1
+scenario_mkdir             || rc=1
 scenario_subject_group     || rc=1
 scenario_object_group      || rc=1
 scenario_deny_wins         || rc=1

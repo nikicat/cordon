@@ -42,7 +42,9 @@ readable by everything, permanently and unlogged. The **escape** (a protected in
 name outside its object) is refused unconditionally, with no rule lookup and no blessing
 exemption; **clobber** and **destroy** are ordinary writes and take the subject's verdict, so
 `audit` objects keep working. An internal rename short-circuits, which is what keeps
-atomic-save alive inside a protected dir. All five programs share `find_object`, so entry is
+atomic-save alive inside a protected dir. `inode_mkdir` joins them by classifying off the
+*parent*, since a to-be-created dentry is negative and matches nothing itself. Every mutation
+program shares `find_object`, so entry is
 a dentry rather than a `struct file`. A rename **over** an existing name is a fourth case,
 classified off the destination *dentry* rather than its directory: it destroys that inode and
 `inode_rename` is the only hook the kernel fires for it, so without it `mv anything secret`
@@ -91,10 +93,11 @@ the core boundary is what the remaining holes are in. The rule: *soundness befor
 
 ### First — finish M3
 
-- **M3 completion** — `inode_mkdir` and `bprm_check_security` (the `execute` action) are the
-  two hooks still missing, and `listdir` ≈ "open dir for read" needs its coarseness
-  documented. The four mutation hooks that ship (§15.5) carry the hard part, and
-  `RENAME_EXCHANGE` is now **verified** rather than believed (see *Durable kernel facts*).
+- **M3 completion** — `bprm_check_security` (the `execute` action) is the one hook still
+  missing, and it is the first to need a **new BTF offset** (`linux_binprm -> file`); every
+  hook so far is handed a dentry the existing offsets already cover. `listdir` ≈ "open dir for
+  read" still needs its coarseness documented. `inode_mkdir` now ships, and
+  `RENAME_EXCHANGE` is **verified** rather than believed (see *Durable kernel facts*).
 
 ### Next — the must-haves
 

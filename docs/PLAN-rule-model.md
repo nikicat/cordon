@@ -111,7 +111,17 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
 ## Milestone 3 — Mutation + exec hooks ← **finish this first (after the bugs)**
 - **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir` — the
   second-name escape, clobber, and destroy. Design + rationale in DESIGN §15.5.
-- Left: `inode_mkdir` and `bprm_check_security` (the `execute` action).
+- **Done (2026-07-28): `inode_mkdir`.** `rmdir` was gated and `mkdir` was not, so a subject
+  that could not remove a directory inside an object could still add one. The new dentry is
+  **negative**, so `find_object` on it misses on the first step and the verdict comes from the
+  *parent* — the same shape as the clobber arm of `decide_reparent`. It is an ordinary
+  create/write on the parent object, so `audit` still observes rather than blocks. This is not
+  the `rm -rf ~/.ssh && mkdir ~/.ssh` case: that one is closed by `inode_rmdir` refusing the
+  removal, since once the object's own directory is gone there is no protected ancestor left
+  for this hook to find.
+- Left: `bprm_check_security` (the `execute` action). Needs a new BTF offset
+  (`linux_binprm -> file`), unlike every hook so far — the mutation hooks all hand over a
+  dentry the existing offsets already cover.
 - `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
   stays opt-in for cost.
 - **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and
