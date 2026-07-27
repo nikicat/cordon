@@ -518,6 +518,12 @@ fn valid_class_dirname(class: &str) -> bool {
 
 /// The daemon's own cgroup directory — the carrier root. From the unified-hierarchy
 /// (`0::`) line of `/proc/self/cgroup`, joined under the standard cgroup2 mount.
+// ponytail: this and `usable_session_scope` both do "read /proc/<pid>/cgroup, take the
+// 0:: line, resolve it against the mount" and diverge only in whose pid and what happens
+// next. Worth one `cgroup_of(pid) -> Result<CgroupPath>` — and `CgroupPath` (or at least a
+// newtype for the raw listing `text`) would stop the `&str` that is really a multi-line
+// /proc file from looking like any other string. Left alone until a third caller shows
+// which shape the seam wants; see STATUS "Deferred refactors".
 fn carrier_root() -> Result<PathBuf> {
     let text = std::fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| Error::msg(format!("/proc/self/cgroup: {e}")))?;

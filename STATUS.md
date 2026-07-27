@@ -280,6 +280,22 @@ and it **relaxes** the gate rather than tightening it.
 (Authoring flow A was renamed observe → **admit** → enforce to reserve "bless" for this; the
 §8.1 threat-model "blessed binary" is unrelated generic usage.)
 
+## Deferred refactors (no behaviour change; do when next in the area)
+- **`carrier_root` / `usable_session_scope` share a shape** (`crates/daemon/src/backend/
+  bpf_lsm/bless.rs`): both read `/proc/<pid>/cgroup`, take the `0::` line and resolve it
+  against the cgroup mount, differing only in whose pid and what they do next. Unify behind
+  one `cgroup_of(pid)`. While there, consider a **domain type for the raw listing** — the
+  `text` threaded through `cgroup_v2_path`/`resolve_placement` is a multi-line `/proc` file
+  masquerading as a `&str`, and a `CgroupListing`/`CgroupPath` pair would make the parse
+  boundary explicit (the tree already prefers this: `SocketPath`, `CarrierProcs`, `Nonce`,
+  `Uid`). Marked in-situ with a `ponytail:` comment.
+- **`PathBuf` → `Box<Path>` where the value is never mutated after construction.** Most
+  stored paths here (`Blessing::dir`, `Ctx::socket`, `Config::policy`, the `Found`/`Scaffold`
+  fields) are built once and only read; `Box<Path>` says that in the type and drops the
+  spare capacity word. Worth doing wholesale rather than piecemeal, since a half-converted
+  API is worse than either end state — and worth measuring nothing, since the point is
+  intent rather than bytes.
+
 ## Pre-rule-model history (retired)
 Phases 0–3 built an **owner model** — explicit rules + TOFU creator-owns, a root-owned
 SQLite store, and a privilege-agnostic core — on two enforcement backends: a root
