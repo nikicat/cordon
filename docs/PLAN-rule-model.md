@@ -119,9 +119,38 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
   the `rm -rf ~/.ssh && mkdir ~/.ssh` case: that one is closed by `inode_rmdir` refusing the
   removal, since once the object's own directory is gone there is no protected ancestor left
   for this hook to find.
-- Left: `bprm_check_security` (the `execute` action). Needs a new BTF offset
-  (`linux_binprm -> file`), unlike every hook so far — the mutation hooks all hand over a
-  dentry the existing offsets already cover.
+- **Done (2026-07-28): `bprm_check_security`** — the `execute` action, and the first hook to
+  need a new BTF offset (`linux_binprm -> file`); every other hook is handed a dentry the
+  existing offsets already cover. Since that offset is applied to the hook's **trusted**
+  context pointer, it must stay *real* under `maybe_poison_offsets` — the verifier
+  range-checks trusted-pointer math against `.rodata` at load, so poisoning it would turn the
+  failure-path test into a load failure.
+  - **`execute` is not implied by `read`.** The exec open is an ordinary `file_open`
+    (`FMODE_EXEC | FMODE_READ`), so an object denying reads already refuses to run its
+    contents; this hook adds the converse — readable but not runnable.
+  - Expressing that needs an explicit `deny`, not a narrower `allow`: copy-down puts the
+    parent's rules in the child's bucket too, so a child rule that does not *match the
+    action* falls through to them. The smoke scenario is built that way.
+  - The self-test needs a **second object** for it. Under the deny-all probe rule the exec
+    *open* is refused by `file_open` and the verdict never reaches this hook, so the probe
+    would pass with the hook detached; the exec probe therefore gets its own object that
+    allows `read` and denies the rest. Its file also needs the x bit, or `may_open(MAY_EXEC)`
+    fails with `EACCES` first.
+- **Done (2026-07-28): the `listdir` limitation is documented** (DESIGN §15.5) — and it is
+  sharper than "coarse". There is no per-`getdents` hook, so listing *is* `file_open` on the
+  directory, and `requested_action` derives only `read`/`write`/`create`: **nothing ever
+  requests `listdir`**, so a rule naming it alone matches no request and the open falls to
+  default-deny. `allow @tools listdir @secrets` therefore *denies* the listing it appears to
+  grant. It fails closed, so this is a usability trap rather than a hole, and the shipped
+  example policies now carry the caution. Making it fire means tagging the request when the
+  opened inode is a directory (`i_mode & S_IFMT`) — one more BTF offset, deliberately not
+  taken, since `read` covers the case correctly today.
+  - Worth considering next: a `cordon policy check` warning on a rule whose action set names
+    `listdir` without `read`. Cheap, userspace-only, and it turns a silent surprise into a
+    lint. Not done here — it is a CLI behaviour change rather than an M3 hook.
+
+**M3 is complete**: every hook in the action↔hook map now fires except `listdir`, which is
+specified above as having no hook by design.
 - `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
   stays opt-in for cost.
 - **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and

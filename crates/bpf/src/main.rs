@@ -182,6 +182,12 @@ pub fn inode_mkdir(ctx: LsmContext) -> i32 {
     clamped(decide_create(kernel::Dentry::from_arg(&ctx, 1), Action::MKDIR))
 }
 
+/// `bprm_check_security(struct linux_binprm *bprm)`
+#[lsm(hook = "bprm_check_security")]
+pub fn bprm_check_security(ctx: LsmContext) -> i32 {
+    clamped(decide_exec(&ctx))
+}
+
 /// Settings + the daemon's own-I/O fast path. `None` ⇒ the caller allows: either we can't
 /// read settings (fail open) or this *is* the daemon (never deadlock on its own I/O).
 fn live_bank(pid: Pid) -> Option<Bank> {
@@ -276,6 +282,26 @@ fn decide_remove(dentry: kernel::Dentry, op: Action) -> Option<Verdict> {
         return Some(Verdict::Allow);
     };
     consult(&matched, Action::WRITE, op, pid, bank)
+}
+
+/// `bprm_check_security`: a binary inside a protected object is being executed. The subject
+/// is the process *performing* the exec — at this hook the caller is still its old image, so
+/// `caller_exe()` names who is launching, not what is being launched.
+///
+/// **`execute` is a distinct capability, not implied by `read`.** The exec open itself
+/// already passes through `file_open` (it is a real open, with `FMODE_EXEC | FMODE_READ`),
+/// so an object that denies reads already refuses to run its contents. What this hook adds
+/// is the *converse*: an object may be readable and still not runnable. Which means a rule
+/// granting only `read` no longer lets a subject execute the object's contents — that now
+/// falls to default-deny, and a policy that wants both must say `["read", "execute"]`.
+fn decide_exec(ctx: &LsmContext) -> Option<Verdict> {
+    let pid = kernel::current_pid();
+    let bank = live_bank(pid)?;
+    let dentry = kernel::Binprm::from_arg(ctx, 0).file()?.dentry()?;
+    let Some(matched) = find_object(dentry, bank) else {
+        return Some(Verdict::Allow);
+    };
+    consult(&matched, Action::EXECUTE, Action::EXECUTE, pid, bank)
 }
 
 /// `inode_mkdir`: a new directory name is appearing inside a (possibly protected) parent.

@@ -173,8 +173,8 @@ bitflags! {
     /// `action = ["read","write"]` is a single [`CompiledRule`]; the kernel matches
     /// when the requested action's bit is set (`intersects`). `READ`/`WRITE`/`CREATE`
     /// are derivable at `file_open` from `f_mode`/`f_flags`; `LINK`/`RENAME`/`UNLINK`/
-    /// `RMDIR`/`MKDIR` fire at the mutation hooks (§15.5). `EXECUTE`/`LISTDIR` still
-    /// compile but don't fire — their hooks haven't landed.
+    /// `RMDIR`/`MKDIR` fire at the mutation hooks and `EXECUTE` at `bprm_check_security`
+    /// (§15.5). `LISTDIR` still compiles but doesn't fire — its hook hasn't landed.
     ///
     /// `#[repr(transparent)]` is load-bearing: it's read byte-for-byte out of the
     /// `RULES` map inside [`CompiledRule`] (`repr(C)`), so the ABI must be exactly the

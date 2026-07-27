@@ -115,6 +115,7 @@ impl KernelBtf {
             sb_s_dev: m("super_block", &["s_dev"])?,
             task_mm: m("task_struct", &["mm"])?,
             mm_exe_file: m("mm_struct", &["exe_file"])?,
+            binprm_file: m("linux_binprm", &["file"])?,
         })
     }
 

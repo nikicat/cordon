@@ -57,6 +57,11 @@ pub struct Offsets {
     pub task_mm: u32,
     /// `mm_struct -> exe_file`.
     pub mm_exe_file: u32,
+    /// `linux_binprm -> file` — the binary being exec'd, at `bprm_check_security`. The
+    /// only offset applied to that hook's trusted context pointer, so like `file_f_*` and
+    /// `dentry_d_*` it must stay **real** under poisoning (the verifier range-checks
+    /// trusted-pointer math against `.rodata` at *load*).
+    pub binprm_file: u32,
 }
 
 impl Offsets {
@@ -78,6 +83,7 @@ impl Offsets {
         sb_s_dev: u32::MAX,
         task_mm: u32::MAX,
         mm_exe_file: u32::MAX,
+        binprm_file: u32::MAX,
     };
 }
 

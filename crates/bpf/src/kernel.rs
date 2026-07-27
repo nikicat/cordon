@@ -109,6 +109,23 @@ impl File {
     }
 }
 
+/// A `struct linux_binprm *` — the exec in progress, at `bprm_check_security`.
+#[derive(Clone, Copy)]
+pub struct Binprm(*const u8);
+
+impl Binprm {
+    /// The nth pointer argument (arg 0 of `bprm_check_security` is the binprm).
+    pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Binprm {
+        Binprm(unsafe { ctx.arg(n) })
+    }
+    /// `bprm->file`: the binary about to be executed. Note this is the *file being
+    /// exec'd*, not the caller — the caller is still the old image at this hook, which is
+    /// what makes the subject the process performing the exec.
+    pub fn file(self) -> Option<File> {
+        Some(File(ptr_at(self.0, offset!(binprm_file))?))
+    }
+}
+
 /// A `struct dentry *`. `PartialEq` compares the pointer (a dentry that is its own
 /// parent is the mount root — the walk's stop condition).
 #[derive(Clone, Copy, PartialEq, Eq)]
