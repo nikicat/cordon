@@ -12,7 +12,8 @@ The architecture is the flat **rule model** (DESIGN §15): a root-owned text pol
 (DESIGN §16). The suite is 27 `bpf-lsm-smoke.sh` scenarios, green on the CI-pinned v6.12.
 The earlier owner model was retired in the migration — see *Pre-rule-model history* below.
 
-Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) (M2–M5 ahead) and
+Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) (M2, M4–M6 ahead; M3 is
+partly landed — the mutation hooks ship, `inode_mkdir`/`bprm_check_security` do not) and
 [docs/PLAN-bless.md](docs/PLAN-bless.md) (B3 next).
 
 ## What's implemented
@@ -33,6 +34,16 @@ and `deny` enforces it, per object — which is what makes the audit→admit→e
 from `f_mode`/`f_flags`, **first-match** scan of the packed `RULES` bucket, default-deny.
 Records carry the **actual opened path**, reconstructed by walking `d_name` up to the matched
 object (`bpf_d_path` is unavailable at `file_open`) through a per-CPU scratch map.
+
+**Sound directory objects** (`inode_link`/`inode_rename`/`inode_unlink`/`inode_rmdir`). A
+directory protects its children by *ancestry*, so a second name for a protected inode — a
+hardlink or a rename out — is an ancestry that avoids the object, and the file becomes
+readable by everything, permanently and unlogged. The **escape** (a protected inode taking a
+name outside its object) is refused unconditionally, with no rule lookup and no blessing
+exemption; **clobber** and **destroy** are ordinary writes and take the subject's verdict, so
+`audit` objects keep working. An internal rename short-circuits, which is what keeps
+atomic-save alive inside a protected dir. All five programs share `find_object`, so entry is
+a dentry rather than a `struct file`. DESIGN §15.5.
 
 **Volume control**, because tools re-open one config hundreds of times per run (helm: 464×
 `~/.kube/config`): an in-kernel LRU suppressor keyed by `(exe, ObjId, action, leaf)` emits at
@@ -86,7 +97,23 @@ Environment, cwd, tty, job control and session are inherited by construction.
 - **B4 — the enumerated-scope gap.** A blessing class's object scope must be listed, so it
   drifts against `@secrets`: every dir added to one must be added to the other or a blessed
   session hits a surprise denial. An "uncordoned" class is sketched in PLAN-bless B4.
-- **M2–M4** — subject predicates beyond exe, mutation/exec hooks, autolearn.
+- **M2–M4** — subject predicates beyond exe, the rest of the mutation/exec hooks
+  (`inode_mkdir`, `bprm_check_security`), autolearn.
+- **M6 — code identity as a subject predicate**, the `exe`-identity fix, and the largest
+  known hole. `exe` is `mm->exe_file`: what was exec'd, not what is running.
+  `LD_PRELOAD=evil.so ssh -V` runs attacker code with ssh's identity and inherits its
+  grants, so **every static `allow` is a confused-deputy grant**. No M2 predicate closes it,
+  IMA exe-hash least of all — the exe genuinely *is* ssh, unmodified. Nor can it be detected
+  at decision time: the attacker can launder the evidence, and `ptrace`/anonymous
+  `PROT_EXEC` touch no file at all. So it must be a sticky taint set at *load* time and read
+  as a predicate — the subject was never `exe`, it is `exe AND untainted`. The set is
+  **enumerated per subject, not inferred from provenance** (a legitimate root-owned library
+  preloaded into ssh defeats provenance) and **not derived statically** (`ldd` sees 17 libs;
+  the real set includes `libnss_*` chosen by `/etc/nsswitch.conf` at runtime). Full design,
+  policy surface, user flows and rejected alternatives in
+  [PLAN-rule-model](docs/PLAN-rule-model.md) M6. Until it ships the deployment answer is
+  `bless`: a per-invocation grant has no standing exe rule to inject into, so the lever is
+  the ratio of static `allow` rules to blessings.
 - Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
 ## Settled, do not redo
@@ -113,6 +140,21 @@ Environment, cwd, tty, job control and session are inherited by construction.
 - **logind is not needed to test carrier placement.** A session scope is a root-owned cgroup
   directory in the shape systemd makes, and everything under test is kernel mechanics; only
   "polkit is then satisfied" is host-only.
+- **Overlayfs does not bypass the ancestor walk** (measured 2026-07-27 on 7.1.4-zen, against
+  the live `deny` on `~/.npmrc`). An unprivileged `unshare -Urm` + overlay over `$HOME`, read
+  through the overlay, journaled `object=~/.config path=~/.config/dconf/user` — the *real*
+  object and the *real* dentry chain. Overlayfs hands `security_file_open` the underlying
+  dentry, so no `sb_mount` gating is needed. Do not re-derive this from first principles; the
+  `f_path`-is-the-overlay-path argument predicts the opposite and is wrong here.
+- **BPF passes at most five arguments in registers**, with no call stack for the rest, so a
+  wider fn must be `#[inline(always)]` or it fails to *link* ("stack arguments are not
+  supported"). And inlining is not merely a linkage workaround: outlining `emit` added a
+  fifth call frame and the v6.12 verifier rejected the whole object with `E2BIG` and a
+  `mark_precise: frame4` storm. `consult` sits exactly at the five-arg ceiling.
+- At the mutation hooks the **trusted context argument is a dentry**, not a `file`. The
+  verifier range-checks offsets applied to trusted pointers against `.rodata`, so the
+  `dentry_d_*` offsets must stay real in `maybe_poison_offsets` or the failure-path test
+  aborts at *load* instead of at the self-test.
 
 ## Pre-rule-model history (retired)
 

@@ -680,7 +680,7 @@ One model, now enforced uniformly.
 - **where** — object: a file, directory, or **subtree** (recursive). Matched in-kernel
   by the dentry ancestor walk (most-specific wins).
 - **action** — `read | write | create | execute | listdir | unlink | mkdir | rmdir |
-  rename` (extensible). Each maps to an LSM hook (§15.5).
+  rename | link` (extensible). Each maps to an LSM hook (§15.5).
 - **policy** — `allow | deny | audit | silence` = `{allow,deny} × {log,silent}`:
   allow=allow+silent, audit=allow+log, deny=deny+log, silence=deny+silent.
 
@@ -712,7 +712,82 @@ fixes identity granularity — this axis is where the security actually lives.
 | read / write / create | `file_open` | one program; `f_flags`/`f_mode` already encode RDONLY/WRONLY/RDWR/`O_CREAT` — three actions free at open time |
 | execute | `bprm_check_security` | exec of a binary |
 | unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | second program; fire on mutation (cheap) |
+| **link** | **`inode_link`** | **a distinct hook — `rename` does not cover it (see below)** |
 | listdir | `file_open` of a directory (coarse) | no clean per-`getdents` hook; finer needs the hot `file_permission` |
+
+**The second-name escape — why `link` is not optional.** A *directory* object protects its
+children by **ancestry**: the kernel walks `d_parent` from the opened file up to a
+`PROTECTED` `(dev,ino)`. A file's membership is therefore positional, and **any second name
+for the same inode outside the object has a different ancestry and matches nothing**:
+
+```
+open ~/.ssh/id_ed25519 → leaf ino (miss) → .ssh ino (HIT)  → deny
+ln ~/.ssh/id_ed25519 ~/x
+open ~/x               → leaf ino (miss) → ~ (miss) → / (miss) → unprotected → ALLOW
+```
+
+Both `rename` and `link` create that second name, and **`link` is the cheaper attack**:
+`rename(2)` needs write+execute on *both* directories and is destructive (the secret
+vanishes from `~/.ssh`, the owning tool breaks, you notice), while `link(2)` needs write
+only on the *destination* directory, requires no read on the secret, and leaves the
+original untouched — silent and non-destructive. `protected_hardlinks=1` does not help: it
+restricts only linking files the caller does not own, and here the adversary *is* the owner.
+
+So the invariant is not "gate rename" but **a protected inode must not acquire a name
+outside its object** — which needs `inode_link` *and* `inode_rename`.
+
+**Shipped (2026-07-27).** Both hooks, plus `inode_unlink`/`inode_rmdir`, share one resolver
+over `find_object`. Three cases:
+
+| | condition | verdict |
+|---|---|---|
+| internal | `src == dst` | allow — an atomic save (temp beside the target, rename over it) must keep working inside a protected dir |
+| **escape** | `src` protected, `dst != src` | **deny, unconditionally** |
+| clobber | `src` unprotected, `dst` protected | the subject's `create`/`write` verdict on `dst` |
+
+`inode_unlink`/`inode_rmdir` have no destination, so they take the subject's `write`
+verdict — gated because objects resolve **once**, at `policy apply`, and nothing re-checks
+them: `rm -rf ~/.ssh && mkdir ~/.ssh` would otherwise dangle the `PROTECTED` entry and leave
+the path unprotected forever.
+
+**Why escape consults no rule.** An escape publishes the inode to *every* subject,
+permanently, and silently — afterwards `find_object` misses, so nothing is ever logged
+again. Gating it on the acting subject's read verdict was considered and rejected: `allow
+/usr/bin/ssh read ~/.ssh` would then let a scriptable or `LD_PRELOAD`-ed allowed subject
+convert a scoped, logged grant into an unscoped permanent one. So no subject may escape —
+not an allowed exe, not a blessed session. Blessing grants *read*, not re-parenting.
+
+The cost is deliberate and one-sided: this enforces on `audit` objects too, which otherwise
+never enforce, so renames *out of* `~/.config` now fail with `EPERM` (app config migrations,
+manual `mv ~/.config/foo ~/backup/`). Internal renames are unaffected, which is the common
+case. Whether an escape is *journaled* still follows the object's policy, so a `silence`
+object refuses it silently and the `{allow,deny}×{log,silent}` split holds. If the cost ever
+bites, the one-line softening is to allow the escape where a `*` subject may already read
+the object. The journal cause is a distinct synthetic `escape-deny` (like `default-deny`),
+because "structurally refused" and "a rule of yours blocked it" want different fixes.
+
+Also note the asymmetry the walk creates: the leaf's own id is tested *first*, so a rule
+naming a **file** matches that inode by any name and was hardlink-proof even before these
+hooks; a rule naming a **directory** protects children only by ancestry. Enumerating secret
+files as objects was therefore a real mitigation, and was rejected anyway: it requires
+listing every secret, so a key generated tomorrow would be silently unprotected. Directory
+objects had to become sound on their own.
+
+*Not* bypasses, for contrast: **symlinks** (`file_open` sees the resolved target dentry),
+**`/proc/PID/fd/N` reopen** (same), **bind mounts** (`d_parent` is filesystem-level, not
+mount-level — walking the dentry chain instead of a path string buys this for free), and
+**copying** (needs a read, which is mediated). **Overlayfs in a user namespace was measured,
+not assumed** (2026-07-27, 7.1.4-zen): mounting an overlay over `$HOME` and reading through
+it journaled `object=~/.config path=~/.config/dconf/user`, i.e. the ancestor walk resolved
+the *real* object and the path reconstruction walked the *real* dentry chain. Overlayfs
+presents the underlying dentry to `security_file_open`, so it is mediated and needs no
+`sb_mount` gating.
+
+Still open, and out of reach of these hooks: `renameat2(RENAME_EXCHANGE)` puts the protected
+inode on the *destination* side, and the `inode_rename` hook carries no `flags` argument
+(only `path_rename` does). The kernel is believed to call the hook a second time with the
+pair swapped, which would cover it — **verify before relying on it**; if it does not hold,
+gate `new_dentry` too when it is positive.
 
 `file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
 is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewhere), so
