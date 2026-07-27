@@ -1572,11 +1572,70 @@ EOF
     return $fail
 }
 
+# --- scenario: rename-over ---------------------------------------------------
+# `rename(2)` onto an existing name *destroys* the destination inode, and `inode_rename`
+# is the only hook the kernel fires for it. Both cases below are invisible to the
+# source/destination-*directory* classification — one looks like an internal shuffle, the
+# other like nothing protected moving at all — so only the destination dentry's own lookup
+# sees them. The daemon self-test covers the mechanism on a deny-all probe; this covers the
+# two shapes that matter under a real policy, and the atomic-save case the fix must NOT break.
+#
+# `who = "*"` throughout: the question here is which *object* answers for the destination,
+# not which subject asked, so plain `mv` is the right actor and needs no exe copy.
+scenario_rename_over() {
+    echo "### scenario: rename-over (atomic save survives; a destroyed object refuses)"
+    ws_new
+    local lonely="$TMP/lonely"; echo "LONELY" > "$lonely"
+    echo "TOKEN" > "$VAULT/token"
+    write_policy <<EOF
+[[rule]]
+who = "*"
+where = "$VAULT"
+action = ["read", "write"]
+policy = "allow"
+[[rule]]
+who = "*"
+where = "$VAULT/token"
+action = "*"
+policy = "deny"
+[[rule]]
+who = "*"
+where = "$lonely"
+action = "*"
+policy = "deny"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    # The pattern the internal-shuffle short-circuit exists for. The destroy check asks the
+    # vault, which allows write, so it still goes through.
+    echo save > "$VAULT/.save"
+    expect_allow "atomic save inside the vault (temp beside target, rename over)" \
+        mv -f "$VAULT/.save" "$SECRET" || fail=1
+    # Same shuffle, but the destination carries a tighter rule of its own. Pre-fix this was
+    # allowed as an internal shuffle and silently destroyed the more-specific object.
+    echo t > "$VAULT/.t"
+    expect_deny "rename over a nested, more-specific object" \
+        mv -f "$VAULT/.t" "$VAULT/token" || fail=1
+    [ -f "$VAULT/.t" ] && echo "  OK: the source survived (no copy+unlink fallback)" \
+        || { echo "  FAIL: the source is gone — the rename took effect"; fail=1; }
+    # A protected *file* whose parent is not protected: both walks miss, so pre-fix this was
+    # the `(None, None)` allow — `rm lonely` refused while `mv x lonely` destroyed it.
+    echo evil > "$TMP/evil"
+    expect_deny "rename over a file object whose parent is unprotected" \
+        mv -f "$TMP/evil" "$lonely" || fail=1
+    # The *source* is what discriminates: the destination exists either way, since a
+    # successful rename just replaces its inode with the attacker's.
+    [ -f "$TMP/evil" ] && echo "  OK: the protected file's inode survived" \
+        || { echo "  FAIL: the protected file was destroyed and replaced"; fail=1; }
+    daemon_stop; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
 scenario_selftest_negative || rc=1
 scenario_per_action        || rc=1
+scenario_rename_over       || rc=1
 scenario_subject_group     || rc=1
 scenario_object_group      || rc=1
 scenario_deny_wins         || rc=1

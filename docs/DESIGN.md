@@ -829,11 +829,13 @@ So the invariant is not "gate rename" but **a protected inode must not acquire a
 outside its object** — which needs `inode_link` *and* `inode_rename`.
 
 **Shipped (2026-07-27).** Both hooks, plus `inode_unlink`/`inode_rmdir`, share one resolver
-over `find_object`. Three cases, where `dst` is the destination **directory**
-(`new_dentry.parent()` — see the gap below for why that is not the whole story):
+over `find_object`. Four cases. `dst` is the destination **directory**
+(`new_dentry.parent()`); `target` is the destination **dentry itself**, which is a distinct
+question — see below:
 
 | | condition | verdict |
 |---|---|---|
+| **destroy** | `target` protected (rename over an existing name) | that object's `write` verdict — asked **first**, before the shuffle short-circuit |
 | internal | `src == dst` | allow — an atomic save (temp beside the target, rename over it) must keep working inside a protected dir |
 | **escape** | `src` protected, `dst != src` | **deny, unconditionally** |
 | clobber | `src` unprotected, `dst` protected | the subject's `create`/`write` verdict on `dst` |
@@ -876,39 +878,39 @@ the *real* object and the path reconstruction walked the *real* dentry chain. Ov
 presents the underlying dentry to `security_file_open`, so it is mediated and needs no
 `sb_mount` gating.
 
-**Known gap: rename-over destroys the destination object unmediated.** `decide_reparent`
-classifies exactly two dentries — the source, and `new_dentry.parent()`. The destination
-dentry's *own* identity is never passed to `find_object`. That is correct for `inode_link`
-(`do_linkat` looks the target up with `LOOKUP_CREATE`, so `link(2)` returns `EEXIST` before
-`vfs_link` and the new dentry is always negative) and **wrong for `inode_rename`**:
-`rename(2)` over an existing file passes a *positive* `new_dentry` whose inode `vfs_rename`
-then destroys. Only `security_inode_rename` fires for that — `security_inode_unlink` is
-reachable solely from `vfs_unlink`, and `do_renameat2`'s own target check is `may_delete()`,
-which is DAC-only. So the clobbered inode receives no verdict, and since objects resolve once
-its `PROTECTED` entry dangles exactly as `rm -rf` would have. The `inode_unlink` gate above is
-therefore bypassable by its sibling syscall: `rm secret` is refused (`decide_remove` tests the
-leaf first), `mv anything secret` is allowed. Two shapes:
+**Why the destination is classified twice.** The destination *directory* answers escape and
+clobber, but it cannot answer for the name being overwritten. `rename(2)` onto an existing
+name **destroys** that inode, and `security_inode_rename` is the only hook the kernel fires
+for it: `security_inode_unlink` is reachable solely from `vfs_unlink`, and `do_renameat2`'s
+own target check is `may_delete()`, which is DAC-only. Left unclassified — as it was when
+these hooks first landed — the `inode_unlink` gate is bypassable by its sibling syscall,
+`rm secret` refused while `mv anything secret` destroys the same inode and dangles the
+`PROTECTED` entry permanently. Two shapes, both invisible to the directory-pair
+classification:
 
 - **the destination is an object whose parent is not** — `deny * * ~/.ssh/authorized_keys`
-  with no rule on `~/.ssh`: both walks miss, the `(None, None)` arm allows, the protected
-  inode is destroyed and the attacker's inode owns the name for every subject, forever.
+  with no rule on `~/.ssh`: both directory walks miss, so the pair reads as `(None, None)`,
+  "nothing protected is moving".
 - **the destination is a nested, more specific object** — `mv ~/.aws/tmp ~/.aws/.danger-token`
-  against the shipped example policy short-circuits as an internal shuffle (both sides resolve
-  to `~/.aws`), destroying the `silence` object so the path falls back to the looser ancestor's
-  `allow read,write`. The general defect is the same one the clobber row has in weaker form:
-  the verdict comes from the destination *directory*, never from the destination's own,
-  more-specific rules.
+  reads as an *internal shuffle*, both sides resolving to `~/.aws`, while the `silence` object
+  it overwrites is a different and tighter one. Precedence (§15.6) says the more specific
+  object wins; taking the directory's verdict inverts that.
 
-Not a regression — before these hooks rename-over was equally unmediated — but it defeats a
-control this same change ships, and the fix is small: when `new_dentry` is positive, run
-`find_object` on it and treat a hit as a destroy, taking *that* object's `write` verdict,
-evaluated **before** the internal-shuffle short-circuit. Branching on `d_inode == NULL`
-distinguishes positive from negative without the `flags` argument the hook does not carry,
-which also closes `renameat2(RENAME_EXCHANGE)` — it puts the protected inode on the
-*destination* side, and the kernel is only *believed* to call the hook a second time with the
-pair swapped (**verify before relying on it**; gating a positive `new_dentry` makes the
-question moot). The startup self-test covers rename-*out* only, so extend it with a
-rename-*over*-the-probe case or the gap can silently reopen.
+So `find_object` runs on `new_dentry` itself, first, before the shuffle short-circuit. A hit
+takes that object's own `write` verdict — the same treatment `inode_unlink` gives, because it
+is the same event. `link` is unaffected: its target is always negative (`do_linkat` resolves
+with `LOOKUP_CREATE`, so an existing name is `EEXIST` before the hook runs), and
+`Dentry::inode` returns `None` on a NULL `d_inode`, so the walk yields nothing on its first
+step. **Atomic save still works**: a rename over a name in an object the subject may already
+write takes that same `allow`, so the shuffle proceeds — it bites only where the destination
+carries a tighter rule, which is the case worth biting on.
+
+`renameat2(RENAME_EXCHANGE)` is *improved but not closed* by this. Both dentries are positive,
+so the destination object now at least receives a `write` verdict instead of nothing — but an
+exchange re-parents both inodes rather than destroying one, and the protected side moving
+*out* deserves the unconditional escape refusal, which only fires if the kernel calls the hook
+a second time with the pair swapped. That second call is still believed, not verified —
+**verify before relying on it**.
 
 `file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
 is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewhere), so

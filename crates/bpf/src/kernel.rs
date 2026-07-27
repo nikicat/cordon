@@ -126,8 +126,17 @@ impl Dentry {
     pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Dentry {
         Dentry(unsafe { ctx.arg(n) })
     }
+    /// The dentry's inode, or `None` when the dentry is **negative** — `d_inode` is NULL,
+    /// i.e. the name does not exist yet.
+    ///
+    /// The distinction decides a verdict, so it is tested rather than left to the NULL read
+    /// faulting out on its own: `link(2)`'s target is always negative (the VFS resolves it
+    /// with `LOOKUP_CREATE`, so an existing name is `EEXIST` before this hook runs), while
+    /// `rename(2)`'s destination is *positive* whenever it clobbers — and `vfs_rename` then
+    /// destroys that inode. See `decide_reparent`.
     pub fn inode(self) -> Option<Inode> {
-        Some(Inode(ptr_at(self.0, offset!(dentry_d_inode))?))
+        let inode = ptr_at(self.0, offset!(dentry_d_inode))?;
+        (!inode.is_null()).then_some(Inode(inode))
     }
     pub fn super_block(self) -> Option<SuperBlock> {
         Some(SuperBlock(ptr_at(self.0, offset!(dentry_d_sb))?))

@@ -9,7 +9,7 @@
 The architecture is the flat **rule model** (DESIGN §15): a root-owned text policy of
 `(who, where, action, policy)` rules, compiled in userspace, enforced **in-kernel** by the
 `bpf-lsm` backend. **M1 is complete and VM-validated**, as is **blessing B1 + B2**
-(DESIGN §16). The suite is 27 `bpf-lsm-smoke.sh` scenarios, green on the CI-pinned v6.12.
+(DESIGN §16). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12.
 The earlier owner model was retired in the migration — see *Pre-rule-model history* below.
 
 Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) (M2, M4–M6 ahead; M3 is
@@ -43,12 +43,10 @@ name outside its object) is refused unconditionally, with no rule lookup and no 
 exemption; **clobber** and **destroy** are ordinary writes and take the subject's verdict, so
 `audit` objects keep working. An internal rename short-circuits, which is what keeps
 atomic-save alive inside a protected dir. All five programs share `find_object`, so entry is
-a dentry rather than a `struct file`. DESIGN §15.5. **One known gap**, found in review and
-not yet fixed: only the destination *directory* is classified, so a rename **over** a
-positive `new_dentry` destroys that inode with no verdict and dangles its `PROTECTED` entry —
-`mv anything secret` does what `rm secret` is refused. Not a regression (rename-over was
-unmediated before these hooks) but it defeats the `inode_unlink` gate. DESIGN §15.5 has both
-exploit shapes; the fix is an M3 task.
+a dentry rather than a `struct file`. A rename **over** an existing name is a fourth case,
+classified off the destination *dentry* rather than its directory: it destroys that inode and
+`inode_rename` is the only hook the kernel fires for it, so without it `mv anything secret`
+did what `rm secret` is refused. DESIGN §15.5.
 
 **Volume control**, because tools re-open one config hundreds of times per run (helm: 464×
 `~/.kube/config`): an in-kernel LRU suppressor keyed by `(exe, ObjId, action, leaf)` emits at
