@@ -1,316 +1,125 @@
 # STATUS
 
-**Current architecture: the flat rule model (DESIGN §15), enforced in-kernel by the
-`bpf-lsm` backend.** M1 is implemented and VM-validated; only fail-safe bpffs pinning
-(M5) remains. The earlier **owner model** (owners / TOFU / a SQLite store, on `mock` +
-`fanotify` backends) was retired in the migration — see *Pre-rule-model history* at the
-bottom. This file is the resume point.
+> **Note.** This is the resume point: what exists, what is left, and the facts that cost
+> real time to learn. It is deliberately not a changelog — finished work is described in
+> present tense or not at all, and `git log` has the rest.
 
-## Rule model (DESIGN §15) — M1 core complete
-The owner model has been replaced by the flat **rule model**
-(`(who, where, action, policy)`), per [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md). M1
-decisions are locked there (copy-down object precedence, `MAX_RULES_PER_OBJ = 32`,
-packed-array rule encoding, recompile + double-buffer swap, default-deny, owner CLI verbs
-removed). All of M1 1a–1h plus 1g coalescing and the atomic double-buffer swap are
-implemented and VM-validated; only fail-safe bpffs pinning (M5) remains as deferred
-hardening.
+## Where things stand
 
-**Landed (M1 1a + 1b — userspace core, pure + unit-tested, no kernel changes yet):**
-- **`crates/bpf-common/src/policy_maps.rs`** — the compiled-form contract shared with
-  the eBPF program: `ObjId`, `Action` (a `bitflags` bitset, `#[repr(transparent)]` for
-  POD/map-layout soundness — validated compiling for `bpfel-unknown-none`), `Policy`,
-  `SubjectMatch`, `CompiledRule`, and the `PROTECTED`/`RULES`/`RULE_COUNT` map names.
-- **`crates/core/src/policy/`** — the three-stage userspace pipeline:
-  `parse` (TOML → spans via `toml::Spanned`; serde + `deny_unknown_fields` for structure),
-  `resolve` (group expansion on all three axes, cycle/ref/name validation, `~`-expansion;
-  the `@ref`/`*`/leaf lexical layer is a `Token`, leaf *semantics* stay here), and
-  `compile` (cross-product → **copy-down** object precedence → sorted, deduped, capped
-  per-object buckets, paths resolved via an injected resolver). Diagnostics carry a
-  source `Pos` (rule/group granularity). 27 unit tests incl. both copy-down exception
-  scenarios.
+The architecture is the flat **rule model** (DESIGN §15): a root-owned text policy of
+`(who, where, action, policy)` rules, compiled in userspace, enforced **in-kernel** by the
+`bpf-lsm` backend. **M1 is complete and VM-validated**, as is **blessing B1 + B2**
+(DESIGN §16). The suite is 27 `bpf-lsm-smoke.sh` scenarios, green on the CI-pinned v6.12.
+The earlier owner model was retired in the migration — see *Pre-rule-model history* below.
 
-**Landed (M1 1c + 1d + 1e + 1f + 1h — the in-kernel enforcement path + authoring CLI,
-VM-validated):** The rule-model `file_open` boundary is proven end-to-end in a
-virtme-ng VM (`lsm=capability,bpf`) on both the host kernel and the CI-pinned **v6.12** —
-all 13 M1 `bpf-lsm-smoke.sh` scenarios
-green: allow + default-deny + learn record, self-test-negative abort, per-action (read
-allowed / write default-denied), subject group, object group, deny>allow,
-**subject-specificity** (a concrete allow outranks a `who="*"` deny), **copy-down**
-(subtree allow + a file-specific deny for one subject; the sibling stays readable),
-audit→deny (observe with a `who="*"` catch-all, then enforce by flipping that one rule —
-no global mode), silence (denied, not logged), **runtime `policy
-apply` + `show`** (a previously-unprotected dir becomes protected without a restart),
-**coalescing** (a 41-open burst collapses to ~2 records with the folded count carried),
-and **leaf-path reconstruction** (distinct files under one audited root surface with
-their real paths).
-- **1c shared types** — `Offsets` gains `file_f_mode`/`file_f_flags` (read/write/create
-  intent at open); the ring-buffer record is reshaped + renamed `LearnEvent` →
-  **`DecisionEvent`** (it records a decision for the journal; autolearn is a later M4
-  consumer) carrying `action` + matched `policy`. *(1c originally shipped a global
-  `enforce`/`permissive`/`off` `Mode`; refinement (1) below has since removed it.)*
-  `FileId` and `Action` gained `Display` (canonical human forms — the daemon journals typed
-  values, no `String` helpers).
-- **1d eBPF program** (`crates/bpf`) — rewritten for the rule model: global-mode/daemon
-  fast-allow, dentry walk → deepest `PROTECTED` object, action from `f_mode`/`f_flags`
-  (empty ⇒ allow, e.g. `O_PATH`), **first-match** scan of the packed `RULES` bucket
-  (`RULE_COUNT`-bounded), default-deny, emit on `policy.logs()`. Builds + links for
-  `bpfel-unknown-none`.
-- **1e daemon backend** (`backend/bpf_lsm/`) — split into `mod.rs` (lifecycle: load →
-  attach → self-test → seed → drain), `seed.rs` (compile-policy → packed maps), and
-  `events.rs` (ring drain → journal). Compiles the **text policy file** at startup
-  (`proc::file_id` resolver) and seeds `PROTECTED`/`RULES`/`RULE_COUNT`/`SETTINGS`; refuses
-  on error diagnostics; self-test adapted to a deny-all rule. `config.policy` path added.
-- **1f CLI + owner-model retirement** — `cordon policy check` (local lint, daemon-free),
-  `policy apply` (send text → daemon recompiles with the mount-aware resolver → re-seed →
-  reply with diagnostics), `policy show` / `status` (read the effective policy via a
-  `PolicyControl` shared between IPC and the backend thread). The owner model was
-  **retired**: removed the `engine`, the SQLite `store` (+ `rusqlite`),
-  `event`/`identity`/`decision`, the `mock` + `fanotify` backends, the owner CLI/IPC verbs
-  + `Submit`, and `config.mode`/`store`. `bpf-lsm` is now the only backend (so a stock,
-  no-feature build compiles but the daemon needs `--features bpf-lsm` to run).
-- **1h validation** — `packaging/test/bpf-lsm-smoke.sh` rewritten for the rule model
-  (policy-file driven, no runtime adopt) + `packaging/cordon.example.policy.toml` (a
-  documented example, regression-tested through parse→resolve in `cargo test`). The
-  smoke caught + fixed a real bug: the self-test seeded a `DENY` (logging) probe rule,
-  spamming a spurious deny record on every startup → now `SILENCE` (block, no log).
+Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) (M2–M5 ahead) and
+[docs/PLAN-bless.md](docs/PLAN-bless.md) (B3 next).
 
-**Landed (M1 1g event coalescing + atomic double-buffer swap — VM-validated, 13/13
-smoke scenarios green):**
-- **1g coalescing** — the audit found tools re-open one config hundreds of times per run
-  (helm: 464× `~/.kube/config`). Two layers now collapse that: an **in-kernel suppressor**
-  (`SUPPRESS`, a `BPF_MAP_TYPE_LRU_HASH` keyed by `(exe, ObjId, action)`) emits at most one
-  `DecisionEvent` per key per 1s window and folds the rest into a `suppressed` count carried
-  on the next emit (LRU so a full map evicts the coldest key, never refuses a hot one); and
-  **daemon-side batch coalescing** (`events.rs::coalesce`) collapses each drain to one
-  journal line per `(exe, object, action)` with the summed `count`/`suppressed`. The smoke
-  proves a 41-open burst collapses to ~2 records with the count carried.
-- **Atomic double-buffer swap** — the three rule maps (`PROTECTED`/`RULES`/`RULE_COUNT`) are
-  **banked**: each holds two generations, keyed/indexed by a `Bank` (via `BankedFile`/
-  `BankedObj`/`rule_slot`), with `Settings.active_bank` selecting the live one. `seed_policy`
-  fills the inactive bank then flips `active_bank` in one `SETTINGS` write (RCU-style), so a
-  `policy apply` re-seed is never half-visible — replacing the old clear-then-insert window.
-  Single-writer by construction (the `&mut Ebpf` lives on one backend thread; CLI applies
-  serialize through one channel).
+## What's implemented
 
-**Decided refinements (see PLAN "Decided refinements" + DESIGN §15.6/§15.10):**
-- **(1) Drop the global mode — ✅ done.** The `enforce/permissive/off` mode is gone
-  (`ids::Mode`, `Settings.mode`, the `mode=` policy key, and `Decision::WOULD_DENY` all
-  removed; the kernel blocks iff `policy.denies()`). The per-rule `policy` is the only
-  enforcement level — `audit` observes an object, `deny` enforces it, per object; "off" is
-  an empty policy or a stopped daemon. The smoke's permissive scenario became an
-  **audit→deny** one; `parse` now rejects a leftover top-level `mode =` key.
-- **(2) Subject-specificity in precedence — ✅ done.** `sort_bucket` now ranks by object
-  depth → **subject specificity** (count of non-wildcard predicates, via the `Specificity`
-  newtype) → deny>allow (`Polarity`), so `allow exe=X` beats an `audit`/`deny` `who="*"`
-  catch-all on the same object — the basis of the audit→admit→enforce flow A. VM-validated
-  (smoke scenario 7: a concrete `allow` outranks a `who="*"` deny).
-- **(3) Leaf-path reconstruction — ✅ done.** On an emitted record the kernel walks
-  `d_name` from the opened file up to the matched protected object (`bpf_d_path` is
-  unavailable at `file_open`), filling a fixed leaf-first component array (`PathComp`,
-  `[[u8;32];8]`) assembled in a **per-CPU scratch** map (the record is too big for the BPF
-  stack) and mem-copied into the ring. The suppressor + daemon coalescing now key on the
-  **opened file's inode** (`leaf`), so distinct files under one audited root surface
-  separately; the daemon joins the reversed components onto the object's path → `path=…`.
-  Enables flow B (discovery) + M4 autolearn's per-file→subtree generalization. VM-validated
-  (smoke scenario 13: siblings + a depth-2 nested file each surface with their real path).
+**The rule pipeline** — `parse` (TOML → spans; both the verbose `[[rule]]` surface and the
+compact one-rule-per-line DSL, normalized to one `ParsedRule`) → `resolve` (group expansion
+on all three axes, cycle/ref validation, `~`-expansion) → `compile` (cross-product →
+**copy-down** object precedence → sorted, deduped, capped per-object buckets). Diagnostics
+carry a source `Pos`. The compiled form is the contract in
+`crates/bpf-common/src/policy_maps.rs`.
 
-**Authoring ergonomics (2026-06-28) — from rewriting the real-system audit policy by hand:**
-- **(4) Compact rule DSL — ✅ done.** A `rules = '''…'''` literal block, one rule per line
-  (`POLICY SUBJECT ACTION OBJECT`), accepted *alongside* `[[rule]]` tables and normalized to
-  the same `ParsedRule` — only surface syntax, so resolve/compile/kernel are untouched. New
-  `crates/core/src/policy/ruleline.rs` (a quote-aware lexer with `Item`/`Sep` types); `parse`
-  normalizes both surfaces; `PolicyName::parse` added; literal-string content is a verbatim
-  source slice so diagnostics give exact `line:col`. 11 unit tests + a regression-tested
-  `packaging/cordon.example.dsl.policy.toml`. The hand audit policy went 129→76 lines, proven
-  to compile to the identical table.
-- **(5) Per-user `~` via `user =` header — ✅ done.** A `user = "name"` header expands `~`
-  against that account's `/etc/passwd` home, so a root-owned per-user file uses `~/.ssh`
-  (the root daemon's `$HOME` is `/root`). New `UserName` newtype + `policy::home_for`, wired
-  into the resolve choke point (`compile_sources` for startup + apply; CLI `check`).
-- **(6) conf.d split — ✅ done.** A policy path may be a single file or a directory of
-  `*.toml` fragments (name-sorted), each parsed/resolved independently (file-local groups,
-  own `user =` home) then **merged** before compile via `policy::compile_fragments`; a bad
-  fragment fails the apply, named. `apply` now ships the read fragments to the daemon
-  (`Request::PolicyApply { sources: Vec<PolicySource> }` replaced the single `text`), which
-  resolves homes + merges; `read_sources` does the file-or-dir read for both daemon startup
-  and CLI `check`/`apply`. *Known gap:* compile-stage diagnostics (e.g. pending-path
-  warnings) carry `line:col` but not yet the fragment name (parse/resolve errors do).
-- **(7) `cordon policy edit` — ✅ done (2026-06-29).** The sudoedit analog for the
-  root-owned policy: `sudo cordon policy edit [FILE]` copies the file to a private temp,
-  runs `$EDITOR` (`$CORDON_EDITOR`→`$VISUAL`→`$EDITOR`→`vi`) **as the invoking user** —
-  closing the `sudo $EDITOR` same-uid escalation (DESIGN §2: the scraper can write your
-  `.vimrc`) — then validates and, on success, applies *and* saves in one step. visudo-style:
-  a broken policy is rejected with diagnostics and re-prompts `[e]dit again / [Q]uit`. No new
-  IPC — the read is direct, validation is the in-process compiler (the `check` path), the
-  commit reuses `PolicyApply`; the file is written **only after** the daemon accepts it, so
-  on-disk == live with no rollback (daemon down ⇒ saved + warned "not applied"). New
-  `crates/cli/src/edit.rs` (privilege model **A**, self-privileged) + `crates/cli/src/sys.rs`
-  (the privileged ops as safe `nix` wrappers over typed `Uid`/`Gid` — `chown` the temp to the
-  invoker, passwd lookup for their `$HOME`/`$USER`, `setgroups`+`setgid`+`setuid` drop in the
-  editor child; the crate's `unsafe` is the two `pre_exec` registrations — the editor drop and
-  the bless carrier join). The editor runs with the **invoking user's** own `$HOME`/`$USER`
-  (not root's, which `sudo` leaves as `/root` — else e.g. nvim can't write its state).
-  Authorization now rests on the socket gate below rather than on `sudo` alone.
+**Precedence** is object depth → **subject specificity** → deny>allow. There is **no global
+mode**: the per-rule `policy` is the only enforcement level, so `audit` observes an object
+and `deny` enforces it, per object — which is what makes the audit→admit→enforce flow
+(§15.10) work one object at a time. "Off" is an empty policy or a stopped daemon.
 
-- **(9) Socket authorization — ✅ done (B2).** Every control-socket **write**
-  (`PolicyApply`, `BlessMint`, `BlessRevoke`) requires peer uid 0 via `SO_PEERCRED`; every
-  **read** (`Status`, `PolicyShow`, `BlessList`) is open. `authorize()` is a pure table with
-  an **exhaustive** match, so a new verb can't be added without picking a side. With the gate
-  in the daemon, the socket is `chmod 0666` right after `bind` — `connect(2)` needs *write*,
-  so a `root:root` socket had made every verb root-only in practice and left `PolicyApply`
-  protected by nothing but that accident. Net effect is **tighter**: what used to be "whoever
-  can reach the socket can apply" is now root-only, and reads became usable unprivileged.
-  Client-side, `SocketPath::{Configured,Default}` carries the path's provenance so a *default*
-  per-user socket with nothing listening falls back to `/run/cordon.sock` (an unprivileged
-  `cordon` finds the system daemon) while an explicitly configured path is never redirected.
-  Multi-user deployments that must not disclose protected paths want `0660` + a `cordon`
-  group instead — same table, narrower reach (DESIGN §15.8). VM scenario 24.
+**In-kernel** (`crates/bpf`, `file_open`): dentry walk → deepest `PROTECTED` object, action
+from `f_mode`/`f_flags`, **first-match** scan of the packed `RULES` bucket, default-deny.
+Records carry the **actual opened path**, reconstructed by walking `d_name` up to the matched
+object (`bpf_d_path` is unavailable at `file_open`) through a per-CPU scratch map.
 
-- **(10) `policy edit` defaults to your own tier — ✅ done (B2).** **Breaking UX change:**
-  bare `sudo cordon policy edit` now opens the invoker's *user tier* (self-bootstrapping via
-  (8)), not the system policy — editing your own rules is the common case, and the old
-  default made the dangerous one the easy one. `--system` opens the system policy; `--user
-  NAME` and a `FILE`/fragment argument are unchanged; all three are clap-exclusive. The
-  invoker is `SUDO_UID` under sudo, the caller's own euid unprivileged (which is what the
-  "edit without sudo" roadmap in (8) wants); real root with neither has no "own tier" and
-  errors naming `--system`/`--user` rather than silently editing the system policy. The
-  three flags are one `EditTargetArgs` clap group with a table-tested `resolve()`, so the
-  choice is a type rather than a bool triple at the call site.
+**Volume control**, because tools re-open one config hundreds of times per run (helm: 464×
+`~/.kube/config`): an in-kernel LRU suppressor keyed by `(exe, ObjId, action, leaf)` emits at
+most one event per key per second and folds the rest into a `suppressed` count, and the
+daemon coalesces each drain batch into one journal line.
 
-- **(8) System / user policy tiers — ✅ done (2026-06-29).** The effective policy is now
-  **system ⊕ user tier** (DESIGN §15.8). A system fragment pulls in a user-tier file via an
-  `[[include]] user = "…" path = "…"` directive; the included file is loaded
-  `SourceOrigin::User` and **home-scoped** — every object path must resolve under that user's
-  `~` (compile error otherwise, so a user can't write rules about `/etc` or another home),
-  and it may not itself `[[include]]`. New `policy::{load_policy, user_include_path}` (include
-  expansion at read time; CLI on `apply`/`check`, daemon at startup), `PolicySource.origin`
-  (over IPC), tier-aware `compile_fragments`, and `cordon policy edit --user NAME` (edits the
-  bound file; `UserName` parsed straight from the flag via `FromStr`). `--user` is
-  **self-bootstrapping**: with no include yet it opens `…/users/NAME.toml` and registers the
-  `[[include]]` in `…/conf.d/00-users.toml` *only after* the edit validates + saves — a
-  cancelled/rejected edit writes neither the file nor the include (no stale binding). VM
-  coverage: a 14th `bpf-lsm-smoke.sh` scenario (`user_tier`) proves a system-tier rule and an
-  `[[include]]`d user-tier rule both enforce in-kernel (the tier assembly reaches the maps).
-  **Precedence is flat
-  for now** — the *system-is-a-floor* semantics (user tightens, never loosens) isn't
-  expressible in the single first-match bucket and only matters once user files are
-  user-owned, so it's sequenced with the home-migration (below). Files are root-owned under
-  `/etc` for now; **roadmap:** move them to `~user/.config/cordon/` and have cordon *cordon*
-  its own user-policy file (a protected object only an authorized editor may write) — that
-  self-protection is the future "edit without sudo".
+**Atomic apply.** The three rule maps are **banked**; `seed_policy` fills the inactive bank
+and flips `Settings.active_bank` in one write, so a re-seed is never half-visible.
+Single-writer by construction — the `&mut Ebpf` lives on one backend thread.
 
-**Next (M1 hardening — the last deferred item):** fail-safe **bpffs pinning** — pin program
-+ maps + link so enforcement survives daemon death (until then it fails open on daemon exit).
-**Pinning must ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active):
-today two daemons can't corrupt each other (each loads private maps), but two daemons sharing
-*pinned* maps would reintroduce a cross-process writer race.
+**Policy tiers.** Effective policy is system ⊕ user tier. A system fragment pulls in a
+user-tier file via `[[include]] user = … path = …`; the included file is **home-scoped** (its
+objects must resolve under that user's `~`) and may not itself include. A policy path may be
+one file or a conf.d directory of fragments merged in name order, each able to expand `~`
+against a `user =` header.
 
-## Blessing (`cordon bless`) — ✅ B1 + B2 done (2026-07-27)
-The runtime, human-authenticated access grant ships, and as of B2 it is **usable**:
-[`DESIGN.md` §16](docs/DESIGN.md) (design) + [`docs/PLAN-bless.md`](docs/PLAN-bless.md)
-(milestone spine: B1 + B2 done, planned in [`docs/PLAN-bless3.md`](docs/PLAN-bless3.md);
-**B3 = the PAM upgrade, the next thing to build**; B4 ergonomics). It's additive to the rule
-model: **a blessing is one more `SubjectMatch` predicate** (`blessing = "<class>"`), so a
-blessing rule is an ordinary rule — its action, **object scope**, and precedence all reuse
-the §15 model (scope = the rule's object column; **fully customizable in policy**, not
-blanket).
+**CLI.** `policy check` (daemon-free lint), `apply`, `show`, `status`, and `policy edit` —
+the sudoedit analog, which runs `$EDITOR` **as the invoking user** (a root editor on a
+same-uid box is an escalation, DESIGN §2), then validates and, if it compiles, applies *and*
+saves in one step. Bare `edit` opens your own tier; `--system` and `--user NAME` name the
+others.
 
-**`cordon bless [--class NAME] [-- <cmd>]` — no `sudo` prefix; it runs as you.** The CLI
-verifies the daemon is root, sends `BlessRequest` and holds the connection open; the daemon
-parks a single-use 128-bit nonce and blocks. The CLI spawns
-`$CORDON_SUDO cordon bless-helper --nonce=…`, the human authenticates, and *that* helper
-reaches the daemon as **uid 0** — which is the entire proof of human presence. The daemon
-then mints a per-invocation **root-owned cgroup** carrier (`cordon-bless-<id>.<class>`) **inside
-the requester's own user subtree** — its `session-N.scope` when it has one, else its
-`user-<uid>.slice`, which is what a desktop terminal actually has — registers it in the tiny unbanked
-`BLESSED: cgroup_id → ClassId` map, and passes the carrier's **`cgroup.procs` descriptor**
-back over `SCM_RIGHTS`. The CLI forks and `pre_exec` writes the child's pid through that
-descriptor before `exec` — so the target never runs unblessed, while the CLI never holds
-privilege (cgroup-v2 checks the descriptor's *opener*, not the writer). Descendants inherit.
-The daemon GCs the carrier when the tree drains (`cgroup.events populated 0`, 30s mint grace),
-`bless revoke <id>` kills it via `cgroup.kill` (root **or** the uid that minted it), and
-startup reconciles leftovers from its own cgroup and every session scope — adopting only
-root-owned ones, since re-registering is a grant. Every apply **remaps live entries by class
-name** (`ClassId`s renumber on recompile — without this a live blessing would silently change
-meaning). Blessed decisions journal `blessing=<name>`.
+**Socket authorization.** Every write (`PolicyApply`, `BlessMint`, `BlessRevoke`) requires
+peer uid 0 via `SO_PEERCRED`; every read is open. `authorize()` is a pure table with an
+**exhaustive** match, so a new verb cannot be added without picking a side. The socket is
+`0666` — the mode decides who can reach the daemon, the table decides what they may do.
 
-**Why the privilege flow was inverted (B2's whole point).** Under B1 the blessed process was
-born under a privilege tool and then relocated into the daemon's cgroup, which cost it two
-things the host run exposed: no `session-N.scope` ancestor, so polkit refused `run0`/`pkexec`;
-and a scrubbed environment, so GUI apps got no `DISPLAY`. Under `run0` there isn't even a
-parent chain left to recover the environment from — so "ship the env over IPC" was never an
-option, and fixing the environment was **not separable** from fixing who spawns the target.
-Now nothing moves it: environment, cwd, tty, job control and session are inherited by
-construction, and the entire privilege-drop path (`Invoker`, `DropTo`, `SUDO_UID` parsing,
-passwd lookup, `getgrouplist`, the `HOME`/`USER`/`LOGNAME` fixups) is **deleted**.
+**Blessing** (`cordon bless`) is one more `SubjectMatch` predicate, so a blessing rule is an
+ordinary rule and its scope is the rule's object column. `cordon bless` runs **unprivileged**:
+it verifies the daemon is root, sends a request, and holds the connection; a helper spawned
+under `$CORDON_SUDO` reaches the daemon as uid 0, which is the entire proof of human
+presence; the daemon mints a root-owned carrier cgroup **inside the requester's own user
+subtree** and passes back its `cgroup.procs` descriptor over `SCM_RIGHTS`. The CLI forks and
+joins in `pre_exec`, so the target never runs unblessed and the CLI never holds privilege.
+Environment, cwd, tty, job control and session are inherited by construction.
 
-**Two boundary checks are load-bearing and easy to get wrong:**
-- The **daemon is the rendezvous**, not the helper. The helper's own credentials say nothing
-  about whose session this is (under `run0` it lives in a transient unit with no session), so
-  each fact is read from the peer that cannot lie about it: placement from the unprivileged
-  requester's `SO_PEERCRED`, human presence from the approver's uid.
-- The **client checks the daemon**. `cordon bless` requires `SO_PEERCRED` uid 0 on the daemon
-  end before sending anything, and passes the same `--socket` to the helper. Otherwise the
-  nonce is a bearer token handed to whoever answers: a local user squatting the client's socket
-  path could park its own request on the real daemon, answer the victim with that nonce, and
-  spend the human's authentication on the attacker's request.
+## What's left
 
-Validated by **10 VM smoke scenarios (18–27 of 27)**: scope, membership boundary, inheritance
-+ full GC, revoke, journal, the unprivileged spawn (child runs as the invoking uid, an env
-canary survives, the blessed read proves the fd join) with a faked elevation refused, socket
-authorization, the anti-hijack guard (a squatted non-root daemon is refused *before* the
-elevation helper is spawned), session-scope placement in both directions, and reconcile
-adopting only root-owned leftovers. **logind is not needed to test placement** — a session
-scope is a root-owned cgroup directory in the shape systemd makes, and everything under test
-is kernel mechanics; only "polkit is then satisfied" is host-only.
+- **B3 — the PAM authenticator** ([PLAN-bless](docs/PLAN-bless.md)). Replaces the uid-0 gate
+  with "the authenticated peer", so a **non-sudoer can bless their own tools**, and restores
+  "no grace window" by construction (sudo's timestamp cache is one today; the deployment
+  workaround is `Defaults!/usr/bin/cordon timestamp_timeout=0`). B2 did its structural work —
+  the `SCM_RIGHTS` hand-off and the unprivileged CLI already ship — so it reduces to swapping
+  *what proves a human is present*, and it **relaxes** the gate rather than tightening it.
+- **M5 — fail-safe bpffs pinning**, the last M1 hardening item: pin program + maps + link so
+  enforcement survives daemon death (until then it fails **open** on daemon exit). **Must
+  ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active): today two
+  daemons cannot corrupt each other because each loads private maps, but two daemons sharing
+  *pinned* maps would reintroduce a cross-process writer race. Pin the policy maps only —
+  a pinned `BLESSED` with a dead daemon means grants that never expire.
+- **B4 — the enumerated-scope gap.** A blessing class's object scope must be listed, so it
+  drifts against `@secrets`: every dir added to one must be added to the other or a blessed
+  session hits a surprise denial. An "uncordoned" class is sketched in PLAN-bless B4.
+- **M2–M4** — subject predicates beyond exe, mutation/exec hooks, autolearn.
+- Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
-**Remaining known issue:** a blessing's object scope must be enumerated, so it drifts against
-`@secrets` — an "uncordoned" class is sketched in PLAN-bless B4.
+## Settled, do not redo
 
-**Design change from the original spec** (DESIGN §16.5): the authenticator is **reaching uid
-0** via a client-side elevation tool, not PAM-in-the-daemon — PAM proved far heavier than
-specced (conversation proxying as multi-frame IPC, stdio fd passing, degraded job control) and
-the systemd-less smoke VM can't test transient scopes. Two accepted deltas, both documented:
-the elevation tool's **auth cache is a grace window** (deployment note:
-`Defaults!/usr/bin/cordon timestamp_timeout=0`), and blessing is **sudoer-only** until the B3
-PAM upgrade. B2 did that upgrade's structural work — the `SCM_RIGHTS` hand-off and the
-unprivileged CLI already ship — so B3 reduces to swapping *what proves a human is present*,
-and it **relaxes** the gate rather than tightening it.
+- **`PathBuf` → `Box<Path>` for stored path fields: tried wholesale, reverted.** The premise
+  was that the type would say "built once, never mutated". It doesn't — anything holding
+  `&mut self` can reassign a `Box<Path>` field just the same, so all it removes is in-place
+  growth that nothing was calling. What it adds is real: `.into()` at every construction,
+  `.to_path_buf()` at every owned read, `.as_os_str()` because `Box<Path>` is not
+  `AsRef<OsStr>`, and a field-vs-transient rule to keep straight forever. If the intent needs
+  recording, a doc line on the field costs nothing.
 
-(Authoring flow A was renamed observe → **admit** → enforce to reserve "bless" for this; the
-§8.1 threat-model "blessed binary" is unrelated generic usage.)
+## Durable kernel facts
 
-## Deferred refactors (no behaviour change; do when next in the area)
-- **`carrier_root` / `usable_session_scope` share a shape** (`crates/daemon/src/backend/
-  bpf_lsm/bless.rs`): both read `/proc/<pid>/cgroup`, take the `0::` line and resolve it
-  against the cgroup mount, differing only in whose pid and what they do next. Unify behind
-  one `cgroup_of(pid)`. While there, consider a **domain type for the raw listing** — the
-  `text` threaded through `cgroup_v2_path`/`resolve_placement` is a multi-line `/proc` file
-  masquerading as a `&str`, and a `CgroupListing`/`CgroupPath` pair would make the parse
-  boundary explicit (the tree already prefers this: `SocketPath`, `CarrierProcs`, `Nonce`,
-  `Uid`). Marked in-situ with a `ponytail:` comment.
-- **`PathBuf` → `Box<Path>` where the value is never mutated after construction.** Most
-  stored paths here (`Blessing::dir`, `Ctx::socket`, `Config::policy`, the `Found`/`Scaffold`
-  fields) are built once and only read; `Box<Path>` says that in the type and drops the
-  spare capacity word. Worth doing wholesale rather than piecemeal, since a half-converted
-  API is worse than either end state — and worth measuring nothing, since the point is
-  intent rather than bytes.
+- `bpf_d_path` is **not allowed** at `file_open`, so identity is inode `(dev,inode)`, never a
+  path — resolved by the daemon at seed time.
+- The daemon takes the device from the **mount table** (`/proc/self/mountinfo`), which matches
+  the kernel's `sb->s_dev` on overlayfs/btrfs where `stat`'s `st_dev` does not.
+- Loading an LSM program needs `CAP_BPF` + `CAP_MAC_ADMIN` and `lockdown` off. An object built
+  against one kernel runs on another via BTF-resolved field offsets injected at load (rustc
+  can't emit CO-RE relocations).
+- On cgroup2 (kernfs) a directory's `st_ino` **is** the id `bpf_get_current_cgroup_id()`
+  returns — which is what lets the daemon key `BLESSED` by a carrier it just created.
+- **logind is not needed to test carrier placement.** A session scope is a root-owned cgroup
+  directory in the shape systemd makes, and everything under test is kernel mechanics; only
+  "polkit is then satisfied" is host-only.
 
 ## Pre-rule-model history (retired)
-Phases 0–3 built an **owner model** — explicit rules + TOFU creator-owns, a root-owned
-SQLite store, and a privilege-agnostic core — on two enforcement backends: a root
-**`fanotify`** `FAN_OPEN_PERM` backend (Phase 1) and an in-kernel `bpf-lsm` backend
-enforcing `subtrees` + `owner_identities` (Phase 3), both VM-validated. The rule-model
-migration (above) replaced all of it: owners / TOFU / rules collapsed into one
-`(who, where, action, policy)` model; the SQLite store and the `mock` + `fanotify` backends
-were removed; `bpf-lsm` now enforces the flat rule table. The full detail lives in git
-history and `DESIGN.md` §1–§14 (marked superseded there).
 
-**Durable kernel facts from that work** (still true for the current backend):
-- `bpf_d_path` is **not allowed** at `file_open`, so identity is inode `(dev,inode)`, never
-  a path — resolved by the daemon at seed time.
-- The daemon takes the device from the **mount table** (`/proc/self/mountinfo`), which
-  matches the kernel's `sb->s_dev` on overlayfs/btrfs where `stat`'s `st_dev` does not.
-- Loading an LSM program needs `CAP_BPF` + `CAP_MAC_ADMIN` and `lockdown` off — the VM boots
-  a minimal `lsm=…,bpf`; an object built against one kernel runs on another via BTF-resolved
-  field offsets injected at load (rustc can't emit CO-RE relocations).
+Phases 0–3 built an **owner model** — explicit rules + TOFU creator-owns, a root-owned SQLite
+store, and a privilege-agnostic core — on two enforcement backends: a root **`fanotify`**
+`FAN_OPEN_PERM` backend (Phase 1) and an in-kernel `bpf-lsm` backend enforcing `subtrees` +
+`owner_identities` (Phase 3), both VM-validated. The rule-model migration replaced all of it:
+owners / TOFU / rules collapsed into one `(who, where, action, policy)` model; the SQLite
+store and the `mock` + `fanotify` backends were removed; `bpf-lsm` is now the only backend.
+The detail lives in git history and DESIGN §1–§14 (marked superseded there).

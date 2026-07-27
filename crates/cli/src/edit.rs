@@ -200,7 +200,7 @@ impl EditTargetArgs {
 
 /// The account whose tier a bare `cordon policy edit` opens: under `sudo` the invoking
 /// user, unprivileged the caller themselves (which is also what the future
-/// edit-without-sudo path wants — STATUS §(8) roadmap).
+/// edit-without-sudo path wants — the home-migration in PLAN-rule-model).
 fn invoking_user() -> Result<UserName> {
     let uid = invoker_uid(
         Uid::from_raw(config::euid()),

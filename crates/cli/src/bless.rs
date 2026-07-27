@@ -7,7 +7,7 @@
 //! root-first shape was born under a privilege tool (under `run0`, a transient unit with
 //! no session at all) and then relocated, losing `$DISPLAY` and breaking polkit.
 //!
-//! The flow (DESIGN §16.5, PLAN-bless3 decision #7):
+//! The flow (DESIGN §16.5):
 //!
 //! 1. Send `BlessRequest` and hold the connection open. The daemon replies with a
 //!    single-use nonce; nothing is minted yet.
