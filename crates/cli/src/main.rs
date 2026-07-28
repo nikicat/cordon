@@ -160,6 +160,10 @@ fn run_request(req: &Request, cli: &Cli) -> ExitCode {
         Err(e) => {
             eprintln!("cordon: {e}");
             eprintln!("       (is cordond running? socket: {})", socket.display());
+            // A dead daemon is not a dead boundary: since M5 the LSM links are pinned, so
+            // enforcement outlives the process. Saying nothing here would let "connection
+            // refused" read as "nothing is being enforced" — the opposite of the truth.
+            eprintln!("       {}", enforcement_note(cli));
             return ExitCode::FAILURE;
         }
     };
@@ -340,6 +344,38 @@ fn home() -> PathBuf {
 /// `--socket` wins; otherwise the socket from the config file, or — when that is only
 /// the per-euid default and nothing is listening there — the system daemon's, so an
 /// unprivileged `cordon` finds `cordond` (`SocketPath::for_client`).
+/// What the bpffs pins say about enforcement when the daemon can't be reached.
+///
+/// Three honest answers, because the wrong one is dangerous in both directions: claiming
+/// the boundary is up when it isn't invites a false sense of safety, and claiming it is
+/// down when it is up sends someone debugging a denial that is working as designed. bpffs
+/// is root-only, so an unprivileged caller gets "unknown" rather than a guess.
+fn enforcement_note(cli: &Cli) -> String {
+    let Ok(cfg) = Config::load(cli.config.as_deref()) else {
+        return "enforcement state unknown (no readable config)".into();
+    };
+    let dir = &cfg.bpf_pin_dir;
+    match std::fs::read_dir(dir) {
+        Ok(entries) => match entries.count() {
+            0 => format!("no pins under {} — enforcement is OFF", dir.display()),
+            n => format!(
+                "enforcement is STILL ACTIVE ({n} pinned generation(s) in {}); \
+                 events are not being journaled while the daemon is down. \
+                 `cordond --teardown` turns it off",
+                dir.display()
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("no pins under {} — enforcement is OFF", dir.display())
+        }
+        // Almost always EACCES: bpffs is root-owned, so this is the unprivileged path.
+        Err(_) => format!(
+            "enforcement state unknown — {} is not readable as this user",
+            dir.display()
+        ),
+    }
+}
+
 fn resolve_socket(cli: &Cli) -> Result<PathBuf> {
     if let Some(s) = cli.socket.clone() {
         return Ok(s);
