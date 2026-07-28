@@ -8,12 +8,14 @@
 
 The architecture is the flat **rule model** (DESIGN §15): a root-owned text policy of
 `(who, where, action, policy)` rules, compiled in userspace, enforced **in-kernel** by the
-`bpf-lsm` backend. **M1 is complete and VM-validated**, as is **blessing B1 + B2**
+`bpf-lsm` backend. **M1, M3 and M5 are complete and VM-validated**, as is **blessing B1 + B2**
 (DESIGN §16). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12.
 The earlier owner model was retired in the migration — see *Pre-rule-model history* below.
 
-Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) — **finish M3, then M5 and M6**
-(M3 is partly landed: the mutation hooks ship, `inode_mkdir`/`bprm_check_security` do not) —
+Enforcement is now **fail-safe**: the LSM links are bpffs-pinned, so the boundary survives
+the daemon crashing, being killed, or being restarted. **M6 is the last must-have.**
+
+Milestones: [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md) — **M6 is what's left** —
 and [docs/PLAN-bless.md](docs/PLAN-bless.md), whose B3/B4 are **deferred behind the core**.
 
 ## What's implemented
@@ -59,6 +61,28 @@ daemon coalesces each drain batch into one journal line.
 and flips `Settings.active_bank` in one write, so a re-seed is never half-visible.
 Single-writer by construction — the `&mut Ebpf` lives on one backend thread.
 
+**Fail-safe pinning (M5).** The seven LSM links are pinned to bpffs under
+`<bpf_pin_dir>/<pid>/`, and that is *all* that is pinned: a pinned link holds its program
+and a program holds its maps, so the whole apparatus — including the seeded policy — stays
+alive and enforcing with **no holding process**. Nothing is adopted on startup. A restarting
+daemon loads its own object with its own private maps exactly as before, so the single-writer
+invariant is untouched and an upgraded package can never end up driving the old kernel
+program. The handover is ordered attach → self-test → seed → **pin** → sweep older
+generations, so the previous boundary stands until the replacement is *proven*; a daemon that
+aborts on a bad policy leaves enforcement up rather than tearing it down for a replacement
+that never arrived. The generation subdirectory exists because `BPF_OBJ_PIN` fails `EEXIST`
+on a taken path, and reusing one directory would force a detach-then-attach gap. Two
+consequences that surprise people: **`systemctl stop cordond` does not stop enforcement**
+(that is `cordond --teardown`, which refuses while a daemon runs), and teardown is
+**asynchronous** — unlinking a pin drops the link's last reference and the kernel detaches
+from a workqueue, so anything that must see the boundary down has to poll.
+
+**One daemon per socket.** Startup takes an exclusive `flock` on `<socket>.lock` and refuses
+if it is held. Required by pinning (two daemons would race over the pin paths, and removing
+a pin to place your own detaches a boundary its owner still believes in) and a bug fix in its
+own right: `serve` unlinks any socket inode it finds without checking whether anyone is
+listening, so a second daemon used to steal the first one's live socket silently.
+
 **Policy tiers.** Effective policy is system ⊕ user tier. A system fragment pulls in a
 user-tier file via `[[include]] user = … path = …`; the included file is **home-scoped** (its
 objects must resolve under that user's `~`) and may not itself include. A policy path may be
@@ -87,26 +111,12 @@ Environment, cwd, tty, job control and session are inherited by construction.
 
 ## What's left
 
-**Order (set 2026-07-28).** Bugs and doc drift first, then finish **M3**; then **M5** and
-**M6**, which are the must-haves. Blessing work waits — B1+B2 already make `bless` usable, and
-the core boundary is what the remaining holes are in. The rule: *soundness before ergonomics.*
+**Order (set 2026-07-28, updated as M3/M5 landed).** M3 and M5 are done. **M6 is the only
+remaining must-have.** Blessing work waits — B1+B2 already make `bless` usable, and the core
+boundary is what the remaining hole is in. The rule: *soundness before ergonomics.*
 
-### First — finish M3
+### Next — the last must-have
 
-- **M3 completion** — every hook now ships: `inode_mkdir` and `bprm_check_security` (the
-  `execute` action) landed, and `RENAME_EXCHANGE` is **verified** rather than believed (see
-  *Durable kernel facts*). What is left is `listdir` ≈ "open dir for read", which is a
-  documentation note about coarseness rather than a hook — a finer one needs the hot
-  `file_permission`.
-
-### Next — the must-haves
-
-- **M5 — fail-safe bpffs pinning**, the last M1 hardening item: pin program + maps + link so
-  enforcement survives daemon death (until then it fails **open** on daemon exit). **Must
-  ship with a singleton guard** (flock on the pin dir / refuse-if-pins-active): today two
-  daemons cannot corrupt each other because each loads private maps, but two daemons sharing
-  *pinned* maps would reintroduce a cross-process writer race. Pin the policy maps only —
-  a pinned `BLESSED` with a dead daemon means grants that never expire.
 - **M6 — fixed code as the precondition for a grant**, the `exe`-identity fix, and the
   largest known hole. The invariant: a grant attaches only to a process that runs the code it
   shipped with, so anything executing foreign code *in its own address space* — a JIT, an
@@ -159,6 +169,29 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
 ## Settled, do not redo
 
+- **Adopt-existing-pins on restart: specified, then dropped as unnecessary.** The M5 text
+  said "pin program + maps + link; adopt existing pins on startup". Pinning the **links**
+  alone delivers the whole property, because a link holds its program and a program holds
+  its maps — so there is nothing left for adoption to buy. What adoption *costs* is real: a
+  mandatory cross-process writer lock on the banked flip, a stale-program-after-upgrade trap
+  needing an ABI/build-id check plus a replace path as fallback, and a direct conflict with
+  the startup self-test, which writes bank 0 and `SETTINGS` before `seed_policy` and would
+  transiently clobber a live adopted policy. Replace-on-start has none of that and is
+  gap-free anyway (attach the new generation before sweeping the old).
+- **"Pin the policy maps only — a pinned `BLESSED` means grants that never expire" is
+  backwards.** Under a pinned program an *unpinned* `BLESSED` is still alive (the program
+  holds a reference to it), so its stale grants persist exactly the same and merely become
+  **unreachable** — strictly worse than pinning it. Moot under the link-only design, which
+  pins no maps at all and so leaves `BLESSED`'s fail-closed-on-restart semantics (DESIGN
+  §16, step 9) exactly as specified. Do not "fix" this by pinning maps.
+- **The daemon fast-allow is `daemon_pid` AND `daemon_exe`, and must stay that way.**
+  `live_bank` returns `None` (a total, unlogged bypass of every protected object) for the
+  daemon's own pid. Pinning makes `SETTINGS` outlive the process that wrote it, so a pid-only
+  test hands that bypass to whatever recycles the pid while the daemon is down. The exe half
+  costs nothing on the hot path — `&&` short-circuits on the pid — and needed no new BTF
+  offset, since `caller_exe()` is argument-free and `live_bank`'s signature (and the
+  five-register ceiling) is untouched.
+
 - **`PathBuf` → `Box<Path>` for stored path fields: tried wholesale, reverted.** The premise
   was that the type would say "built once, never mutated". It doesn't — anything holding
   `&mut self` can reassign a `Box<Path>` field just the same, so all it removes is in-place
@@ -169,6 +202,30 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
 ## Durable kernel facts
 
+- **A pinned `bpf_link` keeps its whole apparatus alive.** The link holds a reference to its
+  program and the program holds references to its maps, so one pinned link per hook keeps the
+  programs *and* the seeded policy resident with no process attached. This is why M5 pins
+  links and nothing else.
+- **Unlinking a pin detaches asynchronously** (measured 2026-07-28 in the VM, and it will
+  bite anyone who assumes otherwise): removing the bpffs entry only drops the link's last
+  reference; the kernel frees it — and detaches the hooks — from a **workqueue**. So
+  enforcement outlives `cordond --teardown` returning by a beat. The first version of the
+  smoke suite failed on exactly this, and its `rm -rf` of the workspace was refused because
+  the boundary was still up. Poll for the effect; never assume it is immediate.
+- **`BPF_OBJ_PIN` refuses a path outside a bpffs with `EINVAL`**, so a `statfs`
+  `BPF_FS_MAGIC` pre-check buys nothing but a nicer message — the kernel already makes
+  "pinned into a regular directory and silently working" impossible.
+- **`/proc/self/exe` stops being resolvable once the binary is replaced** (measured
+  2026-07-28): after a package upgrade renames a new file over a running daemon's
+  executable, `readlink` gives `…/cordond (deleted)` and **`std::fs::canonicalize` fails
+  `ENOENT`** — so `proc::file_id`, which canonicalizes before consulting the mount table,
+  returns `None`. `stat` *through* the magic link still reports the original inode, but the
+  path-based route is what cordon uses. This is why `seed::daemon_exe` memoizes in a
+  `OnceLock` instead of re-reading per seed: re-resolving would either fail a post-upgrade
+  `policy apply` for no actionable reason, or (if it resolved) name the **new** inode, which
+  this process never exec'd — silently breaking the fast-allow the daemon needs for its own
+  I/O. `mm->exe_file` is fixed for the life of a process, so the value is a constant; do not
+  "simplify" it back into a per-call lookup.
 - `bpf_d_path` is **not allowed** at `file_open`, so identity is inode `(dev,inode)`, never a
   path — resolved by the daemon at seed time.
 - The daemon takes the device from the **mount table** (`/proc/self/mountinfo`), which matches

@@ -178,9 +178,9 @@ The gater is **not** an AppArmor analog — it's a programmable authorizer (cous
 of LSM-BPF). The AppArmor analog on macOS is Seatbelt/SBPL, unused.
 
 **Enforcement posture.** With `bpf-lsm` the verdict is in-kernel, so it does **not**
-depend on the daemon being up. Once the programs + maps are **bpffs-pinned** (the
-remaining hardening increment) enforcement is **fail-safe** — it survives daemon
-death; until then a daemon crash drops the program and fails open.
+depend on the daemon being up. The links are **bpffs-pinned** (M5), so enforcement is
+**fail-safe** — it survives daemon death, and a crash or a restart leaves the boundary
+standing with no gap.
 
 ### Optional later bundle (only to cover un-gated reads — §7)
 Relocate + encrypt → needs a **key** → held by a resident **broker** → needs a
@@ -198,7 +198,7 @@ and carries out allow/deny — needs privilege, and it sits behind one interface
 
 | Backend | Privilege | Scope | Boundary? | Status |
 |---|---|---|---|---|
-| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe once pinned) | Linux production — **the boundary** |
+| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe: bpffs-pinned) | Linux production — **the boundary** |
 | `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS — planned (§12, Phase 4) |
 | `mock` / `fanotify` / `seccomp-unotify` | — | — | no | **removed / dropped** — see note |
 
@@ -254,9 +254,12 @@ in-kernel LSM shape buys:
   upgrade) and resisting copy-to-a-blessed-path, against a hash not a spoofable
   path. (IMA *appraisal* + a keyring gets "verified-signed-by-key," the closest
   Linux analog to ES code-signing — enterprise setup, not free.)
-- **Fail-safe, not fail-open.** Pin the programs and their `bpf_link` to **bpffs**
-  (`/sys/fs/bpf/…`) and enforcement persists with **no holding process** — the daemon can
-  crash/restart with *zero* enforcement gap.
+- **Fail-safe, not fail-open — implemented (M5).** The `bpf_link`s are pinned to **bpffs**
+  (`/sys/fs/bpf/cordon/<pid>/<hook>`) and enforcement persists with **no holding process** —
+  the daemon can crash/restart with *zero* enforcement gap. Only the links are pinned: a link
+  holds its program and a program holds its maps, so the seeded policy stays resident too,
+  and no map is ever shared between processes. Turning it off is the explicit
+  `cordond --teardown`.
 
 **Implemented (M1 — validated in a VM, see STATUS / [`PLAN-rule-model.md`](PLAN-rule-model.md)):**
 the `file_open` verdict over the **flat rule table** — deepest protected object via the
@@ -265,10 +268,11 @@ the `file_open` verdict over the **flat rule table** — deepest protected objec
 per-rule `policy` the only enforcement level (no global mode, §15.6); the **text policy**
 compiled + seeded at startup and re-seeded by `cordon policy apply` via an **atomic
 double-buffer swap**; and the
-ring-buffer learn path with **in-kernel event coalescing**. The **structural-op gating**
-(closing the rename bypass), **content-digest identity** (§15.4), and **fail-safe pinning**
-described above are the next increments, not yet shipped — so today's `bpf-lsm` enforces
-open-time actions in-kernel and (until pinning) still fails open when the daemon dies.
+ring-buffer learn path with **in-kernel event coalescing**. **Structural-op gating** (M3 —
+closing the rename bypass, plus `execute`) and **fail-safe pinning** (M5) have since shipped
+too, so `bpf-lsm` mediates opens *and* mutations and keeps enforcing when the daemon dies.
+**Content-digest identity** (§15.4) remains unshipped, and is not what closes the
+`LD_PRELOAD` hole — see M6.
 
 **Deny/learn delivery — decoupled from the verdict.** The in-kernel program has already
 decided; observability rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a
@@ -285,9 +289,9 @@ drains it asynchronously. It does **not** block the syscall. Lossy under flood =
 > **Control plane = the root-owned text policy (durable source of truth) + a thin,
 > restartable daemon** that (a) compiles the policy and seeds the maps at startup and on
 > `cordon policy apply`, and (b) **drains the ring buffer to the journal.** Off the hot
-> path; its absence costs observability, **never** enforcement (and, once pinned, not even
-> across a restart). *The daemon is still required* — to ship ring-buffer events to the
-> journal and to apply policy changes.
+> path; its absence costs observability, **never** enforcement — not even across a restart,
+> since the links are pinned. *The daemon is still required* — to ship ring-buffer events to
+> the journal and to apply policy changes.
 
 **Map concurrency** is handled by map semantics + RCU, not hand-rolled locks: a
 single-element `bpf_map_update_elem` is atomic (a reader sees old-or-new, never torn;
@@ -550,11 +554,12 @@ Same shape both OSes: a root **in-kernel authorizer** + a **root-owned text poli
 the `cordon` CLI. Per-protected-dir cost = a rule, not a per-tool profile.
 
 ## 10. Honest limitations
-- **Fail-open until pinned.** The verdict is in-kernel, but the daemon loads the program —
-  until the programs + maps are **bpffs-pinned** (§4), a daemon crash drops enforcement
-  (fail-open). Pinning makes it fail-safe; it is the remaining hardening increment. On
-  kernels without BPF-LSM (`CONFIG_BPF_LSM` off, or `bpf` not in the LSM list) there is no
-  hardened Linux boundary at all.
+- **~~Fail-open until pinned.~~ Closed (M5).** The LSM links are bpffs-pinned (§4), so a
+  daemon crash, kill or restart leaves enforcement standing with no gap. The residue is a
+  usability edge rather than a hole: `systemctl stop cordond` no longer stops enforcement
+  (`cordond --teardown` does), and teardown is asynchronous — the kernel detaches from a
+  workqueue once the pin's reference goes. On kernels without BPF-LSM (`CONFIG_BPF_LSM` off,
+  or `bpf` not in the LSM list) there is still no hardened Linux boundary at all.
 - **Open-time only (so far).** M1 mediates `file_open` (read/write/create); the structural
   ops (unlink/rename/… — closing the rename-out-of-zone bypass) and `execute` are later
   hooks (§15.5). Until then a same-uid tool can rename a secret out of a protected subtree
@@ -630,7 +635,7 @@ kernel (the unprivileged `cargo test` tier covers the parser + copy-down compile
 > **Superseded by [`PLAN-rule-model.md`](PLAN-rule-model.md) + §15.11 — historical.** The
 > phases below are the *owner-model* roadmap. They shipped through Phase 1, after which the
 > owner model + fanotify were **removed**; the **current** roadmap is the rule-model
-> milestones M1–M5 (M1 done) in PLAN-rule-model.md, summarized in §15.11. Kept for the
+> milestones M1–M6 (M1, M3 and M5 done) in PLAN-rule-model.md, summarized in §15.11. Kept for the
 > design history and the macOS/ES notes (Phase 4), which still apply.
 
 - **Phases 0–3 (owner model — shipped, then retired).** Phase 0 built the
@@ -755,7 +760,7 @@ The flat **rule model** — `(who, where, action, policy)`, in the SELinux/AppAr
 — is cordon's architecture, **shipped in M1**. It subsumes the v1 owner model's owners,
 explicit rules, and TOFU (§5) into one concept, enforced uniformly in-kernel. This section
 is the design; milestone-by-milestone status is in
-[`PLAN-rule-model.md`](PLAN-rule-model.md) (M1 done, M3 partly; M5 and M6 are the must-haves).
+[`PLAN-rule-model.md`](PLAN-rule-model.md) (M1, M3 and M5 done; M6 is the remaining must-have).
 
 ### 15.1 Why
 The owner entity is reducible to allow-rules: `owner_match` ≡ "an allow rule exists for
@@ -1138,19 +1143,20 @@ the same mechanism M4 autolearn needs to collapse per-file opens into a subtree 
    Replaced the owner model and closed the in-kernel-rules gap.
 2. **Subject predicates** beyond exe — uid, cgroup; then IMA/fsverity hash; then
    argv0/ancestor.
-3. **Mutation + exec hooks** — unlink/mkdir/rmdir/rename + `bprm_check_security` as a
-   second program (closes the rename-out-of-zone bypass).
+3. **Mutation + exec hooks** — **done.** link/unlink/mkdir/rmdir/rename +
+   `bprm_check_security` (closes the rename-out-of-zone bypass and adds `execute`).
 4. **Autolearn** (separate sqlite db) + review/promote, scoped to zones.
-5. **Fail-safe pinning** so the compiled policy keeps enforcing across daemon restarts —
-   until it ships, enforcement fails **open** on daemon exit (must ship with a singleton
-   guard — see the plan).
+5. **Fail-safe pinning** — **done.** The LSM links are bpffs-pinned, so the compiled policy
+   keeps enforcing across a daemon crash, kill or restart; enforcement no longer fails open
+   on daemon exit. Shipped with the required singleton guard (an `flock` on the socket) and
+   an explicit `cordond --teardown`.
 6. **Fixed code as the precondition for a grant** — `exe` is `mm->exe_file`, the file that
    was exec'd, not the code that runs, so `LD_PRELOAD` hijacks any static `allow`. A sticky
    load-time taint plus an attestation lint make the subject `exe AND untainted`. The largest
    known hole; full design in the plan.
 
-Numbering is identity, not schedule: the working order is **bugs → finish 3 → 5 → 6**, with 2
-and 4 contributing the pieces 6 needs rather than shipping on their own.
+Numbering is identity, not schedule: 1, 3 and 5 are done and **6 is the only remaining
+must-have**, with 2 and 4 contributing the pieces 6 needs rather than shipping on their own.
 
 ## 16. Blessing — runtime, authenticated access grants
 
