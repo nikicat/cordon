@@ -119,6 +119,34 @@
 #                       desktop placement — because reconcile missing that location does not
 #                       just leak the carrier: the id allocator never advances past it, so
 #                       the next mint recomputes the same name and fails EEXIST forever.
+#  28. fail-safe pinning — every other scenario proves the boundary works while the daemon
+#                       runs; this one proves it works when the daemon is DEAD. The LSM
+#                       links are pinned to bpffs, so SIGKILLing the daemon leaves both the
+#                       deny and the allow standing with no process holding them. Then
+#                       `cordond --teardown` removes the pins and the same read succeeds —
+#                       which is what shows the verdicts came from the pins and not from
+#                       some unrelated failure. SIGKILL specifically: nothing gets to run on
+#                       the way out, so it is the crash path, not a cooperative shutdown.
+#                       It then runs teardown a SECOND time and requires a different
+#                       message: removing nothing means the box was already unenforced, and
+#                       reporting that as "enforcement torn down" is a false statement about
+#                       a security boundary. Both messages are asserted, since checking only
+#                       the second would pass if both claimed "already off".
+#  29. upgrade      — a package upgrade renames a new binary over a RUNNING daemon's, so
+#                       /proc/<pid>/exe becomes "… (deleted)" and no longer canonicalizes.
+#                       `seed_policy` stamps the daemon's own (pid, exe) identity into
+#                       SETTINGS, and re-deriving that exe per seed made the next `policy
+#                       apply` fail with an error nobody could act on. The scenario asserts
+#                       the "(deleted)" precondition first — otherwise a replacement that
+#                       silently did nothing would let it pass proving nothing — then that
+#                       apply succeeds AND the new rules really took effect (the two
+#                       subjects swap verdicts), not merely that the CLI returned OK.
+#  30. singleton     — a second cordond on the same socket refuses to start. Before the
+#                       lock it unlinked the first one's LIVE socket and bound its own,
+#                       leaving the first running with a listener nobody could reach while
+#                       every client silently talked to the second; with pinning the two
+#                       would also race over the pin paths, and removing a pin to place
+#                       your own detaches a boundary whose owner still thinks it is up.
 #
 # The bless scenarios run the daemon in a NESTED cgroup, reproducing production's
 # `Delegate=yes` service cgroup without needing systemd (the carrier root is then a
@@ -138,6 +166,18 @@ if ! grep -qw bpf /sys/kernel/security/lsm; then
     echo "       boot with lsm=…,bpf (the hook loads but never mediates otherwise)." >&2
     exit 1
 fi
+# bpffs holds the pinned LSM links, which is how enforcement outlives the daemon (M5).
+# A hard precondition, not a per-scenario SKIP: the daemon pins unconditionally, so
+# without bpffs *nothing* here can run. virtme-ng gives us a bare /sys, so mount it.
+if [ "$(stat -f -c %t /sys/fs/bpf 2>/dev/null)" != "cafe4a11" ]; then
+    mkdir -p /sys/fs/bpf 2>/dev/null
+    mount -t bpf bpf /sys/fs/bpf 2>/dev/null
+fi
+if [ "$(stat -f -c %t /sys/fs/bpf 2>/dev/null)" != "cafe4a11" ]; then
+    echo "error: /sys/fs/bpf is not a bpffs mount and could not be mounted." >&2
+    echo "       the daemon pins its LSM links there so the boundary survives its death." >&2
+    exit 1
+fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CORDOND="$ROOT_DIR/target/debug/cordond"
@@ -154,6 +194,9 @@ TMP="" VAULT="" SECRET="" OWNER="" OWNER_B="" SCRAPER="" SOCK="" LOG="" DPID=""
 DCGROUP=""
 # policy-edit symlink scenarios (16/17): the synthetic editor user + the root-only sentinel.
 TUID="" TUSER="" SENTINEL="" EDITDIR=""
+# Where the LSM links are pinned. Off the default (/sys/fs/bpf/cordon) so a suite run on a
+# real box can't tear down that box's live boundary.
+PIN_DIR="/sys/fs/bpf/cordon-smoke"
 
 # A throwaway exe with a distinct inode identity — a copy of `bash`, so we can drive
 # both reads (`exec 3<f`) and writes (`exec 3>f`) *as that subject*. Echoes its path.
@@ -191,6 +234,7 @@ backend = "bpf-lsm"
 socket = "$SOCK"
 bpf_object = "$OBJ"
 policy = "$TMP/policy.toml"
+bpf_pin_dir = "$PIN_DIR"
 EOF
     export CORDON_CONFIG="$TMP/config.toml"
 }
@@ -220,6 +264,12 @@ daemon_start() {
 daemon_stop() {
     [ -n "$DPID" ] && { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
     DPID=""
+    # Killing the daemon no longer stops enforcement — the pinned links keep the boundary
+    # up with no process holding it. Without this, each scenario would leave a live
+    # boundary whose PROTECTED entries name inodes the `rm -rf` below is about to free,
+    # and inode reuse would contaminate the next scenario. Runs before the config it reads
+    # is deleted; the singleton lock is free now that the daemon is reaped.
+    [ -n "$TMP" ] && [ -f "$TMP/config.toml" ] && "$CORDOND" --teardown >/dev/null 2>&1
     if [ -n "$DCGROUP" ]; then
         # Best-effort: the daemon's own cgroup is empty once it exits; a carrier that
         # still has members is left for the next daemon's reconcile to adopt.
@@ -227,7 +277,14 @@ daemon_stop() {
         rmdir "$DCGROUP" 2>/dev/null
         DCGROUP=""
     fi
-    [ -n "$TMP" ] && rm -rf "$TMP"
+    # Retried, because teardown is asynchronous: unlinking the pin only drops the link's
+    # last reference and the kernel frees it (detaching the hooks) on a workqueue. Until
+    # that lands the workspace is still protected and the unlink is refused — which is
+    # itself a small proof that the pins were doing their job.
+    if [ -n "$TMP" ]; then
+        for _ in $(seq 1 50); do rm -rf "$TMP" 2>/dev/null && break; sleep 0.1; done
+        rm -rf "$TMP" 2>/dev/null
+    fi
 }
 
 # 0 once the program is attached, self-tested, AND the policy is seeded ("active …",
@@ -251,6 +308,17 @@ log_count() { sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -cE "$1"; }
 wait_log() { for _ in $(seq 1 30); do log_has "$1" && return 0; sleep 0.1; done; return 1; }
 
 expect_allow() { local l="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  OK: $l (allowed)"; else echo "  FAIL: $l — denied, expected ALLOW"; return 1; fi; }
+# Like expect_allow, but tolerant of the teardown lag: the kernel drops a link when its
+# last reference goes, and unlinking the bpffs pin defers that to a workqueue — so the
+# hooks stay attached for a moment after `--teardown` returns.
+expect_allow_eventually() {
+    local l="$1"; shift
+    for _ in $(seq 1 50); do
+        if "$@" >/dev/null 2>&1; then echo "  OK: $l (allowed)"; return 0; fi
+        sleep 0.1
+    done
+    echo "  FAIL: $l — still denied long after teardown"; return 1
+}
 expect_deny()  { local l="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  FAIL: $l — allowed, expected DENY"; return 1; else echo "  OK: $l (denied)"; fi; }
 
 started() { # gate on the daemon being active; dumps the log + fails on timeout
@@ -1759,6 +1827,173 @@ EOF
     daemon_stop; return $fail
 }
 
+# --- fail-safe pinning: the boundary outlives the daemon --------------------
+# The M5 property, and the one thing no other scenario can show: every other scenario
+# proves the boundary works *while the daemon runs*. Until pinning, killing the daemon
+# detached every hook and the box silently stopped enforcing.
+scenario_pinned_survives_daemon_death() {
+    echo "### scenario: fail-safe pinning (SIGKILL the daemon — the verdicts stand; teardown lifts them)"
+    ws_new
+    write_policy <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0
+    expect_allow "owner reads while the daemon is up"    read_as "$OWNER"   "$SECRET" || fail=1
+    expect_deny  "scraper denied while the daemon is up" read_as "$SCRAPER" "$SECRET" || fail=1
+
+    if [ ! -d "$PIN_DIR" ] || [ -z "$(ls -A "$PIN_DIR" 2>/dev/null)" ]; then
+        echo "  FAIL: nothing pinned under $PIN_DIR — the links were never pinned"; daemon_stop; return 1
+    fi
+    echo "  OK: links pinned under $PIN_DIR ($(ls "$PIN_DIR"))"
+
+    # SIGKILL, not SIGTERM: nothing runs on the way out, so this is the *crash* path —
+    # precisely the case that used to drop the boundary on the floor.
+    kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=""
+    if "$CORDON" status >/dev/null 2>&1; then
+        echo "  FAIL: the daemon still answers — the kill did not take"; fail=1
+    else
+        echo "  OK: the daemon is gone (nothing answers the socket)"
+    fi
+
+    # The assertion the milestone exists for: no process holds the boundary, and it holds.
+    expect_deny  "scraper STILL denied with NO daemon"  read_as "$SCRAPER" "$SECRET" || fail=1
+    expect_allow "owner STILL allowed with NO daemon"   read_as "$OWNER"   "$SECRET" || fail=1
+
+    # …and teardown is what lifts it. Without this step the two asserts above would also
+    # pass if the reads were failing for some reason unrelated to the pins.
+    local t1="$TMP/teardown1.log" t2="$TMP/teardown2.log"
+    if "$CORDOND" --teardown >"$t1" 2>&1; then
+        echo "  OK: --teardown removed the pins with no daemon running"
+    else
+        echo "  FAIL: --teardown errored"; sed 's/^/  daemon| /' "$t1"; fail=1
+    fi
+
+    # Teardown reports the *posture*, and the two cases are not the same event. A blind
+    # count made both runs print "enforcement torn down — the boundary is OFF", which on an
+    # already-unenforced box is a false statement about a security boundary. Both halves are
+    # asserted: checking only the second would pass if BOTH said "already off".
+    "$CORDOND" --teardown >"$t2" 2>&1
+    if sed 's/\x1b\[[0-9;]*m//g' "$t1" | grep -q "torn down"; then
+        echo "  OK: the teardown that removed pins reports a disarm"
+    else
+        echo "  FAIL: the real teardown did not report a disarm:"; sed 's/^/  daemon| /' "$t1"; fail=1
+    fi
+    if sed 's/\x1b\[[0-9;]*m//g' "$t2" | grep -q "already off"; then
+        echo "  OK: a second teardown says the box was already off, not that it disarmed one"
+    else
+        echo "  FAIL: a no-op teardown misreports the posture:"; sed 's/^/  daemon| /' "$t2"; fail=1
+    fi
+
+    expect_allow_eventually "scraper allowed once the pins are gone" read_as "$SCRAPER" "$SECRET" || fail=1
+
+    daemon_stop; return $fail
+}
+
+# --- upgrade under a running daemon -----------------------------------------
+# Regression: `seed_policy` stamps the daemon's own identity (pid + exe FileId) into
+# SETTINGS, and that exe lookup used to be re-done on every seed. A package upgrade renames
+# a new binary over the running daemon's, after which /proc/<pid>/exe reads "… (deleted)"
+# and canonicalization fails — so the next `policy apply` was refused with an error nobody
+# could act on. The identity is now resolved once, since mm->exe_file is fixed for the life
+# of the process.
+scenario_apply_survives_binary_upgrade() {
+    echo "### scenario: upgrade under a running daemon (binary replaced; policy apply still works)"
+    ws_new
+    write_policy <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    # Run from a copy we are allowed to replace, the way an upgrade replaces /usr/bin/cordond.
+    cp "$CORDOND" "$TMP/cordond"
+    local saved="$CORDOND"
+    CORDOND="$TMP/cordond"
+    daemon_start
+    CORDOND="$saved"          # restored before any early return; teardown can use either
+    started || return 1
+    local fail=0
+    expect_allow "owner reads before the upgrade"    read_as "$OWNER"   "$SECRET" || fail=1
+    expect_deny  "scraper denied before the upgrade" read_as "$SCRAPER" "$SECRET" || fail=1
+
+    # The upgrade itself: a NEW inode renamed over the running daemon's binary.
+    cp "$CORDOND" "$TMP/cordond.new"
+    mv "$TMP/cordond.new" "$TMP/cordond"
+    # Assert we actually reproduced the condition — without this the scenario would pass
+    # even if the replacement silently did nothing, proving exactly nothing.
+    if readlink "/proc/$DPID/exe" 2>/dev/null | grep -q '(deleted)'; then
+        echo "  OK: the daemon's binary was replaced under it (/proc/$DPID/exe is now deleted)"
+    else
+        echo "  FAIL: could not reproduce the upgrade — /proc/$DPID/exe = $(readlink "/proc/$DPID/exe" 2>&1)"
+        daemon_stop; return 1
+    fi
+
+    # THE assertion: the daemon can still re-seed. Pre-fix this failed on the exe lookup.
+    cat > "$TMP/new.toml" <<EOF
+[[rule]]
+who = "$SCRAPER"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    if "$CORDON" policy apply "$TMP/new.toml" >/dev/null 2>&1; then
+        echo "  OK: policy apply succeeded after the binary was replaced"
+    else
+        echo "  FAIL: policy apply errored after the upgrade"
+        "$CORDON" policy apply "$TMP/new.toml" 2>&1 | sed 's/^/  cli| /'
+        fail=1
+    fi
+    # …and the re-seed really landed, rather than the CLI just returning OK: the rules are
+    # now the *new* ones, so the two subjects have swapped verdicts.
+    expect_allow "scraper allowed by the newly applied policy" read_as "$SCRAPER" "$SECRET" || fail=1
+    expect_deny  "owner denied — the old rule is gone"         read_as "$OWNER"   "$SECRET" || fail=1
+
+    daemon_stop; return $fail
+}
+
+# --- singleton: one daemon per socket ---------------------------------------
+# Before the flock guard a second daemon unlinked the first one's *live* socket and bound
+# its own, leaving the first running with a listener nobody could reach. With pinning the
+# two would also fight over the pin paths.
+scenario_singleton_refuses_a_second_daemon() {
+    echo "### scenario: singleton (a second cordond refuses to start; the first is untouched)"
+    ws_new
+    write_policy <<EOF
+[[rule]]
+who = "$OWNER"
+where = "$VAULT"
+action = "read"
+policy = "allow"
+EOF
+    daemon_start; started || return 1
+    local fail=0 out rc2
+
+    out="$("$CORDOND" 2>&1)"
+    rc2=$?
+    if [ "$rc2" -eq 0 ]; then
+        echo "  FAIL: a second cordond started successfully"; fail=1
+    else
+        echo "  OK: the second cordond refused to start (exit $rc2)"
+    fi
+    if printf '%s' "$out" | grep -q "already running"; then
+        echo "  OK: it named the conflict instead of failing obscurely"
+    else
+        echo "  FAIL: no 'already running' diagnostic:"; printf '%s\n' "$out" | sed 's/^/  second| /'; fail=1
+    fi
+
+    # The first daemon kept its socket, and the boundary is intact.
+    expect_allow "the first daemon still answers status"   "$CORDON" status || fail=1
+    expect_deny  "the boundary is intact (scraper denied)" read_as "$SCRAPER" "$SECRET" || fail=1
+
+    daemon_stop; return $fail
+}
+
 # --- run all scenarios; fail the suite if any fails -------------------------
 rc=0
 scenario_enforce           || rc=1
@@ -1792,6 +2027,9 @@ scenario_socket_authz      || rc=1
 scenario_bless_rejects_fake_daemon || rc=1
 scenario_bless_placement || rc=1
 scenario_bless_reconcile_ownership || rc=1
+scenario_pinned_survives_daemon_death || rc=1
+scenario_apply_survives_binary_upgrade || rc=1
+scenario_singleton_refuses_a_second_daemon || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then

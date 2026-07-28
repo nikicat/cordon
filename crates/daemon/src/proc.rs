@@ -93,6 +93,45 @@ mod fsid {
             assert_eq!(mkdev(259, 1234), Dev((259 << 20) | 1234));
         }
 
+        /// The premise `seed::daemon_exe`'s memoization rests on: this lookup is
+        /// **path-based** (it canonicalizes before consulting the mount table), so the
+        /// answer changes — or disappears — when the path does.
+        ///
+        /// That is exactly what a package upgrade does to a running daemon: a new binary is
+        /// renamed over the old name, after which `/proc/self/exe` reads `… (deleted)` and
+        /// canonicalization fails. So re-deriving the daemon's own identity per seed would
+        /// either start failing mid-run or name an inode the process never exec'd. Resolve
+        /// it once — see `seed::daemon_exe`.
+        #[test]
+        fn file_id_follows_the_name_not_the_inode() {
+            let dir = std::env::temp_dir().join(format!("cordon-fileid.{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("cordond");
+            std::fs::write(&path, b"old").unwrap();
+
+            let before = file_id(&path).expect("a live path resolves");
+
+            // The upgrade: a *new* inode renamed over the running binary's name.
+            let replacement = dir.join("cordond.new");
+            std::fs::write(&replacement, b"new").unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+
+            let after = file_id(&path).expect("the replacement resolves");
+            assert_ne!(
+                before.ino, after.ino,
+                "rename-over yields a different inode — re-resolving would name the new \
+                 binary, which the running process never exec'd"
+            );
+
+            // …and once the name is gone there is no id to be had by path at all, which is
+            // the `(deleted)` case that made `policy apply` fail after an upgrade.
+            std::fs::remove_file(&path).unwrap();
+            assert!(file_id(&path).is_none(), "a vanished path has no FileId");
+
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
         #[test]
         fn dev_from_mountinfo_longest_prefix() {
             let mi = "23 1 0:23 / / rw - ext4 /dev/sda1 rw\n\

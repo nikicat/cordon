@@ -32,9 +32,14 @@ backend = "bpf-lsm"
 # it at the `just build-ebpf` output:
 # bpf_object = "${PWD}/target/bpf/cordon.bpf.o"
 #
-# bpffs directory the program + maps are pinned under for fail-safe enforcement
-# (planned; see DESIGN §4). Default: /sys/fs/bpf/cordon.
-# bpf_pin_dir = "/sys/fs/bpf/cordon"
+# bpffs directory the LSM links are pinned under, one subdirectory per daemon run. This
+# is what makes enforcement fail-SAFE (DESIGN §4): the pinned links hold the programs and
+# their maps, so the boundary survives the daemon crashing, being killed, or being
+# restarted — with no gap. Default: /sys/fs/bpf/cordon.
+#
+# Consequence worth knowing before you meet it: `systemctl stop cordond` does NOT stop
+# enforcement. Turning it off is `cordond --teardown`.
+bpf_pin_dir = "/sys/fs/bpf/cordon"
 #
 # The root-owned text policy (the flat rule model — see cordon.example.policy.toml)
 # the bpf-lsm backend compiles at startup and seeds the maps from. May be a single

@@ -29,21 +29,23 @@ Numbering is identity, not schedule. The queue:
    switch the boundary off. It lives in root-only `/run/cordon` now.
 2. **Docs** — keep DESIGN/STATUS/plan in step with what ships, since these files are the
    resume point.
-3. **Finish M3** ← **here** — `inode_mkdir`, `bprm_check_security`, and verifying
-   `RENAME_EXCHANGE`. The hard part (the four mutation hooks) already ships; this closes the
-   set.
-4. **M5**, then **M6** — the two must-haves. M5 is small and bounded and removes a
-   fail-**open**; M6 is the largest known hole and the longest job, so it goes last of the
-   two and starts with its userspace-only tasks.
+3. ~~**Finish M3**~~ — **done.** `inode_mkdir`, `bprm_check_security`, and `RENAME_EXCHANGE`
+   verified. Every hook in the action↔hook map now fires except `listdir`, which has no hook
+   by design.
+4. ~~**M5**~~ — **done.** The links are bpffs-pinned, so enforcement no longer fails open when
+   the daemon dies, and a singleton `flock` guards the socket and the pins.
+5. **M6** ← **here** — the largest known hole and the longest job. Start with its
+   userspace-only tasks (attestation first; see *Task order*).
 
 **M2 and M4 are not scheduled on their own.** M6 pulls in the parts it needs — M2's
 `unsandboxed` predicate *is* M6 enforcement point (3), and M4's learning machinery is how code
 sets get built (M6 task 6) — so those land as M6 tasks. The rest of M2/M4 is opportunistic.
 Blessing's B3/B4 are deferred behind all of this; see [`PLAN-bless.md`](PLAN-bless.md).
 
-*Why this order:* soundness before ergonomics. M5 and M6 are the two ways the boundary is
-currently unsound — it stops enforcing when the daemon dies, and a grant can be hijacked by
-`LD_PRELOAD` — and no ergonomic win is worth having on top of either.
+*Why this order:* soundness before ergonomics. M5 and M6 were the two ways the boundary was
+unsound — it stopped enforcing when the daemon died, and a grant can be hijacked by
+`LD_PRELOAD`. M5 is closed; **M6 is the one that remains**, and no ergonomic win is worth
+having on top of it.
 
 ---
 
@@ -108,7 +110,7 @@ currently unsound — it stops enforcing when the daemon dies, and a grant can b
 > the policy as a whole — keep `exe`-only the default and opt into argv/ancestor where a
 > dir's opener is an interpreter.
 
-## Milestone 3 — Mutation + exec hooks ← **finish this first (after the bugs)**
+## Milestone 3 — Mutation + exec hooks ← **done**
 - **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir` — the
   second-name escape, clobber, and destroy. Design + rationale in DESIGN §15.5.
 - **Done (2026-07-28): `inode_mkdir`.** `rmdir` was gated and `mkdir` was not, so a subject
@@ -179,23 +181,54 @@ specified above as having no hook by design.
 - `cordon learn review` → diff of proposals → `promote` writes them into the text policy.
 - Learned rules are **lower precedence** and never override a hand-written deny.
 
-## Milestone 5 — Fail-safe pinning ← **must-have, after M3**
+## Milestone 5 — Fail-safe pinning ← **done (2026-07-28), VM-validated**
 
-> No longer parked. Until it ships, enforcement fails **open** the moment the daemon dies —
-> which makes every other guarantee in this document conditional on a process staying alive.
+Enforcement was fail-**open**: `attach()`'s `LsmLinkId` was discarded, so the links lived
+inside `ebpf` — a local in `Backend::run` — and every hook detached when the daemon exited.
+That made every other guarantee in this document conditional on a process staying alive.
 
-- Pin program + maps + link to bpffs so the compiled policy keeps enforcing across daemon
-  restarts; adopt-existing-pins on startup; explicit teardown. (DESIGN §4.)
-- **Singleton guard (required with pinning).** Today two daemons can't corrupt the rule
-  table — each `EbpfLoader::load_file` creates *private* maps, and the single backend
-  thread owns the only `&mut Ebpf`, so there is exactly one writer. Pinning shares maps
-  across processes, which reintroduces a cross-process write/write race (one daemon's bank
-  fill interleaving another's flip → a torn table). So adopting shared pins must take a
-  singleton lock first (flock on the pin dir, or refuse-to-start when live pins exist).
+**Shipped: pin the links, and only the links.** A pinned link holds its program and a program
+holds its maps, so seven pinned links keep the programs *and* the seeded policy enforcing with
+no holding process. The startup sequence is attach → self-test → seed → **pin** →
+sweep older generations: the previous generation keeps enforcing until the new one is
+*proven*, so there is no instant with nothing attached and an abort on a bad policy leaves the
+boundary up. Pins live at `<bpf_pin_dir>/<pid>/<hook>` — a generation subdirectory, because
+`BPF_OBJ_PIN` fails `EEXIST` on a taken path and one shared directory would force a
+detach-then-attach gap.
+
+- **Adopt-existing-pins was specified here and deliberately dropped.** It buys nothing the
+  link pins don't already give, and costs a mandatory cross-process writer lock, an
+  ABI/build-id check to avoid an upgraded daemon driving the old kernel program, and a clash
+  with the self-test (which writes bank 0 + `SETTINGS` before `seed_policy` and would
+  transiently clobber a live adopted policy). A restarting daemon loads its own object with
+  its own private maps, so the single-writer invariant in `seed.rs` is untouched.
+- The old note "pin the policy maps only — a pinned `BLESSED` means grants that never expire"
+  was **backwards** and is retired: under a pinned program an unpinned `BLESSED` is still
+  alive and its stale grants persist anyway, just unreachably. Pinning no maps at all leaves
+  `BLESSED` fail-closed on restart exactly as DESIGN §16 step 9 specifies.
+- **Singleton guard — shipped**, as an exclusive `flock` on `<socket>.lock` taken before the
+  kernel or the socket is touched. Keyed on the socket rather than the pin dir so it also
+  covers user-mode dev daemons, and it fixes a standing bug: `serve` unlinks any socket inode
+  it finds without probing whether anyone is listening, so a second daemon used to steal the
+  first one's live socket and leave it running unreachable.
+- **The fast-allow had to be narrowed in the same milestone.** `live_bank` returns `None` — a
+  total, unlogged bypass of every object — for `settings.daemon_pid`. Pinning makes that
+  record outlive the process that wrote it, so a recycled pid would inherit the bypass;
+  `Settings` gained `daemon_exe` and the kernel now requires both. No new BTF offset:
+  `caller_exe()` is argument-free, so `live_bank`'s signature and the five-register ceiling
+  are unchanged, and `&&` short-circuits on the pid so the hot path is unaffected.
+- **Teardown is explicit and asynchronous.** `systemctl stop` deliberately leaves the pins, so
+  stop/restart/crash are all gapless and a killed log-drainer never disarms the box;
+  `cordond --teardown` removes them and refuses while a daemon holds the lock. Unlinking a pin
+  only drops the link's last reference — the kernel detaches from a workqueue — so anything
+  needing to observe the boundary down must poll.
+- Covered by two smoke scenarios: `pinned_survives_daemon_death` (SIGKILL, assert the deny
+  *and* the allow still stand, then teardown and assert the read succeeds) and
+  `singleton_refuses_a_second_daemon`.
 
 ---
 
-## Milestone 6 — Fixed code as the precondition for a grant ← **must-have, after M5**
+## Milestone 6 — Fixed code as the precondition for a grant ← **the remaining must-have**
 
 > **The invariant.** A grant attaches only to a process that runs *the code it shipped with*.
 > A process that executes foreign code **in its own address space** — a JIT, an interpreter
@@ -613,6 +646,13 @@ Loose ends left by shipped work, none of them a milestone of their own:
   `~user/.config/cordon/`, with cordon *cordoning* its own user-policy file — a protected
   object only an authorized editor may write. That self-protection is the future
   "edit without sudo".
+  - **M5 adds a precondition to it.** `compile_policy()` runs *before* the new generation
+    loads, so it is mediated by the **previous** generation, which does not fast-allow the
+    new daemon (the fast-allow is pid + exe, and the pid is new). A policy file that cordons
+    itself must therefore carry an explicit rule letting cordond's exe read it, or the next
+    daemon cannot compile its own policy and the box stays on the old one until
+    `cordond --teardown`. Not a live problem — the shipped examples protect no policy file —
+    but do not discover it the hard way.
 
 ## The policy surface
 Authored TOML is specified in DESIGN §15.8 and shown by two regression-tested examples:

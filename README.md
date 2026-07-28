@@ -21,9 +21,34 @@ enforced **in-kernel** by the `bpf-lsm` backend — is the architecture. M1 (TOM
 parser → copy-down compiler → flat BPF maps → in-kernel `file_open` verdicts for
 read/write/create, with the per-rule `allow`/`audit`/`deny`/`silence` policy as the only
 enforcement level — no global mode — and `cordon policy check`/`apply`/`edit`/`show`) is
-implemented and validated end-to-end in a virtme-ng VM. The
+implemented and validated end-to-end in a virtme-ng VM, as are the mutation + exec hooks
+(M3) and fail-safe pinning (M5). The
 earlier owner model (`fanotify`/`mock` backends, SQLite store, `adopt`/TOFU) has been
 retired in favor of the one model. See [`STATUS.md`](STATUS.md).
+
+## Enforcement outlives the daemon
+
+The LSM programs are attached by `bpf_link`s **pinned to bpffs**, so the boundary does not
+depend on `cordond` staying alive: kill it, crash it, `systemctl restart` it, and every
+verdict keeps being enforced with no gap. The daemon is still needed to journal decisions and
+to apply policy changes — but its absence costs you the *log*, never the *boundary*.
+
+The corollary surprises people, so it is worth saying plainly:
+
+> **`systemctl stop cordond` does not stop enforcement.**
+
+Turning the boundary off is a deliberate, separate act:
+
+```sh
+sudo systemctl stop cordond     # stops the daemon; the box is STILL enforcing
+sudo cordond --teardown         # removes the pins — THIS is what turns it off
+```
+
+`--teardown` refuses while a daemon is running (stop it first), and needs no socket, so it
+works when the daemon is dead — which is exactly when you need it. It takes effect a moment
+after it returns: unlinking a pin drops the link's last reference and the kernel detaches on
+a workqueue. If `cordon status` can't reach the daemon it tells you whether the pins are
+still in place, so "connection refused" is never mistaken for "not enforcing".
 
 ## Build & try
 

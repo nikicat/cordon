@@ -190,9 +190,15 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
 
 /// Settings + the daemon's own-I/O fast path. `None` ⇒ the caller allows: either we can't
 /// read settings (fail open) or this *is* the daemon (never deadlock on its own I/O).
+///
+/// The daemon is its **pid and its exe**, not the pid alone. Since M5 the links are
+/// bpffs-pinned, so this record — and the bypass it grants — outlives the process that
+/// wrote it; a pid-only test would hand a total bypass of every protected object to
+/// whatever recycles that pid while the daemon is down. `&&` short-circuits on the pid, so
+/// the two extra derefs cost nothing for every caller that isn't the daemon.
 fn live_bank(pid: Pid) -> Option<Bank> {
     let settings = settings()?;
-    if pid == settings.daemon_pid {
+    if pid == settings.daemon_pid && kernel::caller_exe() == Some(settings.daemon_exe) {
         return None;
     }
     // Masked to a valid bank — a torn/garbage read can't escape the array, it just
