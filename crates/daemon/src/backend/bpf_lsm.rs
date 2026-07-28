@@ -34,8 +34,8 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, Bank, ClassId, CompiledRule, FileId, ObjId, Offsets, Pid, Policy, SubjectMatch,
-    rule_slot,
+    Action, Bank, ClassId, CompiledRule, Dev, FileId, Ino, ObjId, Offsets, Pid, Policy,
+    SubjectMatch, rule_slot,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, ClassName, CompiledPolicy, PolicySource, Severity};
@@ -368,11 +368,13 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     // Seed bank 0 and point `active_bank` at it (the zero-initialized default), so the
     // probe is live; the real `seed_policy` then fills bank 1 and flips away from this.
     let bank = Bank::ZERO;
-    // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX
-    // pid so we are *not* fast-allowed (a denying policy always blocks — there is no
-    // global mode). SILENCE (deny + no log) not DENY: the self-test only needs the open
-    // *blocked*, and a logged probe-deny would spam a spurious record on every startup.
-    seed::set_settings(ebpf, Pid(u32::MAX), bank)?;
+    // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX pid
+    // and a zero exe id so we are *not* fast-allowed (a denying policy always blocks —
+    // there is no global mode). No real inode is `dev=0 ino=0`, so the exe half can never
+    // match either — the identity is deliberately unsatisfiable on both fields.
+    // SILENCE (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
+    // logged probe-deny would spam a spurious record on every startup.
+    seed::set_settings(ebpf, Pid(u32::MAX), FileId::new(Dev(0), Ino(0)), bank)?;
     seed::protected_insert(ebpf, bank, id, obj)?;
     seed::rules_set(
         ebpf,

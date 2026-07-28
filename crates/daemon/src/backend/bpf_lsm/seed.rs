@@ -7,9 +7,10 @@
 //! `Settings.active_bank` selects the live one. [`seed_policy`] fills the *inactive*
 //! bank (the kernel never reads it) and then flips `active_bank` in one `SETTINGS`
 //! write — an RCU-style publish, so a re-seed is never half-visible (no clear-then-
-//! insert window). The flip hinges on the 4-byte `active_bank`, which can't tear; since
-//! `daemon_pid` never changes after startup, `active_bank` is the only moving field, so a
-//! concurrent reader always observes a fully-populated bank — never a torn pointer.
+//! insert window). The flip hinges on the 4-byte `active_bank`, which can't tear; since the
+//! daemon identity (`daemon_pid` + `daemon_exe`) never changes after startup, `active_bank`
+//! is the only moving field, so a concurrent reader always observes a fully-populated bank
+//! — never a torn pointer.
 //!
 //! ## Single writer
 //! Every map write goes through `&mut Ebpf`, owned solely by the backend thread; the
@@ -30,6 +31,8 @@ use cordon_bpf_common::{
 };
 use cordon_core::policy::CompiledPolicy;
 use cordon_core::{Error, Result};
+use std::path::Path;
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
 /// Atomically seed a compiled policy: fill the inactive bank from `compiled`, then flip
@@ -60,7 +63,7 @@ pub(super) fn seed_policy(ebpf: &mut Ebpf, compiled: &CompiledPolicy) -> Result<
     }
 
     // The flip: publish the freshly-filled bank in one write.
-    set_settings(ebpf, Pid(std::process::id()), target)?;
+    set_settings(ebpf, Pid(std::process::id()), daemon_exe()?, target)?;
 
     info!(
         objects = compiled.objects.len(),
@@ -151,14 +154,41 @@ pub(super) fn rules_set(ebpf: &mut Ebpf, index: u32, rule: CompiledRule) -> Resu
         .map_err(|e| Error::msg(format!("bpf-lsm: set rule[{index}]: {e}")))
 }
 
-/// Set the one-element `SETTINGS` record: our pid (fast-allowed) and the live bank.
-/// Writing this with a flipped `bank` is the atomic policy publish.
-pub(super) fn set_settings(ebpf: &mut Ebpf, pid: Pid, bank: Bank) -> Result<()> {
+/// Set the one-element `SETTINGS` record: the fast-allowed daemon identity and the live
+/// bank. Writing this with a flipped `bank` is the atomic policy publish.
+pub(super) fn set_settings(ebpf: &mut Ebpf, pid: Pid, exe: FileId, bank: Bank) -> Result<()> {
     let mut settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
         .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SETTINGS}: {e}")))?;
     settings
-        .set(0, Settings::new(pid, bank), 0)
+        .set(0, Settings::new(pid, bank, exe), 0)
         .map_err(|e| Error::msg(format!("bpf-lsm: set settings: {e}")))
+}
+
+/// This daemon's own executable identity, the other half of the fast-allow (the kernel
+/// requires pid **and** exe, see [`Settings`]).
+///
+/// **Resolved once, then memoized — do not make this re-read `/proc/self/exe` per call.**
+/// The kernel's side of the comparison is `mm->exe_file`, which is fixed for the life of the
+/// process, so this value is a constant and re-deriving it can only introduce disagreement.
+/// Concretely, a package upgrade replaces the binary underneath a *running* daemon, and from
+/// that moment `/proc/self/exe` reads `…/cordond (deleted)`. Both outcomes of re-resolving
+/// are bad:
+///   - `fs::canonicalize` fails `ENOENT` on the `(deleted)` path (measured), so the next
+///     `cordon policy apply` would be refused for no reason a user could act on; and
+///   - if it *did* resolve, it would name the **new** inode, which this process never
+///     exec'd — the fast-allow would silently stop matching and the daemon could deadlock
+///     on its own I/O inside a protected object.
+///
+/// Memoizing pins the answer to the binary actually running, which is what the kernel
+/// compares against, and makes an upgrade a non-event until the daemon restarts.
+///
+/// A hard error rather than a zero id: without it the daemon is subject to its own policy
+/// and a protected object it needs at seed time would deny it, which reads as a mysterious
+/// policy bug rather than the missing-identity it is.
+pub(super) fn daemon_exe() -> Result<FileId> {
+    static EXE: OnceLock<Option<FileId>> = OnceLock::new();
+    (*EXE.get_or_init(|| crate::proc::file_id(Path::new("/proc/self/exe"))))
+        .ok_or_else(|| Error::msg("bpf-lsm: cannot resolve /proc/self/exe for the daemon identity"))
 }
 
 /// Remove `bank`'s entries from the keyed rule maps (`PROTECTED`, `RULE_COUNT`), leaving

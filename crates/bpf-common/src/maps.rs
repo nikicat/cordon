@@ -58,24 +58,37 @@ impl core::fmt::Display for FileId {
     }
 }
 
-/// The one-element control record in `SETTINGS`: which pid is the daemon (always
-/// allowed, so we never deadlock on our own opens) and the live double-buffer [`Bank`].
-/// The kernel reads both from one `Array::get(0)` snapshot; an `apply` fills the
-/// inactive bank and then writes this record with `active_bank` flipped to publish.
-/// `daemon_pid` never changes after startup, so the flip's only moving part is the
-/// 4-byte `active_bank`, which can't tear.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct Settings {
-    pub daemon_pid: Pid,
-    pub active_bank: Bank,
+padded_pod! {
+    /// The one-element control record in `SETTINGS`: which process is the daemon (always
+    /// allowed, so we never deadlock on our own opens) and the live double-buffer [`Bank`].
+    /// The kernel reads all of it from one `Array::get(0)` snapshot; an `apply` fills the
+    /// inactive bank and then writes this record with `active_bank` flipped to publish.
+    /// Only `active_bank` moves after startup, so the flip's only moving part is 4 bytes,
+    /// which can't tear.
+    ///
+    /// **The daemon is `daemon_pid` AND `daemon_exe`, never the pid alone.** A pid is a
+    /// recyclable name, and once the LSM links are bpffs-pinned this record outlives the
+    /// process that wrote it — so a pid-only test hands a total, unlogged bypass of every
+    /// protected object to whatever lands on that pid next. Pairing it with the exe's
+    /// [`FileId`] costs one comparison the kernel already has the machinery for (it reads
+    /// `mm->exe_file` for every subject match anyway) and narrows the window to "and it is
+    /// also running cordond".
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct Settings {
+        pub daemon_pid: Pid,
+        pub active_bank: Bank,
+        pub daemon_exe: FileId,
+    }
 }
 
 impl Settings {
-    pub const fn new(daemon_pid: Pid, active_bank: Bank) -> Self {
+    pub const fn new(daemon_pid: Pid, active_bank: Bank, daemon_exe: FileId) -> Self {
         Settings {
             daemon_pid,
             active_bank,
+            daemon_exe,
+            _pad: [0; Self::PAD],
         }
     }
 }
