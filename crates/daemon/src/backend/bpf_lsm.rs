@@ -9,9 +9,10 @@
 //!     the ring buffer of logged decisions into the journal ([`events`]). The daemon is
 //!     still required (for logging) but the verdict no longer depends on it.
 //!
-//! This root holds the lifecycle (load → attach → self-test → seed → drain). The work
-//! lives in submodules: [`seed`] (map writes — the atomic double-buffer swap; fail-safe
-//! pinning lands there next) and [`events`] (ring drain + event coalescing).
+//! This root holds the lifecycle (load → attach → self-test → seed → **pin** → drain). The
+//! work lives in submodules: [`seed`] (map writes — the atomic double-buffer swap),
+//! [`pin`] (bpffs pinning, so the boundary outlives this process) and [`events`] (ring
+//! drain + event coalescing).
 //!
 //! Requires **root** with `CAP_BPF` + `CAP_MAC_ADMIN`, `CONFIG_BPF_LSM=y`, **and**
 //! `bpf` in the active LSM list (`lsm=…,bpf`).
@@ -22,10 +23,17 @@
 //! the only enforcement level (no global mode, DESIGN §15.6). The policy is compiled +
 //! seeded at startup and re-seeded by `cordon policy apply` via an **atomic
 //! double-buffer swap** ([`seed`]).
-//! Fail-safe **pinning** (enforcement surviving daemon death) is the next increment.
+//!
+//! ## Enforcement posture (M5)
+//! The LSM links are **bpffs-pinned** ([`pin`]), so the verdict survives this process:
+//! `systemctl stop`, a restart and a crash all leave the boundary standing. Turning it off
+//! is the deliberate [`pin::teardown`] (`cordond --teardown`), never a side effect of the
+//! daemon going away.
 
 mod bless;
 mod events;
+// `pub(super)` for `pin::teardown`, which `backend::teardown` reaches without a backend.
+pub(super) mod pin;
 mod seed;
 
 use crate::btf::KernelBtf;
@@ -72,8 +80,7 @@ const POISON_OFFSETS_ENV: &str = "CORDON_SELFTEST_POISON_OFFSETS";
 pub struct BpfLsmBackend {
     /// The compiled eBPF object (`just build-ebpf` output / packaged install).
     object: PathBuf,
-    /// bpffs directory for fail-safe pinning (reserved; see module scope note).
-    #[allow(dead_code)]
+    /// bpffs directory the LSM links are pinned under, one subdirectory per run ([`pin`]).
     pin_dir: PathBuf,
     /// The root-owned text policy compiled + seeded at startup.
     policy: PathBuf,
@@ -121,6 +128,10 @@ impl Backend for BpfLsmBackend {
 
         // Attach (maps still empty ⇒ allow-all, transient), then PROVE they enforce
         // before trusting them — a wrong-offset silent no-op must abort loudly.
+        //
+        // The `LsmLinkId`s are kept because they are the handle `pin::pin_links` needs; a
+        // link left inside its `Program` dies with `ebpf`, which *was* the fail-open.
+        let mut links = Vec::with_capacity(HOOKS.len());
         for &hook in HOOKS {
             let program: &mut Lsm = ebpf
                 .program_mut(hook)
@@ -132,15 +143,22 @@ impl Backend for BpfLsmBackend {
             program
                 .load(hook, &btf)
                 .map_err(|e| Error::msg(format!("bpf-lsm: load program {hook}: {e}")))?;
-            program
+            let id = program
                 .attach()
                 .map_err(|e| Error::msg(format!("bpf-lsm: attach {hook}: {e}")))?;
+            links.push((hook, id));
         }
         self_test(&mut ebpf)?;
 
         // Seed the real, compiled policy and publish it for `cordon policy show`.
         seed::seed_policy(&mut ebpf, &compiled)?;
         *control.current.lock().unwrap() = Some(build_view(&compiled));
+
+        // Only now — attached, self-tested and seeded — does this generation take over.
+        // Pinning last means a failure anywhere above leaves the *previous* generation
+        // enforcing instead of tearing it down for a replacement that never arrived.
+        // `_pinned` is held for the run: see `pin::pin_links`.
+        let _pinned = pin::pin_links(&mut ebpf, &self.pin_dir, links)?;
 
         // The message text is load-bearing beyond readability: the VM smoke's readiness
         // gate greps "active on the file_open hook", and every scenario waits on it. Extra

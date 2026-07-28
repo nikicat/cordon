@@ -12,6 +12,8 @@ mod ipc;
 #[cfg(target_os = "linux")]
 mod proc;
 
+use backend::Swept;
+
 use clap::Parser;
 use cordon_core::backend::{BackendKind, ControlSender, Shutdown, control};
 use cordon_core::config::SocketPath;
@@ -55,6 +57,16 @@ struct Args {
     /// Text policy file to compile + seed (overrides the config file).
     #[arg(long)]
     policy: Option<PathBuf>,
+    /// Remove the bpffs pins and exit, disarming enforcement.
+    ///
+    /// Stopping the daemon deliberately does *not* stop enforcement — the pinned links
+    /// keep the boundary up so a restart or a crash is gapless. This is the explicit way
+    /// to take it down, and it refuses while a daemon is running.
+    ///
+    /// Takes effect a moment after it returns: unlinking a pin drops the link's last
+    /// reference and the kernel detaches the hooks on a workqueue.
+    #[arg(long)]
+    teardown: bool,
 }
 
 fn main() -> ExitCode {
@@ -88,13 +100,19 @@ fn init_tracing() {
     }
 }
 
-/// Resolve what to run, take the singleton lock, then serve.
+/// Resolve what to run, take the one lock both modes need, then do one of the two things
+/// this binary does.
 fn run(args: Args) -> cordon_core::Result<()> {
     let cfg = resolve_config(&args)?;
 
-    // Before the kernel or the socket is touched: exactly one daemon per socket.
+    // Before the kernel or the socket is touched: exactly one daemon per socket. Teardown
+    // takes the same lock — removing a live daemon's pins would leave it enforcing on
+    // handles nobody can see, and disarm the boundary the moment it happened to exit.
     let _singleton = acquire_singleton(cfg.socket.path())?;
 
+    if args.teardown {
+        return teardown_enforcement(&cfg);
+    }
     serve_daemon(cfg)
 }
 
@@ -112,6 +130,28 @@ fn resolve_config(args: &Args) -> cordon_core::Result<Config> {
         cfg.policy = p.clone();
     }
     Ok(cfg)
+}
+
+/// `--teardown`: drop the pins that let enforcement outlive the daemon, and exit.
+///
+/// Deliberately loud. This is the one path that *reduces* protection, and it leaves the
+/// box unenforced until a daemon starts again — so the journal should say so plainly
+/// rather than exiting silently.
+fn teardown_enforcement(cfg: &Config) -> cordon_core::Result<()> {
+    match backend::teardown(cfg)? {
+        // Not the same event, and saying "torn down" here would misreport the posture:
+        // nothing was holding the boundary up in the first place.
+        Swept::Nothing => info!(
+            pin_dir = %cfg.bpf_pin_dir.display(),
+            "nothing was pinned — enforcement was already off, no change",
+        ),
+        Swept::Generations(n) => info!(
+            generations = n.get(),
+            pin_dir = %cfg.bpf_pin_dir.display(),
+            "enforcement torn down — the boundary is OFF until cordond starts again",
+        ),
+    }
+    Ok(())
 }
 
 /// The daemon proper: the enforcement backend on its own thread, the IPC server on this

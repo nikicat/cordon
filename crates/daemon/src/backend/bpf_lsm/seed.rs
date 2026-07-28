@@ -15,11 +15,13 @@
 //! ## Single writer
 //! Every map write goes through `&mut Ebpf`, owned solely by the backend thread; the
 //! CLI has no handle and `apply` requests are serialized through one mpsc channel. So
-//! there is exactly one writer by construction — no userspace write/write race. (Maps
-//! are not pinned/shared yet; when pinning lands (M5), adopting shared pins must come
-//! with a singleton guard, since *that* would reintroduce a cross-process writer.)
+//! there is exactly one writer by construction — no userspace write/write race.
 //!
-//! Fail-safe **pinning** is the remaining growth area here.
+//! M5's pinning does **not** change that, deliberately: it pins the LSM *links*, never the
+//! maps, and adopts nothing on startup, so every daemon still creates its own private maps
+//! (see [`super::pin`]). Sharing maps across processes is what would reintroduce a
+//! cross-process writer — one daemon's bank fill interleaving another's flip into a torn
+//! table — which is why adopt-existing-pins was dropped rather than guarded.
 
 use super::map_mut;
 use aya::Ebpf;
