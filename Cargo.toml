@@ -10,7 +10,7 @@ exclude = ["crates/bpf"]
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nbryskin/cordon"
+repository = "https://github.com/nikicat/cordon"
 rust-version = "1.95"
 
 [workspace.dependencies]
