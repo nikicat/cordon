@@ -1,0 +1,22 @@
+# Keep the SHA pins in .github/workflows/ci.yml current.
+#
+# Pinning by commit hash is what makes those actions immutable, and it is also what
+# makes them silently rot: nothing tells you upstream shipped a fix. Dependabot closes
+# that loop — it rewrites both the hash and the `# vX.Y.Z` comment beside it, and the
+# PR runs the full CI (including the VM job), so a bad bump fails before it lands.
+#
+# Monthly, grouped into one PR: four actions on a solo project don't justify a stream
+# of individual PRs, and the group means one review + one CI run instead of four.
+#
+# Cargo deps are deliberately NOT here — Cargo.lock churn deserves a human reading the
+# changelog, and the eBPF crate pins its own nightly toolchain out of Dependabot's view.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
