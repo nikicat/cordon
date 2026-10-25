@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(alice.name.as_str(), "alice");
         assert_eq!(alice.home, Some(Path::new("/home/alice")));
         // root resolves its name but is not regular → no home, so its paths stay absolute.
-        let root = p.lookup(Uid(0)).unwrap();
+        let root = p.lookup(Uid::ROOT).unwrap();
         assert_eq!(root.name.as_str(), "root");
         assert_eq!(root.home, None);
         // A uid with no passwd line → None (the caller shows the bare number).
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn regular_uid_excludes_system_and_overflow() {
-        assert!(!is_regular_uid(Uid(0))); // root
+        assert!(!is_regular_uid(Uid::ROOT)); // root
         assert!(!is_regular_uid(Uid(999))); // a system daemon
         assert!(is_regular_uid(Uid(1000))); // first human account
         assert!(is_regular_uid(Uid(60000))); // login.defs UID_MAX default

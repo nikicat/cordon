@@ -17,8 +17,7 @@
 //! Paths are resolved to `(dev,ino)` by an injected resolver — the daemon's
 //! `proc::file_id` in production, a fake in tests — so this stage stays pure and
 //! unit-testable. A path that doesn't resolve yet is **pending** (re-tried on a later
-//! apply / `inode_create` in M3); an exe that doesn't resolve drops that one rule with
-//! a warning.
+//! apply); an exe that doesn't resolve drops that one rule with a warning.
 
 use super::{ClassName, Diagnostic, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
@@ -36,7 +35,7 @@ use std::path::{Path, PathBuf};
 pub struct CompiledPolicy {
     pub objects: Vec<CompiledObject>,
     /// Object paths that don't currently resolve to an inode — re-tried on a later
-    /// `cordon policy apply` (or when the path is created, M3).
+    /// `cordon policy apply`.
     pub pending: Vec<PathBuf>,
     pub diagnostics: Vec<Diagnostic>,
     /// The blessing class registry (DESIGN §16.3): each declared class name → its dense

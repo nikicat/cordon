@@ -223,20 +223,27 @@ ws_new() {
     SOCK="$TMP/cordon.sock"; LOG="$TMP/daemon.log"
 }
 
-# Write the policy (rules on stdin) + a matching config, then point the daemon at it.
-# Absolute paths only, so no `~` ambiguity. There is no global mode — the per-rule
-# `policy` is the only enforcement level (DESIGN §15.6). `zones = []` keeps the
-# (rule-model-irrelevant) first-run zone seed empty.
-write_policy() { # rules on stdin
-    cat > "$TMP/policy.toml"
+# Write a config naming POLICY (a file or a conf.d dir) and SOCKET (default $SOCK), then
+# point the daemon and CLI at it. Every scenario goes through here so the config always
+# carries the off-default $PIN_DIR: `daemon_stop` runs `cordond --teardown`, and a config
+# without it would tear down the real /sys/fs/bpf/cordon.
+write_config() { # $1 policy path  [$2 socket]
     cat > "$TMP/config.toml" <<EOF
 backend = "bpf-lsm"
-socket = "$SOCK"
+socket = "${2:-$SOCK}"
 bpf_object = "$OBJ"
-policy = "$TMP/policy.toml"
+policy = "$1"
 bpf_pin_dir = "$PIN_DIR"
 EOF
     export CORDON_CONFIG="$TMP/config.toml"
+}
+
+# Write the policy (rules on stdin) + a matching config. Absolute paths only, so no `~`
+# ambiguity. There is no global mode — the per-rule `policy` is the only enforcement
+# level (DESIGN §15.6).
+write_policy() { # rules on stdin
+    cat > "$TMP/policy.toml"
+    write_config "$TMP/policy.toml"
 }
 
 # Start the daemon (env assignments as args). With `$DCGROUP` set, it is started *inside*
@@ -743,13 +750,7 @@ where = "$usrvault"
 action = "read"
 policy = "allow"
 EOF
-    cat > "$TMP/config.toml" <<EOF
-backend = "bpf-lsm"
-socket = "$SOCK"
-bpf_object = "$OBJ"
-policy = "$TMP/conf.d"
-EOF
-    export CORDON_CONFIG="$TMP/config.toml"
+    write_config "$TMP/conf.d"
 
     daemon_start
     if ! wait_active; then
@@ -834,13 +835,7 @@ edit_env_setup() {
         || { echo "  SKIP: /etc/passwd not writable"; return 1; }
     SENTINEL="$TMP/root-secret"; echo "SENTINEL-XYZZY" > "$SENTINEL"; chown 0:0 "$SENTINEL"; chmod 600 "$SENTINEL"
     EDITDIR="${TMPDIR:-/tmp}"   # where cordon mints its per-edit temp dir
-    cat > "$TMP/config.toml" <<EOF
-backend = "bpf-lsm"
-socket = "$TMP/dead.sock"
-bpf_object = "$OBJ"
-policy = "$TMP/policy.toml"
-EOF
-    export CORDON_CONFIG="$TMP/config.toml"
+    write_config "$TMP/policy.toml" "$TMP/dead.sock"
 }
 
 # Undo edit_env_setup: drop the synthetic passwd line + free the workspace.

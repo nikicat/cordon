@@ -12,15 +12,15 @@ pub fn normalize(path: &Path) -> PathBuf {
     for comp in path.components() {
         match comp {
             Component::CurDir => {}
-            Component::ParentDir => {
-                // Don't pop past a root or a leading `..`.
-                match out.last() {
-                    Some(Component::Normal(_)) => {
-                        out.pop();
-                    }
-                    _ => out.push(comp),
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
                 }
-            }
+                // `/..` is `/`.
+                Some(Component::RootDir) => {}
+                // A relative path keeps its leading `..`.
+                _ => out.push(comp),
+            },
             Component::RootDir => {
                 out.clear();
                 out.push(comp);
@@ -71,6 +71,9 @@ mod tests {
     fn normalize_resolves_dot_and_dotdot() {
         assert_eq!(normalize(Path::new("/a/./b/../c")), Path::new("/a/c"));
         assert_eq!(normalize(Path::new("/a/b/../../c")), Path::new("/c"));
+        assert_eq!(normalize(Path::new("/../a")), Path::new("/a"));
+        assert_eq!(normalize(Path::new("/a/../../b")), Path::new("/b"));
+        assert_eq!(normalize(Path::new("../a")), Path::new("../a"));
     }
 
     #[test]

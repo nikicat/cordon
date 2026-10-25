@@ -247,7 +247,8 @@ pub struct Record {
     pub leaf: FileId,
     /// Dense index of the object; the daemon maps it back to the authored path.
     pub obj: ObjId,
-    /// What was attempted (a single bit here, unlike a rule's mask).
+    /// The actions the hook requested, which can be several bits (read, write and create
+    /// for one open).
     pub action: Action,
     /// Blocked or not — becomes the journal's `deny`/`audit` message word.
     pub decision: Decision,
@@ -353,8 +354,8 @@ fn fill_comps(
     (depth as u8, true)
 }
 
-/// The suppression window: at most one ring record per `(exe, object, action)` per this
-/// many nanoseconds (1s). The audit found tools re-open the same config hundreds of
+/// The suppression window: at most one ring record per [`SuppressKey`] per this many
+/// nanoseconds (1s). The audit found tools re-open the same config hundreds of
 /// times per run; a 1s window collapses each such burst to its first occurrence + a
 /// count, keeping the ring (and the learn path) quiet without losing the event.
 const SUPPRESS_WINDOW_NS: Nanos = Nanos(1_000_000_000);

@@ -4,9 +4,9 @@
 //! Per axis (subject/object/action) we recursively expand `@group` refs (cycle-checked
 //! against a path stack), then interpret each leaf in that axis's terms: a subject leaf
 //! is an exe path (or `*` → any), an object leaf is a path (`*` is rejected — you can't
-//! protect the whole filesystem, DESIGN §15.6.4), an action leaf is one of the nine
-//! names (`*` → all). Paths get `~`-expanded and lexically normalized here; inode
-//! resolution is deferred to [`super::compile`].
+//! protect the whole filesystem), an action leaf is an [`ActionName`] (`*` → all). Paths
+//! get `~`-expanded and lexically normalized here; inode resolution is deferred to
+//! [`super::compile`].
 
 use super::parse::{GroupDef, Groups, ParsedPolicy, Token};
 use super::{ActionName, ClassName, GroupName, Pos, expand_path};
@@ -96,12 +96,15 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
 /// Collect the declared blessing classes (DESIGN §16.3) and validate the `blessing` predicate
 /// is well-placed: it lives only on a **subject** group, and is mutually exclusive with
 /// `members`. Returns the distinct class names, sorted (so [`super::compile`] assigns stable
-/// [`bpf::ClassId`]s). Errors point at the offending group's source line.
+/// [`bpf::ClassId`]s).
 fn declared_classes(groups: &Groups) -> Result<Vec<ClassName>> {
     // `blessing` is a subject predicate — reject it in the object/action namespaces.
     for (axis, ns) in [("object", &groups.object), ("action", &groups.action)] {
-        if let Some((name, g)) = ns.iter().find(|(_, g)| g.get_ref().blessing.is_some()) {
-            let _ = g;
+        if let Some(name) = ns
+            .iter()
+            .find(|(_, g)| g.get_ref().blessing.is_some())
+            .map(|(name, _)| name)
+        {
             return Err(Error::msg(format!(
                 "group @{name} in the {axis} namespace has a `blessing` predicate, which is \
                  only valid on a subject group"

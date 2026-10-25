@@ -45,10 +45,6 @@ use tracing::{error, warn};
 /// apply; a map write + mkdir for a bless op) before giving up.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The only uid `authorize` privileges. Named so the gate reads as intent rather than as
-/// a bare zero.
-const ROOT: Uid = Uid(0);
-
 /// How long a `BlessRequest` waits for its approval before giving up. Generous because a
 /// human is in the loop: a polkit dialog or a mistyped password burns real seconds, and
 /// the cost of waiting is one parked thread the requester is holding open anyway.
@@ -307,7 +303,7 @@ impl Ctx {
 /// The match is deliberately **exhaustive** (no `_` arm) so a new verb cannot be added
 /// without choosing a side.
 fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
-    if peer_uid == ROOT {
+    if peer_uid == Uid::ROOT {
         return Ok(());
     }
     match req {
@@ -354,7 +350,7 @@ mod tests {
                 sources: Vec::new(),
             },
         ] {
-            assert!(authorize(&req, ROOT).is_ok());
+            assert!(authorize(&req, Uid::ROOT).is_ok());
             assert!(authorize(&req, Uid(1000)).is_err());
             assert!(authorize(&req, Uid(u32::MAX)).is_err());
         }
@@ -368,7 +364,7 @@ mod tests {
             Request::BlessRequest { class: None },
             Request::BlessRevoke { id: BlessId(1) },
         ] {
-            assert!(authorize(&req, ROOT).is_ok());
+            assert!(authorize(&req, Uid::ROOT).is_ok());
             assert!(authorize(&req, Uid(1000)).is_ok());
         }
     }

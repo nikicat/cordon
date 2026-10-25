@@ -1,9 +1,10 @@
 //! The live blessings table (DESIGN §16): carrier cgroups + the `BLESSED` map.
 //!
-//! A blessing is a **carrier cgroup** (`cordon-bless-<id>.<class>` under the daemon's
-//! own cgroup) whose kernel id is registered in `MAP_BLESSED` → the class's dense
-//! [`ClassId`]. The CLI (root, via sudo) execs the target into the carrier; membership
-//! is the boundary — the dirs are root-owned, so a non-root process can't join.
+//! A blessing is a **carrier cgroup** (`cordon-bless-<id>.<class>`, placed by
+//! [`carrier_parent`]) whose kernel id is registered in `MAP_BLESSED` → the class's dense
+//! [`ClassId`]. The unprivileged CLI joins the target to it through the carrier's
+//! `cgroup.procs` descriptor, which the daemon opens as root and passes back; membership
+//! is the boundary — the dirs are root-owned, so a non-root process can't join otherwise.
 //!
 //! Backend-thread state, like the rule maps: every mutation (mint / revoke / GC /
 //! remap / reconcile) runs on the backend thread via the one control channel, so the
@@ -47,9 +48,9 @@ fn cgroup_root() -> &'static Path {
 
 /// The live blessings table — backend-thread state beside the `Ebpf` handle.
 pub(super) struct Blessings {
-    /// Where carrier cgroups live: the daemon's own cgroup directory, resolved once at
-    /// startup. `None` ⇒ unresolvable (no cgroup2) — minting errors, everything else
-    /// (the 17 pre-bless scenarios) is unaffected.
+    /// The daemon's own cgroup directory, resolved once at startup. A carrier goes here
+    /// when the requester's own session scope or user slice can't hold it. `None` means
+    /// there is no cgroup2, so minting errors and everything else is unaffected.
     root: Option<PathBuf>,
     /// The next [`BlessId`]; monotonic per run, bumped past adopted ids at reconcile.
     next: BlessId,
@@ -133,8 +134,8 @@ impl Blessings {
         }
 
         let id = self.next;
-        // In the requester's own session scope where possible, so the blessed process
-        // keeps its logind session and polkit/run0 keep working inside it.
+        // In the requester's own session scope or user slice where possible, so the
+        // blessed process keeps its logind session and polkit/run0 keep working inside it.
         let dir = carrier_parent(requester, root).join(dir_name(id, &class));
         std::fs::create_dir(&dir)
             .map_err(|e| Error::msg(format!("bless: mkdir {}: {e}", dir.display())))?;
@@ -387,16 +388,16 @@ fn reap(ebpf: &mut Ebpf, b: &Blessing) {
     info!(id = %b.id, class = %b.class, revoked = b.revoked, "blessing reaped");
 }
 
-/// The pure GC predicate, given a carrier that currently reads `populated 0`: reap
-/// once the emptiness is meaningful — it had members and they exited, it was revoked,
-/// or the mint grace expired (a CLI that died before joining).
-/// Who may revoke a blessing: root always, otherwise only the uid that minted it. A
-/// blessing adopted by reconcile has no recorded owner — its requester died with the
-/// previous daemon — so it is root's to tear down.
+/// Checks whether `by` may revoke a blessing that `owner` minted. Root always may, and
+/// otherwise only the minting uid. A blessing adopted by reconcile has no recorded owner,
+/// because its requester died with the previous daemon, so only root may revoke it.
 fn may_revoke(owner: Option<Uid>, by: Uid) -> bool {
-    by == Uid(0) || owner == Some(by)
+    by == Uid::ROOT || owner == Some(by)
 }
 
+/// Checks whether an empty carrier (`populated 0`) should be reaped. Its emptiness counts
+/// once it had members that exited, once it was revoked, or once the mint grace expired,
+/// which covers a CLI that died before joining.
 fn should_reap(saw_populated: bool, revoked: bool, age: Duration) -> bool {
     saw_populated || revoked || age > MINT_GRACE
 }
@@ -597,7 +598,7 @@ fn carrier_root() -> Result<PathBuf> {
 /// itself. Root-owned only: this daemon creates carriers as root, so anything else was
 /// planted by whoever owns it.
 fn adoptable(owner: Uid) -> bool {
-    owner == Uid(0)
+    owner == Uid::ROOT
 }
 
 /// Where a blessing's carrier should live: **inside the requester's own user subtree**
@@ -633,7 +634,7 @@ fn carrier_parent(pid: Pid, fallback: &Path) -> PathBuf {
 ///
 /// The `Err` is a reason string rather than a typed error because no caller branches on
 /// it — every failure means the same thing, "use the daemon's cgroup". Its only job is to
-/// say which of the four ways that happened, on one `debug!` line, when someone is working
+/// say which way that happened, on one `debug!` line, when someone is working
 /// out why `run0` stopped working inside a blessed shell.
 fn usable_session_scope(pid: Pid) -> std::result::Result<PathBuf, &'static str> {
     // A requester that exited between connecting and here has no cgroup to read. The mint
@@ -656,7 +657,7 @@ fn resolve_placement(
         .ok_or("requester's cgroup has no session scope or user slice")?
         .under(cgroup_mount);
     match owner(&parent) {
-        Some(Uid(0)) => Ok(parent),
+        Some(Uid::ROOT) => Ok(parent),
         Some(_) => Err("chosen parent is not root-owned"),
         None => Err("chosen parent vanished"),
     }
@@ -915,7 +916,7 @@ mod tests {
         let mount = Path::new("/fake/cgroup");
         let desktop =
             CgroupPath::new("/user.slice/user-1000.slice/user@1000.service/app.slice/app-t.scope");
-        let root_owned = |_: &Path| Some(Uid(0));
+        let root_owned = |_: &Path| Some(Uid::ROOT);
 
         assert_eq!(
             resolve_placement(&desktop, mount, root_owned),
@@ -1005,7 +1006,7 @@ mod tests {
     /// a carrier this daemon did not create as root is not ours to re-register.
     #[test]
     fn only_root_owned_carriers_are_adoptable() {
-        assert!(adoptable(Uid(0)));
+        assert!(adoptable(Uid::ROOT));
         assert!(!adoptable(Uid(1000)));
         assert!(!adoptable(Uid(u32::MAX)));
     }

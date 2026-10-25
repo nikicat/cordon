@@ -183,6 +183,12 @@ impl OneOrMany {
     }
 }
 
+/// The text of a leaf token: an exe path, an object path or an action name. Which one it
+/// is gets decided per axis in [`super::resolve`], which turns it into a `PathBuf` or an
+/// [`ActionName`]. It is an alias rather than a newtype because every string is a valid
+/// leaf at this lexical layer.
+pub(crate) type RawLeaf = String;
+
 /// A single token, classified by its **lexical** form only (axis-independent). The
 /// *meaning* of a [`Token::Leaf`] is axis-specific — an exe path, an object path, or an
 /// action name — and is interpreted by [`super::resolve`], which holds the `home` dir
@@ -193,12 +199,6 @@ impl OneOrMany {
 /// A token whose first character is `@` is always a group ref (so an exe/object whose
 /// leading component is literally `@name` can't be named — an acceptable limit, same
 /// as treating `*` as the wildcard).
-/// A raw, axis-polymorphic **leaf** token — an exe path, an object path, or an action name;
-/// which it is gets decided per-axis in [`super::resolve`] (→ a `PathBuf` or an [`ActionName`]
-/// there). An **alias**, not a newtype: every string is a valid leaf, so there's no invariant
-/// to enforce at this lexical layer — the alias just names the role; the real domain types are
-/// assigned downstream where the invariant lives.
-pub(crate) type RawLeaf = String;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {

@@ -8,7 +8,7 @@
 //! embed them stay POD (`aya::Pod`).
 
 /// Filesystem device number, in the **kernel's** `s_dev` encoding (see the daemon's
-/// `kernel_dev`, which re-packs `stat(2)`'s differently-encoded `st_dev` to match).
+/// `proc::mkdev`, which re-packs a mount's major and minor numbers to match).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Dev(pub u64);
@@ -34,6 +34,11 @@ pub struct Pid(pub u32);
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Uid(pub u32);
+
+impl Uid {
+    /// The superuser's uid.
+    pub const ROOT: Uid = Uid(0);
+}
 
 /// Render the bare number — for the journal's `user=` fallback when passwd has no name for
 /// the uid, and for the `owner=` field on a minted blessing (recorded through `Display` via
@@ -200,7 +205,7 @@ impl Bank {
 mod user {
     use super::*;
 
-    // SAFETY: each is a `repr(transparent)` wrapper over a `u64`, so every bit
+    // SAFETY: each is a `repr(transparent)` wrapper over an integer, so every bit
     // pattern is valid and the type is `Copy` — aya's `Pod` contract.
     unsafe impl aya::Pod for Dev {}
     unsafe impl aya::Pod for Ino {}

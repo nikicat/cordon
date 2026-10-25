@@ -77,7 +77,8 @@ enum PolicyCmd {
     /// Edit a policy in `$EDITOR`, then validate + apply + save in one step — the
     /// sudoedit analog. The editor runs as the invoking user (never root); the result is
     /// compiled and pushed to the daemon, and the root-owned file is written only once the
-    /// daemon accepts it. Run via `sudo` for a root-owned policy.
+    /// daemon accepts it, or saved unapplied when no daemon is running. Run via `sudo` for
+    /// a root-owned policy.
     ///
     /// With nothing named, edits **your own user tier**; `--system` edits the system policy.
     Edit {
@@ -317,11 +318,14 @@ fn render(resp: &Response) {
     }
 }
 
-/// Exit code: errors fail; a rejected `apply` exits non-zero so CI/scripts can branch.
+/// Returns the exit code for a daemon reply. It is non-zero for an error, a rejected
+/// `apply`, and a mid-handshake reply that only `cordon bless` should ever receive.
 fn exit_for(resp: &Response) -> ExitCode {
     match resp {
-        Response::Error { .. } => ExitCode::FAILURE,
-        Response::PolicyApplied { applied: false, .. } => ExitCode::from(1),
+        Response::Error { .. }
+        | Response::PolicyApplied { applied: false, .. }
+        | Response::BlessPending { .. }
+        | Response::BlessMinted(_) => ExitCode::FAILURE,
         _ => ExitCode::SUCCESS,
     }
 }
@@ -341,9 +345,6 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `--socket` wins; otherwise the socket from the config file, or — when that is only
-/// the per-euid default and nothing is listening there — the system daemon's, so an
-/// unprivileged `cordon` finds `cordond` (`SocketPath::for_client`).
 /// What the bpffs pins say about enforcement when the daemon can't be reached.
 ///
 /// Three honest answers, because the wrong one is dangerous in both directions: claiming
@@ -376,6 +377,9 @@ fn enforcement_note(cli: &Cli) -> String {
     }
 }
 
+/// Returns the socket to dial. An explicit `--socket` wins. Otherwise it is the config's
+/// socket, chosen as
+/// [`SocketPath::for_client`](cordon_core::config::SocketPath::for_client) describes.
 fn resolve_socket(cli: &Cli) -> Result<PathBuf> {
     if let Some(s) = cli.socket.clone() {
         return Ok(s);

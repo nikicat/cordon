@@ -42,7 +42,7 @@ pub const MAP_RULES: &str = "RULES";
 /// [`MAP_RULES`] (its slot is otherwise zero-padded to `MAX_RULES_PER_OBJ`).
 pub const MAP_RULE_COUNT: &str = "RULE_COUNT";
 
-/// `HashMap<u64 /*cgroup_id*/, ClassId>` — the runtime **blessing** indirection
+/// `HashMap<CgroupId, ClassId>` — the runtime **blessing** indirection
 /// (DESIGN §16.3): a live blessed cgroup's id → the [`ClassId`] it was minted with. The
 /// kernel resolves the caller's class once per decision (`BLESSED[current_cgroup_id]`,
 /// or [`ClassId::UNBLESSED`] when absent) and a rule's `blessing` predicate matches that.
@@ -106,8 +106,8 @@ impl ClassId {
     pub const UNBLESSED: ClassId = ClassId(0);
 }
 
-/// The raw class id, for the journal's `blessing=` field (the daemon resolves it back to
-/// the policy name; `0`/[`UNBLESSED`](ClassId::UNBLESSED) renders as no class). `no_std`.
+/// The raw class id, for the journal's `blessing=` field. The daemon resolves it back to
+/// the class name. `no_std`.
 impl core::fmt::Display for ClassId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
@@ -282,8 +282,9 @@ impl Policy {
     }
 }
 
-/// The canonical human form (`allow`/`audit`/`deny`/`silence`/`default-deny`) — the policy
-/// authoring vocabulary plus the synthetic default-deny cause. `no_std`: `core::fmt`.
+/// The canonical human form (`allow`/`audit`/`deny`/`silence`/`default-deny`/
+/// `escape-deny`): the policy authoring vocabulary plus the two synthetic deny causes.
+/// `no_std`: `core::fmt`.
 impl core::fmt::Display for Policy {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match *self {

@@ -412,12 +412,7 @@ pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
             .map_err(|e| crate::Error::msg(format!("read policy {}: {e}", path.display())))?;
         return Ok(vec![PolicySource::system(path.display().to_string(), text)]);
     }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-        .map_err(|e| crate::Error::msg(format!("read policy dir {}: {e}", path.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-        .collect();
-    files.sort();
+    let files = fragment_paths(path)?;
     if files.is_empty() {
         return Err(crate::Error::msg(format!(
             "policy dir {} has no *.toml fragments",
@@ -432,6 +427,18 @@ pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
             Ok(PolicySource::system(p.display().to_string(), text))
         })
         .collect()
+}
+
+/// Returns the `*.toml` fragments of the conf.d directory `dir`, sorted by name. Errors
+/// when the directory cannot be read.
+pub fn fragment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| crate::Error::msg(format!("read policy dir {}: {e}", dir.display())))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 /// Read the full policy: the system fragments at `path` ([`read_sources`]) **plus** every

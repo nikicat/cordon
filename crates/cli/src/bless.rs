@@ -44,10 +44,6 @@ use std::process::{Command, ExitCode};
 const ELEVATION_ENV: &str = "CORDON_SUDO";
 const DEFAULT_ELEVATION: &str = "sudo";
 
-/// The only uid a daemon we will request a blessing from may run as — see
-/// [`require_root_daemon`].
-const ROOT: Uid = Uid(0);
-
 /// `cordon bless [--class <name>] [-- <command>…]` | `bless list` | `bless revoke <id>`.
 /// `list`/`revoke` are subcommands; a command literally named `list` runs via
 /// `cordon bless -- list`.
@@ -69,7 +65,8 @@ pub struct BlessArgs {
 enum BlessCmd {
     /// List the live blessings.
     List,
-    /// Revoke a live blessing: kill its process tree and reap the carrier (root).
+    /// Revoke a live blessing you minted, or any blessing as root. Kills its process tree
+    /// and reaps the carrier.
     Revoke { id: BlessId },
 }
 
@@ -156,7 +153,7 @@ fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<Carrie
 /// (DESIGN §16.4), so a user-owned daemon has nothing to grant.
 fn require_root_daemon(stream: &UnixStream, socket: &Path) -> Result<()> {
     let uid = peer_uid(stream)?;
-    if uid != ROOT {
+    if uid != Uid::ROOT {
         return Err(Error::msg(format!(
             "the daemon on {} runs as uid {}, not root — refusing to request a blessing \
              from it (it could grant nothing, and approving its request would spend your \
@@ -263,7 +260,7 @@ mod tests {
     #[test]
     fn the_daemon_end_must_be_root() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
-        let peer_is_root = peer_uid(&ours).unwrap() == ROOT;
+        let peer_is_root = peer_uid(&ours).unwrap() == Uid::ROOT;
         let verdict = require_root_daemon(&ours, Path::new("/socketpair"));
         assert_eq!(
             verdict.is_err(),
@@ -287,7 +284,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cordon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        if peer_uid(&UnixStream::connect(&path).unwrap()).unwrap() == ROOT {
+        if peer_uid(&UnixStream::connect(&path).unwrap()).unwrap() == Uid::ROOT {
             std::fs::remove_dir_all(&dir).ok();
             return; // running as root: this listener is a legitimate daemon end
         }

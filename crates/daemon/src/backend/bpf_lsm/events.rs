@@ -3,12 +3,12 @@
 //! path.
 //!
 //! **Event coalescing** (M1 §1g): tools re-open the same config hundreds of times per
-//! run. The in-kernel suppressor already throttles the ring to ~one record per `(exe,
-//! object, action)` per second (carrying a folded `suppressed` count); here we collapse
-//! whatever a single drain *does* surface — one journal line per `(exe, object,
-//! action, blessing)` with the folded counts — so a burst never becomes a wall of
-//! identical log lines. Both layers together turn the audit's ~hundreds-of-opens floods
-//! into a line.
+//! run. The in-kernel suppressor already throttles the ring to ~one record per
+//! [`SuppressKey`](cordon_bpf_common::SuppressKey) per second (carrying a folded
+//! `suppressed` count); here we collapse whatever a single drain *does* surface — one
+//! journal line per [`coalesce`] key, with the folded counts — so a burst never becomes a
+//! wall of identical log lines. Both layers together turn the audit's ~hundreds-of-opens
+//! floods into a line.
 
 use super::bless::Blessings;
 use crate::proc;

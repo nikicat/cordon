@@ -24,8 +24,8 @@ pub const MAP_SETTINGS: &str = "SETTINGS";
 /// `audit`), drained by the daemon into the journal.
 pub const MAP_EVENTS: &str = "EVENTS";
 /// `LruHashMap<SuppressKey, SuppressVal>` — the in-kernel event suppressor (DESIGN
-/// §15, M1 §1g). Throttles the ring to ~one [`DecisionEvent`] per `(exe, object,
-/// action)` per window, counting the rest so volume stays visible without flooding.
+/// §15, M1 §1g). Throttles the ring to ~one [`DecisionEvent`] per [`SuppressKey`] per
+/// window, counting the rest so volume stays visible without flooding.
 /// **LRU**, not a plain hash: a full plain hash refuses *new* keys (`-E2BIG`), so a
 /// fresh repeat-opener past the cap would never be throttled; LRU instead evicts the
 /// coldest key, self-bounding to the hottest openers (where suppression matters). An
@@ -93,12 +93,6 @@ impl Settings {
     }
 }
 
-/// One logged decision, pushed to the ring buffer for the daemon to journal. Emitted
-/// only when the matched policy logs (`audit`/`deny`) or on a default-deny — never for
-/// a silent `allow`/`silence`. Carries inode identities (no `bpf_d_path` at this hook);
-/// the daemon reverse-resolves them and reads `/proc/<pid>/exe` for a friendly line.
-/// (Named for what it records — a decision — not a consumer; autolearn (M4) is one
-/// future reader, the journal is today's.)
 /// Max path components the kernel reconstructs (leaf → matched object). Deeper paths set
 /// [`DecisionEvent::trunc`]. Bounds the dentry walk (verifier-friendly) and the record.
 pub const PATH_MAX_DEPTH: usize = 8;
@@ -144,6 +138,13 @@ impl core::ops::Deref for PathComp {
 }
 
 padded_pod! {
+    /// One logged decision, pushed to the ring buffer for the daemon to journal. Emitted
+    /// only when the matched policy logs (`audit`/`deny`) or on a default-deny — never for
+    /// a silent `allow`/`silence`. Carries inode identities (no `bpf_d_path` at this hook);
+    /// the daemon reverse-resolves them and reads `/proc/<pid>/exe` for a friendly line.
+    /// (Named for what it records — a decision — not a consumer; autolearn (M4) is one
+    /// future reader, the journal is today's.)
+    ///
     /// ## Leaf path (DESIGN §15.10 flow B)
     /// `bpf_d_path` is unavailable at `file_open`, so the kernel reconstructs the opened
     /// file's path *relative to the matched protected object* by walking `d_name` up the

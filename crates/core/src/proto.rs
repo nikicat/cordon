@@ -68,6 +68,7 @@ pub enum Request {
 /// carrier descriptor goes back down the requester's own connection, never to whoever
 /// approved.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Nonce(String);
 
 impl Nonce {
@@ -89,6 +90,13 @@ impl Nonce {
 impl std::fmt::Display for Nonce {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for Nonce {
+    type Error = crate::Error;
+    fn try_from(s: String) -> Result<Nonce> {
+        s.parse()
     }
 }
 
@@ -458,6 +466,21 @@ mod tests {
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsFd;
 
+    /// A nonce read off the socket is validated like one parsed from argv.
+    #[test]
+    fn nonce_wire_decode_rejects_junk() {
+        let n = Nonce::generate().unwrap();
+        let wire = serde_json::to_string(&n).unwrap();
+        assert_eq!(serde_json::from_str::<Nonce>(&wire).unwrap(), n);
+        for junk in ["", "nope", "zz112233445566778899aabbccddeeff"] {
+            let wire = serde_json::to_string(junk).unwrap();
+            assert!(
+                serde_json::from_str::<Nonce>(&wire).is_err(),
+                "decoded {junk:?}"
+            );
+        }
+    }
+
     /// The blessing hand-off in miniature: a message plus a descriptor over one socket,
     /// and the received fd is the *same open file* — not a copy of the number. Proven by
     /// writing through it and reading the bytes back on the sender's side.
@@ -527,7 +550,7 @@ mod tests {
         assert_eq!(peer_uid(&b).unwrap(), me);
         // And a non-root test runner must not look like root to the caller's check.
         if !config::is_root() {
-            assert_ne!(peer_uid(&a).unwrap(), crate::Uid(0));
+            assert_ne!(peer_uid(&a).unwrap(), crate::Uid::ROOT);
         }
     }
 

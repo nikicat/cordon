@@ -20,7 +20,8 @@
 //! file — and drops to the invoking user *only* in the forked editor child (see [`sys`]).
 //! No new IPC: the read is a direct file read, validation is the in-process compiler (the
 //! same one `policy check` runs), and the commit reuses `PolicyApply`. The file is written
-//! **only after** the daemon accepts the policy, so on-disk == live with no rollback.
+//! **only after** the daemon accepts the policy, so on-disk == live with no rollback. When
+//! no daemon is listening, the validated file is saved and reported as not applied.
 
 use cordon_core::policy::{self, Diagnostic, PolicySource, SourceOrigin, UserName};
 use cordon_core::proto::{Request, Response};
@@ -422,8 +423,9 @@ impl Session {
 
     /// visudo's two checks: a fast local compile (also the only check when the daemon is
     /// down), then the daemon's authoritative mount-aware compile + live swap. Prints
-    /// diagnostics; returns the [`Verdict`]. A genuine protocol error is a hard failure; a
-    /// connection failure means "daemon down" → [`Verdict::SaveOnly`].
+    /// diagnostics; returns the [`Verdict`]. When no daemon is listening
+    /// ([`is_daemon_down`]), the verdict is [`Verdict::SaveOnly`]. Errors when the daemon
+    /// answers with an error or an unexpected reply, or fails mid-request.
     fn assess(&self, candidate: Vec<PolicySource>) -> Result<Verdict> {
         let compiled = policy::compile_fragments(&candidate, &self.home, policy::stat_resolver);
         print_diags(&compiled.diagnostics);
@@ -449,10 +451,20 @@ impl Session {
             }
             Ok(Response::Error { message }) => Err(Error::msg(format!("daemon error: {message}"))),
             Ok(other) => Err(Error::msg(format!("unexpected daemon response: {other:?}"))),
-            // Connection refused/missing → the daemon isn't up; persist the validated file.
-            Err(_) => Ok(Verdict::SaveOnly),
+            // The daemon isn't up; persist the validated file.
+            Err(e) if is_daemon_down(&e) => Ok(Verdict::SaveOnly),
+            Err(e) => Err(e),
         }
     }
+}
+
+/// Checks whether `err` means no daemon is listening on the socket, as opposed to a daemon
+/// that answered badly or died mid-request.
+fn is_daemon_down(err: &Error) -> bool {
+    matches!(err, Error::Io(e) if matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ))
 }
 
 /// Resolve which file to open from the optional CLI argument and the configured policy root:
@@ -572,17 +584,16 @@ fn candidate_sources(
     target_origin: &SourceOrigin,
 ) -> Result<Vec<PolicySource>> {
     use cordon_core::paths::normalize;
-    let mut sources = if policy_root.exists() {
-        match policy::load_policy(policy_root) {
-            Ok(s) => s,
-            // An empty conf.d directory (no `*.toml` yet) is a hard error from
-            // `load_policy`, but here it just means "no siblings" — the new fragment is
-            // the whole policy.
-            Err(_) if policy_root.is_dir() => Vec::new(),
-            Err(e) => return Err(e),
-        }
-    } else {
+    // An empty conf.d directory (no `*.toml` yet) is a hard error from `load_policy`, but
+    // here it just means "no siblings": the new fragment is the whole policy. Any other
+    // load error must fail, or the candidate would silently drop the unreadable siblings
+    // and the apply would replace the live policy with this one fragment.
+    let no_siblings = !policy_root.try_exists()?
+        || (policy_root.is_dir() && policy::fragment_paths(policy_root)?.is_empty());
+    let mut sources = if no_siblings {
         Vec::new()
+    } else {
+        policy::load_policy(policy_root)?
     };
     let tgt = normalize(target);
     match sources
@@ -1054,6 +1065,30 @@ mod tests {
         let file = dir.join("policy.toml");
         std::fs::write(&file, "").unwrap();
         assert_eq!(resolve_target(None, &file).unwrap(), file);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty conf.d means the edited fragment is the whole policy. A sibling that fails
+    /// to load must fail the edit, not vanish from the candidate the daemon applies.
+    #[test]
+    fn candidate_is_alone_in_empty_confd_and_refuses_unloadable_siblings() {
+        let dir = std::env::temp_dir().join(format!("cordon-cand-{}", std::process::id()));
+        let confd = dir.join("conf.d");
+        std::fs::create_dir_all(&confd).unwrap();
+        let target = confd.join("10-new.toml");
+        let only = candidate_sources(&confd, &target, "x", &SourceOrigin::System).unwrap();
+        assert_eq!(only.len(), 1);
+
+        // An include naming a directory reads as EISDIR, a load error that is not NotFound.
+        std::fs::write(
+            confd.join("00-users.toml"),
+            format!(
+                "[[include]]\nuser = \"u\"\npath = {:?}\n",
+                dir.display().to_string()
+            ),
+        )
+        .unwrap();
+        assert!(candidate_sources(&confd, &target, "x", &SourceOrigin::System).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

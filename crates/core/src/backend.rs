@@ -175,7 +175,7 @@ pub struct ApplyOutcome {
 
 /// A source of verdicts and the actuator of compiled policy.
 pub trait Backend: Send {
-    /// Short stable name shown in `cordon status` (e.g. `bpf-lsm`).
+    /// Short stable name for the daemon's startup log (e.g. `bpf-lsm`).
     fn name(&self) -> &str;
 
     /// Load + seed the compiled policy, then run until `shutdown` trips: drain the
