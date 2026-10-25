@@ -424,9 +424,8 @@ mod user {
 
     // SAFETY: each is `repr(transparent)`/`repr(C)` over POD integer fields, so every
     // bit pattern is valid and the type is `Copy` with a fixed layout — aya's `Pod`
-    // contract. (`Policy`/`Action` accept out-of-range discriminants in memory, like
-    // `Decision`; that's a memory-safety statement, not a claim every value is
-    // semantically meaningful.)
+    // contract. (`Policy`/`Action` accept out-of-range discriminants in memory; that's a
+    // memory-safety statement, not a claim every value is semantically meaningful.)
     unsafe impl aya::Pod for ObjId {}
     unsafe impl aya::Pod for ClassId {}
     unsafe impl aya::Pod for BankedFile {}

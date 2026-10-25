@@ -15,8 +15,8 @@ use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
 use cordon_bpf_common::{
-    Action, ClassId, Decision, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp,
-    Pid, Policy, SuppressedTotal, Uid,
+    Action, ClassId, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp, Pid,
+    Policy, SuppressedTotal, Uid,
 };
 use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
@@ -208,11 +208,9 @@ struct Coalesced {
     /// The matched protected object (the rule's `where`) — for the `object=` field.
     object: FileId,
     action: Action,
-    /// Representative decision/policy/pid/path (the first occurrence; identical across the
-    /// group — same `(exe, leaf, action)` ⇒ same matched rule + reconstructed path).
-    decision: Decision,
-    /// The matched policy — `audit`/`deny`, or `default-deny` (no rule matched). Lets the
-    /// journal distinguish a default-deny from an explicit `deny` (DESIGN §15.6).
+    /// The matched policy of the representative (first) occurrence, the same across the
+    /// group because the same `(exe, leaf, action)` hits the same rule. It decides the
+    /// `deny`/`audit` message word, and names the cause (DESIGN §15.6).
     policy: Policy,
     pid: Pid,
     /// The caller's real uid (representative, like `pid` — the in-kernel suppressor keys on
@@ -260,13 +258,13 @@ impl Coalesced {
         let policy = self.policy;
         let (count, suppressed) = (self.count(), self.suppressed);
         match (
-            self.decision,
+            policy.denies(),
             BlessingName::resolve(self.blessing, class_names),
         ) {
-            (Decision::DENY, Some(blessing)) => {
+            (true, Some(blessing)) => {
                 info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, %blessing, "deny")
             }
-            (Decision::DENY, None) => {
+            (true, None) => {
                 info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "deny")
             }
             (_, Some(blessing)) => {
@@ -301,7 +299,6 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
                     exe: e.exe,
                     object: e.object,
                     action: e.action,
-                    decision: e.decision,
                     policy: e.policy,
                     pid: e.pid,
                     uid: e.uid,
@@ -543,7 +540,7 @@ fn parse_event(bytes: &[u8]) -> Option<DecisionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordon_bpf_common::{ClassId, Dev, Ino, ObjId, Policy, Suppressed, SuppressedTotal};
+    use cordon_bpf_common::{ClassId, Dev, Ino, Policy, Suppressed, SuppressedTotal};
 
     /// A protected root shared by the test events (the `object`); `leaf` is what varies.
     const OBJECT: FileId = FileId::new(Dev(1), Ino(100));
@@ -557,9 +554,7 @@ mod tests {
             FileId::new(Dev(1), exe),
             OBJECT,
             FileId::new(Dev(1), leaf),
-            ObjId(0),
             action,
-            Decision::DENY,
             Policy::DENY,
             suppressed,
             ClassId::UNBLESSED,

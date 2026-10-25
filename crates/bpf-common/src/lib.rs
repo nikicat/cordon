@@ -6,7 +6,7 @@
 //! SQLite store and drains the ring buffer. For that to work the two sides must
 //! agree exactly on every key, value, and record — so they live here, once:
 //!
-//! - [`ids`] — the scalar domain newtypes (`Dev`, `Ino`, `Pid`, `Decision`, `Bank`).
+//! - [`ids`] — the scalar domain newtypes (`Dev`, `Ino`, `Pid`, `Bank`).
 //! - [`maps`] — the map names and the POD key/value/record types.
 //! - [`offsets`] — the running-kernel field offsets the daemon resolves from BTF
 //!   and injects into the program's `.rodata` (the CO-RE-substitute portability
@@ -28,12 +28,10 @@ pub mod maps;
 pub mod offsets;
 pub mod policy_maps;
 
-pub use ids::{
-    Bank, CgroupId, Decision, Dev, Ino, Nanos, Opens, Pid, Suppressed, SuppressedTotal, Uid,
-};
+pub use ids::{Bank, CgroupId, Dev, Ino, Nanos, Opens, Pid, Suppressed, SuppressedTotal, Uid};
 pub use maps::{
-    DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, MAP_SUPPRESS, PATH_MAX_DEPTH, PATH_NAME_MAX,
-    PathComp, Settings, SuppressKey, SuppressVal,
+    DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, PATH_MAX_DEPTH, PATH_NAME_MAX, PathComp,
+    Settings, SuppressKey, SuppressVal,
 };
 pub use offsets::Offsets;
 pub use policy_maps::{

@@ -54,8 +54,6 @@ impl ParsedPolicy {
 pub struct Include {
     user: UserName,
     path: String,
-    #[allow(dead_code)] // carried for future fragment-named diagnostics
-    pos: Pos,
 }
 
 impl Include {
@@ -281,7 +279,6 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
             Include {
                 user: def.user.clone(),
                 path: def.path.clone(),
-                pos: lines.pos(spanned.span().start),
             }
         })
         .collect();

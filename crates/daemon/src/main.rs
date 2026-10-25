@@ -159,7 +159,7 @@ fn teardown_enforcement(cfg: &Config) -> cordon_core::Result<()> {
 fn serve_daemon(cfg: Config) -> cordon_core::Result<()> {
     let backend = backend::select(&cfg)?;
     info!(
-        backend = backend.name(),
+        backend = cfg.backend.as_str(),
         socket = %cfg.socket.path().display(),
         policy = %cfg.policy.display(),
         privilege = if config::is_root() { "root" } else { "user (NOT a boundary)" },

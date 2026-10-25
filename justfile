@@ -48,11 +48,6 @@ build-ebpf:
     cp target/bpfel-unknown-none/release/cordon ../../target/bpf/cordon.bpf.o
     echo "staged eBPF object → target/bpf/cordon.bpf.o"
 
-# Build the daemon (the bpf-lsm backend is on by default; Linux only).
-[linux]
-build-bpf-daemon:
-    cargo build -p cordon-daemon
-
 # Install + activate the LOCAL dev unit: this checkout's debug daemon, driven by the
 # /etc/cordon layout, with `Delegate=yes` so bless carrier cgroups can be created under
 # the daemon's own cgroup.

@@ -175,9 +175,6 @@ pub struct ApplyOutcome {
 
 /// A source of verdicts and the actuator of compiled policy.
 pub trait Backend: Send {
-    /// Short stable name for the daemon's startup log (e.g. `bpf-lsm`).
-    fn name(&self) -> &str;
-
     /// Load + seed the compiled policy, then run until `shutdown` trips: drain the
     /// ring buffer to the journal and honor `policy apply` requests off `control`.
     fn run(self: Box<Self>, control: PolicyControl, shutdown: Arc<Shutdown>) -> crate::Result<()>;

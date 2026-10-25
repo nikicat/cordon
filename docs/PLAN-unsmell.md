@@ -6,9 +6,9 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** step 0 is in the working tree, unstaged. The rest is not started.
+> **Status:** step 0 is committed (`d37d114`). Step 1 is in the working tree, unstaged.
 
-## 0. Bug fixes and false doc claims (done, unstaged)
+## 0. Bug fixes and false doc claims (done)
 
 Behaviour changes, each with a pinning test:
 - `policy edit` on a conf.d refused only an *empty* directory as "no siblings". Any other
@@ -27,21 +27,26 @@ Refactors and docs: `Uid::ROOT` replaces three local root constants and the `Uid
 literals; four doc blocks that rustdoc attached to the wrong item are moved; about fifteen
 stale or false doc claims are corrected.
 
-## 1. Delete dead code
+## 1. Delete dead code (done, unstaged)
 
-- `Config.zones`, `default_zones` and `paths::claimable_subtree`. Their only user was the
-  M4 autolearn, which does not exist.
 - `MAP_SUPPRESS` (the daemon never opens the map), `DecisionEvent.obj` (never read; it
   names the same object as `.object`), and `PathComp`'s unused `Deref`/`DerefMut`.
 - `DecisionEvent.decision` and the `Decision` type: it always equals `policy.denies()`, so
   a record could claim `audit` with a `deny` policy. The daemon branches on the policy.
 - `parse::Include.pos` (`#[allow(dead_code)]`, "for future diagnostics").
-- The `[macos]`/`[windows]` justfile recipes and `build-bpf-daemon`.
+- The `build-bpf-daemon` justfile recipe, a one-line alias for `cargo build -p cordon-daemon`.
 - `BackendKind` keeps its one variant, because the config key is user-facing, but
   `Backend::name` goes: the daemon logs `BackendKind`.
 
 The `DecisionEvent` changes alter the ring record layout. Both sides build from the same
 commit, so nothing needs compatibility.
+
+Kept after a closer look, though the survey flagged them:
+- `Config.zones` and `paths::claimable_subtree` are the autolearn scope, and M6 task 6
+  pulls autolearn in. The config also rejects unknown keys, so removing `zones` would
+  break any config that sets it.
+- The `[macos]`/`[windows]` `build` recipe is what lets `just build` compile the workspace
+  off Linux.
 
 ## 2. Shared core types
 

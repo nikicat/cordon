@@ -36,7 +36,7 @@ use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
-    rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, Decision,
+    rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule,
     FileId, ObjId, Pid, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS,
     MAX_RULES_PER_OBJ, NUM_BANKS,
 };
@@ -354,9 +354,7 @@ fn deny_escape(matched: &Match, op: Action, pid: Pid, bank: Bank) -> Verdict {
                 exe,
                 object: matched.object,
                 leaf: matched.leaf,
-                obj: matched.obj,
                 action: op,
-                decision: Decision::DENY,
                 policy: Policy::ESCAPE_DENY,
                 suppressed,
                 blessing: current_class(),
@@ -427,11 +425,6 @@ fn consult(
     // to its first event + a folded `suppressed` count.
     if policy.logs() {
         if let Some(suppressed) = kernel::throttle(exe, matched.leaf, logged) {
-            let decision = if blocked {
-                Decision::DENY
-            } else {
-                Decision::AUDIT
-            };
             // `emit` assembles the record off-stack (per-CPU scratch) and reconstructs the
             // affected file's path relative to the protected object (DESIGN §15.10 flow B)
             // — no `bpf_d_path` here, so it walks `d_name` from the leaf to
@@ -443,9 +436,7 @@ fn consult(
                 exe,
                 object: matched.object,
                 leaf: matched.leaf,
-                obj: matched.obj,
                 action: logged,
-                decision,
                 policy,
                 suppressed,
                 blessing: class,

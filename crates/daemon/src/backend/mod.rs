@@ -76,7 +76,7 @@ pub fn select(cfg: &Config) -> Result<Box<dyn Backend>> {
                     "this build has no 'bpf-lsm' backend — it is Linux-only and on by \
                      default, so this is a non-Linux target or a `--no-default-features` \
                      build. Rebuild on Linux with default features (`cargo build -p \
-                     cordon-daemon`, or `just build-bpf-daemon`)",
+                     cordon-daemon`, or `just build`)",
                 ))
             }
         }

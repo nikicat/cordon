@@ -97,10 +97,6 @@ impl BpfLsmBackend {
 }
 
 impl Backend for BpfLsmBackend {
-    fn name(&self) -> &str {
-        "bpf-lsm"
-    }
-
     fn run(self: Box<Self>, control: PolicyControl, shutdown: Arc<Shutdown>) -> Result<()> {
         // Compile the policy *before* loading anything — a bad startup policy fails
         // fast, without touching the kernel.

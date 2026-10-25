@@ -27,7 +27,7 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{LruHashMap, PerCpuArray, RingBuf};
 use cordon_bpf_common::{
-    Action, CgroupId, ClassId, Decision, DecisionEvent, Dev, FileId, Ino, Nanos, ObjId, Offsets,
+    Action, CgroupId, ClassId, DecisionEvent, Dev, FileId, Ino, Nanos, ObjId, Offsets,
     PathComp, Pid, Policy, Suppressed, Uid, SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
 };
 
@@ -245,15 +245,11 @@ pub struct Record {
     /// The affected file's own identity — equals `object` when the rule names the file.
     /// Also the suppressor and coalesce key, so distinct leaves surface separately.
     pub leaf: FileId,
-    /// Dense index of the object; the daemon maps it back to the authored path.
-    pub obj: ObjId,
     /// The actions the hook requested, which can be several bits (read, write and create
     /// for one open).
     pub action: Action,
-    /// Blocked or not — becomes the journal's `deny`/`audit` message word.
-    pub decision: Decision,
-    /// *Why*, which `decision` alone can't say: an explicit `deny` rule, the
-    /// `default-deny` fallthrough, or the structural `escape-deny`.
+    /// How the access was handled and why: an explicit `deny` rule, the `default-deny`
+    /// fallthrough, the structural `escape-deny`, or an `audit`.
     pub policy: Policy,
     /// Repeats the in-kernel throttle folded into this record.
     pub suppressed: Suppressed,
@@ -285,11 +281,9 @@ pub fn emit(rec: &Record) {
         (*ev).exe = rec.exe;
         (*ev).object = rec.object;
         (*ev).leaf = rec.leaf;
-        (*ev).obj = rec.obj;
         (*ev).action = rec.action;
         (*ev).pid = rec.pid;
         (*ev).uid = rec.uid;
-        (*ev).decision = rec.decision;
         (*ev).suppressed = rec.suppressed;
         (*ev).policy = rec.policy;
         (*ev).blessing = rec.blessing;

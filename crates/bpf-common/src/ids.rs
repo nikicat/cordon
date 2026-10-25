@@ -145,32 +145,12 @@ impl Nanos {
     }
 }
 
-/// How a mediated, logged access was handled — carried in [`crate::DecisionEvent`] for
-/// the daemon's journal line. A `repr(transparent)` `u32` rather than an enum *on
-/// purpose*: aya map values must be `Pod` (valid for any bit pattern), which an enum is
-/// not — reading a stray discriminant out of map memory would be UB. Named values live
-/// as associated consts.
-///
-/// There is no global enforcement mode (DESIGN §15.6): the per-rule `policy` is the only
-/// enforcement level, so a denying policy always blocks and only the `deny`-vs-`audit`
-/// distinction is journaled here.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Decision(pub u32);
-
-impl Decision {
-    /// A denying policy (`deny` / `silence` / the default-deny) → blocked (`-EPERM`).
-    pub const DENY: Decision = Decision(0);
-    /// An `audit` policy (allow + log) → allowed, logged for visibility.
-    pub const AUDIT: Decision = Decision(2);
-}
-
 /// Which generation of the double-buffered rule table is live (DESIGN §15.8). The
 /// kernel reads `Settings.active_bank`; a `cordon policy apply` fills the other bank
 /// and [`flip`](Bank::flip)s to it in one atomic `SETTINGS` write. Only `0`/`1` are
-/// valid; same `repr(transparent)`-not-enum rationale as [`Decision`] (it's read out of
-/// map memory, so every bit pattern must be a sound value — [`index`](Bank::index)
-/// masks a garbage read back into range).
+/// valid. It is a `repr(transparent)` integer rather than an enum because it is read out
+/// of map memory, so every bit pattern must be a sound value; [`index`](Bank::index)
+/// masks a garbage read back into range.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Bank(pub u32);
@@ -214,6 +194,5 @@ mod user {
     unsafe impl aya::Pod for CgroupId {}
     unsafe impl aya::Pod for Suppressed {}
     unsafe impl aya::Pod for Nanos {}
-    unsafe impl aya::Pod for Decision {}
     unsafe impl aya::Pod for Bank {}
 }

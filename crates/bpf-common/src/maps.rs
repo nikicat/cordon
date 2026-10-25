@@ -9,8 +9,8 @@
 //! paths to `(dev,inode)` via `stat(2)` + the mount table at seed time, and both the
 //! protected object and the caller's executable are matched by [`FileId`].
 
-use crate::ids::{Bank, Decision, Dev, Ino, Nanos, Pid, Suppressed, Uid};
-use crate::policy_maps::{Action, ClassId, ObjId};
+use crate::ids::{Bank, Dev, Ino, Nanos, Pid, Suppressed, Uid};
+use crate::policy_maps::{Action, ClassId};
 
 // ---- map names ------------------------------------------------------------
 // The program defines these maps; the loader resolves them by name. (The rule-table
@@ -23,16 +23,6 @@ pub const MAP_SETTINGS: &str = "SETTINGS";
 /// `RingBuf` — the async learn path: one [`DecisionEvent`] per logged decision (`deny` /
 /// `audit`), drained by the daemon into the journal.
 pub const MAP_EVENTS: &str = "EVENTS";
-/// `LruHashMap<SuppressKey, SuppressVal>` — the in-kernel event suppressor (DESIGN
-/// §15, M1 §1g). Throttles the ring to ~one [`DecisionEvent`] per [`SuppressKey`] per
-/// window, counting the rest so volume stays visible without flooding.
-/// **LRU**, not a plain hash: a full plain hash refuses *new* keys (`-E2BIG`), so a
-/// fresh repeat-opener past the cap would never be throttled; LRU instead evicts the
-/// coldest key, self-bounding to the hottest openers (where suppression matters). An
-/// evicted key loses its pending `suppressed` count and re-emits as a first occurrence
-/// — acceptable, since a cold key by definition wasn't flooding. Kernel-internal: the
-/// daemon never reads or seeds it.
-pub const MAP_SUPPRESS: &str = "SUPPRESS";
 
 /// A file or directory identified by its filesystem device + inode. Inode identity
 /// (not path) is what the in-kernel dentry walk can cheaply compare, and is robust to
@@ -124,19 +114,6 @@ impl PathComp {
     }
 }
 
-/// The mutable backing array, for the kernel's `bpf_probe_read_kernel_str` to fill.
-impl core::ops::DerefMut for PathComp {
-    fn deref_mut(&mut self) -> &mut [u8; PATH_NAME_MAX] {
-        &mut self.0
-    }
-}
-impl core::ops::Deref for PathComp {
-    type Target = [u8; PATH_NAME_MAX];
-    fn deref(&self) -> &[u8; PATH_NAME_MAX] {
-        &self.0
-    }
-}
-
 padded_pod! {
     /// One logged decision, pushed to the ring buffer for the daemon to journal. Emitted
     /// only when the matched policy logs (`audit`/`deny`) or on a default-deny — never for
@@ -163,8 +140,6 @@ padded_pod! {
         /// daemon coalesce on, so distinct files under one audited root surface separately
         /// (DESIGN §15.10 flow B). Equals `object` when the rule targets the file directly.
         pub leaf: FileId,
-        /// The matched protected object's id.
-        pub obj: ObjId,
         /// The requested action(s) at this access (`read`/`write`/`create`).
         pub action: Action,
         /// Thread-group id (userspace pid) of the caller.
@@ -172,8 +147,6 @@ padded_pod! {
         /// The caller's **real** uid — the daemon resolves it to a login name for the audit
         /// line and, for a regular user, collapses a path under that user's home to `~`.
         pub uid: Uid,
-        /// How it was handled (`DENY` blocked / `AUDIT` allowed-and-logged).
-        pub decision: Decision,
         /// How many identical decisions the in-kernel suppressor folded into this one since
         /// the previous emit for the same `(exe, leaf, action)` (M1 §1g). `0` on a first
         /// occurrence; nonzero means a repeat burst was collapsed — the daemon adds it to
@@ -185,8 +158,9 @@ padded_pod! {
         /// name); blessings are loud. Placed among the `u32` scalars (before the `u8`
         /// `policy`/`depth`/`trunc`) to keep the record interior-padding-free.
         pub blessing: ClassId,
-        /// The matched policy — the cause, for the log: an authored `audit`/`deny`, or the
-        /// synthetic `DEFAULT_DENY` when no rule matched (vs an explicit `deny`).
+        /// The matched policy, which says both how the access was handled
+        /// ([`denies`](crate::policy_maps::Policy::denies)) and why: an authored
+        /// `audit`/`deny`, or a synthetic `DEFAULT_DENY`/`ESCAPE_DENY`.
         pub policy: crate::policy_maps::Policy,
         /// Number of valid entries in [`comps`](Self::comps) (`0` ⇒ the object *is* the
         /// opened file, or reconstruction read nothing).
@@ -210,9 +184,7 @@ impl DecisionEvent {
         exe: FileId,
         object: FileId,
         leaf: FileId,
-        obj: ObjId,
         action: Action,
-        decision: Decision,
         policy: crate::policy_maps::Policy,
         suppressed: Suppressed,
         blessing: ClassId,
@@ -221,11 +193,9 @@ impl DecisionEvent {
             exe,
             object,
             leaf,
-            obj,
             action,
             pid,
             uid,
-            decision,
             suppressed,
             policy,
             blessing,
@@ -238,7 +208,7 @@ impl DecisionEvent {
 }
 
 padded_pod! {
-    /// The in-kernel suppressor key ([`MAP_SUPPRESS`]): one decision identity. Keyed on the
+    /// The in-kernel suppressor key (the kernel's `SUPPRESS` map): one decision identity. Keyed on the
     /// **opened file** (`leaf`), not the protected object, so distinct files under one audited
     /// root each get their own throttle window (DESIGN §15.10 flow B). The `padded_pod!` `_pad`
     /// keeps it padding-free (16 + 16 + 4 + 4 = 40, align 8) and **zeroed** — a BPF hash-map
@@ -268,7 +238,7 @@ impl SuppressKey {
 }
 
 padded_pod! {
-    /// The in-kernel suppressor value ([`MAP_SUPPRESS`]): when this key last emitted, and
+    /// The in-kernel suppressor value (the kernel's `SUPPRESS` map): when this key last emitted, and
     /// how many identical decisions have been suppressed since (folded into the next emit).
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
