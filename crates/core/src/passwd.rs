@@ -1,12 +1,7 @@
-//! `/etc/passwd` for the audit log: a cached uid → (login name, home) lookup so the
-//! journal can name the caller and collapse a *regular* user's home to `~` without
-//! rereading the file on every event.
-//!
-//! The [`Passwd`] map is reparsed only when the file's mtime changes (a user added or
-//! removed), so a long-lived daemon parses once and then does O(1) lookups while still
-//! reflecting a passwd edit without a restart. Resolved the same way the policy expands
-//! `~` ([`crate::policy::home_for`] also reads `/etc/passwd`), so a rendered `~` matches
-//! what that user's policy expands to.
+//! `/etc/passwd`, the one place cordon reads accounts from. The journal names a caller by
+//! uid through the cached [`Passwd`], and the policy expands a user's `~` through
+//! [`home_of`]. Both go through the same parser, so a `~` the journal renders is the `~`
+//! that user's policy expands to.
 
 use crate::policy::UserName;
 use cordon_bpf_common::Uid;
@@ -14,7 +9,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The file backing the lookup. A constant so the parser tests can target a string instead.
 const PASSWD: &str = "/etc/passwd";
 
 /// The conventional uid range for human login accounts — the `useradd`/`login.defs`
@@ -42,7 +36,7 @@ pub struct Identity<'a> {
 /// it only when the file changed.
 #[derive(Default)]
 pub struct Passwd {
-    by_uid: HashMap<Uid, (UserName, PathBuf)>,
+    by_uid: HashMap<Uid, Entry>,
     mtime: Option<SystemTime>,
 }
 
@@ -62,7 +56,7 @@ impl Passwd {
             return;
         }
         if let Ok(text) = std::fs::read_to_string(PASSWD) {
-            self.by_uid = parse(&text);
+            self.by_uid = entries(&text).map(|e| (e.uid, e)).collect();
             self.mtime = mtime;
         }
     }
@@ -71,28 +65,47 @@ impl Passwd {
     /// has no passwd entry (a deleted or NSS-only account) — the caller then shows the bare
     /// number. Pure (no I/O): looks up the map [`refresh`](Passwd::refresh) last loaded.
     pub fn lookup(&self, uid: Uid) -> Option<Identity<'_>> {
-        let (name, home) = self.by_uid.get(&uid)?;
+        let entry = self.by_uid.get(&uid)?;
         Some(Identity {
-            name,
-            home: is_regular_uid(uid).then_some(home.as_path()),
+            name: &entry.name,
+            home: is_regular_uid(uid).then_some(entry.home.as_path()),
         })
     }
 }
 
-/// Parse `name:passwd:uid:gid:gecos:home:shell` lines into a uid → (name, home) map,
-/// dropping any malformed line. Split out so it unit-tests without the real file.
-fn parse(passwd: &str) -> HashMap<Uid, (UserName, PathBuf)> {
-    passwd
-        .lines()
-        .filter_map(|line| {
-            // name(0):passwd(1):uid(2):gid(3):gecos(4):home(5):shell(6).
-            let mut fields = line.split(':');
-            let name = fields.next()?;
-            let uid = fields.nth(1)?.parse().ok()?; // skip passwd(1), take uid(2)
-            let home = fields.nth(2)?; // skip gid(3), gecos(4), take home(5)
-            Some((Uid(uid), (UserName::new(name), PathBuf::from(home))))
+/// Returns the home of the login `user`, or `None` when `/etc/passwd` has no entry for
+/// it. Errors when `/etc/passwd` can't be read.
+pub fn home_of(user: &UserName) -> crate::Result<Option<PathBuf>> {
+    let text = std::fs::read_to_string(PASSWD)
+        .map_err(|e| crate::Error::msg(format!("read {PASSWD}: {e}")))?;
+    Ok(home_in(&text, user))
+}
+
+fn home_in(passwd: &str, user: &UserName) -> Option<PathBuf> {
+    entries(passwd).find(|e| e.name == *user).map(|e| e.home)
+}
+
+/// The fields of one passwd line that cordon reads.
+struct Entry {
+    name: UserName,
+    uid: Uid,
+    home: PathBuf,
+}
+
+/// Returns the entries of the passwd text `passwd`, skipping any malformed line.
+fn entries(passwd: &str) -> impl Iterator<Item = Entry> + '_ {
+    passwd.lines().filter_map(|line| {
+        // name(0):passwd(1):uid(2):gid(3):gecos(4):home(5):shell(6).
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let uid = fields.nth(1)?.parse().ok()?; // skip passwd(1), take uid(2)
+        let home = fields.nth(2)?; // skip gid(3), gecos(4), take home(5)
+        Some(Entry {
+            name: UserName::new(name),
+            uid: Uid(uid),
+            home: PathBuf::from(home),
         })
-        .collect()
+    })
 }
 
 #[cfg(test)]
@@ -102,12 +115,20 @@ mod tests {
     const SAMPLE: &str = "root:x:0:0:root:/root:/bin/bash\n\
                           alice:x:1000:1000:Alice,,,:/home/alice:/usr/bin/fish\n";
 
-    /// A cache populated from a literal passwd (no real file) — `parse` + private fields.
+    /// A cache populated from a literal passwd (no real file).
     fn db(passwd: &str) -> Passwd {
         Passwd {
-            by_uid: parse(passwd),
+            by_uid: entries(passwd).map(|e| (e.uid, e)).collect(),
             mtime: None,
         }
+    }
+
+    #[test]
+    fn home_in_finds_a_login_by_name() {
+        let home = |name| home_in(SAMPLE, &UserName::new(name));
+        assert_eq!(home("alice"), Some("/home/alice".into()));
+        assert_eq!(home("root"), Some("/root".into()));
+        assert_eq!(home("ghost"), None);
     }
 
     #[test]

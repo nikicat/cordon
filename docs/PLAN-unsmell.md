@@ -6,7 +6,7 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** step 0 is committed (`d37d114`). Step 1 is in the working tree, unstaged.
+> **Status:** steps 0, 1 and 2.1 are committed. Step 2.2 is in the working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -27,7 +27,7 @@ Refactors and docs: `Uid::ROOT` replaces three local root constants and the `Uid
 literals; four doc blocks that rustdoc attached to the wrong item are moved; about fifteen
 stale or false doc claims are corrected.
 
-## 1. Delete dead code (done, unstaged)
+## 1. Delete dead code (done)
 
 - `MAP_SUPPRESS` (the daemon never opens the map), `DecisionEvent.obj` (never read; it
   names the same object as `.object`), and `PathComp`'s unused `Deref`/`DerefMut`.
@@ -51,13 +51,14 @@ Kept after a closer look, though the survey flagged them:
 ## 2. Shared core types
 
 One commit each, in this order:
-1. **`ClassRegistry`** (core policy): the dense `ClassName ↔ ClassId` map, built by compile,
+1. **`ClassRegistry`** (done; core policy): the dense `ClassName ↔ ClassId` map, built by compile,
    with `id(&ClassName)`, `name(ClassId)` and the "first assignable id is `UNBLESSED + 1`"
    rule. It replaces the `Vec<(ClassName, ClassId)>` on `CompiledPolicy` and the four
    `BTreeMap<ClassName, ClassId>` signatures in the daemon.
-2. **One passwd reader**: `crate::passwd` parses each entry once into a named
-   `PasswdEntry`, and gains a lookup by name. `policy::home_in_passwd` and the CLI's
-   `sys::user_identity` both go through it.
+2. **One passwd reader** (done, unstaged): `crate::passwd` parses each line once into an
+   `Entry` and gains `home_of`, which `policy::home_for` calls in place of its own parser.
+   The CLI's `sys::user_identity` stays separate on purpose: it asks NSS (`getpwuid`), so
+   `policy edit` also works for an LDAP or other non-file account.
 3. **Located errors**: one `Pos`-owned constructor builds the `line:col: msg` text that is
    formatted four ways today, and a fragment's error keeps its position in
    `Diagnostic.pos` instead of only in the message.

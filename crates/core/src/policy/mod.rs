@@ -337,27 +337,11 @@ pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     let Some(user) = user else {
         return Ok(fallback.to_path_buf());
     };
-    let passwd = std::fs::read_to_string("/etc/passwd")
-        .map_err(|e| crate::Error::msg(format!("read /etc/passwd: {e}")))?;
-    home_in_passwd(&passwd, user.as_str()).ok_or_else(|| {
+    crate::passwd::home_of(user)?.ok_or_else(|| {
         crate::Error::msg(format!(
             "policy user {:?} not found in /etc/passwd",
             user.as_str()
         ))
-    })
-}
-
-/// The home field (index 5) of the `/etc/passwd` line whose login name (index 0)
-/// matches `user`. Split from [`home_for`] so it unit-tests without the real file.
-fn home_in_passwd(passwd: &str, user: &str) -> Option<PathBuf> {
-    passwd.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        if fields.next() != Some(user) {
-            return None;
-        }
-        // name(0):passwd(1):uid(2):gid(3):gecos(4):home(5):shell(6) — name consumed,
-        // skip passwd..gecos, take home.
-        fields.nth(4).map(PathBuf::from)
     })
 }
 
@@ -632,15 +616,6 @@ mod tests {
             std::path::PathBuf::from("/etc/ssh")
         );
         assert!(expand_path("relative/path", home).is_err());
-    }
-
-    #[test]
-    fn home_in_passwd_finds_the_home_field() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
-                      alice:x:1000:1000:Alice,,,:/home/alice:/usr/bin/fish\n";
-        assert_eq!(home_in_passwd(passwd, "alice"), Some("/home/alice".into()));
-        assert_eq!(home_in_passwd(passwd, "root"), Some("/root".into()));
-        assert_eq!(home_in_passwd(passwd, "ghost"), None);
     }
 
     #[test]
