@@ -14,6 +14,9 @@ rust-version.workspace = true
 # gather msghdr calls; `socket` alone stops at getsockopt/setsockopt.)
 nix = { version = "0.31.3", features = ["socket", "uio"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # `fs` adds `fcntl`, used only to assert the received descriptor is close-on-exec — a
 # security property that would otherwise fail silently. Test-only, so the shipped binary

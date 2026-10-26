@@ -550,7 +550,8 @@ mod tests {
     #[test]
     fn fd_rides_along_with_the_message() {
         let (a, b) = UnixStream::pair().unwrap();
-        let mut file = tempfile();
+        // An unlinked temp file: an fd with observable identity.
+        let mut file = tempfile::tempfile().unwrap();
 
         send_msg_with_fd(&a, &Response::BlessRevoked { id: BlessId(7) }, file.as_fd()).unwrap();
         let (msg, fd) = read_msg_with_fd::<Response>(&b)
@@ -638,19 +639,5 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         drop(a);
         assert!(read_msg_with_fd::<Response>(&b).unwrap().is_none());
-    }
-
-    /// An unlinked temp file — an fd with observable identity, no cleanup to forget.
-    fn tempfile() -> std::fs::File {
-        let path = std::env::temp_dir().join(format!("cordon-proto-fd-{}", std::process::id()));
-        let file = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        std::fs::remove_file(&path).unwrap();
-        file
     }
 }

@@ -138,12 +138,10 @@ mod tests {
     #[test]
     fn fchown_by_fd_chowns_an_owned_file() {
         use std::os::unix::fs::MetadataExt;
-        let path = std::env::temp_dir().join(format!("cordon-fchown-{}", std::process::id()));
-        let f = std::fs::File::create(&path).expect("create temp file");
+        let f = tempfile::tempfile().expect("create temp file");
         let meta = f.metadata().expect("stat");
         // Re-assert the file's own uid:gid — allowed without CAP_CHOWN (owner unchanged),
         // so the test runs unprivileged while still exercising the real `fchown` path.
         fchown(&f, Uid::from_raw(meta.uid()), Gid::from_raw(meta.gid())).expect("fchown by fd");
-        std::fs::remove_file(&path).ok();
     }
 }

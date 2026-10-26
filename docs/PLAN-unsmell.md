@@ -6,8 +6,8 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 3.2 are committed. Steps 3.3 (`Maps`, `PinDir`) and 3.4
-> (`Client`, `PolicyRoot`) are in the working tree, unstaged.
+> **Status:** steps 0 through 3 are committed. Steps 4.1 (`MAX_OBJECTS`) and 4.2
+> (`tempfile`) are in the working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -86,12 +86,12 @@ parameter into a struct the caller builds once:
   onto it, and `dispatch` becomes `handle`, which replies itself, so `BlessRequest` is an
   ordinary arm instead of an `unreachable!`. `recv_with_fd` refuses to run behind a
   buffered `recv`, which would lose the descriptor.
-- daemon bpf_lsm (done, unstaged): `Maps<'a>(&'a mut Ebpf)` with the seed helpers as
+- daemon bpf_lsm (done): `Maps<'a>(&'a mut Ebpf)` with the seed helpers as
   methods, used by `Blessings`, the event loop and the self-test. Typed `hash`/`array`
   accessors replace the ten copies of the `try_from(map_mut(…))` lookup, and one
   `remove_where` replaces `clear_bank`'s two copies of the key sweep. A `PinDir` type
   holds the four pin functions.
-- cli (done, unstaged): a `Client` that loads the config at most once (it was loaded up to
+- cli (done): a `Client` that loads the config at most once (it was loaded up to
   three times), on first use, so a command given `--socket` and a file still never reads
   it. It owns the socket choice, the policy path, the request-and-render tail and the
   enforcement note. `PolicyRoot { File, ConfD }` in core classifies the policy path once;
@@ -100,12 +100,13 @@ parameter into a struct the caller builds once:
 
 ## 4. Behaviour changes
 
-1. **`MAX_OBJECTS` diagnostic**: compile reports a policy with too many objects as an
-   error, as it already does for `MAX_RULES_PER_OBJ`. Today only seeding catches it, at
-   load time.
-2. **`tempfile` crate**: it replaces the hand-built edit temp dir and the hand-rolled
-   atomic write. The atomic write gains the missing fsync of the parent directory after
-   the rename. The ~16 test temp dirs move to it too, so a panicking test cleans up.
+1. **`MAX_OBJECTS` diagnostic** (done, unstaged): compile reports a policy with too many
+   objects as an error, as it already does for `MAX_RULES_PER_OBJ`, so `policy check`
+   catches it. The seed-time check stays as a guard on the slot arithmetic.
+2. **`tempfile` crate** (done, unstaged): it replaces the hand-built edit temp dir and the
+   hand-rolled atomic write, which gains the missing fsync of the parent directory after
+   the rename. The 16 test temp dirs and files move to it too, so a panicking test cleans
+   up. The daemon also drops nix's `socket` feature, unused since `Conn` moved to core.
 3. **Dev unit as a drop-in**: `just install-service` installs the packaged
    `cordond.service` plus a `cordond.service.d/dev.conf` that overrides only `ExecStart=`
    and `Environment=`. The generated unit has already lost `RequiresMountsFor=`,

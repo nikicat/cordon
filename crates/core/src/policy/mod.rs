@@ -678,7 +678,8 @@ mod tests {
     /// what exists counts as a fragment.
     #[test]
     fn policy_root_classifies_the_path() {
-        let base = std::env::temp_dir().join(format!("cordon-root-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
         let confd = base.join("conf.d");
         std::fs::create_dir_all(&confd).unwrap();
         std::fs::write(confd.join("10-a.toml"), "").unwrap();
@@ -698,8 +699,6 @@ mod tests {
         let dir = PolicyRoot::at(&confd).unwrap();
         assert_eq!(dir, PolicyRoot::ConfD(confd.clone()));
         assert_eq!(dir.fragments().unwrap(), vec![confd.join("10-a.toml")]);
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -812,8 +811,8 @@ mod tests {
     #[test]
     fn load_policy_expands_includes() {
         // A system fragment that includes a user file → two sources, tagged by tier.
-        let dir = std::env::temp_dir().join(format!("cordon-inc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let user_file = dir.join("alice.toml");
         std::fs::write(
             &user_file,
@@ -843,7 +842,6 @@ mod tests {
         let sources = load_policy(&sys_file).unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[1].text, "");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

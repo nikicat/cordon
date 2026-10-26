@@ -27,12 +27,11 @@ use cordon_core::policy::{self, Diagnostic, PolicyRoot, PolicySource, SourceOrig
 use cordon_core::proto::{Request, Response};
 use cordon_core::{Context, Error, Result, config};
 use nix::unistd::{Gid, Uid};
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::fs::{self, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{Client, sys};
 
@@ -692,35 +691,40 @@ impl Scaffold {
 /// the daemon already serves a summary of them to any local user (DESIGN §15.8).
 const NEW_POLICY_MODE: u32 = 0o644;
 
-/// Write `text` to `path` atomically: sibling staging file → fsync → rename, creating
-/// parent directories, cleaning the staging file up on either failure.
+/// Write `text` to `path` atomically: sibling temp file → fsync → rename → fsync of the
+/// directory, creating parent directories. The temp file is removed on any failure.
 ///
 /// **An existing file keeps its mode.** Both callers write root-owned policy files that an
 /// admin may have tightened deliberately, and a save must not quietly widen (or narrow)
 /// what they chose; only a file being created for the first time takes
 /// [`NEW_POLICY_MODE`].
 fn install_atomically(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let mode = fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(NEW_POLICY_MODE);
-    let fname = path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "policy".to_string());
-    let staging = path.with_file_name(format!(".{fname}.cordon-{}.tmp", std::process::id()));
-    if let Err(e) = write_staging(&staging, text, mode) {
-        let _ = fs::remove_file(&staging);
-        return Err(Error::msg(format!("write {}: {e}", path.display())));
-    }
-    fs::rename(&staging, path).map_err(|e| {
-        let _ = fs::remove_file(&staging);
-        Error::msg(format!("install {}: {e}", path.display()))
-    })
+    let write = || -> io::Result<tempfile::NamedTempFile> {
+        let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+        staging.write_all(text.as_bytes())?;
+        staging
+            .as_file()
+            .set_permissions(Permissions::from_mode(mode))?;
+        staging.as_file().sync_all()?;
+        Ok(staging)
+    };
+    let staging = write().with_context(|| format!("write {}", path.display()))?;
+    staging
+        .persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("install {}", path.display()))?;
+    // The rename is durable only once the directory entry is.
+    fs::File::open(parent)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("sync {}", parent.display()))
 }
 
 fn print_diags(diags: &[Diagnostic]) {
@@ -745,7 +749,7 @@ fn reprompt() -> Result<Prompt> {
 /// A temp copy of the policy in a private (0700) directory, removed on drop. The editor
 /// (running as the invoking user) edits this; the privileged parent reads it back.
 struct TempEdit {
-    dir: PathBuf,
+    dir: tempfile::TempDir,
     file: PathBuf,
 }
 
@@ -754,21 +758,17 @@ impl TempEdit {
     /// privileges) so the editor can read+write it. Keeps the target's basename (e.g.
     /// `policy.toml`) so the editor still gets TOML syntax highlighting.
     fn create(target: &Path, seed: &str, editor_as: &EditorAs) -> Result<TempEdit> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("cordon-edit-{}-{nanos}", std::process::id()));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .with_context(|| format!("create temp dir {}", dir.display()))?;
+        let dir = tempfile::Builder::new()
+            .prefix("cordon-edit-")
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()
+            .context("create temp dir")?;
         let basename = target
             .file_name()
             .map(Path::new)
             .unwrap_or_else(|| Path::new("policy.toml"));
         let tmp = TempEdit {
-            file: dir.join(basename),
+            file: dir.path().join(basename),
             dir,
         };
         {
@@ -790,8 +790,8 @@ impl TempEdit {
         // The dir last, by path — a root-created entry in the sticky tmpdir, so its own path
         // can't be swapped — chowned so the dropped editor can enter it.
         if let EditorAs::User { uid, gid, .. } = editor_as {
-            sys::chown(&tmp.dir, *uid, *gid)
-                .with_context(|| format!("chown {}", tmp.dir.display()))?;
+            sys::chown(tmp.dir.path(), *uid, *gid)
+                .with_context(|| format!("chown {}", tmp.dir.path().display()))?;
         }
         Ok(tmp)
     }
@@ -801,27 +801,6 @@ impl TempEdit {
     fn commit(&self, target: &Path, text: &str) -> Result<()> {
         install_atomically(target, text)
     }
-}
-
-impl Drop for TempEdit {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Write `text` to a staging file at `mode`, fsynced — the durable half of [`TempEdit::commit`]'s
-/// atomic replace. Split out so the cleanup-on-error path in `commit` stays a single `if let`.
-fn write_staging(staging: &Path, text: &str, mode: u32) -> io::Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(staging)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    // Reassert the mode in case the file pre-existed with a looser one (open honors umask).
-    fs::set_permissions(staging, Permissions::from_mode(mode))
 }
 
 /// Read the edited temp copy back for validation, **without following a symlink**. The temp
@@ -927,7 +906,8 @@ mod tests {
     /// a first bare `policy edit`.
     #[test]
     fn install_preserves_an_existing_mode_and_defaults_a_new_file() {
-        let dir = std::env::temp_dir().join(format!("cordon-install-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let _ = fs::remove_dir_all(&dir);
 
         let fresh = dir.join("new.toml");
@@ -948,8 +928,6 @@ mod tests {
             "an existing mode survives a rewrite"
         );
         assert_eq!(fs::read_to_string(&tightened).unwrap(), "# second\n");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     fn mode_of(p: &Path) -> u32 {
@@ -998,12 +976,11 @@ mod tests {
 
     #[test]
     fn read_edited_reads_a_regular_file() {
-        let dir = std::env::temp_dir().join(format!("cordon-re-reg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let f = dir.join("policy.toml");
         std::fs::write(&f, "rules = '''\n'''\n").unwrap();
         assert_eq!(read_edited(&f).unwrap(), "rules = '''\n'''\n");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The Vuln-2 regression: a same-uid attacker who owns the temp dir swaps the file for a
@@ -1011,8 +988,8 @@ mod tests {
     /// target's contents never surface (into the policy or the diagnostics).
     #[test]
     fn read_edited_refuses_a_symlink() {
-        let dir = std::env::temp_dir().join(format!("cordon-re-link-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let secret = dir.join("secret");
         std::fs::write(&secret, "TOP-SECRET").unwrap();
         let link = dir.join("policy.toml");
@@ -1022,19 +999,17 @@ mod tests {
             !format!("{err}").contains("TOP-SECRET"),
             "symlinked file contents must not surface"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// …and a directory/fifo/device swapped in for the file is rejected by the regular-file
     /// check rather than read.
     #[test]
     fn read_edited_refuses_a_non_regular_file() {
-        let dir = std::env::temp_dir().join(format!("cordon-re-dir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let notfile = dir.join("policy.toml");
         std::fs::create_dir(&notfile).unwrap();
         assert!(read_edited(&notfile).is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1065,7 +1040,8 @@ mod tests {
     /// to load must fail the edit, not vanish from the candidate the daemon applies.
     #[test]
     fn candidate_is_alone_in_empty_confd_and_refuses_unloadable_siblings() {
-        let dir = std::env::temp_dir().join(format!("cordon-cand-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let confd = dir.join("conf.d");
         std::fs::create_dir_all(&confd).unwrap();
         let target = confd.join("10-new.toml");
@@ -1096,6 +1072,5 @@ mod tests {
             )
             .is_err()
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

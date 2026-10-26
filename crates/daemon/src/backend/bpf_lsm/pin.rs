@@ -159,20 +159,14 @@ mod tests {
         Swept::Generations(std::num::NonZeroUsize::new(n).unwrap())
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cordon-pin-{name}.{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// The handover property, on a plain filesystem: sweeping keeps exactly this run's
     /// generation and drops every other one. If this ever kept none, a restart would
     /// silently disarm the boundary; if it kept all, dead generations would accumulate and
     /// keep enforcing a policy nobody can see.
     #[test]
     fn sweep_keeps_only_the_named_generation() {
-        let pins = PinDir(scratch("sweep"));
+        let tmp = tempfile::tempdir().unwrap();
+        let pins = PinDir(tmp.path().to_path_buf());
         let pin_dir = &pins.0;
         let ours = pins.generation();
         std::fs::create_dir_all(&ours).unwrap();
@@ -193,8 +187,6 @@ mod tests {
         // already-off case unrepresentable as a count, so callers can't log it as a
         // disarming that happened.
         assert_eq!(pins.teardown().unwrap(), Swept::Nothing);
-
-        std::fs::remove_dir_all(pin_dir).unwrap();
     }
 
     /// Teardown on a box that never pinned anything is a no-op, not an error: it is the

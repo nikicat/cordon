@@ -104,9 +104,8 @@ mod fsid {
         /// it once — see `seed::daemon_exe`.
         #[test]
         fn file_id_follows_the_name_not_the_inode() {
-            let dir = std::env::temp_dir().join(format!("cordon-fileid.{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().to_path_buf();
             let path = dir.join("cordond");
             std::fs::write(&path, b"old").unwrap();
 
@@ -128,8 +127,6 @@ mod fsid {
             // the `(deleted)` case that made `policy apply` fail after an upgrade.
             std::fs::remove_file(&path).unwrap();
             assert!(file_id(&path).is_none(), "a vanished path has no FileId");
-
-            std::fs::remove_dir_all(&dir).unwrap();
         }
 
         #[test]

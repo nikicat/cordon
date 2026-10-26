@@ -276,12 +276,11 @@ mod tests {
     /// legitimately accepted and the flow would then block waiting for a real daemon.
     #[test]
     fn a_non_root_daemon_learns_nothing() {
-        let dir = std::env::temp_dir().join(format!("cordon-fakedaemon-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join("cordon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         if Conn::connect(&path).unwrap().peer_uid() == Uid::ROOT {
-            std::fs::remove_dir_all(&dir).ok();
             return; // running as root: this listener is a legitimate daemon end
         }
 
@@ -299,8 +298,6 @@ mod tests {
             Err(e) => panic!("reading the squatted socket: {e}"),
         };
         assert_eq!(sent, 0, "the client sent bytes to a non-root daemon");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Parse through the real `Cli` so the `args_conflicts_with_subcommands` shape is

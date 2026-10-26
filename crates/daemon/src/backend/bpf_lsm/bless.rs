@@ -962,8 +962,8 @@ mod tests {
     /// somewhere reconcile looks.
     #[test]
     fn reconcile_scans_every_parent_placement_can_choose() {
-        let root = std::env::temp_dir().join(format!("cordon-roots-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
         let user_slice = root.join("user.slice/user-1000.slice");
         std::fs::create_dir_all(user_slice.join("session-3.scope")).unwrap();
         std::fs::create_dir_all(user_slice.join("user@1000.service/app.slice")).unwrap();
@@ -995,8 +995,6 @@ mod tests {
         let mut unique = roots.clone();
         unique.dedup();
         assert_eq!(unique, roots, "reconcile would scan a directory twice");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Adoption is a *grant*, so it is gated on the same trust question placement asks:
@@ -1019,7 +1017,8 @@ mod tests {
     /// well-formed carrier dirs and reads their populated state.
     #[test]
     fn scan_finds_carriers_in_a_fake_root() {
-        let root = std::env::temp_dir().join(format!("cordon-bless-test.{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
         let mk = |name: &str, events: Option<&str>| {
             let dir = root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1046,7 +1045,5 @@ mod tests {
                 (9, "rw".to_string(), false),
             ]
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

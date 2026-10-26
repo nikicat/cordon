@@ -249,8 +249,8 @@ mod tests {
     /// as two processes do — which is what makes this testable without forking.
     #[test]
     fn singleton_refuses_a_second_holder() {
-        let dir = std::env::temp_dir().join(format!("cordon-lock-test.{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let socket = dir.join("cordon.sock");
 
         let first = acquire_singleton(&socket).expect("first daemon takes the lock");
@@ -261,7 +261,5 @@ mod tests {
         // cleanup step in between (this is the crash path).
         drop(first);
         assert!(acquire_singleton(&socket).is_ok(), "a dead daemon frees it");
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

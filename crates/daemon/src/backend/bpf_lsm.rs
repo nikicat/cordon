@@ -459,9 +459,8 @@ mod tests {
     /// test below pins because an unprivileged test cannot exercise it.
     #[test]
     fn the_probe_never_reuses_a_directory_it_found() {
-        let base = std::env::temp_dir().join(format!("cordon-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
 
         // Stands in for /etc/cordon/policy.toml — a file outside the probe that root can write.
         let victim = base.join("policy.toml");
@@ -487,8 +486,6 @@ mod tests {
                 .is_symlink(),
             "the probe reused the planted directory instead of recreating it"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The location *is* the fix: `/run` is root-owned `0755`, so nothing unprivileged can
