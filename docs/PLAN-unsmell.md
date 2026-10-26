@@ -6,8 +6,8 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 2 are committed. Step 3's core policy and `Conn` parts are in
-> the working tree, unstaged.
+> **Status:** steps 0 through 3.2 are committed. Steps 3.3 (`Maps`, `PinDir`) and 3.4
+> (`Client`, `PolicyRoot`) are in the working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -76,21 +76,27 @@ One commit each, in this order:
 
 One commit per crate area. Each turns context that every sibling function takes as a
 parameter into a struct the caller builds once:
-- core policy (done, unstaged): `Resolver { parsed, home }` in resolve.rs, with the axis
+- core policy (done): `Resolver { parsed, home }` in resolve.rs, with the axis
   name as an `Axis` enum that also picks the group namespace, and
   `Compiler { resolve_fileid, classes, diagnostics }` in compile.rs, whose `compile` now
   reads as its three steps (objects, own rules, buckets).
-- core proto and daemon ipc (done, unstaged): a `Conn` that reads peer credentials once
+- core proto and daemon ipc (done): a `Conn` that reads peer credentials once
   and sends and receives framed messages and descriptors; the framing functions are
   private to it. The daemon's per-connection state (`peer_uid`, `stream`, `writer`) moves
   onto it, and `dispatch` becomes `handle`, which replies itself, so `BlessRequest` is an
   ordinary arm instead of an `unreachable!`. `recv_with_fd` refuses to run behind a
   buffered `recv`, which would lose the descriptor.
-- daemon bpf_lsm: `Maps<'a>(&'a mut Ebpf)` with the eleven seed helpers as methods, used by
-  `Blessings`; a `PinDir` type for the four pin functions.
-- cli: a `Client` that loads the config once (today: three times) and owns the socket, the
-  policy path and the request round trip; a `PolicyRoot { File, ConfD }` in core for the
-  five edit functions that branch on `is_dir()`.
+- daemon bpf_lsm (done, unstaged): `Maps<'a>(&'a mut Ebpf)` with the seed helpers as
+  methods, used by `Blessings`, the event loop and the self-test. Typed `hash`/`array`
+  accessors replace the ten copies of the `try_from(map_mut(…))` lookup, and one
+  `remove_where` replaces `clear_bank`'s two copies of the key sweep. A `PinDir` type
+  holds the four pin functions.
+- cli (done, unstaged): a `Client` that loads the config at most once (it was loaded up to
+  three times), on first use, so a command given `--socket` and a file still never reads
+  it. It owns the socket choice, the policy path, the request-and-render tail and the
+  enforcement note. `PolicyRoot { File, ConfD }` in core classifies the policy path once;
+  the four edit functions that branched on `is_dir()` match on it, and their tests no
+  longer need real directories.
 
 ## 4. Behaviour changes
 

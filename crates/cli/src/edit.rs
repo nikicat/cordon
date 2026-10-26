@@ -23,7 +23,7 @@
 //! **only after** the daemon accepts the policy, so on-disk == live with no rollback. When
 //! no daemon is listening, the validated file is saved and reported as not applied.
 
-use cordon_core::policy::{self, Diagnostic, PolicySource, SourceOrigin, UserName};
+use cordon_core::policy::{self, Diagnostic, PolicyRoot, PolicySource, SourceOrigin, UserName};
 use cordon_core::proto::{Request, Response};
 use cordon_core::{Context, Error, Result, config};
 use nix::unistd::{Gid, Uid};
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{Cli, sys};
+use crate::{Client, sys};
 
 /// Final fallback editor when no `$*EDITOR` is set, and the program when an editor string
 /// is all whitespace. The one place `vi` is named.
@@ -237,10 +237,10 @@ fn invoker_uid(euid: Uid, sudo_uid: Option<&str>) -> Result<Uid> {
 }
 
 /// `cordon policy edit`. Returns the process exit code.
-pub fn run(target: EditTargetArgs, root_editor: RootEditor, cli: &Cli) -> ExitCode {
+pub fn run(target: EditTargetArgs, root_editor: RootEditor, client: &Client) -> ExitCode {
     match target
         .resolve(invoking_user)
-        .and_then(|t| Session::open(t, root_editor, cli))
+        .and_then(|t| Session::open(t, root_editor, client))
         .and_then(Session::edit_loop)
     {
         Ok(code) => code,
@@ -255,7 +255,7 @@ pub fn run(target: EditTargetArgs, root_editor: RootEditor, cli: &Cli) -> ExitCo
 struct Session {
     /// What the daemon reads on its next restart (the configured `policy`) — the set the
     /// candidate is validated against.
-    policy_root: PathBuf,
+    policy_root: PolicyRoot,
     /// The single file opened in the editor (the same thing in the one-file case, or a
     /// fragment under a conf.d directory).
     target: PathBuf,
@@ -280,8 +280,8 @@ struct Session {
 impl Session {
     /// Resolve paths, decide who the editor runs as, seed the temp copy, and print the
     /// banner — everything before the first keystroke.
-    fn open(target: EditTarget, root_editor: RootEditor, cli: &Cli) -> Result<Session> {
-        let policy_root = crate::policy_path(None, cli)?;
+    fn open(target: EditTarget, root_editor: RootEditor, client: &Client) -> Result<Session> {
+        let policy_root = PolicyRoot::at(&client.policy_path(None)?)?;
         let (target, target_origin, scaffold) = match target {
             EditTarget::System(file) => (
                 resolve_target(file.as_deref(), &policy_root)?,
@@ -310,7 +310,7 @@ impl Session {
             target_origin,
             scaffold,
             home: crate::home(),
-            socket: crate::resolve_socket(cli)?,
+            socket: client.socket()?,
             editor: EditorCommand::lookup(),
             editor_as,
             seed,
@@ -475,22 +475,22 @@ fn is_daemon_down(err: &Error) -> bool {
 ///   `<root>/<name>.toml` (`.toml` appended when the name carries no extension). The
 ///   convenient form: `cordon policy edit local` edits `…/conf.d/local.toml`.
 /// - **Anything with a path separator / absolute** → taken literally.
-fn resolve_target(file: Option<&Path>, policy_root: &Path) -> Result<PathBuf> {
-    match file {
-        None if policy_root.is_dir() => Err(Error::msg(format!(
+fn resolve_target(file: Option<&Path>, policy_root: &PolicyRoot) -> Result<PathBuf> {
+    match (file, policy_root) {
+        (None, PolicyRoot::ConfD(dir)) => Err(Error::msg(format!(
             "policy path {} is a conf.d directory — name a fragment to edit, \
              e.g. `cordon policy edit local`",
-            policy_root.display(),
+            dir.display(),
         ))),
-        None => Ok(policy_root.to_path_buf()),
-        Some(arg) if is_bare_name(arg) && policy_root.is_dir() => {
-            let mut p = policy_root.join(arg);
+        (None, PolicyRoot::File(path)) => Ok(path.clone()),
+        (Some(arg), PolicyRoot::ConfD(dir)) if is_bare_name(arg) => {
+            let mut p = dir.join(arg);
             if p.extension().is_none() {
                 p.set_extension("toml");
             }
             Ok(p)
         }
-        Some(arg) => Ok(arg.to_path_buf()),
+        (Some(arg), _) => Ok(arg.to_path_buf()),
     }
 }
 
@@ -578,7 +578,7 @@ fn spawn_editor(
 /// still fires. A `target` not present in the set (a brand-new system file) is appended as
 /// system tier.
 fn candidate_sources(
-    policy_root: &Path,
+    policy_root: &PolicyRoot,
     target: &Path,
     new_text: &str,
     target_origin: &SourceOrigin,
@@ -588,12 +588,10 @@ fn candidate_sources(
     // here it just means "no siblings": the new fragment is the whole policy. Any other
     // load error must fail, or the candidate would silently drop the unreadable siblings
     // and the apply would replace the live policy with this one fragment.
-    let no_siblings = !policy_root.try_exists()?
-        || (policy_root.is_dir() && policy::fragment_paths(policy_root)?.is_empty());
-    let mut sources = if no_siblings {
+    let mut sources = if policy_root.fragments()?.is_empty() {
         Vec::new()
     } else {
-        policy::load_policy(policy_root)?
+        policy::load_policy(policy_root.path())?
     };
     let tgt = normalize(target);
     match sources
@@ -616,8 +614,11 @@ fn candidate_sources(
 /// Resolve a `--user` target. An existing `[[include]]` for the user wins (edit it in
 /// place). Otherwise the file goes at the convention path and a [`Scaffold`] is returned to
 /// register the binding once the edit validates and saves.
-fn resolve_user_target(policy_root: &Path, user: UserName) -> Result<(PathBuf, Option<Scaffold>)> {
-    if let Some(path) = policy::user_include_path(policy_root, user.as_str())? {
+fn resolve_user_target(
+    policy_root: &PolicyRoot,
+    user: UserName,
+) -> Result<(PathBuf, Option<Scaffold>)> {
+    if let Some(path) = policy::user_include_path(policy_root.path(), user.as_str())? {
         return Ok((path, None));
     }
     let path = convention_user_path(policy_root, &user);
@@ -633,18 +634,20 @@ fn resolve_user_target(policy_root: &Path, user: UserName) -> Result<(PathBuf, O
 /// sibling of the system policy — `/etc/cordon/conf.d` → `/etc/cordon/users/<name>.toml`.
 /// Deliberately *outside* the conf.d directory, so it isn't auto-loaded as a system
 /// fragment; only the include pulls it in.
-fn convention_user_path(policy_root: &Path, user: &UserName) -> PathBuf {
-    let base = policy_root.parent().unwrap_or_else(|| Path::new("/"));
+fn convention_user_path(policy_root: &PolicyRoot, user: &UserName) -> PathBuf {
+    let base = policy_root
+        .path()
+        .parent()
+        .unwrap_or_else(|| Path::new("/"));
     base.join("users").join(format!("{}.toml", user.as_str()))
 }
 
 /// The system fragment a scaffolded `[[include]]` is appended to: a `00-users.toml` inside
 /// the conf.d directory (so it loads as a system fragment), or the single policy file.
-fn include_fragment(policy_root: &Path) -> PathBuf {
-    if policy_root.is_dir() {
-        policy_root.join("00-users.toml")
-    } else {
-        policy_root.to_path_buf()
+fn include_fragment(policy_root: &PolicyRoot) -> PathBuf {
+    match policy_root {
+        PolicyRoot::ConfD(dir) => dir.join("00-users.toml"),
+        PolicyRoot::File(path) => path.clone(),
     }
 }
 
@@ -969,33 +972,28 @@ mod tests {
         assert!(args.next().is_none());
     }
 
-    /// `include_fragment` branches on `is_dir()`, so the shapes have to be **real**: an
-    /// earlier version of this test named `/etc/cordon/conf.d` and passed only on a machine
-    /// where cordon happened to be installed, failing on any clean checkout.
     #[test]
     fn user_tier_path_conventions() {
-        let base = std::env::temp_dir().join(format!("cordon-tiers-{}", std::process::id()));
-        let confd = base.join("conf.d");
-        let file = base.join("policy.toml");
-        std::fs::create_dir_all(&confd).unwrap();
-        std::fs::write(&file, "").unwrap();
+        let confd = PolicyRoot::ConfD(PathBuf::from("/etc/cordon/conf.d"));
+        let file = PolicyRoot::File(PathBuf::from("/etc/cordon/policy.toml"));
         let alice = UserName::new("alice");
 
         // user file is a `users/` sibling of the policy, outside conf.d…
         assert_eq!(
             convention_user_path(&confd, &alice),
-            base.join("users/alice.toml")
+            PathBuf::from("/etc/cordon/users/alice.toml")
         );
         // …and the scaffolded include goes in a conf.d fragment (so it loads).
-        assert_eq!(include_fragment(&confd), confd.join("00-users.toml"));
+        assert_eq!(
+            include_fragment(&confd),
+            PathBuf::from("/etc/cordon/conf.d/00-users.toml")
+        );
         // single-file policy: the include is appended to that file itself.
         assert_eq!(
             convention_user_path(&file, &alice),
-            base.join("users/alice.toml")
+            PathBuf::from("/etc/cordon/users/alice.toml")
         );
-        assert_eq!(include_fragment(&file), file);
-
-        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(include_fragment(&file), file.path());
     }
 
     #[test]
@@ -1041,29 +1039,26 @@ mod tests {
 
     #[test]
     fn bare_name_resolves_to_confd_fragment() {
-        let dir = std::env::temp_dir().join(format!("cordon-rt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = PathBuf::from("/etc/cordon/conf.d");
+        let confd = PolicyRoot::ConfD(dir.clone());
         // bare name → <dir>/<name>.toml; existing extension kept; a path is literal.
         assert_eq!(
-            resolve_target(Some(Path::new("local")), &dir).unwrap(),
+            resolve_target(Some(Path::new("local")), &confd).unwrap(),
             dir.join("local.toml")
         );
         assert_eq!(
-            resolve_target(Some(Path::new("local.toml")), &dir).unwrap(),
+            resolve_target(Some(Path::new("local.toml")), &confd).unwrap(),
             dir.join("local.toml")
         );
         assert_eq!(
-            resolve_target(Some(Path::new("/etc/cordon/x.toml")), &dir).unwrap(),
+            resolve_target(Some(Path::new("/etc/cordon/x.toml")), &confd).unwrap(),
             PathBuf::from("/etc/cordon/x.toml")
         );
         // no argument on a directory → must name a fragment.
-        assert!(resolve_target(None, &dir).is_err());
-        // no argument on a single-file policy → that file. A real file, not a path that
-        // merely happens not to be a directory on this machine.
-        let file = dir.join("policy.toml");
-        std::fs::write(&file, "").unwrap();
-        assert_eq!(resolve_target(None, &file).unwrap(), file);
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(resolve_target(None, &confd).is_err());
+        // no argument on a single-file policy → that file.
+        let file = PolicyRoot::File(PathBuf::from("/etc/cordon/policy.toml"));
+        assert_eq!(resolve_target(None, &file).unwrap(), file.path());
     }
 
     /// An empty conf.d means the edited fragment is the whole policy. A sibling that fails
@@ -1074,7 +1069,13 @@ mod tests {
         let confd = dir.join("conf.d");
         std::fs::create_dir_all(&confd).unwrap();
         let target = confd.join("10-new.toml");
-        let only = candidate_sources(&confd, &target, "x", &SourceOrigin::System).unwrap();
+        let only = candidate_sources(
+            &PolicyRoot::ConfD(confd.clone()),
+            &target,
+            "x",
+            &SourceOrigin::System,
+        )
+        .unwrap();
         assert_eq!(only.len(), 1);
 
         // An include naming a directory reads as EISDIR, a load error that is not NotFound.
@@ -1086,7 +1087,15 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(candidate_sources(&confd, &target, "x", &SourceOrigin::System).is_err());
+        assert!(
+            candidate_sources(
+                &PolicyRoot::ConfD(confd.clone()),
+                &target,
+                "x",
+                &SourceOrigin::System
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

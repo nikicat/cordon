@@ -465,6 +465,46 @@ pub fn fragment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// The configured policy path: one file, or a conf.d directory of `*.toml` fragments
+/// (DESIGN §15.8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicyRoot {
+    /// A single policy file, which may not exist yet.
+    File(PathBuf),
+    ConfD(PathBuf),
+}
+
+impl PolicyRoot {
+    /// Classifies `path`; a path that doesn't exist is a [`File`](Self::File). Errors when
+    /// `path` can't be inspected.
+    pub fn at(path: &Path) -> Result<PolicyRoot> {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => Ok(PolicyRoot::ConfD(path.to_path_buf())),
+            Ok(_) => Ok(PolicyRoot::File(path.to_path_buf())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(PolicyRoot::File(path.to_path_buf()))
+            }
+            Err(e) => Err(crate::Error::msg(format!("policy {}: {e}", path.display()))),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            PolicyRoot::File(p) | PolicyRoot::ConfD(p) => p,
+        }
+    }
+
+    /// Returns the system fragment files that exist: the file itself, or the directory's
+    /// `*.toml` fragments sorted by name.
+    pub fn fragments(&self) -> Result<Vec<PathBuf>> {
+        match self {
+            PolicyRoot::File(p) if p.try_exists()? => Ok(vec![p.clone()]),
+            PolicyRoot::File(_) => Ok(Vec::new()),
+            PolicyRoot::ConfD(dir) => fragment_paths(dir),
+        }
+    }
+}
+
 /// Read the full policy: the system fragments at `path` ([`read_sources`]) **plus** every
 /// user-tier file a system fragment pulls in via `[[include]]` (DESIGN §15.8). Each
 /// include names the owning `user` (whose home scopes its rules) and a `path`; the file is
@@ -633,6 +673,34 @@ pub(crate) fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory is a conf.d, anything else (including nothing yet) is a file, and only
+    /// what exists counts as a fragment.
+    #[test]
+    fn policy_root_classifies_the_path() {
+        let base = std::env::temp_dir().join(format!("cordon-root-{}", std::process::id()));
+        let confd = base.join("conf.d");
+        std::fs::create_dir_all(&confd).unwrap();
+        std::fs::write(confd.join("10-a.toml"), "").unwrap();
+        std::fs::write(confd.join("notes.txt"), "").unwrap();
+        let file = base.join("policy.toml");
+
+        let missing = PolicyRoot::at(&file).unwrap();
+        assert_eq!(missing, PolicyRoot::File(file.clone()));
+        assert!(missing.fragments().unwrap().is_empty());
+
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            PolicyRoot::at(&file).unwrap().fragments().unwrap(),
+            vec![file.clone()]
+        );
+
+        let dir = PolicyRoot::at(&confd).unwrap();
+        assert_eq!(dir, PolicyRoot::ConfD(confd.clone()));
+        assert_eq!(dir.fragments().unwrap(), vec![confd.join("10-a.toml")]);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn line_index_maps_offsets() {

@@ -94,13 +94,14 @@ enum PolicyCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let client = Client::new(&cli);
 
     // `policy check` is local — it never touches the daemon socket.
     if let Cmd::Policy {
         cmd: PolicyCmd::Check { file },
     } = &cli.cmd
     {
-        return policy_check(file.as_deref(), &cli);
+        return policy_check(file.as_deref(), &client);
     }
 
     // `policy edit` drives its own flow (editor → validate → apply → save), reaching the
@@ -114,79 +115,152 @@ fn main() -> ExitCode {
     } = &cli.cmd
     {
         let root_editor = edit::RootEditor::from_flag(*allow_root_editor);
-        return edit::run(target.clone(), root_editor, &cli);
+        return edit::run(target.clone(), root_editor, &client);
     }
 
     // `bless` drives its own flow (mint → fork into the carrier → drop → exec); its
     // `list`/`revoke` subcommands come back through `run_request` like any other.
     if let Cmd::Bless(args) = &cli.cmd {
-        return bless::run(args, &cli);
+        return bless::run(args, &client);
     }
 
     // The approval half of the bless handshake: one request, and what makes it count is
     // the uid it arrives from, not anything it says.
     if let Cmd::BlessHelper { nonce } = &cli.cmd {
-        return run_request(
-            &Request::BlessApprove {
-                nonce: nonce.clone(),
-            },
-            &cli,
-        );
+        return client.run_request(&Request::BlessApprove {
+            nonce: nonce.clone(),
+        });
     }
 
-    let req = match build_request(&cli) {
+    let req = match build_request(&client) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cordon: {e}");
             return ExitCode::FAILURE;
         }
     };
-    run_request(&req, &cli)
+    client.run_request(&req)
 }
 
-/// Send one request to the daemon and render the reply (honoring `--json`) — the
-/// shared tail of every daemon-bound command.
-fn run_request(req: &Request, cli: &Cli) -> ExitCode {
-    let socket = match resolve_socket(cli) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let resp = match round_trip(&socket, req) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            eprintln!("       (is cordond running? socket: {})", socket.display());
-            // A dead daemon is not a dead boundary: since M5 the LSM links are pinned, so
-            // enforcement outlives the process. Saying nothing here would let "connection
-            // refused" read as "nothing is being enforced" — the opposite of the truth.
-            eprintln!("       {}", enforcement_note(cli));
-            return ExitCode::FAILURE;
-        }
-    };
+/// The command line and the config it names, which every command reads through. The
+/// config is loaded on first use, so a command that never needs it never fails on it.
+struct Client<'a> {
+    cli: &'a Cli,
+    config: std::cell::OnceCell<Config>,
+}
 
-    if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
-        return exit_for(&resp);
+impl<'a> Client<'a> {
+    fn new(cli: &'a Cli) -> Self {
+        Client {
+            cli,
+            config: std::cell::OnceCell::new(),
+        }
     }
-    render(&resp);
-    exit_for(&resp)
+
+    fn config(&self) -> Result<&Config> {
+        if let Some(cfg) = self.config.get() {
+            return Ok(cfg);
+        }
+        let cfg = Config::load(self.cli.config.as_deref())?;
+        Ok(self.config.get_or_init(|| cfg))
+    }
+
+    /// Returns the socket to dial. An explicit `--socket` wins. Otherwise it is the
+    /// config's socket, chosen as
+    /// [`SocketPath::for_client`](cordon_core::config::SocketPath::for_client) describes.
+    fn socket(&self) -> Result<PathBuf> {
+        match &self.cli.socket {
+            Some(s) => Ok(s.clone()),
+            None => Ok(self.config()?.socket.clone().for_client(|p| p.exists())),
+        }
+    }
+
+    /// The policy file to act on: an explicit arg, else the configured `policy` path.
+    fn policy_path(&self, file: Option<&Path>) -> Result<PathBuf> {
+        match file {
+            Some(p) => Ok(p.to_path_buf()),
+            None => Ok(self.config()?.policy.clone()),
+        }
+    }
+
+    /// Send one request to the daemon and render the reply (honoring `--json`) — the
+    /// shared tail of every daemon-bound command.
+    fn run_request(&self, req: &Request) -> ExitCode {
+        let socket = match self.socket() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cordon: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let resp = match round_trip(&socket, req) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("cordon: {e}");
+                eprintln!("       (is cordond running? socket: {})", socket.display());
+                // A dead daemon is not a dead boundary: since M5 the LSM links are pinned,
+                // so enforcement outlives the process. Saying nothing here would let
+                // "connection refused" read as "nothing is being enforced" — the opposite
+                // of the truth.
+                eprintln!("       {}", self.enforcement_note());
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if self.cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resp).unwrap_or_default()
+            );
+            return exit_for(&resp);
+        }
+        render(&resp);
+        exit_for(&resp)
+    }
+
+    /// What the bpffs pins say about enforcement when the daemon can't be reached.
+    ///
+    /// Three honest answers, because the wrong one is dangerous in both directions:
+    /// claiming the boundary is up when it isn't invites a false sense of safety, and
+    /// claiming it is down when it is up sends someone debugging a denial that is working
+    /// as designed. bpffs is root-only, so an unprivileged caller gets "unknown" rather
+    /// than a guess.
+    fn enforcement_note(&self) -> String {
+        let Ok(cfg) = self.config() else {
+            return "enforcement state unknown (no readable config)".into();
+        };
+        let dir = &cfg.bpf_pin_dir;
+        match std::fs::read_dir(dir) {
+            Ok(entries) => match entries.count() {
+                0 => format!("no pins under {} — enforcement is OFF", dir.display()),
+                n => format!(
+                    "enforcement is STILL ACTIVE ({n} pinned generation(s) in {}); \
+                     events are not being journaled while the daemon is down. \
+                     `cordond --teardown` turns it off",
+                    dir.display()
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                format!("no pins under {} — enforcement is OFF", dir.display())
+            }
+            // Almost always EACCES: bpffs is root-owned, so this is the unprivileged path.
+            Err(_) => format!(
+                "enforcement state unknown — {} is not readable as this user",
+                dir.display()
+            ),
+        }
+    }
 }
 
 /// Build the IPC request for a daemon-bound command (reading the policy file for
 /// `apply`). `check` is handled locally before this is reached.
-fn build_request(cli: &Cli) -> Result<Request> {
-    match &cli.cmd {
+fn build_request(client: &Client) -> Result<Request> {
+    match &client.cli.cmd {
         Cmd::Status => Ok(Request::Status),
         Cmd::Policy { cmd } => match cmd {
             PolicyCmd::Show => Ok(Request::PolicyShow),
             PolicyCmd::Apply { file } => {
-                let path = policy_path(file.as_deref(), cli)?;
+                let path = client.policy_path(file.as_deref())?;
                 // Read the policy source (a file, or a conf.d dir of fragments) and expand
                 // any `[[include]]` user-tier files; ship the lot. The daemon resolves
                 // per-fragment homes, merges, and compiles.
@@ -203,8 +277,8 @@ fn build_request(cli: &Cli) -> Result<Request> {
 
 /// `cordon policy check` — compile a policy file locally and report diagnostics.
 /// Local + daemon-free so it lints in CI; exits non-zero if the policy has errors.
-fn policy_check(file: Option<&Path>, cli: &Cli) -> ExitCode {
-    let path = match policy_path(file, cli) {
+fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
+    let path = match client.policy_path(file) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("cordon: {e}");
@@ -328,63 +402,11 @@ fn exit_for(resp: &Response) -> ExitCode {
     }
 }
 
-/// The policy file to act on: an explicit arg, else the configured `policy` path.
-fn policy_path(file: Option<&Path>, cli: &Cli) -> Result<PathBuf> {
-    match file {
-        Some(p) => Ok(p.to_path_buf()),
-        None => Ok(Config::load(cli.config.as_deref())?.policy),
-    }
-}
-
 /// `$HOME` for `~`-expansion in the policy being checked (falls back to `/`).
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
-}
-
-/// What the bpffs pins say about enforcement when the daemon can't be reached.
-///
-/// Three honest answers, because the wrong one is dangerous in both directions: claiming
-/// the boundary is up when it isn't invites a false sense of safety, and claiming it is
-/// down when it is up sends someone debugging a denial that is working as designed. bpffs
-/// is root-only, so an unprivileged caller gets "unknown" rather than a guess.
-fn enforcement_note(cli: &Cli) -> String {
-    let Ok(cfg) = Config::load(cli.config.as_deref()) else {
-        return "enforcement state unknown (no readable config)".into();
-    };
-    let dir = &cfg.bpf_pin_dir;
-    match std::fs::read_dir(dir) {
-        Ok(entries) => match entries.count() {
-            0 => format!("no pins under {} — enforcement is OFF", dir.display()),
-            n => format!(
-                "enforcement is STILL ACTIVE ({n} pinned generation(s) in {}); \
-                 events are not being journaled while the daemon is down. \
-                 `cordond --teardown` turns it off",
-                dir.display()
-            ),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            format!("no pins under {} — enforcement is OFF", dir.display())
-        }
-        // Almost always EACCES: bpffs is root-owned, so this is the unprivileged path.
-        Err(_) => format!(
-            "enforcement state unknown — {} is not readable as this user",
-            dir.display()
-        ),
-    }
-}
-
-/// Returns the socket to dial. An explicit `--socket` wins. Otherwise it is the config's
-/// socket, chosen as
-/// [`SocketPath::for_client`](cordon_core::config::SocketPath::for_client) describes.
-fn resolve_socket(cli: &Cli) -> Result<PathBuf> {
-    if let Some(s) = cli.socket.clone() {
-        return Ok(s);
-    }
-    Ok(Config::load(cli.config.as_deref())?
-        .socket
-        .for_client(|p| p.exists()))
 }
 
 fn round_trip(socket: &Path, req: &Request) -> Result<Response> {

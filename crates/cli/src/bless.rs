@@ -25,7 +25,7 @@
 //! No CLI-side cleanup: the daemon GCs the carrier when it empties (its mint grace
 //! covers a CLI that dies before the join).
 
-use crate::Cli;
+use crate::Client;
 use crate::sys;
 use clap::Subcommand;
 use cordon_core::policy::ClassName;
@@ -68,7 +68,7 @@ enum BlessCmd {
     Revoke { id: BlessId },
 }
 
-pub fn run(args: &BlessArgs, cli: &Cli) -> ExitCode {
+pub fn run(args: &BlessArgs, client: &Client) -> ExitCode {
     match &args.cmd {
         // list/revoke are plain round trips — render like any other command (revoke is
         // yours to call for a blessing you minted; the daemon says so if it isn't).
@@ -77,9 +77,9 @@ pub fn run(args: &BlessArgs, cli: &Cli) -> ExitCode {
                 BlessCmd::List => Request::BlessList,
                 BlessCmd::Revoke { id } => Request::BlessRevoke { id: *id },
             };
-            crate::run_request(&req, cli)
+            client.run_request(&req)
         }
-        None => match mint_and_exec(args, cli) {
+        None => match mint_and_exec(args, client) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("cordon: {e}");
@@ -90,8 +90,8 @@ pub fn run(args: &BlessArgs, cli: &Cli) -> ExitCode {
 }
 
 /// The blessed-exec flow: request → elevate → receive the carrier → fork the target.
-fn mint_and_exec(args: &BlessArgs, cli: &Cli) -> Result<ExitCode> {
-    let socket = crate::resolve_socket(cli)?;
+fn mint_and_exec(args: &BlessArgs, client: &Client) -> Result<ExitCode> {
+    let socket = client.socket()?;
     let procs = request_and_approve(&socket, args.class.clone())?;
     let mut cmd = build_command(&args.command);
     sys::join_cgroup_on_exec(&mut cmd, procs);
@@ -306,7 +306,7 @@ mod tests {
     /// Parse through the real `Cli` so the `args_conflicts_with_subcommands` shape is
     /// tested exactly as shipped.
     fn parse(argv: &[&str]) -> BlessArgs {
-        match Cli::try_parse_from(argv).expect("parse").cmd {
+        match crate::Cli::try_parse_from(argv).expect("parse").cmd {
             crate::Cmd::Bless(args) => args,
             other => panic!("expected bless, got {other:?}"),
         }
