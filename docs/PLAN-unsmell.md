@@ -6,8 +6,8 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 6.1 are committed. Step 6.2 (house style) is in the working
-> tree, unstaged.
+> **Status:** done. Every step is committed. The refactor candidates the doc pass found
+> are listed below and are not scheduled.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -154,7 +154,7 @@ Two commits:
    stopped daemon", a `BlessMint` verb and two `policy check` lints that don't exist, the
    pinning of maps, `/dev/urandom` for the nonce, and others). It adds no rustdoc
    error: the `--document-private-items` run has 30, all pre-existing.
-2. **House style** (done, unstaged). Every doc and comment, in the crates, the smoke suite,
+2. **House style** (done). Every doc and comment, in the crates, the smoke suite,
    the example configs and the markdown docs, is rewritten as plain, verb-first reference
    text, with "Errors when…" for the error contract. Entity docs state the item's place in
    the system instead of listing its fields, tautologies are deleted, and mechanism moved
