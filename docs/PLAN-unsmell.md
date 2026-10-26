@@ -6,8 +6,8 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 3 are committed. Steps 4.1 (`MAX_OBJECTS`) and 4.2
-> (`tempfile`) are in the working tree, unstaged.
+> **Status:** steps 0 through 4.2 are committed. Step 4.3 (the dev drop-in) is in the
+> working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -100,17 +100,18 @@ parameter into a struct the caller builds once:
 
 ## 4. Behaviour changes
 
-1. **`MAX_OBJECTS` diagnostic** (done, unstaged): compile reports a policy with too many
+1. **`MAX_OBJECTS` diagnostic** (done): compile reports a policy with too many
    objects as an error, as it already does for `MAX_RULES_PER_OBJ`, so `policy check`
    catches it. The seed-time check stays as a guard on the slot arithmetic.
-2. **`tempfile` crate** (done, unstaged): it replaces the hand-built edit temp dir and the
+2. **`tempfile` crate** (done): it replaces the hand-built edit temp dir and the
    hand-rolled atomic write, which gains the missing fsync of the parent directory after
    the rename. The 16 test temp dirs and files move to it too, so a panicking test cleans
    up. The daemon also drops nix's `socket` feature, unused since `Conn` moved to core.
-3. **Dev unit as a drop-in**: `just install-service` installs the packaged
-   `cordond.service` plus a `cordond.service.d/dev.conf` that overrides only `ExecStart=`
-   and `Environment=`. The generated unit has already lost `RequiresMountsFor=`,
-   `DefaultDependencies=no` and `Before=basic.target`.
+3. **Dev unit as a drop-in** (done, unstaged): `just install-service` installs the
+   packaged `cordond.service` plus a `cordond.service.d/dev.conf` that overrides only
+   `ExecStart=` and `Environment=`, so the dev unit regains `RequiresMountsFor=`,
+   `DefaultDependencies=no` and `Before=basic.target`. Every privileged step runs under
+   one `sudo` (it was three).
 4. **Machine-checkable outcomes for the smoke suite**: the suite matches about fifteen
    message strings that the Rust code writes. Each matched string is either replaced by a
    distinct exit code or `--json` field, or marked at its Rust site as matched by the

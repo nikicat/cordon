@@ -165,6 +165,14 @@ boundary is what the remaining hole is in. The rule: *soundness before ergonomic
   get built (M6 task 6). The remainder — `uid`/`gid`/`cgroup`, IMA/fsverity, argv0/ancestor,
   autolearn for objects — is opportunistic, taken when a real policy needs it.
 
+- **VM coverage of the systemd packaging.** The VM smoke starts `cordond` directly, so
+  nothing tests `packaging/systemd/cordond.service` or `just install-service`. The unit's
+  ordering (`DefaultDependencies=no`, `Before=basic.target`, `RequiresMountsFor=/sys/fs/bpf`),
+  `Delegate=yes` for bless carriers and the dev drop-in are checked only by
+  `systemd-analyze verify` and by hand. Closing it needs a systemd-booted guest; today
+  `run-bpf-lsm-vm.sh` runs the suite under virtme-ng's own init (`vng --run -- bash …`),
+  with no systemd to start the unit.
+
 Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
 
 ## Settled, do not redo
