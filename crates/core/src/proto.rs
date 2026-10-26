@@ -13,10 +13,9 @@ use crate::policy::{ClassName, Diagnostic};
 use crate::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
-#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A command from a client to the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,7 +203,7 @@ pub struct BlessingView {
 
 /// The blessing carrier's `cgroup.procs`, **opened for write by the root daemon** — the
 /// out-of-band half of a [`Response::BlessMinted`], passed over `SCM_RIGHTS` rather than
-/// serialized (hence no `Serialize`; it rides beside the JSON, see [`send_msg_with_fd`]).
+/// serialized (hence no `Serialize`; it rides beside the JSON, see [`Conn::send_with_fd`]).
 ///
 /// Writing a pid into it joins that task to the blessing. It is a **capability, not a
 /// path**: cgroup-v2 checks migration permission against the credentials of whoever
@@ -215,7 +214,7 @@ pub struct BlessingView {
 pub struct CarrierProcs(pub std::os::fd::OwnedFd);
 
 /// A process id (thread-group id) on the control plane: a carrier cgroup member as listed
-/// in `cgroup.procs`, or a socket peer as reported by [`peer_pid`]. `u32` to match the
+/// in `cgroup.procs`, or a socket peer as reported by [`Conn::peer_pid`]. `u32` to match the
 /// kernel's pid width there; a newtype so it can't be mixed up with a [`BlessId`] or a raw
 /// count (the wire discipline of the bpf-common scalars, which this seam deliberately
 /// doesn't depend on).
@@ -269,8 +268,110 @@ pub struct ObjectView {
     pub rules: usize,
 }
 
+/// One end of a connection between the CLI and the daemon. It sends and receives framed
+/// messages, and knows who is on the other end.
+pub struct Conn {
+    stream: UnixStream,
+    /// Buffers [`recv`](Self::recv). [`recv_with_fd`](Self::recv_with_fd) reads the socket
+    /// directly, and refuses while this holds bytes it would skip.
+    reader: BufReader<UnixStream>,
+    peer_uid: crate::Uid,
+    peer_pid: Pid,
+}
+
+impl Conn {
+    /// Wraps a connected socket and reads its peer's `SO_PEERCRED`.
+    pub fn new(stream: UnixStream) -> Result<Conn> {
+        let (peer_uid, peer_pid) = peer_cred(&stream)?;
+        Ok(Conn {
+            reader: BufReader::new(stream.try_clone()?),
+            stream,
+            peer_uid,
+            peer_pid,
+        })
+    }
+
+    /// Connects to the socket at `path`. A failed `connect(2)` is an [`Error::Io`](crate::Error::Io),
+    /// so a caller can tell that no daemon is listening.
+    pub fn connect(path: &Path) -> Result<Conn> {
+        Conn::new(UnixStream::connect(path)?)
+    }
+
+    /// Returns the peer's **kernel-attested** uid.
+    ///
+    /// Used from **both** ends, and for the same reason each way. The daemon asks who is
+    /// calling, so it can gate the writes. The client asks who answered, because a socket
+    /// path is not proof of a daemon: `cordon bless` hands the reply's nonce to a process it
+    /// then elevates to root, so it must know it is talking to the real root daemon and not
+    /// to something a local user left listening at the same path (DESIGN §16.5).
+    ///
+    /// This is the only identity in the protocol that isn't asserted by the party it
+    /// describes — which is exactly why every authorization decision rests on it. Off
+    /// Linux it is an impossible uid, so every check that consults it fails closed.
+    pub fn peer_uid(&self) -> crate::Uid {
+        self.peer_uid
+    }
+
+    /// Returns the peer's pid. The daemon reads the requester's cgroup through it to place a
+    /// blessing carrier in that process's own logind session scope (DESIGN §16.6).
+    ///
+    /// **Weaker than [`peer_uid`](Self::peer_uid), and the difference matters.** The kernel
+    /// records this at `connect(2)`, so no client asserts it — but what it records is a
+    /// *number*, and pid numbers are recycled once the task is reaped. Between the connect
+    /// and the daemon's `/proc/<pid>/cgroup` read sits the whole approval wait, so a pid
+    /// that has since been reused names a different process. `SO_PEERPIDFD` (Linux 6.5) is
+    /// the fix for that class of staleness if this ever needs to be authoritative.
+    ///
+    /// It doesn't today, because placement is not authorization: the grant is gated on a
+    /// uid-0 `BlessApprove`, and anyone able to complete one already has root. A stale pid
+    /// resolves to nothing, or to a cgroup with no session scope, and placement falls back
+    /// to the daemon's own cgroup — the safe, pre-B2 behaviour. Off Linux it is 0, which is
+    /// not a real process, so the cgroup read fails and placement falls back the same way.
+    pub fn peer_pid(&self) -> Pid {
+        self.peer_pid
+    }
+
+    /// Sends one message.
+    pub fn send(&self, msg: &impl Serialize) -> Result<()> {
+        write_msg(&mut &self.stream, msg)
+    }
+
+    /// Receives one message, or `None` when the peer hung up between messages.
+    pub fn recv<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
+        read_msg(&mut self.reader)
+    }
+
+    /// Sends one message with `fd` attached as `SCM_RIGHTS` ancillary data — the blessing
+    /// hand-off (DESIGN §16.6): the daemon opens the carrier's `cgroup.procs` as root and
+    /// passes *only that fd*, so the CLI never needs privilege to join. The peer must read
+    /// it with [`recv_with_fd`](Self::recv_with_fd).
+    #[cfg(target_os = "linux")]
+    pub fn send_with_fd(
+        &self,
+        msg: &impl Serialize,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<()> {
+        send_msg_with_fd(&self.stream, msg, fd)
+    }
+
+    /// Receives one message and the descriptor that rode along with it, if any. `None`
+    /// when the peer hung up between messages. Errors if an earlier [`recv`](Self::recv)
+    /// buffered bytes past its message, since this read would skip them.
+    #[cfg(target_os = "linux")]
+    pub fn recv_with_fd<T: DeserializeOwned>(
+        &self,
+    ) -> Result<Option<(T, Option<std::os::fd::OwnedFd>)>> {
+        if !self.reader.buffer().is_empty() {
+            return Err(crate::Error::msg(
+                "internal: a buffered read holds bytes past its message",
+            ));
+        }
+        read_msg_with_fd(&self.stream)
+    }
+}
+
 /// Write one newline-framed JSON message and flush.
-pub fn write_msg<W: Write>(w: &mut W, value: &impl Serialize) -> Result<()> {
+fn write_msg<W: Write>(w: &mut W, value: &impl Serialize) -> Result<()> {
     let mut s = serde_json::to_string(value)?;
     s.push('\n');
     w.write_all(s.as_bytes())?;
@@ -279,7 +380,7 @@ pub fn write_msg<W: Write>(w: &mut W, value: &impl Serialize) -> Result<()> {
 }
 
 /// Read one newline-framed JSON message. `Ok(None)` on clean EOF.
-pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
+fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
     let mut line = String::new();
     if r.read_line(&mut line)? == 0 {
         return Ok(None);
@@ -287,70 +388,28 @@ pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>>
     Ok(Some(serde_json::from_str(line.trim_end())?))
 }
 
-/// The peer's **kernel-attested** uid on a connected Unix socket, via `SO_PEERCRED`
-/// (std's `peer_cred()` is still unstable).
-///
-/// Used from **both** ends, and for the same reason each way. The daemon asks who is
-/// calling, so it can gate the writes. The client asks who answered, because a socket
-/// path is not proof of a daemon: `cordon bless` hands the reply's nonce to a process it
-/// then elevates to root, so it must know it is talking to the real root daemon and not
-/// to something a local user left listening at the same path (DESIGN §16.5).
-///
-/// This is the only identity in the protocol that isn't asserted by the party it
-/// describes — which is exactly why every authorization decision rests on it.
+/// Returns the peer's uid and pid from one `SO_PEERCRED` (std's `peer_cred()` is still
+/// unstable).
 #[cfg(target_os = "linux")]
-pub fn peer_uid(sock: &UnixStream) -> Result<crate::Uid> {
+fn peer_cred(sock: &UnixStream) -> Result<(crate::Uid, Pid)> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     let creds = getsockopt(sock, PeerCredentials).context("SO_PEERCRED")?;
-    Ok(crate::Uid(creds.uid()))
+    Ok((crate::Uid(creds.uid()), Pid::from_raw(creds.pid())))
 }
 
-/// No `SO_PEERCRED` off Linux: report an impossible uid so every check that consults it
-/// fails closed (the enforcement backend is Linux-only anyway; this keeps the non-Linux
-/// build compiling, per the Cargo feature notes).
+/// No `SO_PEERCRED` off Linux (the enforcement backend is Linux-only anyway; this keeps
+/// the non-Linux build compiling): values every check fails closed on.
 #[cfg(not(target_os = "linux"))]
-pub fn peer_uid(_sock: &UnixStream) -> Result<crate::Uid> {
-    Ok(crate::Uid(u32::MAX))
+fn peer_cred(_sock: &UnixStream) -> Result<(crate::Uid, Pid)> {
+    Ok((crate::Uid(u32::MAX), Pid::from_raw(0)))
 }
 
-/// The peer's pid, from the same `SO_PEERCRED` as [`peer_uid`]. The daemon reads the
-/// requester's cgroup through it to place a blessing carrier in that process's own logind
-/// session scope (DESIGN §16.6).
-///
-/// **Weaker than [`peer_uid`], and the difference matters.** The kernel records this at
-/// `connect(2)`, so no client asserts it — but what it records is a *number*, and pid
-/// numbers are recycled once the task is reaped. Between the connect and the daemon's
-/// `/proc/<pid>/cgroup` read sits the whole approval wait, so a pid that has since been
-/// reused names a different process. `SO_PEERPIDFD` (Linux 6.5) is the fix for that class
-/// of staleness if this ever needs to be authoritative.
-///
-/// It doesn't today, because placement is not authorization: the grant is gated on a uid-0
-/// `BlessApprove`, and anyone able to complete one already has root. A stale pid resolves
-/// to nothing, or to a cgroup with no session scope, and placement falls back to the
-/// daemon's own cgroup — the safe, pre-B2 behaviour.
-#[cfg(target_os = "linux")]
-pub fn peer_pid(sock: &UnixStream) -> Result<Pid> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let creds = getsockopt(sock, PeerCredentials).context("SO_PEERCRED")?;
-    Ok(Pid::from_raw(creds.pid()))
-}
-
-/// No `SO_PEERCRED` off Linux — see [`peer_uid`]'s note. Pid 0 is not a real process, so
-/// the cgroup read that follows simply fails and placement falls back.
-#[cfg(not(target_os = "linux"))]
-pub fn peer_pid(_sock: &UnixStream) -> Result<Pid> {
-    Ok(Pid::from_raw(0))
-}
-
-/// Send one newline-framed JSON message with a file descriptor riding along as
-/// `SCM_RIGHTS` ancillary data — the blessing hand-off (DESIGN §16.6): the daemon opens
-/// the carrier's `cgroup.procs` as root and passes *only that fd*, so the CLI never needs
-/// privilege to join.
+/// Send one newline-framed JSON message with `fd` attached to it.
 ///
 /// The fd is attached to this one `sendmsg`, so it is delivered at exactly this point in
-/// the byte stream; the peer must read it with [`read_msg_with_fd`].
+/// the byte stream.
 #[cfg(target_os = "linux")]
-pub fn send_msg_with_fd(
+fn send_msg_with_fd(
     sock: &UnixStream,
     value: &impl Serialize,
     fd: std::os::fd::BorrowedFd<'_>,
@@ -400,7 +459,7 @@ fn send_all_with_fd(
 /// tasks into its own blessing (DESIGN §16.4). The `pre_exec` join happens before the exec
 /// that would drop it, so nothing legitimate needs it to persist.
 #[cfg(target_os = "linux")]
-pub fn read_msg_with_fd<T: DeserializeOwned>(
+fn read_msg_with_fd<T: DeserializeOwned>(
     sock: &UnixStream,
 ) -> Result<Option<(T, Option<std::os::fd::OwnedFd>)>> {
     let mut line = Vec::new();
@@ -529,6 +588,19 @@ mod tests {
         assert!(fd.is_none());
     }
 
+    /// A descriptor read must not start behind bytes that a buffered `recv` already
+    /// pulled off the socket: those bytes, and a descriptor riding on them, would be lost.
+    #[test]
+    fn recv_with_fd_refuses_after_a_buffered_read() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (a, mut b) = (Conn::new(a).unwrap(), Conn::new(b).unwrap());
+        a.send(&Response::BlessRevoked { id: BlessId(1) }).unwrap();
+        a.send(&Response::BlessRevoked { id: BlessId(2) }).unwrap();
+        drop(a);
+        assert!(b.recv::<Response>().unwrap().is_some());
+        assert!(b.recv_with_fd::<Response>().is_err());
+    }
+
     /// `pid_t` is signed and pids are not. A real pid passes through; a negative — which
     /// is a `kill(2)` process-group overload, never something that reaches this type —
     /// lands on `0`, the "no usable process" value whose consumers already fall back.
@@ -550,11 +622,12 @@ mod tests {
     fn peer_uid_reports_the_other_end() {
         let (a, b) = UnixStream::pair().unwrap();
         let me = crate::Uid(config::euid());
-        assert_eq!(peer_uid(&a).unwrap(), me);
-        assert_eq!(peer_uid(&b).unwrap(), me);
+        let a = Conn::new(a).unwrap();
+        assert_eq!(a.peer_uid(), me);
+        assert_eq!(Conn::new(b).unwrap().peer_uid(), me);
         // And a non-root test runner must not look like root to the caller's check.
         if !config::is_root() {
-            assert_ne!(peer_uid(&a).unwrap(), crate::Uid::ROOT);
+            assert_ne!(a.peer_uid(), crate::Uid::ROOT);
         }
     }
 

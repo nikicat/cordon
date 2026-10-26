@@ -29,9 +29,7 @@ use crate::Cli;
 use crate::sys;
 use clap::Subcommand;
 use cordon_core::policy::ClassName;
-use cordon_core::proto::{
-    BlessId, CarrierProcs, Nonce, Request, Response, peer_uid, read_msg_with_fd, write_msg,
-};
+use cordon_core::proto::{BlessId, CarrierProcs, Conn, Nonce, Request, Response};
 use cordon_core::{Context, Error, Result, Uid};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
@@ -105,7 +103,7 @@ fn mint_and_exec(args: &BlessArgs, cli: &Cli) -> Result<ExitCode> {
 ///
 /// One connection, two replies, an elevation in between — and it must be a dedicated
 /// connection rather than [`crate::round_trip`], because ancillary data is lost to any
-/// buffered read (see `read_msg_with_fd`).
+/// buffered read (see `Conn::recv_with_fd`).
 fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<CarrierProcs> {
     let stream = UnixStream::connect(socket).map_err(|e| {
         Error::msg(format!(
@@ -113,9 +111,10 @@ fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<Carrie
             socket.display()
         ))
     })?;
-    require_root_daemon(&stream, socket)?;
-    write_msg(&mut &stream, &Request::BlessRequest { class })?;
-    let nonce = match reply(&stream)? {
+    let conn = Conn::new(stream)?;
+    require_root_daemon(&conn, socket)?;
+    conn.send(&Request::BlessRequest { class })?;
+    let nonce = match reply(&conn)? {
         (Response::BlessPending { nonce }, _) => nonce,
         (other, _) => return Err(unexpected(other)),
     };
@@ -126,7 +125,7 @@ fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<Carrie
     // the handshake provably reach the daemon we just vetted.
     elevate(&nonce, socket)?;
 
-    match reply(&stream)? {
+    match reply(&conn)? {
         (Response::BlessMinted(_), Some(procs)) => Ok(CarrierProcs(procs)),
         (Response::BlessMinted(view), None) => Err(Error::msg(format!(
             "daemon minted {} but passed no cgroup.procs descriptor",
@@ -149,8 +148,8 @@ fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<Carrie
 /// process approve actually the root daemon". Blessing against a non-root daemon could
 /// never work anyway: the carrier's whole boundary is that only root can place tasks in it
 /// (DESIGN §16.4), so a user-owned daemon has nothing to grant.
-fn require_root_daemon(stream: &UnixStream, socket: &Path) -> Result<()> {
-    let uid = peer_uid(stream)?;
+fn require_root_daemon(conn: &Conn, socket: &Path) -> Result<()> {
+    let uid = conn.peer_uid();
     if uid != Uid::ROOT {
         return Err(Error::msg(format!(
             "the daemon on {} runs as uid {}, not root — refusing to request a blessing \
@@ -165,8 +164,8 @@ fn require_root_daemon(stream: &UnixStream, socket: &Path) -> Result<()> {
 
 /// Read one reply, turning a daemon-side `Error` and a hang-up into our error type so
 /// callers only ever match the replies they expect.
-fn reply(stream: &UnixStream) -> Result<(Response, Option<std::os::fd::OwnedFd>)> {
-    match read_msg_with_fd::<Response>(stream)? {
+fn reply(conn: &Conn) -> Result<(Response, Option<std::os::fd::OwnedFd>)> {
+    match conn.recv_with_fd::<Response>()? {
         Some((resp, fd)) => Ok((resp.into_result()?, fd)),
         None => Err(Error::msg("daemon closed the connection without replying")),
     }
@@ -256,7 +255,8 @@ mod tests {
     #[test]
     fn the_daemon_end_must_be_root() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
-        let peer_is_root = peer_uid(&ours).unwrap() == Uid::ROOT;
+        let ours = Conn::new(ours).unwrap();
+        let peer_is_root = ours.peer_uid() == Uid::ROOT;
         let verdict = require_root_daemon(&ours, Path::new("/socketpair"));
         assert_eq!(
             verdict.is_err(),
@@ -280,7 +280,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cordon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        if peer_uid(&UnixStream::connect(&path).unwrap()).unwrap() == Uid::ROOT {
+        if Conn::connect(&path).unwrap().peer_uid() == Uid::ROOT {
             std::fs::remove_dir_all(&dir).ok();
             return; // running as root: this listener is a legitimate daemon end
         }

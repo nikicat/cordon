@@ -6,7 +6,8 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 2.3 are committed. Step 2.4 is in the working tree, unstaged.
+> **Status:** steps 0 through 2 are committed. Step 3's core policy and `Conn` parts are in
+> the working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -64,7 +65,7 @@ One commit each, in this order:
    position) in place of a bare `pos`. Output changes: a fragment's error renders as
    `file:line:col: error: msg` instead of `error: file: line:col: msg`, and a compile
    warning about a rule now names the rule's fragment.
-4. **`Context`** (done, unstaged): a `Context` extension trait in core replaces all 64
+4. **`Context`** (done): a `Context` extension trait in core replaces all 64
    hand-written `.map_err(|e| Error::msg(format!("<what>: {e}")))` sites, with identical
    error text. `Response::into_result` replaces the CLI's two ways of turning a daemon
    `Error` reply into an error (`daemon:` and `daemon error:` prefixes; now `daemon:`).
@@ -75,13 +76,16 @@ One commit each, in this order:
 
 One commit per crate area. Each turns context that every sibling function takes as a
 parameter into a struct the caller builds once:
-- core policy: `Resolver { lines, groups, home }` in resolve.rs, which also owns the axis
-  name as an `Axis` enum, and `Compiler { resolve_fileid, classes, diagnostics }` in
-  compile.rs, whose `compile` then reads as its four steps.
-- core proto and daemon ipc: a `Conn` that reads peer credentials once and sends and
-  receives framed messages and descriptors. The daemon's per-connection state
-  (`peer_uid`, `stream`, `writer`) moves onto it, and `dispatch` stops having an
-  `unreachable!` arm.
+- core policy (done, unstaged): `Resolver { parsed, home }` in resolve.rs, with the axis
+  name as an `Axis` enum that also picks the group namespace, and
+  `Compiler { resolve_fileid, classes, diagnostics }` in compile.rs, whose `compile` now
+  reads as its three steps (objects, own rules, buckets).
+- core proto and daemon ipc (done, unstaged): a `Conn` that reads peer credentials once
+  and sends and receives framed messages and descriptors; the framing functions are
+  private to it. The daemon's per-connection state (`peer_uid`, `stream`, `writer`) moves
+  onto it, and `dispatch` becomes `handle`, which replies itself, so `BlessRequest` is an
+  ordinary arm instead of an `unreachable!`. `recv_with_fd` refuses to run behind a
+  buffered `recv`, which would lose the descriptor.
 - daemon bpf_lsm: `Maps<'a>(&'a mut Ebpf)` with the eleven seed helpers as methods, used by
   `Blessings`; a `PinDir` type for the four pin functions.
 - cli: a `Client` that loads the config once (today: three times) and owns the socket, the

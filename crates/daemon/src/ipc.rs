@@ -28,11 +28,8 @@
 use crate::Ctx;
 use cordon_core::backend::{ApplyRequest, BlessOp, ControlMsg};
 use cordon_core::policy::ClassName;
-use cordon_core::proto::{
-    Nonce, Request, Response, StatusInfo, peer_pid, peer_uid, read_msg, send_msg_with_fd, write_msg,
-};
+use cordon_core::proto::{Conn, Nonce, Request, Response, StatusInfo};
 use cordon_core::{Error, Result, Uid};
-use std::io::{BufReader, BufWriter};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -95,36 +92,15 @@ impl Ctx {
     }
 
     fn handle_conn(&self, stream: UnixStream) -> Result<()> {
-        // The peer's kernel-attested credentials, read once per connection — the uid
-        // can't change for the lifetime of the socket, and `authorize` gates every
-        // request on it.
-        let peer_uid = peer_uid(&stream)?;
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = BufWriter::new(stream.try_clone()?);
-        while let Some(req) = read_msg::<_, Request>(&mut reader)? {
-            let outcome = match authorize(&req, peer_uid) {
-                // `BlessRequest` is the one verb that doesn't fit request→response: it
-                // replies twice on one connection and the second reply carries a
-                // descriptor, so it owns the raw socket for its duration.
-                Ok(()) => match req {
-                    Request::BlessRequest { class } => {
-                        self.serve_bless_request(&stream, &mut writer, class, peer_uid)
-                    }
-                    other => self
-                        .dispatch(other, peer_uid)
-                        .and_then(|resp| write_msg(&mut writer, &resp)),
-                },
-                Err(e) => Err(e),
-            };
+        let mut conn = Conn::new(stream)?;
+        while let Some(req) = conn.recv::<Request>()? {
             // Any failure — refused, timed out, backend error — becomes an `Error` reply
             // rather than a dropped connection, so the CLI can say why.
-            if let Err(e) = outcome {
-                write_msg(
-                    &mut writer,
-                    &Response::Error {
-                        message: e.to_string(),
-                    },
-                )?;
+            if let Err(e) = authorize(&req, conn.peer_uid()).and_then(|()| self.handle(&conn, req))
+            {
+                conn.send(&Response::Error {
+                    message: e.to_string(),
+                })?;
             }
         }
         Ok(())
@@ -141,26 +117,12 @@ impl Ctx {
     /// this is: under `run0` it lives in a transient unit with no session at all. Here the
     /// placement decision rests on this peer's kernel-attested identity, and the human
     /// presence check rests on the approver's. Neither is a client's assertion.
-    fn serve_bless_request(
-        &self,
-        stream: &UnixStream,
-        writer: &mut BufWriter<UnixStream>,
-        class: Option<ClassName>,
-        peer_uid: Uid,
-    ) -> Result<()> {
-        // The carrier's placement follows *this* peer. Reading the pid here rather than
-        // after the approval wait is tidiness, not a guarantee — it is a number, and the
-        // cgroup behind it is only read at mint time (see `peer_pid`). Placement is not
-        // authorization, so a stale one costs at worst the session scope.
-        let peer_pid = peer_pid(stream)?;
+    fn serve_bless_request(&self, conn: &Conn, class: Option<ClassName>) -> Result<()> {
         let nonce = Nonce::generate()?;
         let approved = self.register_pending(nonce.clone())?;
-        let sent = write_msg(
-            writer,
-            &Response::BlessPending {
-                nonce: nonce.clone(),
-            },
-        );
+        let sent = conn.send(&Response::BlessPending {
+            nonce: nonce.clone(),
+        });
         let waited = sent.and_then(|()| {
             approved.recv_timeout(APPROVAL_TIMEOUT).map_err(|_| {
                 Error::msg("no approval within the timeout — was the elevation cancelled?")
@@ -171,15 +133,15 @@ impl Ctx {
         self.pending.lock().unwrap().remove(&nonce);
         waited?;
 
+        // The carrier's placement follows *this* peer; see `Conn::peer_pid` for why a
+        // pid is good enough for placement.
         let (view, procs) = self.bless(|reply| BlessOp::Mint {
             class,
-            owner: peer_uid,
-            requester: peer_pid,
+            owner: conn.peer_uid(),
+            requester: conn.peer_pid(),
             reply,
         })?;
-        // Bypasses the buffered writer (empty here — `write_msg` flushes every message):
-        // the descriptor can only travel as ancillary data on a raw `sendmsg`.
-        send_msg_with_fd(stream, &Response::BlessMinted(view), procs.0.as_fd())
+        conn.send_with_fd(&Response::BlessMinted(view), procs.0.as_fd())
     }
 
     /// Park a nonce for an approver to release. Bounded: `BlessRequest` is ungated on a
@@ -230,8 +192,13 @@ impl Ctx {
             .map_err(Error::msg)
     }
 
-    fn dispatch(&self, req: Request, peer_uid: Uid) -> Result<Response> {
-        match req {
+    /// Serves one authorized request, replying on `conn`.
+    fn handle(&self, conn: &Conn, req: Request) -> Result<()> {
+        let resp = match req {
+            // The one verb that doesn't fit request→response: it replies twice, and the
+            // second reply carries a descriptor.
+            Request::BlessRequest { class } => return self.serve_bless_request(conn, class),
+
             Request::Status => {
                 let objects = self
                     .control
@@ -240,17 +207,17 @@ impl Ctx {
                     .unwrap()
                     .as_ref()
                     .map(|v| v.objects.len());
-                Ok(Response::Status(StatusInfo {
+                Response::Status(StatusInfo {
                     backend: self.backend,
                     socket: self.socket.clone(),
                     policy: self.policy.clone(),
                     objects,
-                }))
+                })
             }
 
-            Request::PolicyShow => Ok(Response::PolicyView(
-                self.control.current.lock().unwrap().clone(),
-            )),
+            Request::PolicyShow => {
+                Response::PolicyView(self.control.current.lock().unwrap().clone())
+            }
 
             Request::PolicyApply { sources } => {
                 // Hand the fragments to the backend thread (which owns the BPF maps)
@@ -269,32 +236,26 @@ impl Ctx {
                 let outcome = reply_rx.recv_timeout(REPLY_TIMEOUT).map_err(|_| {
                     Error::msg("timed out waiting for the backend to apply the policy")
                 })?;
-                Ok(Response::PolicyApplied {
+                Response::PolicyApplied {
                     applied: outcome.applied,
                     diagnostics: outcome.diagnostics,
-                })
+                }
             }
 
-            // Handled by `serve_bless_request`, which needs the raw socket.
-            Request::BlessRequest { .. } => {
-                unreachable!("BlessRequest is served on the connection, not dispatched")
-            }
+            Request::BlessApprove { nonce } => self.approve(&nonce)?,
 
-            Request::BlessApprove { nonce } => self.approve(&nonce),
-
-            Request::BlessList => Ok(Response::Blessings(
-                self.bless(|reply| BlessOp::List { reply })?,
-            )),
+            Request::BlessList => Response::Blessings(self.bless(|reply| BlessOp::List { reply })?),
 
             Request::BlessRevoke { id } => {
                 self.bless(|reply| BlessOp::Revoke {
                     id,
-                    by: peer_uid,
+                    by: conn.peer_uid(),
                     reply,
                 })?;
-                Ok(Response::BlessRevoked { id })
+                Response::BlessRevoked { id }
             }
-        }
+        };
+        conn.send(&resp)
     }
 }
 

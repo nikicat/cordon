@@ -10,10 +10,8 @@ mod edit;
 mod sys;
 
 use clap::{Parser, Subcommand};
-use cordon_core::proto::{Nonce, Pid, Request, Response, read_msg, write_msg};
+use cordon_core::proto::{Conn, Nonce, Pid, Request, Response};
 use cordon_core::{Config, Error, Result, policy};
-use std::io::{BufReader, BufWriter};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -390,10 +388,8 @@ fn resolve_socket(cli: &Cli) -> Result<PathBuf> {
 }
 
 fn round_trip(socket: &Path, req: &Request) -> Result<Response> {
-    let stream = UnixStream::connect(socket)?;
-    let mut writer = BufWriter::new(stream.try_clone()?);
-    let mut reader = BufReader::new(stream);
-    write_msg(&mut writer, req)?;
-    read_msg(&mut reader)?
+    let mut conn = Conn::connect(socket)?;
+    conn.send(req)?;
+    conn.recv()?
         .ok_or_else(|| Error::msg("daemon closed the connection without replying"))
 }
