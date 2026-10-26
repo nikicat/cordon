@@ -176,8 +176,9 @@ Left as code; each makes its doc long or awkward:
 - `OneOrMany::classified` was `tokens().to_vec()` under a misleading name. Done, it is
   now `From<OneOrMany> for Vec<Token>`.
 - `UserName::from_str` accepted the empty string and `/`. Done, it now refuses both.
-- Smoke suite: `cgroup2_ready` has three unrelated effects; `edit_env_setup` returns its
-  results through five globals.
+- Smoke suite: `cgroup2_ready` had three effects under a cgroup name, and
+  `edit_env_setup` returned five globals. Done. It is now `bless_env_ready`, which also
+  unsets `CORDON_SUDO` when the scenario ends, and the edit user and temp dir are constants.
 
 ## Out of scope
 

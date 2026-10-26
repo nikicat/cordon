@@ -48,9 +48,11 @@ TMP="" VAULT="" SECRET="" OWNER="" OWNER_B="" SCRAPER="" SOCK="" LOG="" DPID=""
 # The cgroup that the daemon starts in instead of the cgroup2 root. Only the bless
 # scenarios set it.
 DCGROUP=""
-# The editor user, the root-only sentinel and the edit temp dir that `edit_env_setup`
-# sets for the policy-edit symlink scenarios.
-TUID="" TUSER="" SENTINEL="" EDITDIR=""
+# The throwaway user that the policy-edit symlink scenarios drop the editor to, and the
+# directory where cordon mints its per-edit temp dir.
+TUID=4243 TUSER="cordonedit$$" EDITDIR="${TMPDIR:-/tmp}"
+# The root-only sentinel file that `edit_env_setup` creates.
+SENTINEL=""
 # The directory the LSM links are pinned under. It differs from the default
 # /sys/fs/bpf/cordon, so a suite run on a real machine cannot tear down that machine's live
 # boundary.
@@ -632,19 +634,16 @@ EOF
 # symlink attack on the user-owned temp copy, which is the threat DESIGN §2 puts in scope.
 # They need no daemon, because the attack is resolved before the apply.
 
-# Creates a fresh workspace, a throwaway regular user for the editor to drop to, a root-only
-# sentinel and a config, and sets TUID, TUSER, SENTINEL, EDITDIR and CORDON_CONFIG. Echoes a
-# SKIP and fails when the guest cannot support that.
+# Creates a fresh workspace, the passwd entry for $TUSER, the root-only $SENTINEL and a
+# config. Echoes a SKIP and fails when the guest cannot support that.
 edit_env_setup() {
     ws_new
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 1; }
-    TUID=4243; TUSER="cordonedit$$"
     local thome="$TMP/ehome"; mkdir -p "$thome"; chown "$TUID:$TUID" "$thome"; chmod 755 "$TMP"
     printf '%s:x:%s:%s:Cordon Edit:%s:/bin/sh\n' "$TUSER" "$TUID" "$TUID" "$thome" >> /etc/passwd 2>/dev/null \
         || { echo "  SKIP: /etc/passwd not writable"; return 1; }
     on_cleanup drop_user "$TUSER"
     SENTINEL="$TMP/root-secret"; echo "SENTINEL-XYZZY" > "$SENTINEL"; chown 0:0 "$SENTINEL"; chmod 600 "$SENTINEL"
-    EDITDIR="${TMPDIR:-/tmp}"   # where cordon mints its per-edit temp dir
     write_config "$TMP/policy.toml" "$TMP/dead.sock"
 }
 
@@ -715,10 +714,11 @@ RACER
 # The daemon's cgroup in the bless scenarios. It stands in for the systemd service cgroup.
 BLESS_DCGROUP="/sys/fs/cgroup/cordon-smoke.scope"
 
-# Mounts cgroup2 for the carrier cgroups if the guest has not (virtme usually has). Sets
-# $DCGROUP, so the daemon starts in a nested cgroup as in production, and sets
-# $CORDON_SUDO. Echoes a SKIP and fails when cgroup2 cannot be made available.
-cgroup2_ready() {
+# Prepares a bless scenario. Mounts cgroup2 for the carrier cgroups if the guest has not
+# (virtme usually has), sets $DCGROUP so the daemon starts in a nested cgroup as in
+# production, and exports $CORDON_SUDO until the scenario ends. Echoes a SKIP and fails
+# when cgroup2 cannot be made available.
+bless_env_ready() {
     if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
         mkdir -p /sys/fs/cgroup 2>/dev/null
         if ! mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; then
@@ -733,6 +733,7 @@ cgroup2_ready() {
     # replaces it with a wrapper that elevates from an unprivileged CLI, as a real sudo
     # does.
     export CORDON_SUDO="env"
+    on_cleanup unset CORDON_SUDO
     return 0
 }
 
@@ -818,7 +819,7 @@ bless_none_left() { [ -z "$(bless_dirs)" ] && [ -z "$(bless_ids)" ]; }
 scenario_bless_scope() {
     echo "### scenario: bless scope (blessed read allowed on V, denied on V2, unblessed denied)"
     ws_new
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     local vault2="$TMP/vault2"; mkdir -p "$vault2"; echo S2 > "$vault2/secret"
     write_policy <<EOF
 [group.subject.blessed-ro]
@@ -853,7 +854,7 @@ EOF
 scenario_bless_boundary() {
     echo "### scenario: bless boundary (non-root write to the carrier cgroup.procs fails)"
     ws_new
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
     write_policy <<EOF
 [group.subject.blessed-ro]
@@ -894,7 +895,7 @@ EOF
 scenario_bless_inherit_gc() {
     echo "### scenario: bless inherit + GC (grandchild reads; carrier fully reaped after exit)"
     ws_new
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     write_policy <<EOF
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -936,7 +937,7 @@ EOF
 scenario_bless_revoke() {
     echo "### scenario: bless revoke (the blessed tree dies promptly; list + dirs drain)"
     ws_new
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     write_policy <<EOF
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -975,7 +976,7 @@ EOF
 scenario_bless_journal() {
     echo "### scenario: bless journal (a blessed read logs blessing=ro — bless is loud)"
     ws_new
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     write_policy <<EOF
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -1001,7 +1002,7 @@ scenario_bless_unprivileged() {
     echo "### scenario: unprivileged bless (runs as you, env survives, still blessed)"
     ws_new
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     local buid=4244 bgid=4244
     local cordon; cordon="$(unpriv_cordon)"
     local out="$TMP/blessed.id"; : > "$out"; chmod 666 "$out"
@@ -1240,7 +1241,7 @@ scenario_bless_placement() {
     echo "### scenario: the carrier lands where logind can still attribute the user"
     ws_new
     command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     P_UID=4248
     P_CORDON="$(unpriv_cordon)"
     P_READY="$TMP/ready"; mkdir -p "$P_READY"; chown "$P_UID:$P_UID" "$P_READY"
@@ -1280,7 +1281,7 @@ EOF
 scenario_bless_reconcile_ownership() {
     echo "### scenario: reconcile adopts a root-owned leftover, ignores a planted one"
     ws_new
-    cgroup2_ready || return 0
+    bless_env_ready || return 0
     local buid=4249
     local uslice="/sys/fs/cgroup/user.slice/user-$buid.slice"
     local scope="$uslice/session-97.scope"
