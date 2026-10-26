@@ -18,8 +18,7 @@
 //! from a previous daemon run (its map entries died with it — a blessing only ever
 //! grants again if its class is still declared).
 
-use super::seed;
-use aya::Ebpf;
+use super::seed::Maps;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
 use cordon_core::policy::{ClassName, ClassRegistry};
 use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, Pid};
@@ -110,7 +109,7 @@ impl Blessings {
     /// target into the carrier by writing the child's pid through that fd.
     pub(super) fn mint(
         &mut self,
-        ebpf: &mut Ebpf,
+        maps: &mut Maps,
         class: Option<ClassName>,
         owner: Uid,
         requester: Pid,
@@ -165,7 +164,7 @@ impl Blessings {
                 )));
             }
         };
-        if let Err(e) = seed::blessed_insert(ebpf, cgroup, class_id) {
+        if let Err(e) = maps.blessed_insert(cgroup, class_id) {
             let _ = std::fs::remove_dir(&dir);
             return Err(e);
         }
@@ -238,7 +237,7 @@ impl Blessings {
     /// reaped once it reads `populated 0` *and* that emptiness is meaningful:
     /// something ran and exited, it was revoked, or the mint grace expired (the CLI
     /// died before joining). Reaping = `MAP_BLESSED` remove + rmdir + drop.
-    pub(super) fn gc(&mut self, ebpf: &mut Ebpf) {
+    pub(super) fn gc(&mut self, maps: &mut Maps) {
         self.live.retain_mut(|b| {
             match read_populated(&b.dir) {
                 Some(true) => {
@@ -246,14 +245,14 @@ impl Blessings {
                     true
                 }
                 Some(false) if should_reap(b.saw_populated, b.revoked, b.minted.elapsed()) => {
-                    reap(ebpf, b);
+                    reap(maps, b);
                     false
                 }
                 Some(false) => true,
                 // The carrier dir (or its cgroup.events) vanished under us — nothing
                 // left to keep alive; drop the map entry and the table row.
                 None => {
-                    reap(ebpf, b);
+                    reap(maps, b);
                     false
                 }
             }
@@ -265,16 +264,16 @@ impl Blessings {
     /// name-sorted), so without this a live blessing silently changes meaning. A
     /// vanished class unregisters the map entry (the blessing grants nothing) but the
     /// carrier is left to GC — never kill the tree because policy changed under it.
-    pub(super) fn remap(&mut self, ebpf: &mut Ebpf, registry: &ClassRegistry) {
+    pub(super) fn remap(&mut self, maps: &mut Maps, registry: &ClassRegistry) {
         for b in &mut self.live {
             match remap_plan(b.registered, registry.id(&b.class)) {
-                Remap::Register(class_id) => match seed::blessed_insert(ebpf, b.cgroup, class_id) {
+                Remap::Register(class_id) => match maps.blessed_insert(b.cgroup, class_id) {
                     Ok(()) => b.registered = true,
                     Err(e) => {
                         // Fail closed: a stale entry would mean the *renumbered* id —
                         // a different class. Grant nothing rather than the wrong thing.
                         warn!(id = %b.id, error = %e, "bless: remap re-insert failed; unregistering");
-                        let _ = seed::blessed_remove(ebpf, b.cgroup);
+                        let _ = maps.blessed_remove(b.cgroup);
                         b.registered = false;
                     }
                 },
@@ -283,7 +282,7 @@ impl Blessings {
                         id = %b.id, class = %b.class,
                         "bless: class vanished on apply; blessing is now inert (GC reaps it when empty)"
                     );
-                    if let Err(e) = seed::blessed_remove(ebpf, b.cgroup) {
+                    if let Err(e) = maps.blessed_remove(b.cgroup) {
                         warn!(id = %b.id, error = %e, "bless: remap remove failed");
                     }
                     b.registered = false;
@@ -308,7 +307,7 @@ impl Blessings {
     /// and unwritable), which is exactly why it is worth asserting rather than assuming:
     /// a `Delegate=yes` drop-in or a wider [`carrier_roots`] would make it reachable
     /// without anything here looking different.
-    pub(super) fn reconcile(&mut self, ebpf: &mut Ebpf, registry: &ClassRegistry) {
+    pub(super) fn reconcile(&mut self, maps: &mut Maps, registry: &ClassRegistry) {
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -340,7 +339,7 @@ impl Blessings {
             }
             let cgroup = CgroupId(std::os::unix::fs::MetadataExt::ino(&meta));
             let registered = match registry.id(&found.class) {
-                Some(class_id) => match seed::blessed_insert(ebpf, cgroup, class_id) {
+                Some(class_id) => match maps.blessed_insert(cgroup, class_id) {
                     Ok(()) => true,
                     Err(e) => {
                         warn!(dir = %found.dir.display(), error = %e, "bless: reconcile re-register failed; adopted inert");
@@ -374,9 +373,9 @@ impl Blessings {
 }
 
 /// Unregister + rmdir + log one dead blessing (the table row is dropped by the caller).
-fn reap(ebpf: &mut Ebpf, b: &Blessing) {
+fn reap(maps: &mut Maps, b: &Blessing) {
     if b.registered
-        && let Err(e) = seed::blessed_remove(ebpf, b.cgroup)
+        && let Err(e) = maps.blessed_remove(b.cgroup)
     {
         warn!(id = %b.id, error = %e, "bless: MAP_BLESSED remove failed");
     }

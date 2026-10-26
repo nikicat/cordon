@@ -199,7 +199,7 @@ detach-then-attach gap.
 - **Adopt-existing-pins was specified here and deliberately dropped.** It buys nothing the
   link pins don't already give, and costs a mandatory cross-process writer lock, an
   ABI/build-id check to avoid an upgraded daemon driving the old kernel program, and a clash
-  with the self-test (which writes bank 0 + `SETTINGS` before `seed_policy` and would
+  with the self-test (which writes bank 0 + `SETTINGS` before `Maps::seed` and would
   transiently clobber a live adopted policy). A restarting daemon loads its own object with
   its own private maps, so the single-writer invariant in `seed.rs` is untouched.
 - The old note "pin the policy maps only — a pinned `BLESSED` means grants that never expire"

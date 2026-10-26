@@ -4,7 +4,7 @@
 //!
 //! ## Atomic apply — the double-buffer (DESIGN §15.8)
 //! The three rule maps are **banked**: each holds two generations, and
-//! `Settings.active_bank` selects the live one. [`seed_policy`] fills the *inactive*
+//! `Settings.active_bank` selects the live one. [`Maps::seed`] fills the *inactive*
 //! bank (the kernel never reads it) and then flips `active_bank` in one `SETTINGS`
 //! write — an RCU-style publish, so a re-seed is never half-visible (no clear-then-
 //! insert window). The flip hinges on the 4-byte `active_bank`, which can't tear; since the
@@ -13,8 +13,8 @@
 //! — never a torn pointer.
 //!
 //! ## Single writer
-//! Every map write goes through `&mut Ebpf`, owned solely by the backend thread; the
-//! CLI has no handle and `apply` requests are serialized through one mpsc channel. So
+//! Every map write goes through [`Maps`], over the `&mut Ebpf` that the backend thread
+//! alone owns; the CLI has no handle and `apply` requests are serialized through one mpsc channel. So
 //! there is exactly one writer by construction — no userspace write/write race.
 //!
 //! M5's pinning does **not** change that, deliberately: it pins the LSM *links*, never the
@@ -23,9 +23,8 @@
 //! cross-process writer — one daemon's bank fill interleaving another's flip into a torn
 //! table — which is why adopt-existing-pins was dropped rather than guarded.
 
-use super::map_mut;
-use aya::Ebpf;
-use aya::maps::{Array, HashMap as BpfHashMap};
+use aya::maps::{Array, HashMap as BpfHashMap, MapData};
+use aya::{Ebpf, Pod};
 use cordon_bpf_common::{
     Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, FileId, MAP_BLESSED,
     MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES, MAP_SETTINGS, MAX_OBJECTS, ObjId, Pid, Settings,
@@ -37,130 +36,157 @@ use std::path::Path;
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
-/// Atomically seed a compiled policy: fill the inactive bank from `compiled`, then flip
-/// `active_bank` so the kernel switches to it in one update. Used both at startup (from
-/// the zero-initialized `SETTINGS`, so the first fill targets bank 1) and on every
-/// `cordon policy apply`.
-pub(super) fn seed_policy(ebpf: &mut Ebpf, compiled: &CompiledPolicy) -> Result<()> {
-    if compiled.objects.len() > MAX_OBJECTS {
-        return Err(Error::msg(format!(
-            "bpf-lsm: {} protected objects exceed MAX_OBJECTS ({MAX_OBJECTS})",
-            compiled.objects.len()
-        )));
-    }
+/// The maps of one loaded program, for writing. The backend thread builds one over its
+/// `Ebpf` wherever it writes, so there is a single writer (see the module doc).
+pub(super) struct Maps<'a>(pub(super) &'a mut Ebpf);
 
-    let target = current_bank(ebpf)?.flip();
-
-    // Drop the target bank's previous generation first, so removed objects/paths don't
-    // linger once we flip to it. (RULES needs no clearing — RULE_COUNT gates the scan,
-    // and every live slot is overwritten below.)
-    clear_bank(ebpf, target)?;
-
-    for obj in &compiled.objects {
-        protected_insert(ebpf, target, obj.file, obj.id)?;
-        rule_count_insert(ebpf, target, obj.id, obj.rules.len() as u32)?;
-        for (i, rule) in obj.rules.iter().enumerate() {
-            rules_set(ebpf, rule_slot(target, obj.id, i as u32), *rule)?;
+impl Maps<'_> {
+    /// Atomically seed a compiled policy: fill the inactive bank from `compiled`, then flip
+    /// `active_bank` so the kernel switches to it in one update. Used both at startup (from
+    /// the zero-initialized `SETTINGS`, so the first fill targets bank 1) and on every
+    /// `cordon policy apply`.
+    pub(super) fn seed(&mut self, compiled: &CompiledPolicy) -> Result<()> {
+        if compiled.objects.len() > MAX_OBJECTS {
+            return Err(Error::msg(format!(
+                "bpf-lsm: {} protected objects exceed MAX_OBJECTS ({MAX_OBJECTS})",
+                compiled.objects.len()
+            )));
         }
-    }
 
-    // The flip: publish the freshly-filled bank in one write.
-    set_settings(ebpf, Pid(std::process::id()), daemon_exe()?, target)?;
+        let target = self.current_bank()?.flip();
 
-    info!(
-        objects = compiled.objects.len(),
-        pending = compiled.pending.len(),
-        bank = target.index(),
-        "bpf-lsm seeded compiled policy (atomic bank flip)"
-    );
-    if !compiled.pending.is_empty() {
-        warn!(
-            count = compiled.pending.len(),
-            "bpf-lsm: some policy paths don't exist yet and aren't enforced until re-apply"
+        // Drop the target bank's previous generation first, so removed objects/paths don't
+        // linger once we flip to it. (RULES needs no clearing — RULE_COUNT gates the scan,
+        // and every live slot is overwritten below.)
+        self.clear_bank(target)?;
+
+        for obj in &compiled.objects {
+            self.protected_insert(target, obj.file, obj.id)?;
+            self.rule_count_insert(target, obj.id, obj.rules.len() as u32)?;
+            for (i, rule) in obj.rules.iter().enumerate() {
+                self.rules_set(rule_slot(target, obj.id, i as u32), *rule)?;
+            }
+        }
+
+        // The flip: publish the freshly-filled bank in one write.
+        self.set_settings(Pid(std::process::id()), daemon_exe()?, target)?;
+
+        info!(
+            objects = compiled.objects.len(),
+            pending = compiled.pending.len(),
+            bank = target.index(),
+            "bpf-lsm seeded compiled policy (atomic bank flip)"
         );
+        if !compiled.pending.is_empty() {
+            warn!(
+                count = compiled.pending.len(),
+                "bpf-lsm: some policy paths don't exist yet and aren't enforced until re-apply"
+            );
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-/// The live bank, read from `SETTINGS`. A zero-initialized (never-seeded) `SETTINGS`
-/// reads as [`Bank::ZERO`], so the first [`seed_policy`] targets bank 1.
-fn current_bank(ebpf: &mut Ebpf) -> Result<Bank> {
-    let settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
-        .with_context(|| format!("bpf-lsm: {MAP_SETTINGS}"))?;
-    let s = settings.get(&0, 0).context("bpf-lsm: read settings")?;
-    Ok(s.active_bank.masked())
-}
+    /// The live bank, read from `SETTINGS`. A zero-initialized (never-seeded) `SETTINGS`
+    /// reads as [`Bank::ZERO`], so the first [`seed`](Self::seed) targets bank 1.
+    fn current_bank(&mut self) -> Result<Bank> {
+        let s = self
+            .array::<Settings>(MAP_SETTINGS)?
+            .get(&0, 0)
+            .context("bpf-lsm: read settings")?;
+        Ok(s.active_bank.masked())
+    }
 
-pub(super) fn protected_insert(
-    ebpf: &mut Ebpf,
-    bank: Bank,
-    file: FileId,
-    obj: ObjId,
-) -> Result<()> {
-    let mut map: BpfHashMap<_, BankedFile, ObjId> =
-        BpfHashMap::try_from(map_mut(ebpf, MAP_PROTECTED)?)
-            .with_context(|| format!("bpf-lsm: {MAP_PROTECTED}"))?;
-    map.insert(BankedFile::new(bank, file), obj, 0)
-        .context("bpf-lsm: insert protected")
-}
+    pub(super) fn protected_insert(&mut self, bank: Bank, file: FileId, obj: ObjId) -> Result<()> {
+        self.hash::<BankedFile, ObjId>(MAP_PROTECTED)?
+            .insert(BankedFile::new(bank, file), obj, 0)
+            .context("bpf-lsm: insert protected")
+    }
 
-pub(super) fn protected_remove(ebpf: &mut Ebpf, bank: Bank, file: FileId) -> Result<()> {
-    let mut map: BpfHashMap<_, BankedFile, ObjId> =
-        BpfHashMap::try_from(map_mut(ebpf, MAP_PROTECTED)?)
-            .with_context(|| format!("bpf-lsm: {MAP_PROTECTED}"))?;
-    map.remove(&BankedFile::new(bank, file))
-        .context("bpf-lsm: remove protected")
-}
+    pub(super) fn protected_remove(&mut self, bank: Bank, file: FileId) -> Result<()> {
+        self.hash::<BankedFile, ObjId>(MAP_PROTECTED)?
+            .remove(&BankedFile::new(bank, file))
+            .context("bpf-lsm: remove protected")
+    }
 
-pub(super) fn rule_count_insert(ebpf: &mut Ebpf, bank: Bank, obj: ObjId, count: u32) -> Result<()> {
-    let mut map: BpfHashMap<_, BankedObj, u32> =
-        BpfHashMap::try_from(map_mut(ebpf, MAP_RULE_COUNT)?)
-            .with_context(|| format!("bpf-lsm: {MAP_RULE_COUNT}"))?;
-    map.insert(BankedObj::new(bank, obj), count, 0)
-        .context("bpf-lsm: insert rule count")
-}
+    pub(super) fn rule_count_insert(&mut self, bank: Bank, obj: ObjId, count: u32) -> Result<()> {
+        self.hash::<BankedObj, u32>(MAP_RULE_COUNT)?
+            .insert(BankedObj::new(bank, obj), count, 0)
+            .context("bpf-lsm: insert rule count")
+    }
 
-pub(super) fn rule_count_remove(ebpf: &mut Ebpf, bank: Bank, obj: ObjId) -> Result<()> {
-    let mut map: BpfHashMap<_, BankedObj, u32> =
-        BpfHashMap::try_from(map_mut(ebpf, MAP_RULE_COUNT)?)
-            .with_context(|| format!("bpf-lsm: {MAP_RULE_COUNT}"))?;
-    map.remove(&BankedObj::new(bank, obj))
-        .context("bpf-lsm: remove rule count")
-}
+    pub(super) fn rule_count_remove(&mut self, bank: Bank, obj: ObjId) -> Result<()> {
+        self.hash::<BankedObj, u32>(MAP_RULE_COUNT)?
+            .remove(&BankedObj::new(bank, obj))
+            .context("bpf-lsm: remove rule count")
+    }
 
-/// Register a live blessing: the carrier cgroup's id → its class. `MAP_BLESSED` is
-/// **unbanked** (blessings are runtime state, not policy — an apply remaps values in
-/// place by class name rather than re-seeding a generation).
-pub(super) fn blessed_insert(ebpf: &mut Ebpf, cgroup: CgroupId, class: ClassId) -> Result<()> {
-    let mut map: BpfHashMap<_, CgroupId, ClassId> =
-        BpfHashMap::try_from(map_mut(ebpf, MAP_BLESSED)?)
-            .with_context(|| format!("bpf-lsm: {MAP_BLESSED}"))?;
-    map.insert(cgroup, class, 0)
-        .context("bpf-lsm: insert blessed")
-}
+    /// Register a live blessing: the carrier cgroup's id → its class. `MAP_BLESSED` is
+    /// **unbanked** (blessings are runtime state, not policy — an apply remaps values in
+    /// place by class name rather than re-seeding a generation).
+    pub(super) fn blessed_insert(&mut self, cgroup: CgroupId, class: ClassId) -> Result<()> {
+        self.hash::<CgroupId, ClassId>(MAP_BLESSED)?
+            .insert(cgroup, class, 0)
+            .context("bpf-lsm: insert blessed")
+    }
 
-pub(super) fn blessed_remove(ebpf: &mut Ebpf, cgroup: CgroupId) -> Result<()> {
-    let mut map: BpfHashMap<_, CgroupId, ClassId> =
-        BpfHashMap::try_from(map_mut(ebpf, MAP_BLESSED)?)
-            .with_context(|| format!("bpf-lsm: {MAP_BLESSED}"))?;
-    map.remove(&cgroup).context("bpf-lsm: remove blessed")
-}
+    pub(super) fn blessed_remove(&mut self, cgroup: CgroupId) -> Result<()> {
+        self.hash::<CgroupId, ClassId>(MAP_BLESSED)?
+            .remove(&cgroup)
+            .context("bpf-lsm: remove blessed")
+    }
 
-pub(super) fn rules_set(ebpf: &mut Ebpf, index: u32, rule: CompiledRule) -> Result<()> {
-    let mut map: Array<_, CompiledRule> = Array::try_from(map_mut(ebpf, MAP_RULES)?)
-        .with_context(|| format!("bpf-lsm: {MAP_RULES}"))?;
-    map.set(index, rule, 0)
-        .with_context(|| format!("bpf-lsm: set rule[{index}]"))
-}
+    pub(super) fn rules_set(&mut self, index: u32, rule: CompiledRule) -> Result<()> {
+        self.array::<CompiledRule>(MAP_RULES)?
+            .set(index, rule, 0)
+            .with_context(|| format!("bpf-lsm: set rule[{index}]"))
+    }
 
-/// Set the one-element `SETTINGS` record: the fast-allowed daemon identity and the live
-/// bank. Writing this with a flipped `bank` is the atomic policy publish.
-pub(super) fn set_settings(ebpf: &mut Ebpf, pid: Pid, exe: FileId, bank: Bank) -> Result<()> {
-    let mut settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
-        .with_context(|| format!("bpf-lsm: {MAP_SETTINGS}"))?;
-    settings
-        .set(0, Settings::new(pid, bank, exe), 0)
-        .context("bpf-lsm: set settings")
+    /// Set the one-element `SETTINGS` record: the fast-allowed daemon identity and the live
+    /// bank. Writing this with a flipped `bank` is the atomic policy publish.
+    pub(super) fn set_settings(&mut self, pid: Pid, exe: FileId, bank: Bank) -> Result<()> {
+        self.array::<Settings>(MAP_SETTINGS)?
+            .set(0, Settings::new(pid, bank, exe), 0)
+            .context("bpf-lsm: set settings")
+    }
+
+    /// Remove `bank`'s entries from the keyed rule maps (`PROTECTED`, `RULE_COUNT`), leaving
+    /// the *other* bank — the live one during a re-seed — untouched.
+    fn clear_bank(&mut self, bank: Bank) -> Result<()> {
+        self.remove_where::<BankedFile, ObjId>(MAP_PROTECTED, |k| k.bank == bank)?;
+        self.remove_where::<BankedObj, u32>(MAP_RULE_COUNT, |k| k.bank == bank)
+    }
+
+    /// Removes every key of the hash map `name` that `stale` picks.
+    fn remove_where<K: Pod, V: Pod>(
+        &mut self,
+        name: &str,
+        stale: impl Fn(&K) -> bool,
+    ) -> Result<()> {
+        let mut map = self.hash::<K, V>(name)?;
+        let keys = map
+            .keys()
+            .collect::<std::result::Result<Vec<K>, _>>()
+            .with_context(|| format!("bpf-lsm: list {name}"))?;
+        for k in keys.iter().filter(|k| stale(k)) {
+            map.remove(k)
+                .with_context(|| format!("bpf-lsm: clear {name}"))?;
+        }
+        Ok(())
+    }
+
+    fn hash<K: Pod, V: Pod>(&mut self, name: &str) -> Result<BpfHashMap<&mut MapData, K, V>> {
+        BpfHashMap::try_from(self.map(name)?).with_context(|| format!("bpf-lsm: {name}"))
+    }
+
+    fn array<V: Pod>(&mut self, name: &str) -> Result<Array<&mut MapData, V>> {
+        Array::try_from(self.map(name)?).with_context(|| format!("bpf-lsm: {name}"))
+    }
+
+    fn map(&mut self, name: &str) -> Result<&mut aya::maps::Map> {
+        self.0
+            .map_mut(name)
+            .ok_or_else(|| Error::msg(format!("bpf-lsm: map '{name}' missing from object")))
+    }
 }
 
 /// This daemon's own executable identity, the other half of the fast-allow (the kernel
@@ -188,42 +214,4 @@ pub(super) fn daemon_exe() -> Result<FileId> {
     static EXE: OnceLock<Option<FileId>> = OnceLock::new();
     (*EXE.get_or_init(|| crate::proc::file_id(Path::new("/proc/self/exe"))))
         .ok_or_else(|| Error::msg("bpf-lsm: cannot resolve /proc/self/exe for the daemon identity"))
-}
-
-/// Remove `bank`'s entries from the keyed rule maps (`PROTECTED`, `RULE_COUNT`), leaving
-/// the *other* bank — the live one during a re-seed — untouched.
-fn clear_bank(ebpf: &mut Ebpf, bank: Bank) -> Result<()> {
-    {
-        let mut map: BpfHashMap<_, BankedFile, ObjId> =
-            BpfHashMap::try_from(map_mut(ebpf, MAP_PROTECTED)?)
-                .with_context(|| format!("bpf-lsm: {MAP_PROTECTED}"))?;
-        let stale: Vec<BankedFile> = map
-            .keys()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .with_context(|| format!("bpf-lsm: list {MAP_PROTECTED}"))?
-            .into_iter()
-            .filter(|k| k.bank == bank)
-            .collect();
-        for k in stale {
-            map.remove(&k)
-                .with_context(|| format!("bpf-lsm: clear {MAP_PROTECTED}"))?;
-        }
-    }
-    {
-        let mut map: BpfHashMap<_, BankedObj, u32> =
-            BpfHashMap::try_from(map_mut(ebpf, MAP_RULE_COUNT)?)
-                .with_context(|| format!("bpf-lsm: {MAP_RULE_COUNT}"))?;
-        let stale: Vec<BankedObj> = map
-            .keys()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .with_context(|| format!("bpf-lsm: list {MAP_RULE_COUNT}"))?
-            .into_iter()
-            .filter(|k| k.bank == bank)
-            .collect();
-        for k in stale {
-            map.remove(&k)
-                .with_context(|| format!("bpf-lsm: clear {MAP_RULE_COUNT}"))?;
-        }
-    }
-    Ok(())
 }

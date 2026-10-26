@@ -46,7 +46,7 @@ pub fn teardown(cfg: &Config) -> Result<Swept> {
         BackendKind::BpfLsm => {
             #[cfg(all(target_os = "linux", feature = "bpf-lsm"))]
             {
-                bpf_lsm::pin::teardown(&cfg.bpf_pin_dir)
+                bpf_lsm::pin::PinDir(cfg.bpf_pin_dir.clone()).teardown()
             }
             // This build never pinned anything, so there is nothing to remove — not an error.
             #[cfg(not(all(target_os = "linux", feature = "bpf-lsm")))]

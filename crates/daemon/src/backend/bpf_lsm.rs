@@ -27,14 +27,17 @@
 //! ## Enforcement posture (M5)
 //! The LSM links are **bpffs-pinned** ([`pin`]), so the verdict survives this process:
 //! `systemctl stop`, a restart and a crash all leave the boundary standing. Turning it off
-//! is the deliberate [`pin::teardown`] (`cordond --teardown`), never a side effect of the
+//! is the deliberate [`PinDir::teardown`] (`cordond --teardown`), never a side effect of the
 //! daemon going away.
 
 mod bless;
 mod events;
-// `pub(super)` for `pin::teardown`, which `backend::teardown` reaches without a backend.
+// `pub(super)` for `PinDir::teardown`, which `backend::teardown` reaches without a backend.
 pub(super) mod pin;
 mod seed;
+
+use pin::PinDir;
+use seed::Maps;
 
 use crate::btf::KernelBtf;
 use crate::proc;
@@ -81,7 +84,7 @@ pub struct BpfLsmBackend {
     /// The compiled eBPF object (`just build-ebpf` output / packaged install).
     object: PathBuf,
     /// bpffs directory the LSM links are pinned under, one subdirectory per run ([`pin`]).
-    pin_dir: PathBuf,
+    pin_dir: PinDir,
     /// The root-owned text policy compiled + seeded at startup.
     policy: PathBuf,
 }
@@ -90,7 +93,7 @@ impl BpfLsmBackend {
     pub fn new(object: PathBuf, pin_dir: PathBuf, policy: PathBuf) -> Self {
         BpfLsmBackend {
             object,
-            pin_dir,
+            pin_dir: PinDir(pin_dir),
             policy,
         }
     }
@@ -124,7 +127,7 @@ impl Backend for BpfLsmBackend {
         // Attach (maps still empty ⇒ allow-all, transient), then PROVE they enforce
         // before trusting them — a wrong-offset silent no-op must abort loudly.
         //
-        // The `LsmLinkId`s are kept because they are the handle `pin::pin_links` needs; a
+        // The `LsmLinkId`s are kept because they are the handle `PinDir::pin_links` needs; a
         // link left inside its `Program` dies with `ebpf`, which *was* the fail-open.
         let mut links = Vec::with_capacity(HOOKS.len());
         for &hook in HOOKS {
@@ -146,14 +149,14 @@ impl Backend for BpfLsmBackend {
         self_test(&mut ebpf)?;
 
         // Seed the real, compiled policy and publish it for `cordon policy show`.
-        seed::seed_policy(&mut ebpf, &compiled)?;
+        Maps(&mut ebpf).seed(&compiled)?;
         *control.current.lock().unwrap() = Some(build_view(&compiled));
 
         // Only now — attached, self-tested and seeded — does this generation take over.
         // Pinning last means a failure anywhere above leaves the *previous* generation
         // enforcing instead of tearing it down for a replacement that never arrived.
-        // `_pinned` is held for the run: see `pin::pin_links`.
-        let _pinned = pin::pin_links(&mut ebpf, &self.pin_dir, links)?;
+        // `_pinned` is held for the run: see `PinDir::pin_links`.
+        let _pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
 
         // The message text is load-bearing beyond readability: the VM smoke's readiness
         // gate greps "active on the file_open hook", and every scenario waits on it. Extra
@@ -170,7 +173,9 @@ impl Backend for BpfLsmBackend {
         // registry, blessings table), then adopt any carrier cgroups a previous
         // daemon run left behind (its map entries died with it).
         let mut runtime = events::Runtime::new(&compiled);
-        runtime.blessings.reconcile(&mut ebpf, &runtime.classes);
+        runtime
+            .blessings
+            .reconcile(&mut Maps(&mut ebpf), &runtime.classes);
 
         // Drain the ring buffer + honor control requests (applies, bless ops) until
         // shutdown; the apply path refreshes the runtime's maps on each re-seed.
@@ -291,13 +296,13 @@ fn maybe_poison_offsets(offsets: &mut Offsets) {
 /// fails open in complete silence. This is the only thing that catches that.
 fn self_test(ebpf: &mut Ebpf) -> Result<()> {
     let probe = make_probe(Path::new(PROBE_DIR))?;
-    let outcome = run_self_test(ebpf, &probe);
+    let outcome = run_self_test(&mut Maps(ebpf), &probe);
     let _ = std::fs::remove_dir_all(&probe);
     outcome
 }
 
 /// Root-only scratch for the self-test probe. Deliberately **not** `TMPDIR`: the daemon is
-/// uid 0 and this runs *before* `seed_policy`, so cordon is not yet enforcing on itself. In a
+/// uid 0 and this runs *before* `Maps::seed`, so cordon is not yet enforcing on itself. In a
 /// world-writable directory a local user pre-creates `cordon-selftest.<pid>/` (pids are
 /// sequential, so guessing is cheap) holding `src -> /etc/cordon/policy.toml`, and root
 /// truncates the policy on the next start — after which the daemon fails to compile and the
@@ -355,12 +360,12 @@ fn expect_denied(what: &str, result: std::io::Result<()>) -> Result<()> {
     }
 }
 
-fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
+fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     let id = proc::file_id(probe)
         .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve probe FileId"))?;
     let obj = ObjId(0);
     // Seed bank 0 and point `active_bank` at it (the zero-initialized default), so the
-    // probe is live; the real `seed_policy` then fills bank 1 and flips away from this.
+    // probe is live; the real `Maps::seed` then fills bank 1 and flips away from this.
     let bank = Bank::ZERO;
     // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX pid
     // and a zero exe id so we are *not* fast-allowed (a denying policy always blocks —
@@ -368,14 +373,13 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     // match either — the identity is deliberately unsatisfiable on both fields.
     // SILENCE (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
     // logged probe-deny would spam a spurious record on every startup.
-    seed::set_settings(ebpf, Pid(u32::MAX), FileId::new(Dev(0), Ino(0)), bank)?;
-    seed::protected_insert(ebpf, bank, id, obj)?;
-    seed::rules_set(
-        ebpf,
+    maps.set_settings(Pid(u32::MAX), FileId::new(Dev(0), Ino(0)), bank)?;
+    maps.protected_insert(bank, id, obj)?;
+    maps.rules_set(
         rule_slot(bank, obj, 0),
         CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
     )?;
-    seed::rule_count_insert(ebpf, bank, obj, 1)?;
+    maps.rule_count_insert(bank, obj, 1)?;
 
     // A second object, for `execute` alone. It cannot be proven under the deny-all rule
     // above: an exec *opens* the file first, so `file_open` would refuse it and the verdict
@@ -387,18 +391,16 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     let exec_path = probe.join("exe");
     let exec_id = proc::file_id(&exec_path)
         .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve exec probe FileId"))?;
-    seed::protected_insert(ebpf, bank, exec_id, exec_obj)?;
-    seed::rules_set(
-        ebpf,
+    maps.protected_insert(bank, exec_id, exec_obj)?;
+    maps.rules_set(
         rule_slot(bank, exec_obj, 0),
         CompiledRule::new(SubjectMatch::ANY, Action::READ, Policy::ALLOW),
     )?;
-    seed::rules_set(
-        ebpf,
+    maps.rules_set(
         rule_slot(bank, exec_obj, 1),
         CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
     )?;
-    seed::rule_count_insert(ebpf, bank, exec_obj, 2)?;
+    maps.rule_count_insert(bank, exec_obj, 2)?;
 
     // One operation per attached hook. `outside` is in the same directory as the probe so
     // link/rename really reach the LSM hook instead of failing `EXDEV` at the VFS layer.
@@ -423,8 +425,8 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     let executed = std::process::Command::new(&exec_path).status().map(drop);
 
     // Clean up the probe entries (the real seed also clears, but don't rely on it).
-    let _ = seed::protected_remove(ebpf, bank, id);
-    let _ = seed::rule_count_remove(ebpf, bank, obj);
+    let _ = maps.protected_remove(bank, id);
+    let _ = maps.rule_count_remove(bank, obj);
     // Only exists if a hook let us through, i.e. if we are about to abort anyway.
     let _ = std::fs::remove_file(&outside);
 
@@ -441,20 +443,12 @@ fn run_self_test(ebpf: &mut Ebpf, probe: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `ebpf.map_mut(name)` with a uniform error. Private to this module; the `seed` and
-/// `events` submodules reach it via `super::map_mut` (a child sees its ancestor's
-/// private items).
-fn map_mut<'a>(ebpf: &'a mut Ebpf, name: &str) -> Result<&'a mut aya::maps::Map> {
-    ebpf.map_mut(name)
-        .ok_or_else(|| Error::msg(format!("bpf-lsm: map '{name}' missing from object")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The probe must never inherit a directory it did not create. `cordond` is uid 0 and
-    /// `make_probe` runs *before* `seed_policy`, so cordon is not yet enforcing on itself: a
+    /// `make_probe` runs *before* `Maps::seed`, so cordon is not yet enforcing on itself: a
     /// probe that reuses a found directory lets whoever could create it aim the seed writes
     /// — `fs::write`, which is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW` — at any file
     /// root can reach. `/etc/cordon/policy.toml` is the target that matters, since a policy

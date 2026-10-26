@@ -134,7 +134,7 @@
 #                       the second would pass if both claimed "already off".
 #  29. upgrade      — a package upgrade renames a new binary over a RUNNING daemon's, so
 #                       /proc/<pid>/exe becomes "… (deleted)" and no longer canonicalizes.
-#                       `seed_policy` stamps the daemon's own (pid, exe) identity into
+#                       `Maps::seed` stamps the daemon's own (pid, exe) identity into
 #                       SETTINGS, and re-deriving that exe per seed made the next `policy
 #                       apply` fail with an error nobody could act on. The scenario asserts
 #                       the "(deleted)" precondition first — otherwise a replacement that
@@ -1890,7 +1890,7 @@ EOF
 }
 
 # --- upgrade under a running daemon -----------------------------------------
-# Regression: `seed_policy` stamps the daemon's own identity (pid + exe FileId) into
+# Regression: `Maps::seed` stamps the daemon's own identity (pid + exe FileId) into
 # SETTINGS, and that exe lookup used to be re-done on every seed. A package upgrade renames
 # a new binary over the running daemon's, after which /proc/<pid>/exe reads "… (deleted)"
 # and canonicalization fails — so the next `policy apply` was refused with an error nobody

@@ -11,6 +11,7 @@
 //! floods into a line.
 
 use super::bless::Blessings;
+use super::seed::Maps;
 use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
@@ -81,6 +82,7 @@ pub(super) fn serve(
             .ok_or_else(|| Error::msg(format!("bpf-lsm: {MAP_EVENTS} missing from object")))?,
     )
     .with_context(|| format!("bpf-lsm: {MAP_EVENTS}"))?;
+    let mut maps = Maps(ebpf);
     let raw = ring.as_raw_fd();
     // Names callers on the audit line; reloaded only when /etc/passwd changes (per drain).
     let mut passwd = Passwd::new();
@@ -120,20 +122,20 @@ pub(super) fn serve(
         while let Ok(msg) = control.msg_rx.try_recv() {
             match msg {
                 ControlMsg::Apply(req) => {
-                    apply(ebpf, control, &req.sources, &req.reply, &mut runtime)
+                    apply(&mut maps, control, &req.sources, &req.reply, &mut runtime)
                 }
-                ControlMsg::Bless(op) => bless_op(ebpf, &mut runtime, op),
+                ControlMsg::Bless(op) => bless_op(&mut maps, &mut runtime, op),
             }
         }
         // Reap dead blessing carriers (`populated 0`) each tick.
-        runtime.blessings.gc(ebpf);
+        runtime.blessings.gc(&mut maps);
     }
     Ok(())
 }
 
 /// Execute one bless op against the runtime's table + maps and send the outcome back.
 /// A dropped reply receiver (CLI gone) is fine — the op has already taken effect.
-fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
+fn bless_op(maps: &mut Maps, runtime: &mut Runtime, op: BlessOp) {
     match op {
         BlessOp::Mint {
             class,
@@ -143,7 +145,7 @@ fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
         } => {
             let outcome = runtime
                 .blessings
-                .mint(ebpf, class, owner, requester, &runtime.classes)
+                .mint(maps, class, owner, requester, &runtime.classes)
                 .map_err(|e| e.to_string());
             let _ = reply.send(outcome);
         }
@@ -157,11 +159,11 @@ fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
 }
 
 /// Handle one `policy apply`: recompile the text, and if it has no errors re-seed the
-/// maps via the atomic double-buffer swap ([`super::seed::seed_policy`]) and republish
+/// maps via the atomic double-buffer swap ([`Maps::seed`]) and republish
 /// the effective view. Always replies with the diagnostics so the CLI can show them
 /// whether or not it applied.
 fn apply(
-    ebpf: &mut Ebpf,
+    maps: &mut Maps,
     control: &PolicyControl,
     sources: &[PolicySource],
     reply: &std::sync::mpsc::Sender<ApplyOutcome>,
@@ -171,14 +173,14 @@ fn apply(
     let applied = if compiled.has_errors() {
         false
     } else {
-        match super::seed::seed_policy(ebpf, &compiled) {
+        match maps.seed(&compiled) {
             Ok(()) => {
                 *control.current.lock().unwrap() = Some(super::build_view(&compiled));
                 runtime.refresh(&compiled);
                 // The keystone: this compile renumbered ClassIds (dense, name-sorted),
                 // so every live blessing's MAP_BLESSED value must be re-pointed **by
                 // class name** — or a live blessing silently changes meaning.
-                runtime.blessings.remap(ebpf, &runtime.classes);
+                runtime.blessings.remap(maps, &runtime.classes);
                 info!(objects = compiled.objects.len(), "policy applied");
                 true
             }
