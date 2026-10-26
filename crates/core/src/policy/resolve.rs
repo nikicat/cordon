@@ -183,49 +183,48 @@ impl Resolver<'_> {
 
     fn subjects(&self, tokens: &[Token], pos: Pos) -> Result<Vec<SubjectSpec>> {
         let mut out = Vec::new();
-        self.expand(Axis::Subject, tokens, pos, &mut |tok, _p| {
-            match tok {
-                Token::Wildcard => push_unique(&mut out, SubjectSpec::Any),
-                Token::Leaf(s) => {
-                    push_unique(&mut out, SubjectSpec::Exe(expand_path(s, self.home)?))
-                }
-                Token::Blessing(class) => {
-                    push_unique(&mut out, SubjectSpec::Blessed(class.clone()))
-                }
+        for (tok, _) in self.expand(Axis::Subject, tokens, pos)? {
+            let spec = match tok {
+                Token::Wildcard => SubjectSpec::Any,
+                Token::Leaf(s) => SubjectSpec::Exe(expand_path(&s, self.home)?),
+                Token::Blessing(class) => SubjectSpec::Blessed(class),
                 Token::Group(_) => unreachable!("group tokens are consumed by expand"),
-            }
-            Ok(())
-        })?;
+            };
+            push_unique(&mut out, spec);
+        }
         Ok(out)
     }
 
     fn objects(&self, tokens: &[Token], pos: Pos) -> Result<Vec<PathBuf>> {
         let mut out = Vec::new();
-        self.expand(Axis::Object, tokens, pos, &mut |tok, p| match tok {
-            Token::Wildcard => Err(Error::at(
-                p,
-                "`where` cannot be `*` — the filesystem can't be default-denied wholesale",
-            )),
-            Token::Leaf(s) => {
-                push_unique(&mut out, expand_path(s, self.home)?);
-                Ok(())
+        for (tok, p) in self.expand(Axis::Object, tokens, pos)? {
+            match tok {
+                Token::Wildcard => {
+                    return Err(Error::at(
+                        p,
+                        "`where` cannot be `*` — the filesystem can't be default-denied wholesale",
+                    ));
+                }
+                Token::Leaf(s) => push_unique(&mut out, expand_path(&s, self.home)?),
+                Token::Blessing(_) => {
+                    return Err(Error::at(
+                        p,
+                        "a blessing group is a subject predicate; it can't appear in `where`",
+                    ));
+                }
+                Token::Group(_) => unreachable!("group tokens are consumed by expand"),
             }
-            Token::Blessing(_) => Err(Error::at(
-                p,
-                "a blessing group is a subject predicate; it can't appear in `where`",
-            )),
-            Token::Group(_) => unreachable!("group tokens are consumed by expand"),
-        })?;
+        }
         Ok(out)
     }
 
     fn actions(&self, tokens: &[Token], pos: Pos) -> Result<bpf::Action> {
         let mut mask = bpf::Action::empty();
-        self.expand(Axis::Action, tokens, pos, &mut |tok, p| {
+        for (tok, p) in self.expand(Axis::Action, tokens, pos)? {
             match tok {
                 Token::Wildcard => mask |= bpf::Action::all(),
                 Token::Leaf(s) => {
-                    let name = ActionName::parse(s)
+                    let name = ActionName::parse(&s)
                         .ok_or_else(|| Error::at(p, format!("unknown action: {s:?}")))?;
                     mask |= name.bit();
                 }
@@ -237,41 +236,35 @@ impl Resolver<'_> {
                 }
                 Token::Group(_) => unreachable!("group tokens are consumed by expand"),
             }
-            Ok(())
-        })?;
+        }
         Ok(mask)
     }
 
-    /// Expands `@group` refs in `tokens` and hands every other token to `leaf`, with the
-    /// position of its enclosing rule or group. A `@ref` to a `blessing = "…"` group
-    /// (DESIGN §16.3) is a leaf, not a member list, so `leaf` gets a [`Token::Blessing`]
-    /// for it. The subject axis accepts that token, and the other axes reject it. Errors
-    /// when the groups form a cycle, when a `@ref` names an unknown group, or when `leaf`
-    /// errors.
-    fn expand(
-        &self,
-        axis: Axis,
-        tokens: &[Token],
-        enclosing: Pos,
-        leaf: &mut dyn FnMut(&Token, Pos) -> Result<()>,
-    ) -> Result<()> {
-        self.expand_within(axis, tokens, enclosing, &mut Vec::new(), leaf)
+    /// Returns `tokens` with every `@group` ref expanded, each paired with the position of
+    /// its enclosing rule or group. A `@ref` to a `blessing = "…"` group (DESIGN §16.3) is
+    /// a leaf, not a member list, so it comes back as one [`Token::Blessing`]. The subject
+    /// axis accepts that token, and the other axes reject it. Errors when the groups form a
+    /// cycle or when a `@ref` names an unknown group.
+    fn expand(&self, axis: Axis, tokens: &[Token], enclosing: Pos) -> Result<Vec<(Token, Pos)>> {
+        let mut out = Vec::new();
+        self.expand_within(axis, tokens, enclosing, &mut Vec::new(), &mut out)?;
+        Ok(out)
     }
 
-    /// Behaves like [`expand`](Self::expand), but inside the groups on `stack`. A
-    /// reference back to any group on `stack` is a cycle.
+    /// Behaves like [`expand`](Self::expand), but inside the groups on `stack`, and
+    /// appends to `out`. A reference back to any group on `stack` is a cycle.
     fn expand_within(
         &self,
         axis: Axis,
         tokens: &[Token],
         enclosing: Pos,
         stack: &mut Vec<GroupName>,
-        leaf: &mut dyn FnMut(&Token, Pos) -> Result<()>,
+        out: &mut Vec<(Token, Pos)>,
     ) -> Result<()> {
         let groups = axis.groups(&self.parsed.groups);
         for tok in tokens {
             let Token::Group(name) = tok else {
-                leaf(tok, enclosing)?;
+                out.push((tok.clone(), enclosing));
                 continue;
             };
             let group_pos = |g: &Spanned<GroupDef>| self.parsed.lines.pos(g.span().start);
@@ -294,11 +287,11 @@ impl Resolver<'_> {
             // A blessing-class group is a subject predicate, not a member list. It has no
             // members to recurse into, so it becomes one synthesized `Blessing` leaf.
             if let Some(class) = &g.get_ref().blessing {
-                leaf(&Token::Blessing(class.clone()), gpos)?;
+                out.push((Token::Blessing(class.clone()), gpos));
                 continue;
             }
             stack.push(name.clone());
-            self.expand_within(axis, &g.get_ref().members, gpos, stack, leaf)?;
+            self.expand_within(axis, &g.get_ref().members, gpos, stack, out)?;
             stack.pop();
         }
         Ok(())

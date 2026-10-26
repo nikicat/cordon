@@ -167,8 +167,10 @@ Two commits:
 Left as code; each makes its doc long or awkward:
 - `Ctx::serve_bless_request` issued the nonce, waited for approval, minted and sent the
   descriptor in one function. Done, `Ctx::await_approval` owns the rendezvous.
-- `events::apply`, `Resolver::expand` and `Compiler`'s steps return results through a
-  parameter or side channel (`reply`, the `leaf` callback, `self.diagnostics`).
+- `events::apply`, `Resolver::expand` and `Compiler`'s steps returned results through a
+  parameter or side channel (`reply`, the `leaf` callback, `self.diagnostics`). Done for
+  the first two, which now return their results. `Compiler` keeps its diagnostics list,
+  because every step adds to it, and returning it from each would only add tuples.
 - `Maps::seed` also rewrites the daemon's fast-allow identity on every flip. Kept. The
   bank and the identity share one `SETTINGS` element, which the kernel reads as one
   snapshot, so the flip must write both. The value never changes after the first seed,

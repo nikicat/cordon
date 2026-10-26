@@ -119,7 +119,10 @@ pub(super) fn serve(
         while let Ok(msg) = control.msg_rx.try_recv() {
             match msg {
                 ControlMsg::Apply(req) => {
-                    apply(&mut maps, control, &req.sources, &req.reply, &mut runtime)
+                    // The apply takes effect even when the requester no longer waits.
+                    let _ = req
+                        .reply
+                        .send(apply(&mut maps, control, &req.sources, &mut runtime));
                 }
                 ControlMsg::Bless(op) => bless_op(&mut maps, &mut runtime, op),
             }
@@ -157,15 +160,13 @@ fn bless_op(maps: &mut Maps, runtime: &mut Runtime, op: BlessOp) {
 
 /// Recompiles the policy fragments `sources`. When they have no errors, it re-seeds the
 /// maps ([`Maps::seed`]), republishes the effective view, refreshes `runtime` and remaps
-/// live blessings. Always sends the diagnostics on `reply`, with whether the policy was
-/// applied.
+/// live blessings. Returns the diagnostics, with whether the policy was applied.
 fn apply(
     maps: &mut Maps,
     control: &PolicyControl,
     sources: &[PolicySource],
-    reply: &std::sync::mpsc::Sender<ApplyOutcome>,
     runtime: &mut Runtime,
-) {
+) -> ApplyOutcome {
     let compiled = super::compile_sources(sources);
     let applied = if compiled.has_errors() {
         false
@@ -185,10 +186,10 @@ fn apply(
             }
         }
     };
-    let _ = reply.send(ApplyOutcome {
+    ApplyOutcome {
         applied,
         diagnostics: compiled.diagnostics,
-    });
+    }
 }
 
 /// The decisions in one drain batch that share a [`coalesce`] key, folded into a single
