@@ -270,7 +270,7 @@ impl PolicyName {
 /// the policy layer, such as paths, group names and tokens. It serializes as a plain
 /// string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct UserName(String);
 
 impl UserName {
@@ -284,11 +284,30 @@ impl UserName {
     }
 }
 
+impl TryFrom<String> for UserName {
+    type Error = crate::Error;
+    fn try_from(s: String) -> Result<UserName> {
+        s.parse()
+    }
+}
+
+impl From<UserName> for String {
+    fn from(name: UserName) -> String {
+        name.0
+    }
+}
+
 impl std::str::FromStr for UserName {
-    type Err = std::convert::Infallible;
-    /// Accepts any string as a candidate login name. Whether the account exists is
-    /// checked later against `/etc/passwd`, through [`home_for`].
-    fn from_str(s: &str) -> std::result::Result<UserName, Self::Err> {
+    type Err = crate::Error;
+    /// Parses a candidate login name. Errors when it is empty or holds `/`, `:`, a newline
+    /// or NUL. The name becomes a file name (`users/<name>.toml`) and is matched against
+    /// passwd fields, so a `/` could escape `users/` and an empty name could match a
+    /// malformed passwd line. Whether the account exists is checked later against
+    /// `/etc/passwd`, through [`home_for`].
+    fn from_str(s: &str) -> Result<UserName> {
+        if s.is_empty() || s.contains(['/', ':', '\n', '\0']) {
+            return Err(crate::Error::msg(format!("invalid user name {s:?}")));
+        }
         Ok(UserName::new(s))
     }
 }
@@ -671,6 +690,18 @@ pub(crate) fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name that could escape `users/` or match a malformed passwd line is refused, both
+    /// from the command line and from a policy's `user =` header.
+    #[test]
+    fn user_name_rejects_unsafe_names() {
+        assert_eq!("alice".parse::<UserName>().unwrap().as_str(), "alice");
+        for bad in ["", "../etc/x", "a/b", "a:b", "a\nb", "a\0b"] {
+            assert!(bad.parse::<UserName>().is_err(), "{bad:?} must be refused");
+        }
+        assert!(parse("user = \"\"\n").is_err());
+        assert!(parse("user = \"../x\"\n").is_err());
+    }
 
     /// A directory is a conf.d, anything else (including nothing yet) is a file, and only
     /// what exists counts as a fragment.

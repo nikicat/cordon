@@ -174,7 +174,7 @@ Left as code; each makes its doc long or awkward:
   `SUDO_UID` with the same message.
 - `decide_reparent` (eBPF) answers three questions, within the verifier's limits.
 - `OneOrMany::classified` is `tokens().to_vec()` under a misleading name.
-- `UserName::from_str` accepts the empty string; the doc now says so.
+- `UserName::from_str` accepted the empty string and `/`. Done, it now refuses both.
 - Smoke suite: `cgroup2_ready` has three unrelated effects; `edit_env_setup` returns its
   results through five globals.
 
