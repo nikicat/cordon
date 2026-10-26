@@ -8,13 +8,11 @@
 //!      cycle-check, validate action/policy names, expand `~`, lexically normalize →
 //!      a [`ResolvedPolicy`] that is group-free but still **path-based**.
 //!   3. [`compile`] — cross-product `who × where × action`, resolve object/exe paths
-//!      to inode identity, apply **copy-down** object precedence, sort + dedup → a
+//!      to inode identity, build each object's **copy-down** bucket → a
 //!      [`CompiledPolicy`] of per-object [`cordon_bpf_common::CompiledRule`] buckets.
 //!
 //! All group expansion, nesting, and object precedence resolve *here*, so the kernel
-//! stays flat (DESIGN §15.3): each protected object's bucket is pre-merged and
-//! pre-sorted, and the kernel applies the first matching rule in the deepest object's
-//! bucket.
+//! stays flat (DESIGN §15.3).
 //!
 //! Diagnostics carry a source [`Pos`] (rule-/group-level) so `cordon policy check`
 //! can report `config.toml:LINE: …`. We reuse the `toml` crate's spans rather than
@@ -263,10 +261,10 @@ impl PolicyName {
     }
 }
 
-/// The account named by a policy's `user =` header — whose home directory `~` expands
-/// against. A newtype over the raw login name so it can't be mixed up with the other
-/// strings in the policy layer (paths, group/action names, tokens); (de)serialized
-/// transparently from/to the TOML/JSON string.
+/// The account named by a policy's `user =` header (see [`home_for`]). A newtype over
+/// the raw login name so it can't be mixed up with the other strings in the policy layer
+/// (paths, group/action names, tokens); (de)serialized transparently from/to the
+/// TOML/JSON string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserName(String);
@@ -370,10 +368,10 @@ impl fmt::Display for ClassName {
 }
 
 /// Resolve which home directory `~` expands against for a policy: the home of its
-/// `user =` header (looked up in `/etc/passwd`), or `fallback` (the daemon/CLI `$HOME`)
-/// when the policy names no user. Errors if the named account has no `/etc/passwd`
-/// entry — a root-owned policy naming a missing user is a misconfiguration, not a
-/// silent fall-through to the wrong home.
+/// `user =` header (looked up in `/etc/passwd`), or `fallback` (the daemon's or CLI's
+/// `$HOME`, so `/root` for a root daemon) when the policy names no user. Errors if the
+/// named account has no `/etc/passwd` entry — a root-owned policy naming a missing user is
+/// a misconfiguration, not a silent fall-through to the wrong home.
 pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     let Some(user) = user else {
         return Ok(fallback.to_path_buf());
@@ -386,26 +384,22 @@ pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     })
 }
 
-/// Which tier a [`PolicySource`] belongs to (DESIGN §15.8). Determines how `~` expands,
-/// whether the rules are home-scoped, and (later, once user files move into the home) the
-/// system-is-a-floor precedence — for now the tiers merge flat, so this only drives `~`
-/// resolution and the home-scope lint.
+/// Which tier a [`PolicySource`] belongs to (DESIGN §15.8). Determines how `~` expands
+/// and whether the rules are home-scoped; the tiers merge flat, with no precedence
+/// between them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceOrigin {
     /// Root-authored, full authority: the system policy and its conf.d fragments.
     #[default]
     System,
-    /// Pulled in by a system fragment's `[[include]]`, scoped to `user`'s home — a
-    /// user-tier policy. Its `~` expands against `user`'s home and every object path it
-    /// names must resolve under that home (enforced at compile).
+    /// Pulled in by a system fragment's `[[include]]` — a user-tier policy, scoped to
+    /// `user`'s home (see `check_scope`).
     User { user: UserName },
 }
 
 /// One named policy fragment: a source name (a file path, for diagnostics), its text, and
 /// its [`SourceOrigin`] (tier). The unit of the **conf.d split** + the **system/user tier**
-/// model (DESIGN §15.8) — fragments are parsed/resolved independently (groups are
-/// file-local; `~` uses the fragment's owning user), then merged into one compiled table.
-/// Sent over IPC on `apply`.
+/// model (DESIGN §15.8), compiled by [`compile_fragments`]. Sent over IPC on `apply`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicySource {
     pub name: String,
@@ -565,9 +559,9 @@ pub fn user_include_path(policy_root: &Path, user: &str) -> Result<Option<PathBu
 /// Parse → resolve → **merge** → compile a set of fragments into one decision table.
 /// Each fragment resolves independently — its `@`-groups are file-local and its `~`
 /// expands against its own `user =` header (else `fallback_home`) — then the resolved
-/// rules are concatenated and compiled together, so precedence (object/subject
-/// specificity then deny>allow, all source-order-independent) applies across the whole
-/// set. A fragment's parse/resolve failure becomes an error diagnostic naming it, so one
+/// rules are concatenated in the order given (name order, from [`read_sources`]) and
+/// compiled together, so precedence ([`compile()`]) applies across the whole set. A
+/// fragment's parse/resolve failure becomes an error diagnostic naming it, so one
 /// bad fragment fails the apply via [`CompiledPolicy::has_errors`] rather than silently
 /// dropping its rules.
 pub fn compile_fragments<R>(
@@ -591,8 +585,7 @@ where
                 let home = home_for(parsed.user(), fallback_home)?;
                 resolve(&parsed, &home)
             }
-            // User tier: the owning user is fixed by the include, `~` expands against *their*
-            // home, every object must resolve under it, and it may not pull in further files.
+            // User tier: the owning user is fixed by the include; see `check_scope`.
             SourceOrigin::User { user } => {
                 if !parsed.includes().is_empty() {
                     return Err(crate::Error::msg(
@@ -626,10 +619,12 @@ where
     compiled
 }
 
-/// Enforce the user-tier scope: every object a user policy names must resolve under the
-/// owning user's `home` (DESIGN §15.8). Rejects the first out-of-scope object with a
-/// `line:col`-prefixed error — a user can only govern paths in their own home, so a rule
-/// reaching into `/etc` or another user's home is a hard error, not a silent drop.
+/// Enforce the user-tier scope (DESIGN §15.8): every object a user policy names must
+/// resolve under the owning user's `home`, whose `~` it expands against. Rejects the first
+/// out-of-scope object with a `line:col`-prefixed error — a rule reaching into `/etc` or
+/// another user's home is a hard error, not a silent drop. The rest of the user-tier
+/// scope sits in [`compile_fragments`]: a user tier may not `[[include]]`, so the
+/// user↔file binding only ever lives in a system fragment.
 fn check_scope(resolved: &ResolvedPolicy, home: &Path) -> Result<()> {
     for rule in &resolved.rules {
         for obj in &rule.objects {
@@ -851,8 +846,8 @@ mod tests {
         assert_eq!(ActionName::Write.bit(), bpf::Action::WRITE);
         assert_eq!(PolicyName::Silence.lower(), bpf::Policy::SILENCE);
         // The mutation-hook actions round-trip: authored name → bit → journal name.
-        // `link` is the newest and the one with no `file_open` fallback, so a missing
-        // arm here would surface as `action=read` on a `ln` denial (DESIGN §15.5).
+        // `link` has no `file_open` fallback, so a missing arm here would surface as
+        // `action=read` on a `ln` denial (DESIGN §15.5).
         assert_eq!(ActionName::parse("link"), Some(ActionName::Link));
         assert_eq!(ActionName::Link.bit(), bpf::Action::LINK);
         assert_eq!(bpf::Action::LINK.to_string(), "link");

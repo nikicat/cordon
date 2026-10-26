@@ -33,9 +33,9 @@ pub struct Offsets {
     pub file_f_path_dentry: u32,
     /// `file -> f_inode` (the opened inode; the caller-exe identity path).
     pub file_f_inode: u32,
-    /// `file -> f_mode` (`fmode_t`: `FMODE_READ`/`FMODE_WRITE` → the read/write action).
+    /// `file -> f_mode` (`fmode_t`).
     pub file_f_mode: u32,
-    /// `file -> f_flags` (`O_CREAT` → the create action).
+    /// `file -> f_flags`.
     pub file_f_flags: u32,
     /// `dentry -> d_inode`.
     pub dentry_d_inode: u32,
@@ -43,9 +43,10 @@ pub struct Offsets {
     pub dentry_d_sb: u32,
     /// `dentry -> d_parent` (next ancestor; self-parent == mount root).
     pub dentry_d_parent: u32,
-    /// `dentry -> d_name.name` — the component name pointer, for leaf-path reconstruction
-    /// (DESIGN §15.10 flow B). It addresses a NUL-terminated string, so the program reads
-    /// it with `bpf_probe_read_kernel_str` and needs no separate length field.
+    /// `dentry -> d_name.name` — the component name pointer the leaf-path walk reads (see
+    /// [`DecisionEvent::comps`](crate::DecisionEvent::comps)). It addresses a
+    /// NUL-terminated string, so the program reads it with `bpf_probe_read_kernel_str` and
+    /// needs no separate length field.
     pub dentry_d_name_name: u32,
     /// `inode -> i_ino`.
     pub inode_i_ino: u32,
@@ -57,18 +58,16 @@ pub struct Offsets {
     pub task_mm: u32,
     /// `mm_struct -> exe_file`.
     pub mm_exe_file: u32,
-    /// `linux_binprm -> file` — the binary being exec'd, at `bprm_check_security`. The
-    /// only offset applied to that hook's trusted context pointer, so like `file_f_*` and
-    /// `dentry_d_*` it must stay **real** under poisoning (the verifier range-checks
-    /// trusted-pointer math against `.rodata` at *load*).
+    /// `linux_binprm -> file` — the binary being exec'd, at `bprm_check_security`. Applied
+    /// to that hook's trusted context pointer, so like `file_f_*` and `dentry_d_*` it stays
+    /// real under poisoning (see the daemon's `maybe_poison_offsets`).
     pub binprm_file: u32,
 }
 
 impl Offsets {
     /// The eBPF-side initializer: every offset poisoned to `u32::MAX`. If the loader
     /// ever fails to inject the real offsets, every field read targets a wild
-    /// address, faults, and fails **open** — which the daemon's self-test (it expects
-    /// a *deny*) turns into a loud abort rather than a silent allow-all boundary.
+    /// address, faults, and fails **open**, which the daemon's `self_test` catches.
     pub const POISON: Offsets = Offsets {
         file_f_path_dentry: u32::MAX,
         file_f_inode: u32::MAX,

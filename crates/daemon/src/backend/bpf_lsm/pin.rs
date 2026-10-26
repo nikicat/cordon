@@ -1,27 +1,6 @@
-//! bpffs pinning — what makes the boundary outlive the daemon (M5, DESIGN §4).
-//!
-//! ## Why links, and only links
-//! A pinned `bpf_link` holds a reference to its program, and a loaded program holds
-//! references to its maps. So pinning the LSM links alone keeps the whole apparatus alive
-//! — programs, and the seeded policy sitting in `PROTECTED`/`RULES`/`RULE_COUNT`/
-//! `SETTINGS` — with **no holding process**. Until this shipped, `Ebpf` dropping at the end
-//! of `Backend::run` detached every hook, so a daemon crash silently switched enforcement
-//! off (fail-open).
-//!
-//! Nothing is *adopted* on startup. A restarting daemon always loads its own object with
-//! its own private maps, exactly as before, and the pins only decide how long the
-//! **previous** generation keeps enforcing. That is what keeps the single-writer invariant
-//! in [`super::seed`] true: no map is ever shared between processes, so the banked flip
-//! can't be torn by a second writer, and an upgraded package can never find itself talking
-//! to the old kernel program.
-//!
-//! ## Generations
-//! Each run pins under `<pin_dir>/<pid>/`. The directory exists because the new links must
-//! be pinned *before* the old ones are removed — `BPF_OBJ_PIN` fails `EEXIST` on a path
-//! that is already taken, so a single shared directory would force a
-//! detach-then-attach window with nothing enforcing. With generations the handover is:
-//! attach → self-test → seed → pin the new → sweep the old, and the previous boundary
-//! stands until the replacement is *proven*.
+//! bpffs pinning: what keeps the boundary up with no daemon running (DESIGN §4). See
+//! [`PinDir::pin_links`] for what is pinned and how a new run takes over, and
+//! [`PinDir::teardown`] for how it comes down.
 
 use super::super::Swept;
 use aya::Ebpf;
@@ -41,12 +20,26 @@ impl PinDir {
         self.0.join(std::process::id().to_string())
     }
 
-    /// Pin this run's links, then remove every other generation.
+    /// Pins this run's links, then removes every other generation.
     ///
-    /// Order matters and is the whole fail-safe property: the previous generation is swept
-    /// only after ours is pinned, so there is no instant with nothing attached. Callers must
-    /// therefore have already run the self-test and seeded the real policy — a daemon that
-    /// aborts before this point leaves the old boundary standing rather than disarming it.
+    /// Only the LSM links are pinned. A pinned `bpf_link` holds its program, and a loaded
+    /// program holds its maps, so the links alone keep the programs and the seeded policy
+    /// enforcing with no holding process: a stop, a restart or a crash leaves the boundary
+    /// standing. No map is pinned and nothing is adopted on startup: every run loads its
+    /// own object with its own private maps, and the pins only decide how long the
+    /// previous generation keeps enforcing. That keeps [`Maps`](super::seed::Maps) the
+    /// single writer of every map, and an upgraded daemon never talks to an old program.
+    /// It also means a new run's `BLESSED` starts empty, for `Blessings::reconcile` to
+    /// rebuild.
+    ///
+    /// Each run pins under its own generation directory, `<pin_dir>/<pid>/`, because
+    /// `BPF_OBJ_PIN` fails `EEXIST` on a taken path: one shared directory would force a
+    /// detach-then-attach window with nothing enforcing. The handover is attach →
+    /// self-test → seed → pin the new → sweep the old, and the order is the fail-safe
+    /// property: the previous generation is swept only after ours is pinned, so there is no
+    /// instant with nothing attached. Callers must therefore have already run the self-test
+    /// and seeded the real policy; a daemon that aborts before this point leaves the old
+    /// boundary standing rather than disarming it.
     ///
     /// The returned handles are held for the daemon's lifetime. They are *not* what keeps the
     /// links alive (the bpffs entries are), but holding them means a stray `rm` of the pin
@@ -104,9 +97,10 @@ impl PinDir {
         Ok(pinned)
     }
 
-    /// Remove every pinned generation, disarming enforcement. This is the explicit teardown:
-    /// stopping the daemon deliberately does **not** do it, so that a restart — or a crash — is
-    /// gapless and a stopped log-drainer never drops the boundary.
+    /// Removes every pinned generation, disarming enforcement (`cordond --teardown`). This
+    /// is the explicit off switch: stopping the daemon deliberately is not, so a restart or
+    /// a crash is gapless and a stopped log-drainer never drops the boundary.
+    /// `cordond` refuses to run it while a daemon holds the singleton lock.
     ///
     /// Needs no daemon and no BPF handle, because the pins are the only state: removing the
     /// last reference to a link detaches its program, which frees its maps.
@@ -183,9 +177,7 @@ mod tests {
         assert_eq!(pins.teardown().unwrap(), generations(1));
         assert!(!ours.exists());
 
-        // A second teardown is `Nothing`, not `Generations(0)` — the type makes the
-        // already-off case unrepresentable as a count, so callers can't log it as a
-        // disarming that happened.
+        // A second teardown is `Nothing` (see `Swept`).
         assert_eq!(pins.teardown().unwrap(), Swept::Nothing);
     }
 

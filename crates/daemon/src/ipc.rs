@@ -6,24 +6,9 @@
 //! and the bless ops (`BlessRequest`/`BlessApprove`/`BlessList`/`BlessRevoke`, DESIGN
 //! §16). The verdict path is in-kernel — none of this is on it.
 //!
-//! ## Authorization
-//! `PolicyApply` and `BlessApprove` require the peer's kernel-attested uid (`SO_PEERCRED`)
-//! to be **root**. Reads (`Status`, `PolicyShow`, `BlessList`) are open, and so is
-//! `BlessRequest` — asking for a blessing is not getting one, since the request stays
-//! inert until a uid-0 peer approves it. `BlessRevoke` passes this gate for anyone and is
-//! ownership-checked in the backend, which is where the live table is: this gate answers
-//! "may this uid speak this verb", not "is this particular object yours".
-//!
-//! The socket itself is `0666`, so the file mode carries no security weight: it decides
-//! who can *reach* the daemon, `authorize()` decides what they may do. (A multi-user host
-//! that must not disclose protected paths to every local account wants `0660` + a `cordon`
-//! group instead — DESIGN §15.8.)
-//!
-//! ## The mint handshake
-//! One blessing spans **two** connections: the unprivileged `cordon bless` sends
-//! `BlessRequest` and holds its connection open; the root helper it spawns sends
-//! `BlessApprove` with the returned nonce on a second one; the carrier and its
-//! `cgroup.procs` descriptor then go back down the *first*. See `serve_bless_request`.
+//! Every request passes [`authorize`] before dispatch; the socket's file mode decides only
+//! who can reach the daemon (see `Ctx::serve`). A blessing spans two connections (see
+//! `Ctx::serve_bless_request`).
 
 use crate::Ctx;
 use cordon_core::backend::{ApplyRequest, BlessOp, ControlMsg};
@@ -69,11 +54,13 @@ impl Ctx {
         }
 
         let listener = UnixListener::bind(&socket)?;
-        // Open the socket to every local user: `connect(2)` needs *write*, so without
-        // this even the ungated read verbs are root-only in practice. Authorization is
-        // `authorize()`'s job (uid 0 for every write), never the file mode. Widening
-        // after `bind` is safe: until this lands the mode is `0777 & ~umask`, which is
-        // narrower, so there is no window where the socket is more open than intended.
+        // Open the socket (`0666`) to every local user: `connect(2)` needs *write*, so
+        // without this even the ungated read verbs are root-only in practice. The mode
+        // carries no security weight; authorization is `authorize()`'s job. (A multi-user
+        // host that must not disclose protected paths to every local account wants `0660`
+        // + a `cordon` group instead, DESIGN §15.8.) Widening after `bind` is safe: until
+        // this lands the mode is `0777 & ~umask`, which is narrower, so there is no window
+        // where the socket is more open than intended.
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))?;
         for conn in listener.incoming() {
             match conn {
@@ -106,11 +93,14 @@ impl Ctx {
         Ok(())
     }
 
-    /// The unprivileged half of the mint handshake (DESIGN §16.5).
+    /// Serves the unprivileged half of the mint handshake (DESIGN §16.5). One blessing
+    /// spans **two** connections: the unprivileged `cordon bless` sends `BlessRequest` on
+    /// this one and holds it open; the root helper it spawns sends `BlessApprove` with the
+    /// nonce on a second one ([`Ctx::approve`]).
     ///
-    /// Register a nonce, hand it to the requester, and block until a **uid-0** peer
-    /// approves it on a *different* connection. Only then mint, and send the carrier's
-    /// `cgroup.procs` back down this connection.
+    /// Registers a nonce, hands it to the requester, and blocks until a **uid-0** peer
+    /// approves it. Only then mints, and sends the carrier's `cgroup.procs` back down this
+    /// connection.
     ///
     /// The daemon is the rendezvous — rather than the elevation helper forwarding the
     /// descriptor — because the helper's own credentials say nothing about *whose* session
@@ -128,8 +118,7 @@ impl Ctx {
                 Error::msg("no approval within the timeout — was the elevation cancelled?")
             })
         });
-        // Ours to clean up on every path, including the timeout: the entry lives exactly
-        // as long as this call, which is why no reaper thread is needed.
+        // Ours to clean up on every path, including the timeout (see `Ctx::pending`).
         self.pending.lock().unwrap().remove(&nonce);
         waited?;
 
@@ -221,8 +210,7 @@ impl Ctx {
 
             Request::PolicyApply { sources } => {
                 // Hand the fragments to the backend thread (which owns the BPF maps)
-                // and block on its reply. The backend resolves per-fragment homes,
-                // merges, compiles with its mount-aware resolver, and re-seeds the maps.
+                // and block on its compile + re-seed outcome.
                 let (reply_tx, reply_rx) = mpsc::channel();
                 self.control
                     .msg_tx
@@ -259,10 +247,14 @@ impl Ctx {
     }
 }
 
-/// The pure authorization gate, applied to every request before dispatch. Every write
-/// requires the peer to be **root**, kernel-attested via `SO_PEERCRED`; reads are open.
-/// The match is deliberately **exhaustive** (no `_` arm) so a new verb cannot be added
-/// without choosing a side.
+/// Checks one request against its peer's uid, before dispatch. The writes (`PolicyApply`,
+/// `BlessApprove`) require the peer to be **root**, kernel-attested via `SO_PEERCRED`.
+/// Reads (`Status`, `PolicyShow`, `BlessList`) are open, and so are `BlessRequest` and
+/// `BlessRevoke`, for the reasons on their arm. This gate answers "may this uid speak this
+/// verb", not "is this particular object yours". The match is deliberately
+/// **exhaustive** (no `_` arm) so a new verb cannot be added without choosing a side.
+///
+/// Errors when the peer may not speak the verb.
 fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
     if peer_uid == Uid::ROOT {
         return Ok(());
@@ -282,7 +274,7 @@ fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
         // Reads stay open, the parity `BlessList` was specced with (DESIGN §16.5).
         // `BlessRequest` joins them: asking is not minting — the request is inert until a
         // uid-0 peer approves it. `BlessRevoke` is ownership-checked in the backend, which
-        // is where the live table is; this gate only decides who may speak the verb.
+        // is where the live table is.
         Request::Status
         | Request::PolicyShow
         | Request::BlessList
@@ -315,9 +307,7 @@ mod tests {
             assert!(authorize(&req, Uid(1000)).is_err());
             assert!(authorize(&req, Uid(u32::MAX)).is_err());
         }
-        // Reads pass any uid, and so do the two verbs that are *not* gated here:
-        // `BlessRequest` (asking is inert until approved) and `BlessRevoke` (ownership is
-        // checked in the backend, which is the only place that knows who minted what).
+        // Reads pass any uid, and so do `BlessRequest` and `BlessRevoke`.
         for req in [
             Request::Status,
             Request::PolicyShow,

@@ -24,10 +24,9 @@ pub struct ParsedPolicy {
     pub(crate) groups: Groups,
     pub(crate) rules: Vec<ParsedRule>,
     pub(crate) lines: LineIndex,
-    /// The optional `user = "name"` header: whose home `~` expands against. `None` ⇒
-    /// the caller's fallback (the daemon/CLI `$HOME`). Lets a root-owned, per-user
-    /// policy file use `~` instead of spelling out `/home/<name>` (DESIGN §15.8); the
-    /// caller resolves it to a home via [`super::home_for`].
+    /// The optional `user = "name"` header. Lets a root-owned, per-user policy file use
+    /// `~` instead of spelling out `/home/<name>` (DESIGN §15.8); [`super::home_for`]
+    /// resolves it to the home `~` expands against.
     pub(crate) user: Option<UserName>,
     /// `[[include]]` directives: user-tier files this (system) fragment pulls in
     /// (DESIGN §15.8). Resolved by [`super::load_policy`] at read time, not here.
@@ -47,9 +46,8 @@ impl ParsedPolicy {
 }
 
 /// One `[[include]]` directive — a system fragment pulling in a user-tier policy file
-/// (DESIGN §15.8): the owning `user` (whose home scopes the included rules and which `~`
-/// expands against) and the `path` to read. The directive lives in a *system* fragment;
-/// the file it names is loaded as [`super::SourceOrigin::User`].
+/// (DESIGN §15.8): the owning `user` and the `path` to read, loaded as
+/// [`super::SourceOrigin::User`].
 #[derive(Debug)]
 pub struct Include {
     user: UserName,
@@ -79,13 +77,12 @@ pub(crate) struct ParsedRule {
 
 /// The top-level TOML shape. `[[rule]]` tables collect into `blocks`; the optional
 /// `rules = '''…'''` literal block into `rules` (the DSL, [`super::ruleline`]);
-/// `[group.{subject,object,action}.NAME]` into `group`. There is no top-level `mode`
-/// key — the per-rule `policy` is the only enforcement level (DESIGN §15.6).
+/// `[group.{subject,object,action}.NAME]` into `group`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
-    /// `user = "name"` — whose home `~` expands against (DESIGN §15.8). Like `rules`,
-    /// a top-level key, so it must precede any `[group.*]` header.
+    /// `user = "name"` ([`ParsedPolicy::user`]). Like `rules`, a top-level key, so it
+    /// must precede any `[group.*]` header.
     #[serde(default)]
     user: Option<UserName>,
     #[serde(default)]
@@ -93,9 +90,10 @@ struct RawPolicy {
     #[serde(default, rename = "rule")]
     blocks: Vec<Spanned<RuleDef>>,
     /// The compact rule DSL. A TOML *literal* (`'''…'''`) string so paths keep their
-    /// backslashes and our own `"…"` quoting is free of TOML escape processing — one
-    /// rule per line, `POLICY SUBJECT ACTION OBJECT`. Must precede any `[group.*]`
-    /// header (a bare top-level key binds to the last table otherwise).
+    /// backslashes and our own `"…"` quoting is free of TOML escape processing, and so
+    /// its content is a verbatim slice of the source: byte offsets in it map straight to
+    /// file positions. One rule per line, `POLICY SUBJECT ACTION OBJECT`. Must precede
+    /// any `[group.*]` header (a bare top-level key binds to the last table otherwise).
     #[serde(default)]
     rules: Option<Spanned<String>>,
     /// `[[include]]` tables — user-tier files this system fragment pulls in (DESIGN §15.8).
@@ -127,8 +125,8 @@ pub(crate) struct Groups {
 /// **subject** group may instead carry a single `blessing = "<class>"` predicate (DESIGN
 /// §16.3) — declaring a blessing class referenced as `@<group>`; [`super::resolve`] rejects
 /// `blessing` on an object/action group and rejects mixing it with `members`. The other
-/// conjunctive subject predicates (`exe = … argv0 = …`, DESIGN §15.4) land in M2 and stay
-/// rejected by `deny_unknown_fields` until then.
+/// conjunctive subject predicates (`exe = … argv0 = …`, DESIGN §15.4) are not implemented,
+/// so `deny_unknown_fields` rejects them.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupDef {
@@ -257,9 +255,8 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
             pos: lines.pos(spanned.span().start),
         });
     }
-    // `rules = '''…'''` DSL block → normalized rules. The literal-string content is a
-    // verbatim slice of the source starting at `content_start`, so byte offsets inside
-    // it map straight back to real file positions via `lines`.
+    // `rules = '''…'''` DSL block → normalized rules. Its content starts at
+    // `content_start`, so byte offsets inside it map back to file positions via `lines`.
     if let Some(block) = &raw.rules {
         let content = block.get_ref();
         let content_start = block_content_start(text, block.span().start);
@@ -406,9 +403,9 @@ mod tests {
         format!("[[rule]]\n{body}\n")
     }
 
-    /// The global mode is gone (DESIGN §15.6): a leftover top-level `mode = "…"` key
-    /// must fail loud (unknown field) rather than silently parse, so stale policies
-    /// surface at `cordon policy check` instead of being half-honored.
+    /// Guards against a leftover top-level `mode = "…"` key silently parsing: it must
+    /// fail loud (unknown field), so a stale policy surfaces at `cordon policy check`
+    /// instead of being half-honored.
     #[test]
     fn rejects_mode_key() {
         let err = parse(
@@ -448,7 +445,7 @@ mod tests {
 
     #[test]
     fn rejects_conjunctive_subject_group_until_m2() {
-        // The M2 `exe = … argv0 = …` form is not a known field in M1.
+        // The conjunctive `exe = … argv0 = …` form is not a known field.
         let err = parse("[group.subject.aws]\nexe = \"/usr/bin/python3\"\nargv0 = \"aws\"\n")
             .unwrap_err();
         assert!(format!("{err}").contains("exe") || format!("{err}").contains("unknown"));

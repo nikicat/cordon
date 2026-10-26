@@ -1,34 +1,14 @@
-//! Linux **BPF-LSM** enforcement backend — the hardened boundary (DESIGN §4, §15).
+//! Linux BPF-LSM enforcement backend (DESIGN §4, §15).
 //!
-//! Control-plane / data-plane split:
-//!   - **Data plane (in-kernel):** an eBPF program (`crates/bpf`) on the `file_open`
-//!     LSM hook returns the verdict *in-kernel* by reading the flat rule table from
-//!     BPF maps. It is the boundary; this Rust code never sees an individual open.
-//!   - **Control plane (this module):** load + attach the program, **compile the text
-//!     policy** (`cordon_core::policy`) and seed the maps from it ([`seed`]), and drain
-//!     the ring buffer of logged decisions into the journal ([`events`]). The daemon is
-//!     still required (for logging) but the verdict no longer depends on it.
+//! The eBPF program (`crates/bpf`) returns every verdict in-kernel from the rule table in
+//! BPF maps; this Rust code never sees an individual open. This module is the control
+//! plane: it compiles the text policy (`cordon_core::policy`), loads, attaches and
+//! self-tests the program, and hands the rest to its submodules: [`seed`] writes the maps,
+//! [`pin`] keeps the boundary up without a daemon, [`events`] drains logged decisions into
+//! the journal, and [`bless`] owns the live blessings.
 //!
-//! This root holds the lifecycle (load → attach → self-test → seed → **pin** → drain). The
-//! work lives in submodules: [`seed`] (map writes — the atomic double-buffer swap),
-//! [`pin`] (bpffs pinning, so the boundary outlives this process) and [`events`] (ring
-//! drain + event coalescing).
-//!
-//! Requires **root** with `CAP_BPF` + `CAP_MAC_ADMIN`, `CONFIG_BPF_LSM=y`, **and**
-//! `bpf` in the active LSM list (`lsm=…,bpf`).
-//!
-//! ## Scope (M1)
-//! Open-time actions (`read`/`write`/`create`): deepest protected object → first
-//! matching rule in its copy-down bucket → allow/deny/audit. The per-rule `policy` is
-//! the only enforcement level (no global mode, DESIGN §15.6). The policy is compiled +
-//! seeded at startup and re-seeded by `cordon policy apply` via an **atomic
-//! double-buffer swap** ([`seed`]).
-//!
-//! ## Enforcement posture (M5)
-//! The LSM links are **bpffs-pinned** ([`pin`]), so the verdict survives this process:
-//! `systemctl stop`, a restart and a crash all leave the boundary standing. Turning it off
-//! is the deliberate [`PinDir::teardown`] (`cordond --teardown`), never a side effect of the
-//! daemon going away.
+//! `BpfLsmBackend::run` is the lifecycle: load → attach → self-test → seed → pin → drain.
+//! The kernel and privilege requirements are listed in the README.
 
 mod bless;
 mod events;
@@ -106,8 +86,8 @@ impl Backend for BpfLsmBackend {
         let compiled = self.compile_policy()?;
 
         // Kernel BTF resolves the hook's BTF id for attach (and sanitizes the program's
-        // own BTF). The object carries no struct layout (rustc can't emit CO-RE
-        // relocations); resolve the running kernel's field offsets and inject them.
+        // own BTF). The object carries no struct layout, so resolve the running kernel's
+        // field offsets and inject them (see `Offsets`).
         let btf = Btf::from_sys_fs().context("bpf-lsm: kernel BTF")?;
         let mut offsets = KernelBtf::from_running_kernel()?.offsets()?;
         maybe_poison_offsets(&mut offsets);
@@ -124,11 +104,12 @@ impl Backend for BpfLsmBackend {
                 ))
             })?;
 
-        // Attach (maps still empty ⇒ allow-all, transient), then PROVE they enforce
-        // before trusting them — a wrong-offset silent no-op must abort loudly.
+        // Attach (the maps are still empty, so this allows everything until the seed),
+        // then prove the hooks enforce before trusting them (see `self_test`).
         //
-        // The `LsmLinkId`s are kept because they are the handle `PinDir::pin_links` needs; a
-        // link left inside its `Program` dies with `ebpf`, which *was* the fail-open.
+        // Keep the `LsmLinkId`s: they are the handle `PinDir::pin_links` takes. A link
+        // left inside its `Program` detaches when `ebpf` drops, ending enforcement with
+        // the daemon.
         let mut links = Vec::with_capacity(HOOKS.len());
         for &hook in HOOKS {
             let program: &mut Lsm = ebpf
@@ -154,10 +135,7 @@ impl Backend for BpfLsmBackend {
         Maps(&mut ebpf).seed(&compiled)?;
         *control.current.lock().unwrap() = Some(build_view(&compiled));
 
-        // Only now — attached, self-tested and seeded — does this generation take over.
-        // Pinning last means a failure anywhere above leaves the *previous* generation
-        // enforcing instead of tearing it down for a replacement that never arrived.
-        // `_pinned` is held for the run: see `PinDir::pin_links`.
+        // Pinned last, and `_pinned` held for the run: see `PinDir::pin_links` for both.
         let _pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
 
         // A fixed phrase that marks readiness, so it can be grepped for; context goes in
@@ -172,8 +150,8 @@ impl Backend for BpfLsmBackend {
         );
 
         // The per-run state beside the Ebpf handle (journal naming maps, class
-        // registry, blessings table), then adopt any carrier cgroups a previous
-        // daemon run left behind (its map entries died with it).
+        // registry, blessings table), then adopt the carrier cgroups a previous daemon
+        // run left behind (see `Blessings::reconcile`).
         let mut runtime = events::Runtime::new(&compiled);
         runtime
             .blessings
@@ -202,11 +180,10 @@ impl BpfLsmBackend {
     }
 }
 
-/// Resolve (each fragment's own `user =` home, else the daemon `$HOME`) → merge →
-/// compile a set of policy fragments, logging diagnostics. Always returns a
-/// `CompiledPolicy`: a per-fragment parse/resolve failure is folded in as an error
-/// diagnostic naming the fragment (so `policy apply` reports it instead of the daemon
-/// crashing). The caller decides whether to seed via [`CompiledPolicy::has_errors`].
+/// Compiles a set of policy fragments with [`policy::compile_fragments`], falling back to
+/// [`policy_home`] for `~`, and logs every diagnostic. Always returns a `CompiledPolicy`,
+/// so `policy apply` reports a bad fragment instead of the daemon crashing; the caller
+/// decides whether to seed via [`CompiledPolicy::has_errors`].
 pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
     let compiled = policy::compile_fragments(sources, &policy_home(), proc::file_id);
     for d in &compiled.diagnostics {
@@ -233,18 +210,16 @@ pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
     }
 }
 
-/// The protected objects' `inode → path` map, for naming objects in the journal. The
-/// kernel can't resolve paths at `file_open` (`bpf_d_path` is disallowed there), so a
-/// `DecisionEvent` carries the object's `FileId`; this is the reverse of the path→inode
-/// resolution the daemon did at seed time. Rebuilt on every apply (inodes are stable, but
-/// the *set* of protected objects changes).
+/// Returns the protected objects' `inode → path` map, which names objects in the journal:
+/// a `DecisionEvent` carries only the object's [`FileId`], the reverse of the path→inode
+/// resolution done at seed time. Rebuilt on every apply, since the set of protected
+/// objects changes.
 pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
     c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
 }
 
-/// Where `~` in the (system-wide, root-owned) policy expands to. M1 uses the daemon's
-/// `$HOME` (so a user-session dev daemon resolves its own home); multi-user `~` is a
-/// later refinement — system policies can always use absolute paths.
+/// Returns the home `~` expands against in a fragment with no `user =` header: the
+/// daemon's `$HOME`, else `/root`. A user-session dev daemon thus resolves its own home.
 fn policy_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -370,9 +345,8 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     // probe is live; the real `Maps::seed` then fills bank 1 and flips away from this.
     let bank = Bank::ZERO;
     // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX pid
-    // and a zero exe id so we are *not* fast-allowed (a denying policy always blocks —
-    // there is no global mode). No real inode is `dev=0 ino=0`, so the exe half can never
-    // match either — the identity is deliberately unsatisfiable on both fields.
+    // and a zero exe id so we are *not* fast-allowed. No real inode is `dev=0 ino=0`, so
+    // the exe half can never match either — the identity is unsatisfiable on both fields.
     // SILENCE (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
     // logged probe-deny would spam a spurious record on every startup.
     maps.set_settings(Pid(u32::MAX), FileId::new(Dev(0), Ino(0)), bank)?;
@@ -449,16 +423,12 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The probe must never inherit a directory it did not create. `cordond` is uid 0 and
-    /// `make_probe` runs *before* `Maps::seed`, so cordon is not yet enforcing on itself: a
-    /// probe that reuses a found directory lets whoever could create it aim the seed writes
-    /// — `fs::write`, which is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW` — at any file
-    /// root can reach. `/etc/cordon/policy.toml` is the target that matters, since a policy
-    /// that no longer compiles means the boundary is off entirely.
+    /// Guards the planted-directory attack described at [`PROBE_DIR`]: `make_probe` must
+    /// recreate the probe directory, never reuse one it finds, or the seed writes follow a
+    /// planted symlink.
     ///
     /// Driven through a writable `base` because the test is unprivileged. That is the
-    /// *second* line of defence; the first is that [`PROBE_DIR`] is root-only, which the
-    /// test below pins because an unprivileged test cannot exercise it.
+    /// *second* line of defence; the first, the root-only location, is pinned below.
     #[test]
     fn the_probe_never_reuses_a_directory_it_found() {
         let tmp = tempfile::tempdir().unwrap();
@@ -490,10 +460,9 @@ mod tests {
         );
     }
 
-    /// The location *is* the fix: `/run` is root-owned `0755`, so nothing unprivileged can
-    /// plant any component of the probe path, and the reuse hazard above cannot be reached
-    /// at all. Pinned as a constant because an unprivileged test cannot write `/run` —
-    /// moving this back under `TMPDIR` would reopen the hole with every other line intact.
+    /// Pins [`PROBE_DIR`] under the root-only `/run`. Checked as a constant because an
+    /// unprivileged test cannot write `/run`; moving the probe under `TMPDIR` would reopen
+    /// the hole with every other line intact.
     #[test]
     fn the_probe_lives_where_only_root_can_write() {
         assert!(

@@ -61,8 +61,9 @@ this adds frames beside it rather than reshaping the IPC. Full design in DESIGN 
   front-end never asserts "I authed" — it relays only, so a scraper on the socket controls the
   I/O channel and never the verdict.
 - **Relaxes the uid-0 gate to "the authenticated peer":** `authorize()` stops requiring root
-  for mint, so **a non-sudoer can bless their own tools** — the property the sudo gate can't
-  offer. Revoke follows the same rule (your own blessings).
+  for `BlessApprove`, so **a non-sudoer can bless their own tools** — the property the sudo
+  gate can't offer. Revoke needs no change: it is already open to the minting uid
+  (`may_revoke` in `crates/daemon/src/backend/bpf_lsm/bless.rs`).
 - **Restores "no grace window" by construction** (every mint authenticates), retiring the
   sudoers `timestamp_timeout=0` note.
 - **Mechanically, B2 already did the hard part.** The `SCM_RIGHTS` `cgroup.procs` hand-off
@@ -88,7 +89,7 @@ this adds frames beside it rather than reshaping the IPC. Full design in DESIGN 
   fanning the rule into every protected object's bucket: no kernel change, no new bypass in
   `decide()`, and "allow on every protected object" *is* the complete definition of
   uncordoned, since an unprotected path is already unmediated. `where = "*"` is currently
-  rejected outright in `resolve.rs` (`object_paths`) because it can't work for *deny*. Open questions: what
+  rejected outright in `resolve.rs` because it can't work for *deny*. Open questions: what
   a bare `*` means in a home-scoped user-tier fragment, and that a blanket class is a skeleton
   key that widens the §16.7 ptrace/open-fd exposure — so it must be an opt-in second class,
   never a change to what blessing means.
@@ -100,11 +101,12 @@ this adds frames beside it rather than reshaping the IPC. Full design in DESIGN 
   `bpf_get_current_cgroup_id` read and the `SubjectMatch`-predicate pattern, but is a
   *distinct* predicate — it matches *any cgroup currently registered as class X in
   `BLESSED`*, via indirection, not a fixed cgroup id. The two stay independent.
-- **Interaction with M5 (fail-safe pinning):** pin the *policy* maps
-  (`PROTECTED`/`RULES`/`RULE_COUNT`/`SETTINGS`) for fail-safe enforcement, but treat `BLESSED`
-  as **ephemeral daemon state — do not pin it.** A pinned `BLESSED` with a dead daemon = grants
-  that never expire (no GC) and a stale-id hazard. Fail-closed on daemon death (entries gone);
-  rebuild via startup reconciliation (§16.6).
+- **Interaction with M5 (fail-safe pinning):** M5 pins the LSM links and no maps
+  (`PinDir::pin_links`); `BLESSED` lives exactly as long as the program of its generation. A
+  restarted daemon loads a fresh, empty `BLESSED` — fail closed — and `Blessings::reconcile`
+  re-registers the leftover carriers whose class is still declared (§16.6). Pinning `BLESSED`
+  separately would buy nothing: the old generation's program already holds it, so its entries
+  would be no more or less stale, only reachable (see STATUS, *Settled*).
 - **cgroup v2 assumed** (unified hierarchy). v1/hybrid is out of scope; detect and refuse with
   a clear diagnostic.
 - **Naming:** `bless` is reserved for this runtime grant; authoring flow A is observe →

@@ -243,9 +243,9 @@ in-kernel LSM shape buys:
   *strings* are out: `bpf_d_path` is **not allowed at the `file_open` hook** (a
   verifier discovery — `security_file_open` isn't in `btf_allowlist_d_path`), so
   matching is inode-based. The daemon resolves paths → `(dev,inode)` at seed time,
-  taking the device from the **mount table** (`/proc/self/mountinfo` = the mount's
-  `sb->s_dev`) so it agrees with the kernel on overlayfs/btrfs — *not* `stat`'s
-  per-layer/-subvolume device.
+  taking the device from the **mount table** so it agrees with the kernel's `sb->s_dev`
+  on overlayfs/btrfs, where `stat`'s per-layer/-subvolume device does not (`proc::file_id`
+  in `crates/daemon/src/proc.rs`).
 - **Stronger identity, in-kernel.** Caller exe identity is its **`(dev,inode)`**,
   read straight from `task->mm->exe_file` — race-free, no `/proc` readlink. The
   hardening beyond that is a **content digest** of the opener via
@@ -255,10 +255,11 @@ in-kernel LSM shape buys:
   path. (IMA *appraisal* + a keyring gets "verified-signed-by-key," the closest
   Linux analog to ES code-signing — enterprise setup, not free.)
 - **Fail-safe, not fail-open — implemented (M5).** The `bpf_link`s are pinned to **bpffs**
-  (`/sys/fs/bpf/cordon/<pid>/<hook>`) and enforcement persists with **no holding process** —
-  the daemon can crash/restart with *zero* enforcement gap. Only the links are pinned: a link
-  holds its program and a program holds its maps, so the seeded policy stays resident too,
-  and no map is ever shared between processes. Turning it off is the explicit
+  and enforcement persists with **no holding process** — the daemon can crash/restart with
+  *zero* enforcement gap. Only the links are pinned (a link holds its program and a program
+  holds its maps, so the seeded policy stays resident too), so no map is ever shared between
+  processes; the layout and handover are `PinDir::pin_links` in
+  `crates/daemon/src/backend/bpf_lsm/pin.rs`. Turning it off is the explicit
   `cordond --teardown`.
 
 **Implemented (M1 — validated in a VM, see STATUS / [`PLAN-rule-model.md`](PLAN-rule-model.md)):**
@@ -278,10 +279,10 @@ too, so `bpf-lsm` mediates opens *and* mutations and keeps enforcing when the da
 decided; observability rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a
 `deny` or `audit` the hook emits a record (pid, exe `(dev,inode)`, object
 `(dev,inode)`, the opened file's reconstructed leaf path, action, decision), **coalesced
-by an in-kernel suppressor** (keyed on the opened file, so distinct leaves surface), and
-the daemon
-drains it asynchronously. It does **not** block the syscall. Lossy under flood = you drop
-*observability records*, never *enforcement* (a discard counter bumps).
+by an in-kernel suppressor** (`SuppressKey`: keyed on the opened file, so distinct leaves
+surface), and the daemon drains it asynchronously. It does **not** block the syscall.
+Lossy under flood = you drop *observability records*, never *enforcement*: a full ring
+loses the record silently (`emit` in `crates/bpf/src/kernel.rs`).
 
 **Control plane vs data plane** — the daemon leaves the hot path entirely:
 > **Data plane = in-kernel BPF** — every open, every verdict — *always on,
@@ -296,10 +297,10 @@ drains it asynchronously. It does **not** block the syscall. Lossy under flood =
 **Map concurrency** is handled by map semantics + RCU, not hand-rolled locks: a
 single-element `bpf_map_update_elem` is atomic (a reader sees old-or-new, never torn;
 element lifetime is RCU). The atomic *multi-entry* policy swap on `apply` uses exactly the
-**generation-counter / double-buffer** this called for — **now implemented** (§15.8): the
-three rule maps are banked, and the daemon fills the inactive bank then flips
-`Settings.active_bank` in one update, RCU-style. `bpf_spin_lock` is available if a value
-ever needs in-program read-modify-write.
+**generation-counter / double-buffer** this called for (§15.8): the three rule maps are
+banked, and `Maps::seed` fills the inactive bank then flips `Settings.active_bank` in one
+update, RCU-style. `bpf_spin_lock` is available if a value ever needs in-program
+read-modify-write.
 
 **Durability.** BPF maps are ephemeral (lost on reboot / program reload), but the **text
 policy is the durable source of truth** — the daemon recompiles and re-seeds it at startup,
@@ -914,8 +915,8 @@ presents the underlying dentry to `security_file_open`, so it is mediated and ne
 clobber, but it cannot answer for the name being overwritten. `rename(2)` onto an existing
 name **destroys** that inode, and `security_inode_rename` is the only hook the kernel fires
 for it: `security_inode_unlink` is reachable solely from `vfs_unlink`, and `do_renameat2`'s
-own target check is `may_delete()`, which is DAC-only. Left unclassified — as it was when
-these hooks first landed — the `inode_unlink` gate is bypassable by its sibling syscall,
+own target check is `may_delete()`, which is DAC-only. Left unclassified, the
+`inode_unlink` gate would be bypassable by its sibling syscall,
 `rm secret` refused while `mv anything secret` destroys the same inode and dangles the
 `PROTECTED` entry permanently. Two shapes, both invisible to the directory-pair
 classification:
@@ -937,16 +938,16 @@ step. **Atomic save still works**: a rename over a name in an object the subject
 write takes that same `allow`, so the shuffle proceeds — it bites only where the destination
 carries a tighter rule, which is the case worth biting on.
 
-`renameat2(RENAME_EXCHANGE)` is *improved but not closed* by this. Both dentries are positive,
-so the destination object now at least receives a `write` verdict instead of nothing — but an
-exchange re-parents both inodes rather than destroying one, and the protected side moving
-*out* deserves the unconditional escape refusal, which only fires if the kernel calls the hook
-a second time with the pair swapped. That second call is still believed, not verified —
-**verify before relying on it**.
+`renameat2(RENAME_EXCHANGE)` re-parents both inodes rather than destroying one, so the
+destroy check alone does not cover it: the protected side moving *out* needs the
+unconditional escape refusal. It gets it because `security_inode_rename` calls the hook a
+second time with the pair swapped when `RENAME_EXCHANGE` is set — verified in the VM, and
+pinned by the smoke suite's `rename_exchange` scenario, which runs against a *writable*
+object so that the destroy and clobber checks cannot refuse first and hide a missing second
+call.
 
 `file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
-is opt-in. `bpf_d_path` is unavailable at `file_open` (and inconsistent elsewhere), so
-**identity is inode across all hooks** (the dentry walk), never path.
+is opt-in. **Identity is inode across all hooks** (the dentry walk), never path (§4).
 
 ### 15.6 Precedence (pin it explicitly)
 The kernel takes the **first matching rule** in the most-specific protected object's
@@ -968,10 +969,9 @@ per-object, flipped by editing that object's catch-all rule, not a system-wide s
 deliberately drops SELinux's `enforce|permissive|off`: cordon's user is their *own* policy
 admin iterating live on one box, not an admin staging policy for a fleet, so a global
 "permissive" preview + "enforce" cutover is just the **audit→deny** progression (§15.10).
-"Off" is an empty policy (or a stopped daemon). *(M1 shipped a global enforce/permissive/off
-mode; it has since been **removed** — the kernel now blocks iff `policy.denies()` — and the
-subject-specificity precedence key in (2) above is implemented. See
-[`PLAN-rule-model.md`](PLAN-rule-model.md).)*
+"Off" is an empty policy, or `cordond --teardown`; stopping the daemon leaves the pinned
+boundary enforcing (§4). The kernel blocks iff the matched rule's policy denies
+(`Policy::denies` in `crates/bpf-common/src/policy_maps.rs`).
 
 ### 15.7 Groups
 Named, nestable, **symmetric across all three axes** (subject / object / action),
@@ -1046,8 +1046,10 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
 - **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
   swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
   only on an explicit apply, so an edit-in-progress is never half-enforced.
-- **`cordon policy check`** — linter/compiler: unknown exes, group cycles, shadowed /
-  unreachable rules, missing paths, deny-shadowed-by-allow.
+- **`cordon policy check`** — linter/compiler, daemon-free: unknown group refs and cycles,
+  exes that don't resolve (warned, rule dropped), objects that don't resolve yet (pending),
+  the per-object rule cap. Shadowed / unreachable-rule and deny-shadowed-by-allow lints are
+  not implemented yet.
 - **`cordon policy edit`** — the **sudoedit analog** (✅ 2026-06-29). `sudo cordon policy
   edit` copies the root-owned file to a private temp, runs `$EDITOR` **as the invoking
   user** (never root — `sudo $EDITOR policy.toml` would run the editor as root, and a
@@ -1068,26 +1070,25 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
   **after** the edit validates and saves, registers the `[[include]]` in `…/conf.d/00-users.toml`
   — so a cancelled or rejected edit never leaves a stale binding. It reaches the daemon only
   through `PolicyApply`, so it is covered by the socket authorization below.
-- **Socket authorization** (✅ B2). Every **write** on the control socket — `PolicyApply`,
-  `BlessMint`, `BlessRevoke` — requires the peer to be **root**, kernel-attested via
-  `SO_PEERCRED`; every **read** — `Status`, `PolicyShow`, `BlessList` — is open. The gate is a
-  pure `authorize(req, peer_uid)` table with an exhaustive match, so a new verb cannot be added
-  without choosing a side.
+- **Socket authorization** (✅ B2). The gate is `authorize` in `crates/daemon/src/ipc.rs`, a
+  pure table over the peer's `SO_PEERCRED` uid with an exhaustive match, so a new verb cannot
+  be added without choosing a side. `PolicyApply` and `BlessApprove` (the human-presence step,
+  §16.5) require **root**; the reads — `Status`, `PolicyShow`, `BlessList` — are open, and so
+  is `BlessRequest`, which is inert until a root peer approves it. `BlessRevoke` is open at
+  the socket and ownership-checked in the backend, where the live table is: root revokes
+  anything, anyone else only what they minted.
 
   The socket is `0666`, and this is deliberate: `connect(2)` on a Unix socket needs *write*, so
-  a `root:root` socket made **every** verb root-only in practice — which is what made
-  `cordon bless list` unusable from a user account (§16). Opening it while moving `PolicyApply`
-  behind the uid gate is strictly *tighter* than the previous state, where "whoever can reach
-  the socket can apply" was literally true and DAC was the only thing standing in the way. The
-  file mode now decides who can *reach* the daemon; `authorize` decides what they may do.
+  a `root:root` socket would make **every** verb root-only in practice, leaving
+  `cordon bless list` unusable from a user account (§16). The file mode decides who can
+  *reach* the daemon; `authorize` decides what they may do.
 
   **Deployment posture.** `0666` makes `PolicyShow` world-readable, which discloses protected
   *paths* to any local account. On a single-user workstation that is the intent. A multi-user
   host that must not disclose them wants `0660` + a `cordon` group instead (the group created
   by packaging, members added deliberately) — same `authorize` table, narrower reach.
-- **Atomic swap** in-kernel — **implemented** as a generation-counter **double-buffer**:
-  the rule maps are banked, the daemon fills the inactive bank and flips `active_bank` in
-  one write (RCU-style), so an `apply` has no visible window.
+- **Atomic swap** in-kernel: the rule maps are banked, so an `apply` has no visible window
+  (the double-buffer, §4; `Maps::seed`).
 - **Learned rules** live in a *separate* SQLite db (high-churn, machine-managed),
   **lower precedence**, never overriding a hand-written deny; promoted into the text
   file on review (§15.9).
@@ -1130,10 +1131,10 @@ is "admit", not "bless".)*
 Audit one exe across your home: `who=<app> where="~" action="*" policy="audit"`. Two wins
 over `strace`: the `where="~"` scope leaves `/usr/lib/*.so`, `/dev`, `/proc` *unprotected*
 → never logged (only home-subtree access surfaces), and coalescing prevents the flood. The
-discovered paths then graduate into `@secrets` under flow A. *Implemented: the kernel
-reconstructs the opened file's path by walking `d_name` (no `bpf_d_path` at `file_open`)
-and the suppressor keys on the opened file, so each leaf surfaces with its real `path=` —
-the same mechanism M4 autolearn needs to collapse per-file opens into a subtree rule.*
+discovered paths then graduate into `@secrets` under flow A. Each opened file surfaces
+with its real `path=`, because the record carries the leaf path rebuilt from `d_name` and
+the suppressor keys on the opened file (§4) — the same mechanism M4 autolearn needs to
+collapse per-file opens into a subtree rule.
 
 ### 15.11 Phasing (M1–M6; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
 1. **Rule core** — **done.** Text policy + compiler (groups/precedence resolved in
@@ -1224,7 +1225,7 @@ process (§16.7), which short-lived blesses bound.
 
 > **As shipped (§16.5):** the human-presence check is `sudo`, which runs PAM itself — so this
 > argument holds unchanged for the *presence* property. The one caveat is right here: sudo
-> caches its timestamp, so B1 does have a grace window unless sudoers sets
+> caches its timestamp, so the shipped flow has a grace window unless sudoers sets
 > `Defaults!/usr/bin/cordon timestamp_timeout=0`. PAM-in-the-daemon (PLAN-bless B3) closes it
 > by construction.
 
@@ -1271,9 +1272,9 @@ caller's class once (`BLESSED[current_cgroup_id]`, or a "not blessed" sentinel),
 unchanged: copy-down resolves object precedence, and **subject-specificity already ranks a
 concrete `blessing` rule above a `who="*"` catch-all** (§15.6), so a blessing `allow` outranks
 the catch-all `deny` that protects the object — no special casing. Because it is a real rule,
-a blessing can also be `audit` (observe a blessed class) and is **logged like any decision**
-(extend `DecisionEvent` with the matched class so the journal shows bless-mediated access —
-bless is loud).
+a blessing can also be `audit` (observe a blessed class) and is **logged like any decision**:
+`DecisionEvent` carries the matched class, so the journal shows bless-mediated access —
+bless is loud.
 
 > **Precedence note.** A `blessing` predicate counts as **one** unit of subject specificity,
 > like `exe`. So a *targeted* `deny <exe> …` and an `allow @blessed-ro …` on the same object
@@ -1339,15 +1340,11 @@ forge it the way it forges ancestry.
 The requirement from §16.2 is *a human at the keyboard proves presence at mint time*. What
 satisfies it is **reaching uid 0**: the daemon refuses to approve a mint for any other peer,
 and every elevation tool worth the name puts a human in front of that transition. Which tool
-is not cordon's business, and deliberately so — B1 hardcoded `sudo`, B2 made it a seam.
+is not cordon's business, and deliberately so: `$CORDON_SUDO` is the seam.
 
 - **The boundary is `SO_PEERCRED` uid 0 on `BlessApprove`.** Kernel-attested, never asserted.
-  `PolicyApply` and `BlessApprove` require root; `Status`, `PolicyShow`, `BlessList` and
-  `BlessRequest` are open (asking for a blessing is not getting one — the request stays inert
-  until approved); `BlessRevoke` passes the uid gate for anyone and is ownership-checked
-  against the recorded requester in the backend, which is the only place that knows who minted
-  what. That table is what let the socket be opened to `0666` without loosening anything
-  (§15.8): the mode decides who can *reach* the daemon, `authorize()` decides what they may do.
+  The rest of the verb table — `BlessRequest` open because asking is not getting,
+  `BlessRevoke` ownership-checked in the backend — is the socket authorization in §15.8.
 
 - **The mint is a two-connection handshake**, because the two facts it needs come from two
   different peers:
@@ -1417,11 +1414,11 @@ is not cordon's business, and deliberately so — B1 hardcoded `sudo`, B2 made i
 - **Environment: nothing is restored, because nothing was ever taken.** `cordon bless` runs as
   the user, an ordinary child of their shell, so the blessed command inherits its environment,
   cwd, tty, job control and logind session by construction. The only thing the grant adds is
-  cgroup membership. This is the whole reason the privilege flow was inverted in B2: under the
-  older root-first shape the target was born under a privilege tool that had already scrubbed
-  the environment, and under `run0` there is not even a parent chain left to recover it from —
-  so "restore the env" was not separable from "fix who spawns the target". `$SHELL` is
-  authoritative again for the same reason.
+  cgroup membership. This is why the unprivileged CLI is the spawner: a target spawned by
+  the root helper would be born under a privilege tool that had already scrubbed the
+  environment, and under `run0` there would be no parent chain left to recover it from — so
+  "keep the env" is not separable from "who spawns the target". `$SHELL` is authoritative for
+  the same reason.
 
 ### 16.6 Lifecycle
 1. `cordon bless --class NAME -- <cmd>` — **no `sudo` prefix**; it runs as you. (`--class`
@@ -1460,15 +1457,18 @@ is not cordon's business, and deliberately so — B1 hardcoded `sudo`, B2 made i
 7. **GC on exit.** The daemon watches the carrier's `cgroup.events` `populated` flag; when the
    tree drains (`populated 0`) it removes the cgroup and drops the `BLESSED` entry — the grant
    **evaporates with the process tree**. No standing always-armed cgroup. A mint **grace
-   window** (30s) covers the interval where a fresh carrier is legitimately empty because the
-   CLI has not joined the target yet; it also reaps a carrier whose CLI died before joining.
+   window** (`MINT_GRACE`) covers the interval where a fresh carrier is legitimately empty
+   because the CLI has not joined the target yet; once it expires, a carrier whose CLI died
+   before joining is reaped.
 8. `cordon bless list` / `cordon bless revoke <id>` enumerate and tear down live blessings
    (the per-invocation cgroup *is* the handle; revoke writes `cgroup.kill`, and the same GC
    finishes the teardown). Revoke is allowed for root **or the uid that minted it** — having
-   minted one unprivileged, you must be able to revoke it the same way.
-9. **Restart reconciliation.** `BLESSED` is deliberately unpinned, so a daemon restart drops
-   every entry (fail-closed). At startup the daemon scans its own cgroup **and every live
-   session scope** — carriers now live in both — for leftovers: empty ones are removed,
+   minted one unprivileged, you must be able to revoke it the same way. A blessing adopted at
+   restart (step 9) has no recorded minter, so only root may revoke it (`may_revoke`).
+9. **Restart reconciliation.** Only the LSM links are pinned (§4), so a restarted daemon
+   loads a fresh, empty `BLESSED` (fail-closed). At startup it scans every directory placement
+   can choose — its own cgroup, every `user-*.slice` and every `session-*.scope`
+   (`carrier_roots`) — for leftover carriers: empty ones are removed,
    populated ones are re-registered if their class is still declared, and populated ones whose
    class vanished are adopted **inert** (GC only — a live process tree is never killed because
    policy changed under it). Only **root-owned** directories are adopted: re-registering is a
@@ -1517,16 +1517,16 @@ sequenceDiagram
     D->>K: BLESSED remove + rmdir carrier
 ```
 
-> **Why placement is not "put it in the session scope".** That was the first shape tried, and
-> it is wrong on any desktop: the requester is not *in* the session scope, only the session
-> leader is. A rule that keyed on the session scope alone sent every desktop blessing to the
-> daemon's cgroup — where logind cannot attribute the process at all — and the failure looked
-> exactly like the bug it was meant to fix. What the carrier needs is not the session; it is
-> to remain somewhere logind can still say *whose* the process is.
+> **Why placement is not "put it in the session scope".** On a desktop the requester is not
+> *in* the session scope, only the session leader is, so a rule keyed on the session scope
+> alone would send every desktop blessing to the daemon's cgroup — where logind cannot
+> attribute the process at all. What the carrier needs is not the session; it is to remain
+> somewhere logind can still say *whose* the process is (`CgroupPath::placement`).
 
 > **Apply-time remap (correctness keystone).** `policy apply` recompiles, and `ClassId`s are
 > dense and name-sorted — so they *renumber*. Every apply therefore re-points live `BLESSED`
-> entries **by class name** inside the same single-writer path that owns the maps; a class
+> entries **by class name** (`Blessings::remap`) inside the same single-writer path that owns
+> the maps; a class
 > that disappeared is unregistered (the blessing goes inert) rather than left pointing at a
 > renumbered id. Without this, a live blessing would silently change meaning on an unrelated
 > policy edit.

@@ -10,38 +10,36 @@
 # identically and may be mixed.
 #
 # A rule is `(who, where, action, policy)`:
-#   who    — subject: an exe path, `*` (any), or `@subject-group`. (uid/cgroup/argv0
-#            predicates arrive in M2.)
+#   who    — subject: an exe path, `*` (any), or `@subject-group`.
 #   where  — object: a file or a directory (matched recursively as a subtree). `*` is
 #            NOT allowed — the whole filesystem can't be default-denied.
-#   action — read | write | create (M1, at open) [ execute | listdir | unlink | mkdir
-#            | rmdir | rename arrive with their hooks]; a single value, a list, `*`
-#            (all), or `@action-group`.
+#   action — read | write | create | execute | listdir | unlink | mkdir | rmdir |
+#            rename | link; a single value, a list, `*` (all), or `@action-group`.
 #   policy — allow (allow, silent) | audit (allow, log) | deny (deny, log) |
 #            silence (deny, silent).
 #
-# Precedence (resolved in userspace; the kernel just takes the first match):
+# Precedence (DESIGN §15.6):
 #   1. most-specific `where` wins (a file rule beats the subtree it sits in);
 #   2. ancestor rules are inherited downward, so a file is still governed by its
 #      subtree's rules for anything it doesn't override (copy-down);
-#   3. deny beats allow at the same specificity (fail-safe);
-#   4. a protected object with no matching rule is default-denied;
-#   5. anything not under any rule is unmediated (allowed).
+#   3. on the same object, a concrete `who` beats `*`;
+#   4. deny beats allow at the same specificity (fail-safe);
+#   5. a protected object with no matching rule is default-denied;
+#   6. anything not under any rule is unmediated (allowed).
 #
-# There is no global mode (no enforce/permissive/off): the per-rule `policy` is the only
-# enforcement level. Use `audit` to observe an object (allow + log — the safe-rollout
-# preview), then switch that rule to `deny` to enforce it. "Off" is an empty policy (or a
-# stopped daemon).
+# There is no global mode (no enforce/permissive/off). Use `audit` to observe an object
+# (allow + log — the safe-rollout preview), then switch that rule to `deny` to enforce
+# it. "Off" is an empty policy, or `cordond --teardown` (stopping the daemon does not
+# stop enforcement).
 
 # --- groups: named, nestable, symmetric across all three axes ----------------
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
 # A blessing class (DESIGN §16): a subject group with a `blessing = "<name>"` predicate
-# instead of `members`. `sudo cordon bless --class ro -- <cmd>` runs <cmd> in a cgroup tagged
-# `ro`; this rule lets such a blessed process read the cloud creds (and only those — the
-# object column is the scope). Subject-specificity makes the blessed `allow` outrank the
-# `*` audit catch-all below, so a blessed reader goes silent while unknown ones stay logged.
+# instead of `members`. `cordon bless --class ro -- <cmd>` runs <cmd> in a cgroup tagged
+# `ro`; the rule below lets such a blessed process read the cloud creds (and only those —
+# the object column is the scope).
 [group.subject.blessed-ro]
 blessing = "ro"
 
@@ -63,10 +61,10 @@ where = "~/.ssh"
 action = "@ro"
 policy = "allow"
 
-# a `sudo cordon bless --class ro` process may read the cloud creds (runtime grant, human-
-# authenticated by sudo; see DESIGN §16). The blessed allow outranks the `*` audit catch-all
-# below by subject-specificity, so an interactive `cat ~/.aws/credentials` under a bless works
-# without widening the catch-all.
+# a `cordon bless --class ro` process may read the cloud creds (a runtime grant the human
+# approves through `$CORDON_SUDO`, default sudo; see DESIGN §16). The blessed allow outranks
+# the `*` audit catch-all below (precedence 3), so a blessed reader goes silent while
+# unknown ones stay logged.
 [[rule]]
 who = "@blessed-ro"
 where = "@cloud-creds"
@@ -89,8 +87,8 @@ action = "read"
 policy = "audit"
 
 # copy-down exception: aws may read ~/.aws (above), but never this one stashed token,
-# and silently (deny + no log line). More-specific object → wins over the subtree
-# allow, but only for this file and only for aws.
+# and silently (deny + no log line). Precedence 1 makes it win over the subtree allow,
+# but only for this file and only for aws.
 [[rule]]
 who = "/usr/bin/aws"
 where = "~/.aws/.danger-token"

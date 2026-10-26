@@ -8,9 +8,9 @@
 #   CORDON_VM_KERNEL=host packaging/test/run-bpf-lsm-vm.sh    # host kernel (fast iteration)
 #   CORDON_VM_KERNEL=v6.6 packaging/test/run-bpf-lsm-vm.sh    # another pinned kernel
 #
-# Default = the CI-pinned kernel, NOT the host: the host verifier is laxer and once
-# masked a v6.12 LSM return-bound rejection that only CI caught. So local runs match CI
-# by default; opt into the host kernel explicitly for fast iteration.
+# Default = the CI-pinned kernel, NOT the host: the host verifier is laxer and can pass
+# an object the v6.12 verifier rejects (see `clamped` in crates/bpf/src/main.rs). So local
+# runs match CI by default; opt into the host kernel explicitly for fast iteration.
 #
 # The host userspace + host-built binaries are exposed read-only in the guest, so
 # there is no rootfs to build.

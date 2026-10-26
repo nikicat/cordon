@@ -24,8 +24,8 @@ pub fn is_regular_uid(uid: Uid) -> bool {
     REGULAR_UID_RANGE.contains(&uid)
 }
 
-/// A resolved caller for the audit line: the login name, plus — only for a *regular*
-/// account, so root/system paths stay absolute — the home to collapse to `~`. Borrows the
+/// A resolved caller for the audit line: the login name, plus the home to collapse to `~`
+/// (only for a uid in `REGULAR_UID_RANGE`). Borrows the
 /// [`Passwd`] cache, so naming a caller costs no allocation.
 pub struct Identity<'a> {
     pub name: &'a UserName,

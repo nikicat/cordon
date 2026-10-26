@@ -2,22 +2,16 @@
 //! handles, so the decision flow in `main.rs` is `unsafe`-free.
 //!
 //! ## No committed struct layout — offsets come from the running kernel
-//! There is no `vmlinux.rs` here. rustc can't emit CO-RE relocations
-//! (rust-lang/rust#158412), so a generated binding would pin this object to the
-//! layout of whatever kernel it was *built* against and silently read garbage on any
-//! other. Instead every field is read at a byte offset taken from [`OFFSETS`] — a
-//! `.rodata` global the daemon fills from the running kernel's BTF and injects at
-//! load time. The handles below (`File`, `Dentry`, …) are `Copy` newtypes over a raw
-//! base address; each accessor reads one field at its injected offset.
+//! There is no `vmlinux.rs` here: every field is read at a byte offset taken from
+//! [`OFFSETS`], which the daemon fills from the running kernel's BTF (see
+//! `cordon_bpf_common::offsets` for why). The handles below (`File`, `Dentry`, …) are
+//! `Copy` newtypes over a raw base address; each accessor reads one field at its
+//! injected offset.
 //!
 //! [`read_at`] (a `bpf_probe_read_kernel`, the kernel's *fault-safe* reader: a bad
 //! address faults into an `Err` instead of crashing) does all the actually-unsafe
-//! work. Accessors return [`Option`] — `None` ("couldn't read") becomes a fail-open
-//! allow in the caller.
-//!
-//! There is **no path resolution** here: `bpf_d_path` is not allowed at the
-//! `file_open` LSM hook, so both subtrees and executables are identified by inode
-//! ([`FileId`]).
+//! work. Accessors return [`Option`]; `None` means "couldn't read", and the decision flow
+//! fails open on it. Files are identified by inode ([`FileId`]), never by path.
 
 use aya_ebpf::helpers::{
     bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task,
@@ -32,9 +26,8 @@ use cordon_bpf_common::{
 };
 
 /// Running-kernel field offsets, injected into `.rodata` by the daemon
-/// (`override_global("OFFSETS", …)`) after it parses the kernel BTF. The initializer
-/// is [`Offsets::POISON`] (all-ones) so a missing injection fails open + trips the
-/// daemon's self-test rather than silently mis-reading; see `offsets` module docs.
+/// (`override_global("OFFSETS", …)`). The initializer is [`Offsets::POISON`]; see there
+/// for what a missing injection does.
 #[unsafe(no_mangle)]
 static OFFSETS: Offsets = Offsets::POISON;
 
@@ -73,10 +66,9 @@ pub fn current_uid() -> Uid {
     Uid(bpf_get_current_uid_gid() as u32)
 }
 
-/// The current task's cgroup-v2 id (`bpf_get_current_cgroup_id`) — the blessing carrier
-/// (DESIGN §16.3). The daemon registers a blessed cgroup's id in `BLESSED`; the decision
-/// flow resolves the caller's class from this. A general helper, but validated callable from
-/// the `file_open` LSM hook on the pinned kernel (PLAN-bless B1b verifier check).
+/// The current task's cgroup-v2 id (`bpf_get_current_cgroup_id`), from which the decision
+/// flow resolves the caller's blessing class via `BLESSED` (DESIGN §16.3). A general
+/// helper; the verifier accepts it at the `file_open` LSM hook on the CI-pinned kernel.
 pub fn current_cgroup_id() -> CgroupId {
     // SAFETY: an argless helper returning a scalar id — no pointers, always callable.
     CgroupId(unsafe { bpf_get_current_cgroup_id() })
@@ -118,9 +110,7 @@ impl Binprm {
     pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Binprm {
         Binprm(unsafe { ctx.arg(n) })
     }
-    /// `bprm->file`: the binary about to be executed. Note this is the *file being
-    /// exec'd*, not the caller — the caller is still the old image at this hook, which is
-    /// what makes the subject the process performing the exec.
+    /// `bprm->file`: the binary about to be executed, not the caller (see `decide_exec`).
     pub fn file(self) -> Option<File> {
         Some(File(ptr_at(self.0, offset!(binprm_file))?))
     }
@@ -138,19 +128,17 @@ impl Dentry {
     ///
     /// The index is the caller's responsibility and is **not** type-checked: reading an
     /// `inode *` argument as a dentry yields a plausible-but-wrong pointer whose field
-    /// reads fail, which fails *open*. The daemon's self-test exercises every hook for
-    /// exactly this reason.
+    /// reads fail, which fails *open*, silently. The daemon's `self_test` exercises every
+    /// hook so a wrong index fails loudly at startup.
     pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Dentry {
         Dentry(unsafe { ctx.arg(n) })
     }
     /// The dentry's inode, or `None` when the dentry is **negative** — `d_inode` is NULL,
     /// i.e. the name does not exist yet.
     ///
-    /// The distinction decides a verdict, so it is tested rather than left to the NULL read
-    /// faulting out on its own: `link(2)`'s target is always negative (the VFS resolves it
-    /// with `LOOKUP_CREATE`, so an existing name is `EEXIST` before this hook runs), while
-    /// `rename(2)`'s destination is *positive* whenever it clobbers — and `vfs_rename` then
-    /// destroys that inode. See `decide_reparent`.
+    /// The distinction decides a verdict (a positive rename destination is about to be
+    /// destroyed; see `decide_reparent`), so it is tested rather than left to the NULL read
+    /// faulting out on its own.
     pub fn inode(self) -> Option<Inode> {
         let inode = ptr_at(self.0, offset!(dentry_d_inode))?;
         (!inode.is_null()).then_some(Inode(inode))
@@ -198,8 +186,8 @@ impl Inode {
 pub struct SuperBlock(*const u8);
 
 impl SuperBlock {
-    /// The device number in the kernel's `s_dev` encoding (matches what the daemon
-    /// re-packs `stat(2)`'s `st_dev` into).
+    /// The device number in the kernel's `s_dev` encoding — the device the daemon takes
+    /// from the mount table (its `proc::file_id`), not `stat(2)`'s `st_dev`.
     pub fn dev(self) -> Option<Dev> {
         // s_dev is dev_t == u32.
         Some(Dev(read_at::<u32>(self.0, offset!(sb_s_dev))? as u64))
@@ -223,9 +211,9 @@ static SCRATCH: PerCpuArray<DecisionEvent> = PerCpuArray::with_max_entries(1, 0)
 /// One logged decision, assembled by the caller and handed to [`emit`] as a unit.
 ///
 /// A struct rather than a parameter list for two reasons. BPF passes at most five
-/// arguments in registers and has no call stack for the rest, so a thirteen-argument
-/// `emit` only linked while LLVM happened to inline it — a second call site turned that
-/// into "stack arguments are not supported". And three of these fields are [`FileId`]s
+/// arguments in registers and has no stack for the rest, so a long positional `emit` links
+/// only while LLVM happens to inline it; a second call site turns that into "stack
+/// arguments are not supported". And three of these fields are [`FileId`]s
 /// whose order a positional call site could transpose in complete silence, swapping (say)
 /// the object and the leaf in every journal line. Named fields cost nothing and make both
 /// problems structural.
@@ -243,7 +231,6 @@ pub struct Record {
     /// The matched protected object's identity.
     pub object: FileId,
     /// The affected file's own identity — equals `object` when the rule names the file.
-    /// Also the suppressor and coalesce key, so distinct leaves surface separately.
     pub leaf: FileId,
     /// The actions the hook requested, which can be several bits (read, write and create
     /// for one open).
@@ -354,7 +341,7 @@ fn fill_comps(
 /// count, keeping the ring (and the learn path) quiet without losing the event.
 const SUPPRESS_WINDOW_NS: Nanos = Nanos(1_000_000_000);
 
-/// The in-kernel event suppressor (M1 §1g): the hottest decision keys and when each
+/// The in-kernel event suppressor: the hottest decision keys and when each
 /// last emitted. **LRU** so a full map evicts the coldest key rather than refusing a
 /// new hot one. Kernel-internal — the daemon never touches it.
 #[map]
@@ -363,10 +350,8 @@ static SUPPRESS: LruHashMap<SuppressKey, SuppressVal> = LruHashMap::with_max_ent
 /// Throttle a logged decision. Returns `Some(suppressed)` when this open should emit a
 /// ring record — `suppressed` being how many identical decisions were folded in since
 /// the previous emit for this key — or `None` when it falls inside the window and is
-/// suppressed (its only effect a bumped counter). Keyed on the opened file (`leaf`), not
-/// the protected object, so distinct files under one audited root each surface (DESIGN
-/// §15.10 flow B). Best-effort: a failed map write just means a slightly off count, never
-/// a missed *first* occurrence.
+/// suppressed (its only effect a bumped counter). Keyed by [`SuppressKey`]. Best-effort:
+/// a failed map write just means a slightly off count, never a missed *first* occurrence.
 pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed> {
     let now = now_ns();
     let key = SuppressKey::new(exe, leaf, action);

@@ -3,17 +3,15 @@
 # Install:  cp to /etc/systemd/system/ && systemctl daemon-reload && systemctl
 #           enable --now cordond
 #
-# Requires root with CAP_BPF + CAP_MAC_ADMIN, a kernel with CONFIG_BPF_LSM=y and
-# `bpf` in the active LSM list (`lsm=…,bpf` on the kernel cmdline), the daemon's
-# bpf-lsm backend (built in by default), and the eBPF object installed (default
-# /usr/lib/cordon/cordon.bpf.o). The daemon compiles the text policy at startup
-# (/etc/cordon/policy.toml, or a /etc/cordon/conf.d/ directory of *.toml fragments) and
-# seeds the in-kernel maps; `cordon policy apply` re-seeds at runtime. Operational
+# Kernel and privilege requirements are in the README (Requirements). Needs the eBPF
+# object installed (default /usr/lib/cordon/cordon.bpf.o). The daemon compiles the text
+# policy at startup (/etc/cordon/policy.toml, or a /etc/cordon/conf.d/ directory of
+# *.toml fragments) and seeds the in-kernel maps; `cordon policy apply` re-seeds at runtime. Operational
 # settings come from /etc/cordon/config.toml (see packaging/cordon.example.toml).
 
 [Unit]
 Description=cordon gater (bpf-lsm in-kernel boundary)
-# The verdict is in-kernel; start early so coverage begins before user sessions.
+# Start early so coverage begins before user sessions.
 DefaultDependencies=no
 After=local-fs.target
 Before=basic.target
@@ -27,16 +25,14 @@ Type=simple
 ExecStart=/usr/bin/cordond
 Restart=on-failure
 RestartSec=1
-# NOTE: `systemctl stop cordond` does NOT stop enforcement. The LSM links are pinned to
-# bpffs, so the boundary stands with no process holding it — which is what makes a restart
-# or a crash gapless, and what stops a killed log-drainer from silently disarming the box.
+# NOTE: `systemctl stop cordond` does NOT stop enforcement (the pinned links hold it).
 # There is deliberately no ExecStopPost teardown here: turning enforcement off is an
-# explicit act, `cordond --teardown` (which refuses while the daemon is running).
-# CAP_BPF loads the program + maps; CAP_MAC_ADMIN is required to load an LSM program.
+# explicit act, `cordond --teardown`, which refuses while the daemon is running.
 AmbientCapabilities=CAP_BPF CAP_MAC_ADMIN
-# The bless carrier cgroups (`cordon-bless-<id>.<class>`) are created under the
-# daemon's own cgroup; Delegate=yes hands the subtree to the daemon so systemd
-# doesn't fight its mkdir/rmdir there.
+# A bless carrier cgroup (`cordon-bless-<id>.<class>`) goes under the requester's session
+# scope or user slice, and under the daemon's own cgroup when neither is usable;
+# Delegate=yes hands that subtree to the daemon so systemd doesn't fight its mkdir/rmdir
+# there.
 Delegate=yes
 
 [Install]

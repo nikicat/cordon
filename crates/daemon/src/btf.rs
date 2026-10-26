@@ -1,11 +1,10 @@
 //! A minimal read-only BTF parser — just enough to resolve struct field **byte
 //! offsets** from the running kernel's `/sys/kernel/btf/vmlinux`.
 //!
-//! This is the userspace half of the CO-RE-substitute: rustc can't emit CO-RE
-//! relocations (rust-lang/rust#158412), so the eBPF object carries no struct layout
-//! of its own. Here we read the running kernel's BTF, resolve the handful of field
-//! offsets the `file_open` hook chases, and hand them back as an [`Offsets`] the
-//! daemon injects into the program's `.rodata` (see `backend::bpf_lsm`).
+//! The eBPF object carries no struct layout of its own (see [`Offsets`] for why), so this
+//! reads the running kernel's BTF, resolves the handful of field offsets the hooks chase,
+//! and hands them back as an [`Offsets`] the daemon injects into the program's `.rodata`
+//! (see `backend::bpf_lsm`).
 //!
 //! aya-obj already parses BTF, but its member/offset accessors are `pub(crate)`, so
 //! we parse the slice ourselves. The format is small and stable

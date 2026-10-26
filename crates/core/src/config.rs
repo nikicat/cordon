@@ -1,8 +1,7 @@
 //! Operational configuration — the bootstrap settings the daemon needs before (or
 //! independent of) the policy: the `backend`, the `socket` path, and the `bpf-lsm`
 //! object/pin/`policy` paths. The *enforcement* settings — the rules and their per-rule
-//! `policy` (the only enforcement level; there is no global mode) — live in the **text
-//! policy file** (`policy`), not here (DESIGN §15.8).
+//! `policy` — live in the **text policy file** (`policy`), not here (DESIGN §15.8).
 //!
 //! Precedence is **CLI flag > config file > built-in default**. String values in the
 //! file may interpolate `${ENV}` (e.g. `socket = "${XDG_RUNTIME_DIR}/cordon.sock"`).
@@ -20,18 +19,19 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub backend: BackendKind,
     pub socket: SocketPath,
-    /// Reserved for autolearn (M4, DESIGN §15.9): the roots where learning may
-    /// propose rules. Accepted but unused by M1 enforcement.
+    /// The roots where autolearn may propose rules (DESIGN §15.9). Accepted, but nothing
+    /// enforces from it.
     pub zones: Vec<PathBuf>,
     /// `bpf-lsm` backend: the compiled eBPF object to load at runtime (built by
-    /// `just build-ebpf`). Ignored by the other backends.
+    /// `just build-ebpf`).
     pub bpf_object: PathBuf,
-    /// `bpf-lsm` backend: the bpffs directory to pin the program + maps under, so
-    /// enforcement survives the daemon dying (fail-safe, DESIGN §4).
+    /// `bpf-lsm` backend: the bpffs directory the LSM links are pinned under (the
+    /// daemon's `PinDir::pin_links`; DESIGN §4).
     pub bpf_pin_dir: PathBuf,
     /// The root-owned text policy (the flat rule model, DESIGN §15.8) — a single file,
-    /// or a **conf.d directory** of `*.toml` fragments merged in name order. The
-    /// `bpf-lsm` backend compiles it at startup and seeds the maps from it.
+    /// or a conf.d directory of `*.toml` fragments
+    /// ([`read_sources`](crate::policy::read_sources)). The `bpf-lsm` backend compiles it
+    /// at startup and seeds the maps from it.
     pub policy: PathBuf,
 }
 
@@ -166,11 +166,9 @@ fn default_socket() -> PathBuf {
     env::temp_dir().join(format!("cordon-{}.sock", euid()))
 }
 
-/// The daemon socket path *and where it came from*. The provenance is load-bearing on
-/// the client side, so it travels with the path rather than beside it: a built-in default
-/// that nothing is listening on means "no per-user daemon — talk to the system one",
-/// while a path the operator wrote down is used verbatim, so a typo is reported as
-/// written instead of silently redirected.
+/// The daemon socket path *and where it came from*. The provenance decides whether a
+/// client may fall back to the system daemon ([`SocketPath::for_client`]), so it travels
+/// with the path rather than beside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SocketPath {
     /// An explicit `socket =` in the config file, or a `--socket` flag.
@@ -187,13 +185,13 @@ impl SocketPath {
         }
     }
 
-    /// The socket a **client** should talk to.
+    /// Returns the socket a **client** should talk to.
     ///
     /// [`default_socket`] resolves by euid, so an unprivileged `cordon` would otherwise
-    /// look for a *per-user* daemon that almost never exists and never find the system
-    /// one — which is what made `cordon bless list` unusable from a user account. A
-    /// default with nothing listening therefore falls back to [`SYSTEM_SOCKET`];
-    /// a configured path never does.
+    /// look for a *per-user* daemon that almost never exists and never reach the system
+    /// one (`cordon bless list` from a user account is the case this guards). A default
+    /// with nothing listening therefore falls back to [`SYSTEM_SOCKET`]; a configured path
+    /// never does, so a typo is reported as written instead of silently redirected.
     pub fn for_client(self, exists: impl Fn(&Path) -> bool) -> PathBuf {
         match self {
             SocketPath::Configured(p) => p,
@@ -226,7 +224,7 @@ fn default_bpf_pin_dir() -> PathBuf {
 }
 
 /// Default text-policy location (root-owned). User-mode dev points it elsewhere via
-/// config; the rule-model backend compiles it at startup.
+/// config.
 fn default_policy() -> PathBuf {
     if is_root() {
         return PathBuf::from("/etc/cordon/policy.toml");
@@ -284,8 +282,7 @@ mod tests {
         // …but a per-user daemon that *is* listening wins.
         let d = SocketPath::Default(user.clone());
         assert_eq!(d.for_client(present), user);
-        // An explicit `socket =` is never redirected, even when absent — a
-        // misconfigured path must be reported as written.
+        // An explicit `socket =` is never redirected, even when absent.
         let c = SocketPath::Configured(user.clone());
         assert_eq!(c.for_client(missing), user);
         // Root's default is already the system socket: no existence check needed.

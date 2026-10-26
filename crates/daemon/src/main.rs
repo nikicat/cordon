@@ -3,7 +3,7 @@
 //! Wires the rule-model enforcement backend (`bpf-lsm`) to the IPC control plane over
 //! a Unix socket (thread-per-connection). The backend runs on its own thread; the IPC
 //! threads reach it through a [`ControlSender`] (apply a policy, read the effective
-//! one). There is no store/engine — policy is the compiled text file (DESIGN §15).
+//! one). The policy is the compiled text file (DESIGN §15).
 
 mod backend;
 #[cfg(feature = "bpf-lsm")]
@@ -119,9 +119,9 @@ fn init_tracing(format: LogFormat) {
 fn run(args: Args) -> cordon_core::Result<()> {
     let cfg = resolve_config(&args)?;
 
-    // Before the kernel or the socket is touched: exactly one daemon per socket. Teardown
-    // takes the same lock — removing a live daemon's pins would leave it enforcing on
-    // handles nobody can see, and disarm the boundary the moment it happened to exit.
+    // Before the kernel or the socket is touched (see `acquire_singleton`). Teardown takes
+    // the same lock, so it refuses while a daemon runs: removing a live daemon's pins would
+    // leave it enforcing on handles nobody can see, and disarm the boundary when it exits.
     let _singleton = acquire_singleton(cfg.socket.path())?;
 
     if args.teardown {
@@ -146,15 +146,14 @@ fn resolve_config(args: &Args) -> cordon_core::Result<Config> {
     Ok(cfg)
 }
 
-/// `--teardown`: drop the pins that let enforcement outlive the daemon, and exit.
+/// `--teardown`: removes the pins (see `PinDir::teardown`) and exits.
 ///
 /// Deliberately loud. This is the one path that *reduces* protection, and it leaves the
 /// box unenforced until a daemon starts again — so the journal should say so plainly
 /// rather than exiting silently.
 fn teardown_enforcement(cfg: &Config) -> cordon_core::Result<()> {
     match backend::teardown(cfg)? {
-        // Not the same event, and saying "torn down" here would misreport the posture:
-        // nothing was holding the boundary up in the first place.
+        // Nothing was holding the boundary up; "torn down" would misreport it.
         Swept::Nothing => info!(
             event = "teardown",
             generations = 0,

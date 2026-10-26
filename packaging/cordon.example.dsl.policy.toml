@@ -10,19 +10,18 @@
 #   POLICY  — allow (allow, silent) | audit (allow, log) | deny (deny, log) |
 #             silence (deny, silent).
 #   SUBJECT — an exe path, `*` (any), or `@subject-group`.
-#   ACTION  — read | write | create (M1, at open); a single value, a comma list, `*`
-#             (all), or `@action-group`.
+#   ACTION  — any action from cordon.example.policy.toml; a single value, a comma list,
+#             `*` (all), or `@action-group`.
 #   OBJECT  — a file or directory (matched recursively as a subtree), or `@object-group`.
-#             `*` is NOT allowed — the whole filesystem can't be default-denied.
+#             `*` is NOT allowed.
 #
 # Fields are whitespace-separated (align the columns however you like); list items use
 # commas with no spaces; `"…"` quotes a token that contains spaces, and inside the
 # quotes `*`/`@` are literal (the way to name a path that starts with those). `#` starts
 # a comment; blank lines are ignored.
 #
-# Precedence, enforcement levels, and the no-global-mode rule are exactly as in the
-# `[[rule]]` example — see cordon.example.policy.toml. There is no `mode` key; use
-# `audit` to observe an object and `deny` to enforce it.
+# Precedence and enforcement levels are exactly as in the `[[rule]]` example — see
+# cordon.example.policy.toml.
 #
 # For a root-owned, per-user policy, declare whose home `~` expands against (looked up
 # in /etc/passwd) so you can write `~/.ssh` instead of `/home/<name>/.ssh`:
@@ -39,9 +38,8 @@ rules = '''
 # ssh tooling may read ~/.ssh; every other opener there is default-denied.
 allow    @ssh-tools     @ro          ~/.ssh
 
-# a `sudo cordon bless --class ro` process may read the cloud creds (runtime grant, human-
-# authenticated by sudo; DESIGN §16). The blessed allow outranks the `*` audit catch-all by
-# subject-specificity, so an interactive reader under a bless works without widening the catch-all.
+# a `cordon bless --class ro` process may read the cloud creds (a runtime grant; DESIGN
+# §16). It outranks the `*` audit catch-all below, which keeps logging everyone else.
 allow    @blessed-ro    @ro          @cloud-creds
 
 # the aws cli reads + writes its own creds.
@@ -52,8 +50,8 @@ allow    /usr/bin/aws   read,write   ~/.aws
 audit    *              read         @cloud-creds
 
 # copy-down exception: aws may read ~/.aws (above), but never this one stashed token,
-# and silently (deny + no log line). More-specific object wins over the subtree allow,
-# but only for this file and only for aws.
+# and silently (deny + no log line); the more-specific object wins, but only for this
+# file and only for aws.
 silence  /usr/bin/aws   *            ~/.aws/.danger-token
 '''
 
@@ -62,7 +60,7 @@ silence  /usr/bin/aws   *            ~/.aws/.danger-token
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
 # A blessing class (DESIGN §16): a subject group with a `blessing = "<name>"` predicate
-# instead of `members`. `sudo cordon bless --class ro -- <cmd>` tags its cgroup `ro`; the rule
+# instead of `members`. `cordon bless --class ro -- <cmd>` tags its cgroup `ro`; the rule
 # above grants such a process read access to the cloud creds (and only those).
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -70,8 +68,7 @@ blessing = "ro"
 [group.object.cloud-creds]
 members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
 
-# `listdir` has no hook of its own yet: a directory open requests `read`, so it is `read`
-# that grants listing here. Do not write `listdir` alone — nothing requests it, so the open
-# falls to default-deny and the rule denies what it looks like it grants (DESIGN §15.5).
+# `read` is what grants listing; `listdir` alone grants nothing (see the same group in
+# cordon.example.policy.toml).
 [group.action.ro]
 members = ["read", "listdir"]

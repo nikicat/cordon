@@ -1,4 +1,4 @@
-# The eBPF data plane: the in-kernel boundary that returns file_open verdicts.
+# The eBPF data plane: the in-kernel boundary that returns the LSM hook verdicts.
 #
 # This crate is INTENTIONALLY a standalone workspace (`[workspace]` below) and is
 # `exclude`d from the root workspace — it compiles only for `bpfel-unknown-none`
@@ -23,7 +23,7 @@ bench = false
 
 [dependencies]
 aya-ebpf = "0.1.1"
-# Shared map/record layout + identity hash (no_std, no `user` feature → no aya).
+# Shared map/record layout (no_std, no `user` feature → no aya).
 cordon-bpf-common = { path = "../bpf-common" }
 
 # eBPF objects must be optimized (the verifier rejects the bloated, high-stack code

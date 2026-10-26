@@ -10,18 +10,15 @@
 //!     file ahead of the kernel, and a syntactically broken file persists even though the
 //!     daemon refuses to load it.
 //!
-//! This command closes both, borrowing from three tools at once: **sudoedit** (the editor
-//! runs as the invoking user, never root — only a dumb byte copy is privileged),
-//! **visudo** (validate before install; reject a broken policy and re-prompt), and
-//! `cordon policy apply` (push the validated result to the live kernel in the same step).
+//! This command closes both, borrowing from three tools at once: sudoedit (only a dumb
+//! byte copy is privileged; see [`editor_identity`]), visudo (validate before install;
+//! reject a broken policy and re-prompt), and `cordon policy apply` (push the validated
+//! result to the live kernel in the same step; see [`Session::assess`]).
 //!
-//! Privilege model **A** (self-privileged): invoked `sudo cordon policy edit`, the CLI
-//! stays root in the parent — it reads, validates, applies, and writes the root-owned
-//! file — and drops to the invoking user *only* in the forked editor child (see [`sys`]).
-//! No new IPC: the read is a direct file read, validation is the in-process compiler (the
-//! same one `policy check` runs), and the commit reuses `PolicyApply`. The file is written
-//! **only after** the daemon accepts the policy, so on-disk == live with no rollback. When
-//! no daemon is listening, the validated file is saved and reported as not applied.
+//! Invoked as `sudo cordon policy edit`, the CLI stays root in the parent, which reads,
+//! validates, applies and writes the root-owned file; only the forked editor child drops
+//! privilege. No new IPC: the read is a direct file read, validation is the in-process
+//! compiler (the same one `policy check` runs), and the commit reuses `PolicyApply`.
 
 use cordon_core::policy::{self, Diagnostic, PolicyRoot, PolicySource, SourceOrigin, UserName};
 use cordon_core::proto::{Request, Response};
@@ -164,9 +161,8 @@ pub(crate) enum EditTarget {
     User(UserName),
 }
 
-/// The mutually-exclusive ways to name what to edit (clap-enforced). **Naming nothing
-/// edits your own tier** — the common case, and the reason `sudo cordon policy edit` no
-/// longer means "edit the system policy".
+/// The mutually-exclusive ways to name what to edit (clap-enforced). Naming nothing
+/// edits your own tier.
 #[derive(clap::Args, Clone, Debug)]
 pub struct EditTargetArgs {
     /// Policy file to edit, system tier (for a conf.d directory, name a fragment,
@@ -198,9 +194,8 @@ impl EditTargetArgs {
     }
 }
 
-/// The account whose tier a bare `cordon policy edit` opens: under `sudo` the invoking
-/// user, unprivileged the caller themselves (which is also what the future
-/// edit-without-sudo path wants — the home-migration in PLAN-rule-model).
+/// Returns the login name of the account whose tier a bare `cordon policy edit` opens
+/// (see [`invoker_uid`]). Errors when that uid has no passwd entry.
 fn invoking_user() -> Result<UserName> {
     let uid = invoker_uid(
         Uid::from_raw(config::euid()),
@@ -211,8 +206,11 @@ fn invoking_user() -> Result<UserName> {
     Ok(name)
 }
 
-/// The uid behind [`invoking_user`]. Real root with no `SUDO_UID` (a root login, a cron
-/// job) has no "own tier": name the target rather than silently editing the system policy.
+/// Returns the uid whose tier a bare `cordon policy edit` opens: the caller when
+/// unprivileged, the `SUDO_UID` invoker under `sudo`. Errors when real root has no
+/// non-root `SUDO_UID` (a root login, a cron job, sudo to root), since that has no own
+/// tier and must name `--system` or `--user` rather than silently edit the system policy;
+/// also errors on a malformed `SUDO_UID`.
 fn invoker_uid(euid: Uid, sudo_uid: Option<&str>) -> Result<Uid> {
     if !euid.is_root() {
         return Ok(euid);
@@ -263,8 +261,7 @@ struct Session {
     /// `[[include]]` exists on disk (bootstrap).
     target_origin: SourceOrigin,
     /// A pending `[[include]]` to register — `Some` only for a first-time `--user` edit
-    /// with no binding yet. Written by [`Session::save`] **after** a successful save, so a
-    /// cancelled edit never leaves a stale include.
+    /// with no binding yet (see [`Session::save`]).
     scaffold: Option<Scaffold>,
     /// `$HOME` for `~`-expansion in the local validation compile.
     home: PathBuf,
@@ -387,9 +384,9 @@ impl Session {
         }
     }
 
-    /// Persist the edited file, then — only now, after it validated and saved — register a
-    /// pending `[[include]]` (the `--user` bootstrap). Doing it here, last, means a cancelled
-    /// or rejected edit never leaves a stale binding.
+    /// Persists the edited file, then registers any pending `[[include]]` (the `--user`
+    /// bootstrap). Registering last, only after the file validated and saved, means a
+    /// cancelled or rejected edit never leaves a stale binding.
     fn save(&self, edited: &str) -> Result<()> {
         self.tmp.commit(&self.target, edited)?;
         if let Some(s) = &self.scaffold {
@@ -420,10 +417,12 @@ impl Session {
         Ok(())
     }
 
-    /// visudo's two checks: a fast local compile (also the only check when the daemon is
-    /// down), then the daemon's authoritative mount-aware compile + live swap. Prints
-    /// diagnostics; returns the [`Verdict`]. When no daemon is listening
-    /// ([`is_daemon_down`]), the verdict is [`Verdict::SaveOnly`]. Errors when the daemon
+    /// Runs visudo's two checks and returns the [`Verdict`], printing diagnostics: a fast
+    /// local compile (also the only check when the daemon is down), then the daemon's
+    /// authoritative mount-aware compile + live swap. The caller writes the file only on
+    /// [`Verdict::Apply`], after the daemon accepted it, so on disk matches live with no
+    /// rollback; or on [`Verdict::SaveOnly`], when no daemon is listening
+    /// ([`is_daemon_down`]), and then reports it as not applied. Errors when the daemon
     /// answers with an error or an unexpected reply, or fails mid-request.
     fn assess(&self, candidate: Vec<PolicySource>) -> Result<Verdict> {
         let compiled = policy::compile_fragments(&candidate, &self.home, policy::stat_resolver);
@@ -450,7 +449,6 @@ impl Session {
                 Ok(Verdict::Reedit)
             }
             Ok(other) => Err(Error::msg(format!("unexpected daemon response: {other:?}"))),
-            // The daemon isn't up; persist the validated file.
             Err(e) if is_daemon_down(&e) => Ok(Verdict::SaveOnly),
             Err(e) => Err(e),
         }
@@ -502,9 +500,13 @@ fn is_bare_name(p: &Path) -> bool {
             .unwrap_or(true)
 }
 
-/// Decide who the editor runs as. Unprivileged caller ⇒ no drop (it's already them). Root
-/// ⇒ drop to the sudo-invoking user; refuse when there is none (running the editor as root
-/// is the very escalation this command avoids), unless explicitly overridden.
+/// Decides who the editor runs as: never root unless `root_editor` allows it. An
+/// unprivileged caller is already the right user. Under `sudo`, the editor drops to
+/// `SUDO_UID`/`SUDO_GID` with that user's own home and name ([`EditorAs::User`]). Errors
+/// when root has no non-root invoker (no `SUDO_UID`/`SUDO_GID`, or sudo to root) and
+/// `root_editor` is [`RootEditor::Refuse`], because a root editor is the same-uid
+/// escalation the module doc describes; also errors when `SUDO_UID`/`SUDO_GID` don't
+/// parse or the uid has no passwd home.
 fn editor_identity(root_editor: RootEditor) -> Result<EditorAs> {
     if !config::is_root() {
         return Ok(EditorAs::Current);
@@ -533,8 +535,6 @@ fn editor_identity(root_editor: RootEditor) -> Result<EditorAs> {
     if uid.is_root() {
         return refuse("the invoking user is root");
     }
-    // Resolve the user's own home/name now — the editor must see them, not root's (it runs
-    // as this uid but would otherwise inherit `sudo`'s `HOME=/root`).
     let (name, home) = sys::user_identity(uid)
         .ok_or_else(|| Error::msg(format!("cannot resolve home directory for uid {uid}")))?;
     Ok(EditorAs::User {
@@ -545,8 +545,7 @@ fn editor_identity(root_editor: RootEditor) -> Result<EditorAs> {
     })
 }
 
-/// Spawn the editor on `file`, dropping privileges in the child per `editor_as` and giving
-/// it the invoking user's own `$HOME`/`$USER` (not root's, inherited via `sudo`).
+/// Spawns the editor on `file` and waits for it, running it as `editor_as` says.
 fn spawn_editor(
     editor: &EditorCommand,
     file: &Path,
@@ -650,8 +649,8 @@ fn include_fragment(policy_root: &PolicyRoot) -> PathBuf {
     }
 }
 
-/// A pending `[[include]]` registration — the `--user` bootstrap. Written by
-/// [`Scaffold::register`] only after the user file has validated and saved.
+/// A pending `[[include]]` registration — the `--user` bootstrap, registered by
+/// [`Session::save`].
 struct Scaffold {
     /// The system fragment to append the `[[include]]` to.
     fragment: PathBuf,
@@ -684,8 +683,7 @@ impl Scaffold {
     }
 }
 
-/// Mode for a policy file this command **creates**. An existing file keeps whatever mode
-/// it has ([`install_atomically`]), so this only ever applies to a first write. `0644`
+/// Mode for a policy file this command creates (see [`install_atomically`]). `0644`
 /// root-owned matches the rest of the tree and is what an unprivileged `cordon policy
 /// check` needs to read; the file holds rules — paths and exe names — not credentials, and
 /// the daemon already serves a summary of them to any local user (DESIGN §15.8).
@@ -779,16 +777,13 @@ impl TempEdit {
                 .open(&tmp.file)
                 .context("create temp file")?;
             f.write_all(seed.as_bytes())?;
-            // Hand the file to the invoking user via its **fd**, while the dir is still
-            // root-owned 0700 (so the fd is still the one we created). `fchown` acts on the
-            // open inode, not a name, so — unlike a path `chown` — a same-uid attacker can't
-            // redirect it through a symlink once the dir becomes theirs (arbitrary-chown TOCTOU).
+            // Hand the file over by fd while the dir is still root-owned 0700, so the fd is
+            // still the one we created (see `sys::fchown`).
             if let EditorAs::User { uid, gid, .. } = editor_as {
                 sys::fchown(&f, *uid, *gid).context("chown temp file")?;
             }
         }
-        // The dir last, by path — a root-created entry in the sticky tmpdir, so its own path
-        // can't be swapped — chowned so the dropped editor can enter it.
+        // The dir last, by path (see `sys::chown`), so the dropped editor can enter it.
         if let EditorAs::User { uid, gid, .. } = editor_as {
             sys::chown(tmp.dir.path(), *uid, *gid)
                 .with_context(|| format!("chown {}", tmp.dir.path().display()))?;
@@ -843,8 +838,7 @@ fn read_seed(target: &Path) -> Result<Seed> {
 mod tests {
     use super::*;
 
-    /// The target table. The headline is the **last** row: naming nothing edits your own
-    /// tier, so `sudo cordon policy edit` no longer means "edit the system policy".
+    /// The target table; the bare form resolves to the invoker's own tier.
     #[test]
     fn edit_target_resolution() {
         let args = |file: Option<&str>, user: Option<&str>, system: bool| EditTargetArgs {
@@ -881,8 +875,7 @@ mod tests {
         );
     }
 
-    /// Who "your own tier" means. Root with no invoker has no answer — it must say so
-    /// rather than fall back to the system policy.
+    /// Each row of [`invoker_uid`]'s contract.
     #[test]
     fn invoker_uid_prefers_sudo_then_self() {
         let root = Uid::from_raw(0);
@@ -899,11 +892,10 @@ mod tests {
         assert!(invoker_uid(root, Some("not-a-number")).is_err());
     }
 
-    /// A save must never quietly change what an admin chose: an existing file keeps its
-    /// mode, and only a brand-new one takes the default. Both policy writes — the edited
-    /// file and the scaffolded `[[include]]` fragment — go through here, and the fragment
-    /// path used to hardcode 0644, so a tightened `/etc/cordon/policy.toml` was widened by
-    /// a first bare `policy edit`.
+    /// Both policy writes, the edited file and the scaffolded `[[include]]` fragment, go
+    /// through [`install_atomically`], so this guards both: a tightened
+    /// `/etc/cordon/policy.toml` stays tight when a first bare `policy edit` appends its
+    /// include, and only a brand-new file takes [`NEW_POLICY_MODE`].
     #[test]
     fn install_preserves_an_existing_mode_and_defaults_a_new_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -983,9 +975,9 @@ mod tests {
         assert_eq!(read_edited(&f).unwrap(), "rules = '''\n'''\n");
     }
 
-    /// The Vuln-2 regression: a same-uid attacker who owns the temp dir swaps the file for a
-    /// symlink to a root-only file. The privileged read-back must refuse to follow it, so the
-    /// target's contents never surface (into the policy or the diagnostics).
+    /// Guards the symlink swap: a same-uid attacker who owns the temp dir replaces the file
+    /// with a symlink to a root-only file, and its contents must never surface (into the
+    /// policy or the diagnostics).
     #[test]
     fn read_edited_refuses_a_symlink() {
         let tmp = tempfile::tempdir().unwrap();

@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use toml::Spanned;
 
-/// A subject after group expansion, before inode resolution (M1: exe, wildcard, or a
-/// blessing class; M2 extends to conjunctive predicates — DESIGN §15.4).
+/// A subject after group expansion, before inode resolution: any caller, an exe, or a
+/// blessing class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubjectSpec {
     /// `who = "*"` — any caller.
@@ -451,7 +451,7 @@ mod tests {
         );
     }
 
-    // ---- blessing (DESIGN §16.3 / PLAN-bless B1c) ----
+    // ---- blessing (DESIGN §16.3) ----
 
     /// A subject group with `blessing = "…"` is a class declaration: `@<group>` in `who`
     /// resolves to a blessing predicate (not an exe), and the class is collected.

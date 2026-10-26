@@ -4,9 +4,7 @@
 //! compiled policy by the control plane. Everything behind this trait — the policy
 //! compiler, the IPC — is privilege-agnostic; only the backend needs root.
 //!
-//! Under the rule model the only backend is `bpf-lsm` (the hardened Linux boundary),
-//! built into the daemon with the `bpf-lsm` cargo feature. The earlier owner-model
-//! backends were retired with the rule-model migration (DESIGN §15).
+//! The only backend is `bpf-lsm`, built into the daemon with the `bpf-lsm` cargo feature.
 
 use crate::Uid;
 use crate::policy::{ClassName, Diagnostic, PolicySource};
@@ -15,13 +13,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Which enforcement backend to run — the selector that flows from config to the
-/// daemon's backend factory. Only `bpf-lsm` remains under the rule model.
+/// daemon's backend factory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
-    /// Linux BPF-LSM (root, CAP_BPF + CAP_MAC_ADMIN). In-kernel verdicts from BPF
-    /// maps the daemon seeds from the compiled policy (DESIGN §4, §15). Built into the
-    /// daemon only with the `bpf-lsm` cargo feature.
+    /// Linux BPF-LSM: in-kernel verdicts from BPF maps the daemon seeds from the compiled
+    /// policy (DESIGN §4, §15; kernel and capability requirements in the README).
     #[default]
     #[serde(rename = "bpf-lsm")]
     BpfLsm,
@@ -86,10 +83,8 @@ impl Shutdown {
 
 /// The control-plane handle the daemon hands the backend thread: **one** channel of
 /// control messages (`policy apply` + bless ops) to honor, and a slot to publish the
-/// effective policy into for `cordon policy show`. One channel, not two, on purpose:
-/// an apply renumbers `ClassId`s and remaps the live blessings, so strict ordering
-/// between applies and bless ops is what keeps a mint from racing the remap. The IPC
-/// side holds the matching [`ControlSender`].
+/// effective policy into for `cordon policy show`. Why it is one channel: see
+/// [`ControlMsg`]. The IPC side holds the matching [`ControlSender`].
 pub struct PolicyControl {
     pub msg_rx: Receiver<ControlMsg>,
     pub current: Arc<Mutex<Option<PolicyView>>>,
@@ -115,9 +110,13 @@ pub fn control() -> (PolicyControl, ControlSender) {
     )
 }
 
-/// One control-plane message to the backend thread (which owns the BPF maps — every
-/// map write funnels through this single channel, preserving the single-writer
-/// discipline).
+/// One control-plane message to the backend thread, which owns the BPF maps.
+///
+/// Applies and bless ops share one channel on purpose. Every map write funnels through it,
+/// so the backend thread is the maps' single writer; and an apply renumbers `ClassId`s and
+/// remaps the live blessings (see [`ClassRegistry`](crate::policy::ClassRegistry)), so
+/// strict ordering between applies and bless ops is what keeps a mint from racing the
+/// remap.
 pub enum ControlMsg {
     Apply(ApplyRequest),
     Bless(BlessOp),
@@ -128,19 +127,16 @@ pub enum ControlMsg {
 /// error types out of the seam.
 pub enum BlessOp {
     /// Mint a blessing: create + register a carrier cgroup for `class` (`None` → the
-    /// sole declared class). The reply carries the carrier's `cgroup.procs` **opened by
-    /// the (root) backend thread** — passing that fd is what lets an unprivileged client
-    /// join, since the kernel checks migration permission against the opener's
-    /// credentials, not the writer's (DESIGN §16.4).
+    /// sole declared class). The reply carries the carrier's `cgroup.procs` opened by
+    /// the root backend thread ([`CarrierProcs`]).
     Mint {
         class: Option<ClassName>,
-        /// The **requester's** kernel-attested uid, recorded on the blessing so they can
-        /// later revoke what they minted without needing root ([`Self::Revoke`]).
+        /// The requester's uid ([`Conn::peer_uid`](crate::proto::Conn::peer_uid)),
+        /// recorded on the blessing so [`Self::Revoke`] can let them revoke it.
         owner: Uid,
-        /// The **requester's** kernel-attested pid. The daemon reads its cgroup to place
-        /// the carrier in that process's own logind session scope, so the blessed command
-        /// keeps a session polkit will resolve. Attested, never asserted: a client-supplied
-        /// pid would let a caller aim the carrier at *another* user's session.
+        /// The requester's pid ([`Conn::peer_pid`](crate::proto::Conn::peer_pid)), whose
+        /// logind session scope the carrier is placed in, so the blessed command keeps a
+        /// session polkit will resolve.
         requester: Pid,
         reply: Sender<std::result::Result<(BlessingView, CarrierProcs), String>>,
     },
@@ -148,10 +144,11 @@ pub enum BlessOp {
     List {
         reply: Sender<std::result::Result<Vec<BlessingView>, String>>,
     },
-    /// Kill a blessing's carrier and unregister it. `by` is the caller's kernel-attested
-    /// uid: root revokes anything, anyone else only what they minted. The check lives here
-    /// rather than in the IPC `authorize` gate because it needs the live table — the gate
-    /// answers "may this uid speak this verb", ownership answers "is this one yours".
+    /// Kill a blessing's carrier and unregister it. `by` is the caller's
+    /// [`Conn::peer_uid`](crate::proto::Conn::peer_uid); who may revoke what is the
+    /// daemon's `may_revoke`. The check lives behind this channel rather than in the IPC
+    /// `authorize` gate because it needs the live table — the gate answers "may this uid
+    /// speak this verb", ownership answers "is this one yours".
     Revoke {
         id: BlessId,
         by: Uid,

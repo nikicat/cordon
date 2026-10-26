@@ -1,11 +1,4 @@
-//! Path → inode identity for the bpf-lsm backend.
-//!
-//! The backend keys policy on a file's `(device, inode)`. The device must equal what
-//! the kernel's eBPF reads — `inode->i_sb->s_dev`, the *mount's* super_block device —
-//! which is **not** `stat(2)`'s `st_dev` on overlayfs (containers) or btrfs
-//! (per-subvolume device). So we resolve it from `/proc/self/mountinfo`. (The
-//! owner-model `/proc` caller-identity helpers were retired with the rule-model
-//! migration; the rule model identifies the caller in-kernel via `mm->exe_file`.)
+//! Path → inode identity for the bpf-lsm backend (see `file_id`).
 
 #[cfg(feature = "bpf-lsm")]
 pub use fsid::file_id;
@@ -16,9 +9,11 @@ mod fsid {
     use std::os::linux::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    /// A path's [`FileId`] matching the eBPF view: device from the mount table, inode
-    /// number from `stat` (which does match the kernel's `i_ino`). `None` if the path
-    /// can't be resolved.
+    /// Returns a path's [`FileId`] as the eBPF program sees it, or `None` if the path
+    /// can't be resolved. The device must equal `inode->i_sb->s_dev`, the mount's
+    /// super_block device, which is not `stat(2)`'s `st_dev` on overlayfs (containers) or
+    /// btrfs (per-subvolume device); so it comes from `/proc/self/mountinfo`. The inode
+    /// number comes from `stat`, which does match the kernel's `i_ino`.
     pub fn file_id(path: &Path) -> Option<FileId> {
         let canonical = std::fs::canonicalize(path).ok()?;
         let dev = mount_dev(&canonical)?;
@@ -93,15 +88,9 @@ mod fsid {
             assert_eq!(mkdev(259, 1234), Dev((259 << 20) | 1234));
         }
 
-        /// The premise `seed::daemon_exe`'s memoization rests on: this lookup is
-        /// **path-based** (it canonicalizes before consulting the mount table), so the
-        /// answer changes — or disappears — when the path does.
-        ///
-        /// That is exactly what a package upgrade does to a running daemon: a new binary is
-        /// renamed over the old name, after which `/proc/self/exe` reads `… (deleted)` and
-        /// canonicalization fails. So re-deriving the daemon's own identity per seed would
-        /// either start failing mid-run or name an inode the process never exec'd. Resolve
-        /// it once — see `seed::daemon_exe`.
+        /// Guards the premise `seed::daemon_exe`'s memoization rests on: this lookup is
+        /// path-based, so its answer changes, or disappears, when a package upgrade renames
+        /// a new binary over the running one.
         #[test]
         fn file_id_follows_the_name_not_the_inode() {
             let tmp = tempfile::tempdir().unwrap();
@@ -123,8 +112,9 @@ mod fsid {
                  binary, which the running process never exec'd"
             );
 
-            // …and once the name is gone there is no id to be had by path at all, which is
-            // the `(deleted)` case that made `policy apply` fail after an upgrade.
+            // …and once the name is gone there is no id to be had by path at all: the
+            // `(deleted)` case, where re-resolving would refuse `policy apply` after an
+            // upgrade.
             std::fs::remove_file(&path).unwrap();
             assert!(file_id(&path).is_none(), "a vanished path has no FileId");
         }

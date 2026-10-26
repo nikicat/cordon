@@ -1,8 +1,6 @@
-//! Backend selection. Under the rule model the only backend is `bpf-lsm` (the hardened
-//! Linux boundary), in the `bpf-lsm` cargo feature — **on by default**, so a stock Linux
-//! build has it. The earlier owner-model backends were retired with the rule-model
-//! migration (DESIGN §15). The feature is Linux-only, so `select` only hits the
-//! no-backend error on a non-Linux target or a `--no-default-features` build.
+//! Backend selection. The only backend is `bpf-lsm` (the hardened Linux boundary), in the
+//! `bpf-lsm` cargo feature, which is on by default. The feature is Linux-only, so `select`
+//! only hits the no-backend error on a non-Linux target or a `--no-default-features` build.
 
 use cordon_core::Result;
 use cordon_core::backend::{Backend, BackendKind};
@@ -36,11 +34,10 @@ impl Swept {
     }
 }
 
-/// Disarm enforcement: drop whatever the backend left standing so it could outlive the
-/// daemon.
+/// Disarms enforcement by removing what the backend pinned (see `PinDir::teardown`).
 ///
-/// Separate from `Backend` because it must work with **no backend loaded and no daemon
-/// running** — that is the whole point of `cordond --teardown`.
+/// Separate from `Backend` because `cordond --teardown` runs with no backend loaded and no
+/// daemon running.
 pub fn teardown(cfg: &Config) -> Result<Swept> {
     match cfg.backend {
         BackendKind::BpfLsm => {

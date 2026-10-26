@@ -1,27 +1,12 @@
 //! The control plane → BPF maps: seed the flat rule table (`PROTECTED` / `RULES` /
-//! `RULE_COUNT`) and `SETTINGS` from a compiled policy, plus the typed map-write
-//! helpers.
-//!
-//! ## Atomic apply — the double-buffer (DESIGN §15.8)
-//! The three rule maps are **banked**: each holds two generations, and
-//! `Settings.active_bank` selects the live one. [`Maps::seed`] fills the *inactive*
-//! bank (the kernel never reads it) and then flips `active_bank` in one `SETTINGS`
-//! write — an RCU-style publish, so a re-seed is never half-visible (no clear-then-
-//! insert window). The flip hinges on the 4-byte `active_bank`, which can't tear; since the
-//! daemon identity (`daemon_pid` + `daemon_exe`) never changes after startup, `active_bank`
-//! is the only moving field, so a concurrent reader always observes a fully-populated bank
-//! — never a torn pointer.
+//! `RULE_COUNT`) and `SETTINGS` from a compiled policy ([`Maps::seed`], an atomic bank
+//! flip), plus the typed map-write helpers.
 //!
 //! ## Single writer
 //! Every map write goes through [`Maps`], over the `&mut Ebpf` that the backend thread
-//! alone owns; the CLI has no handle and `apply` requests are serialized through one mpsc channel. So
-//! there is exactly one writer by construction — no userspace write/write race.
-//!
-//! M5's pinning does **not** change that, deliberately: it pins the LSM *links*, never the
-//! maps, and adopts nothing on startup, so every daemon still creates its own private maps
-//! (see [`super::pin`]). Sharing maps across processes is what would reintroduce a
-//! cross-process writer — one daemon's bank fill interleaving another's flip into a torn
-//! table — which is why adopt-existing-pins was dropped rather than guarded.
+//! alone owns; the CLI has no handle, and applies and bless ops reach that thread over one
+//! channel (see `cordon_core::backend::ControlMsg`). No map is shared with another
+//! process either (see [`super::pin`]), so there is exactly one writer by construction.
 
 use aya::maps::{Array, HashMap as BpfHashMap, MapData};
 use aya::{Ebpf, Pod};
@@ -41,13 +26,21 @@ use tracing::{info, warn};
 pub(super) struct Maps<'a>(pub(super) &'a mut Ebpf);
 
 impl Maps<'_> {
-    /// Atomically seed a compiled policy: fill the inactive bank from `compiled`, then flip
-    /// `active_bank` so the kernel switches to it in one update. Used both at startup (from
-    /// the zero-initialized `SETTINGS`, so the first fill targets bank 1) and on every
-    /// `cordon policy apply`.
+    /// Seeds a compiled policy atomically (DESIGN §15.8). The three rule maps are banked:
+    /// each holds two generations, and `Settings.active_bank` selects the live one (see
+    /// [`Bank`]). This fills the inactive bank, which the kernel never reads, then flips
+    /// `active_bank` in one `SETTINGS` write, so a re-seed is never half-visible (no
+    /// clear-then-insert window). The flip hinges on the 4-byte `active_bank`, which can't
+    /// tear, and since the daemon identity in the same record never changes after startup,
+    /// `active_bank` is its only moving field: a concurrent reader always sees a fully
+    /// populated bank.
+    ///
+    /// Used both at startup (from the zero-initialized `SETTINGS`, so the first fill
+    /// targets bank 1) and on every `cordon policy apply`.
+    ///
+    /// Errors when `compiled` holds more than `MAX_OBJECTS` objects, or a map write fails.
     pub(super) fn seed(&mut self, compiled: &CompiledPolicy) -> Result<()> {
-        // Compile already reports this as an error, which refuses the apply; this guards
-        // the slot arithmetic against a caller that seeds anyway.
+        // Guards the slot arithmetic against a caller that seeds a policy compile refused.
         if compiled.objects.len() > MAX_OBJECTS {
             return Err(Error::msg(format!(
                 "bpf-lsm: {} protected objects exceed MAX_OBJECTS ({MAX_OBJECTS})",
@@ -70,7 +63,7 @@ impl Maps<'_> {
             }
         }
 
-        // The flip: publish the freshly-filled bank in one write.
+        // The flip.
         self.set_settings(Pid(std::process::id()), daemon_exe()?, target)?;
 
         info!(
@@ -122,9 +115,8 @@ impl Maps<'_> {
             .context("bpf-lsm: remove rule count")
     }
 
-    /// Register a live blessing: the carrier cgroup's id → its class. `MAP_BLESSED` is
-    /// **unbanked** (blessings are runtime state, not policy — an apply remaps values in
-    /// place by class name rather than re-seeding a generation).
+    /// Registers a live blessing: the carrier cgroup's id → its class. Written in place,
+    /// never through a bank (see [`MAP_BLESSED`]).
     pub(super) fn blessed_insert(&mut self, cgroup: CgroupId, class: ClassId) -> Result<()> {
         self.hash::<CgroupId, ClassId>(MAP_BLESSED)?
             .insert(cgroup, class, 0)
@@ -143,8 +135,8 @@ impl Maps<'_> {
             .with_context(|| format!("bpf-lsm: set rule[{index}]"))
     }
 
-    /// Set the one-element `SETTINGS` record: the fast-allowed daemon identity and the live
-    /// bank. Writing this with a flipped `bank` is the atomic policy publish.
+    /// Sets the one-element `SETTINGS` record: the fast-allowed daemon identity and the
+    /// live bank.
     pub(super) fn set_settings(&mut self, pid: Pid, exe: FileId, bank: Bank) -> Result<()> {
         self.array::<Settings>(MAP_SETTINGS)?
             .set(0, Settings::new(pid, bank, exe), 0)

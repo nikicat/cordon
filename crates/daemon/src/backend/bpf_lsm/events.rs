@@ -2,13 +2,9 @@
 //! them out. The verdict already happened in-kernel; this is the audit/observability
 //! path.
 //!
-//! **Event coalescing** (M1 §1g): tools re-open the same config hundreds of times per
-//! run. The in-kernel suppressor already throttles the ring to ~one record per
-//! [`SuppressKey`](cordon_bpf_common::SuppressKey) per second (carrying a folded
-//! `suppressed` count); here we collapse whatever a single drain *does* surface — one
-//! journal line per [`coalesce`] key, with the folded counts — so a burst never becomes a
-//! wall of identical log lines. Both layers together turn the audit's ~hundreds-of-opens
-//! floods into a line.
+//! Tools re-open the same config hundreds of times per run. The in-kernel suppressor
+//! (keyed by [`SuppressKey`](cordon_bpf_common::SuppressKey)) thins the ring, and
+//! [`coalesce`] folds whatever one drain still surfaces, so a burst becomes one line.
 
 use super::bless::Blessings;
 use super::seed::Maps;
@@ -38,8 +34,7 @@ use tracing::{error, info, warn};
 const POLL_TIMEOUT_MS: u16 = 500;
 
 /// The backend thread's per-run state beside the `Ebpf` handle: the journal's object
-/// names, the class registry, and the live blessings table. One
-/// bundle, one owner — every mutation happens on this thread.
+/// names, the class registry, and the live blessings table. Mutated only on that thread.
 pub(super) struct Runtime {
     /// `inode → path` for naming protected objects in the journal.
     pub object_paths: HashMap<FileId, PathBuf>,
@@ -94,8 +89,7 @@ pub(super) fn serve(
         match poll(&mut fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
             Ok(0) => {} // timeout → re-check shutdown + apply channel
             Ok(_) => {
-                // Drain the whole ready batch, then coalesce identical decisions into
-                // one journal line each (the in-kernel suppressor already thinned it).
+                // Drain the whole ready batch, then coalesce it.
                 let mut batch: Vec<DecisionEvent> = Vec::new();
                 while let Some(item) = ring.next() {
                     match parse_event(&item) {
@@ -116,9 +110,8 @@ pub(super) fn serve(
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(Error::msg(format!("bpf-lsm: poll: {e}"))),
         }
-        // Service the control messages that arrived since the last tick. One channel
-        // for applies AND bless ops: strict ordering is what makes the apply-time
-        // remap safe (a mint can't interleave with the renumbering).
+        // Service the control messages that arrived since the last tick, in order (see
+        // `ControlMsg` for why applies and bless ops share one channel).
         while let Ok(msg) = control.msg_rx.try_recv() {
             match msg {
                 ControlMsg::Apply(req) => {
@@ -158,10 +151,9 @@ fn bless_op(maps: &mut Maps, runtime: &mut Runtime, op: BlessOp) {
     }
 }
 
-/// Handle one `policy apply`: recompile the text, and if it has no errors re-seed the
-/// maps via the atomic double-buffer swap ([`Maps::seed`]) and republish
-/// the effective view. Always replies with the diagnostics so the CLI can show them
-/// whether or not it applied.
+/// Handles one `policy apply`: recompiles the text and, if it has no errors, re-seeds the
+/// maps ([`Maps::seed`]) and republishes the effective view. Always replies with the
+/// diagnostics so the CLI can show them whether or not it applied.
 fn apply(
     maps: &mut Maps,
     control: &PolicyControl,
@@ -177,9 +169,7 @@ fn apply(
             Ok(()) => {
                 *control.current.lock().unwrap() = Some(super::build_view(&compiled));
                 runtime.refresh(&compiled);
-                // The keystone: this compile renumbered ClassIds (dense, name-sorted),
-                // so every live blessing's MAP_BLESSED value must be re-pointed **by
-                // class name** — or a live blessing silently changes meaning.
+                // This compile renumbered the ClassIds (see `Blessings::remap`).
                 runtime.blessings.remap(maps, &runtime.classes);
                 info!(objects = compiled.objects.len(), "policy applied");
                 true
@@ -196,11 +186,9 @@ fn apply(
     });
 }
 
-/// A drain batch's worth of ring events sharing one `(exe, leaf, action, blessing)`
-/// identity, folded into a single journal record. `events` is how many ring records were folded
-/// (each one open that passed the in-kernel suppressor); `suppressed` is the sum of
-/// their in-kernel folded counts. `count` (their sum) is the true number of opens the
-/// burst represents.
+/// One [`coalesce`] key's worth of a drain batch, folded into a single journal record.
+/// `events` is how many ring records were folded (each one open that passed the in-kernel
+/// suppressor); `suppressed` is the sum of their in-kernel folded counts.
 struct Coalesced {
     exe: FileId,
     /// The matched protected object (the rule's `where`) — for the `object=` field.
@@ -211,12 +199,11 @@ struct Coalesced {
     /// `deny`/`audit` message word, and names the cause (DESIGN §15.6).
     policy: Policy,
     pid: Pid,
-    /// The caller's real uid (representative, like `pid` — the in-kernel suppressor keys on
-    /// `(exe, leaf, action)` regardless of uid, so a group can only carry one).
+    /// The caller's real uid (representative, like `pid`: uid is not part of the
+    /// [`coalesce`] key, so a group can only carry one).
     uid: Uid,
     /// The caller's resolved blessing class ([`ClassId::UNBLESSED`] when none). Part of the
-    /// coalesce key — a blessed and an unblessed burst mean different things and must not
-    /// fold — and rendered as `blessing=<name>` on the line, only when blessed.
+    /// [`coalesce`] key, and rendered by [`BlessingName`].
     blessing: ClassId,
     /// The opened file's path components (leaf-first) + how many are valid + truncation,
     /// for the `path=` field. Carried verbatim from the representative event.
@@ -234,13 +221,10 @@ impl Coalesced {
         Opens(u64::from(self.events) + u64::from(self.suppressed))
     }
 
-    /// Journal it at the level its decision warrants. The fields are typed (`user` via
-    /// [`CallerUser`], `object`/`path` via [`AuditPath`], `action`/`exe` via their own
-    /// `Display`); `tracing` renders them lazily — no eager `String`s. For a regular user
-    /// (DESIGN §15.8) a path under their home renders as `~/…`, so a `deny` line drops
-    /// straight into that user's policy. A blessed caller gets a trailing `blessing=<name>`
-    /// (bless is loud, DESIGN §16.3); the unblessed line stays byte-identical to before the
-    /// field existed.
+    /// Journals it at the level its decision warrants. The fields are typed (`user` via
+    /// [`CallerUser`], `object`/`path` via [`AuditPath`], `blessing` via [`BlessingName`],
+    /// `action`/`exe` via their own `Display`); `tracing` renders them lazily, with no
+    /// eager `String`s. An unblessed line carries no `blessing` field.
     fn log(
         &self,
         object_paths: &HashMap<FileId, PathBuf>,
@@ -275,12 +259,13 @@ impl Coalesced {
     }
 }
 
-/// Collapse a drain batch to one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
-/// summing the ring-record count and the in-kernel suppressed totals. Keyed on the opened
-/// file (`leaf`), matching the in-kernel suppressor, so distinct files under one audited
-/// root each get their own journal line (DESIGN §15.10 flow B); split by blessing so a
-/// blessed access never folds into (or hides behind) an unblessed one. Insertion order is
-/// preserved (first occurrence wins the representative decision/pid/path). Pure — the
+/// Collapses a drain batch to one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
+/// summing the ring-record count and the in-kernel suppressed totals, so the true volume of
+/// a record is [`Coalesced::count`]. Keyed on the opened file (`leaf`), matching the
+/// in-kernel suppressor, so distinct files under one audited root each get their own
+/// journal line (DESIGN §15.10 flow B); split by blessing (bless is loud, DESIGN §16.3) so
+/// a blessed access never folds into, or hides behind, an unblessed one. Insertion order
+/// is preserved (first occurrence wins the representative decision/pid/path). Pure: the
 /// `/proc` resolution and logging happen later, per record.
 fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
     let mut records: Vec<Coalesced> = Vec::new();
@@ -314,10 +299,10 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
 }
 
 /// The caller's user in the journal: the login name resolved from the kernel-captured uid
-/// (via the [`Passwd`] cache), plus — when it's a *regular* account (DESIGN §15.8) — that
-/// user's home, so a path under it collapses to `~` and the line drops into the user's
-/// policy. Falls back to the bare uid when passwd has no entry (a deleted or NSS-only
-/// account). Borrows the cache, so naming a caller costs no allocation.
+/// (via the [`Passwd`] cache), plus the home [`AuditPath`] collapses to `~`, which
+/// `Passwd` gives only for a regular account. Falls back to the bare uid when passwd has
+/// no entry (a deleted or NSS-only account). Borrows the cache, so naming a caller costs
+/// no allocation.
 enum CallerUser<'a> {
     Named {
         name: &'a UserName,
@@ -419,8 +404,7 @@ impl fmt::Display for CallerExe {
 
 /// The protected object in the journal: its policy **path** when the daemon knows the
 /// inode (it seeded the object from that path), else the raw inode. Same "path *or* inode,
-/// kept distinct" modelling as [`CallerExe`] — there's no path at the `file_open` hook, so
-/// the kernel only ever hands us the `FileId`.
+/// kept distinct" modelling as [`CallerExe`]; the kernel only ever hands us the `FileId`.
 enum ObjectName {
     Path(PathBuf),
     Inode(FileId),
@@ -445,10 +429,9 @@ impl ObjectName {
 
 /// The **actual opened file** in the journal (DESIGN §15.10 flow B): the protected
 /// object's known path with the kernel-reconstructed relative path joined on
-/// (`object=~/.aws` + `config` → `path=~/.aws/config`). The kernel walks `d_name` since
-/// `bpf_d_path` is unavailable at `file_open`. Falls back to the relative path alone (then
-/// the inode) when the object's base path is unknown — same "best identity we have" stance
-/// as [`ObjectName`].
+/// (`object=~/.aws` + `config` → `path=~/.aws/config`; see [`DecisionEvent::comps`]).
+/// Falls back to the relative path alone (then the inode) when the object's base path is
+/// unknown — same "best identity we have" stance as [`ObjectName`].
 enum OpenedPath {
     Path(PathBuf),
     Inode(FileId),
@@ -474,9 +457,10 @@ impl OpenedPath {
     }
 }
 
-/// A resolved audit path as it prints in the journal, with a *regular* user's home
-/// collapsed to `~` (DESIGN §15.8) so `object=`/`path=` read exactly as that user's policy
-/// would author them — copy-paste from a `deny` line straight into the user's policy.
+/// A resolved audit path as it prints in the journal, with a regular user's home
+/// collapsed to `~` (DESIGN §15.8; which uids count is `cordon_core::passwd`'s call) so
+/// `object=`/`path=` read exactly as that user's policy would author them: a `deny` line
+/// copies straight into the user's policy.
 /// Both [`ObjectName`] and [`OpenedPath`] lower to this, so the two fields collapse
 /// identically; the inode fallback (no known path) passes through. `home` is `None` for
 /// root/system callers and unresolvable uids, leaving their paths absolute.
@@ -541,7 +525,7 @@ mod tests {
     const OBJECT: FileId = FileId::new(Dev(1), Ino(100));
 
     /// A `DecisionEvent` for the given exe + **opened file (leaf)** inodes, action, and
-    /// in-kernel suppressed count — the coalesce key is `(exe, leaf, action)`.
+    /// in-kernel suppressed count, unblessed.
     fn ev(exe: Ino, leaf: Ino, action: Action, suppressed: Suppressed) -> DecisionEvent {
         DecisionEvent::new(
             Pid(1),

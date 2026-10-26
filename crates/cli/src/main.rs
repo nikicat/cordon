@@ -2,8 +2,7 @@
 //!
 //! Policy is authored in a root-owned text file. `policy check` lints a file locally
 //! (no daemon); `policy apply` sends its text to the daemon, which compiles + seeds
-//! the in-kernel maps; `policy show` and `status` read the effective policy. There are
-//! no per-object owner mutations — the owner model was retired with the rule model.
+//! the in-kernel maps; `policy show` and `status` read the effective policy.
 
 mod bless;
 mod edit;
@@ -47,9 +46,8 @@ enum Cmd {
     /// Run a command under a fresh blessing; also `bless list` / `bless revoke <id>`.
     /// Runs as you — no `sudo` prefix; the human-presence check is a helper it spawns.
     Bless(bless::BlessArgs),
-    /// Internal: approve a pending blessing. `cordon bless` spawns this under
-    /// `$CORDON_SUDO` so it reaches the daemon as root — which *is* the proof a human
-    /// authenticated (DESIGN §16.5). Never invoked by hand; hidden from `--help`.
+    /// Internal: approve a pending blessing. Spawned by `cordon bless` (see
+    /// `bless::elevate`), never invoked by hand; hidden from `--help`.
     #[command(hide = true)]
     BlessHelper {
         #[arg(long)]
@@ -78,7 +76,7 @@ enum PolicyCmd {
     /// daemon accepts it, or saved unapplied when no daemon is running. Run via `sudo` for
     /// a root-owned policy.
     ///
-    /// With nothing named, edits **your own user tier**; `--system` edits the system policy.
+    /// With nothing named, edits your own user tier; `--system` edits the system policy.
     Edit {
         #[command(flatten)]
         target: edit::EditTargetArgs,
@@ -118,14 +116,13 @@ fn main() -> ExitCode {
         return edit::run(target.clone(), root_editor, &client);
     }
 
-    // `bless` drives its own flow (mint → fork into the carrier → drop → exec); its
-    // `list`/`revoke` subcommands come back through `run_request` like any other.
+    // `bless` drives its own flow (see `bless::run`); its `list`/`revoke` subcommands
+    // come back through `run_request` like any other.
     if let Cmd::Bless(args) = &cli.cmd {
         return bless::run(args, &client);
     }
 
-    // The approval half of the bless handshake: one request, and what makes it count is
-    // the uid it arrives from, not anything it says.
+    // The approval half of the bless handshake (see `bless::elevate`).
     if let Cmd::BlessHelper { nonce } = &cli.cmd {
         return client.run_request(&Request::BlessApprove {
             nonce: nonce.clone(),
@@ -198,10 +195,6 @@ impl<'a> Client<'a> {
             Err(e) => {
                 eprintln!("cordon: {e}");
                 eprintln!("       (is cordond running? socket: {})", socket.display());
-                // A dead daemon is not a dead boundary: since M5 the LSM links are pinned,
-                // so enforcement outlives the process. Saying nothing here would let
-                // "connection refused" read as "nothing is being enforced" — the opposite
-                // of the truth.
                 eprintln!("       {}", self.enforcement_note());
                 return ExitCode::FAILURE;
             }
@@ -218,13 +211,17 @@ impl<'a> Client<'a> {
         exit_for(&resp)
     }
 
-    /// What the bpffs pins say about enforcement when the daemon can't be reached.
+    /// Returns what the bpffs pins say about enforcement, for when the daemon can't be
+    /// reached.
     ///
-    /// Three honest answers, because the wrong one is dangerous in both directions:
+    /// The pinned LSM links keep the boundary up without the daemon (see
+    /// `PinDir::pin_links` in cordond), so "connection refused" must not read as "nothing
+    /// is enforced". There are three answers, because a wrong one misleads either way:
     /// claiming the boundary is up when it isn't invites a false sense of safety, and
     /// claiming it is down when it is up sends someone debugging a denial that is working
-    /// as designed. bpffs is root-only, so an unprivileged caller gets "unknown" rather
-    /// than a guess.
+    /// as designed. Pins present means active; an absent or empty pin directory means off;
+    /// an unreadable one (bpffs is root-only, so any unprivileged caller) or an unreadable
+    /// config means unknown rather than a guess.
     fn enforcement_note(&self) -> String {
         let Ok(cfg) = self.config() else {
             return "enforcement state unknown (no readable config)".into();
@@ -243,7 +240,7 @@ impl<'a> Client<'a> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 format!("no pins under {} — enforcement is OFF", dir.display())
             }
-            // Almost always EACCES: bpffs is root-owned, so this is the unprivileged path.
+            // Almost always EACCES.
             Err(_) => format!(
                 "enforcement state unknown — {} is not readable as this user",
                 dir.display()
@@ -261,9 +258,8 @@ fn build_request(client: &Client) -> Result<Request> {
             PolicyCmd::Show => Ok(Request::PolicyShow),
             PolicyCmd::Apply { file } => {
                 let path = client.policy_path(file.as_deref())?;
-                // Read the policy source (a file, or a conf.d dir of fragments) and expand
-                // any `[[include]]` user-tier files; ship the lot. The daemon resolves
-                // per-fragment homes, merges, and compiles.
+                // Ship every source `load_policy` gathers; the daemon compiles them (see
+                // `compile_fragments`).
                 let sources = policy::load_policy(&path)?;
                 Ok(Request::PolicyApply { sources })
             }
@@ -285,9 +281,6 @@ fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A file → one fragment; a conf.d dir → every `*.toml`; plus any `[[include]]`
-    // user-tier files. Each resolves with its own home (the owning user's, else the CLI
-    // `$HOME`); per-fragment errors fold into the compile diagnostics, naming the fragment.
     let sources = match policy::load_policy(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -380,9 +373,8 @@ fn render(resp: &Response) {
         // `bless-helper` succeeding is silent on purpose — it is spawned mid-command, not
         // run by a human, and its whole output is its exit status.
         Response::BlessApproved => {}
-        // Both halves of the mint hand-off are consumed inside `bless`'s own connection
-        // (they carry a descriptor and a handshake state this renderer has no use for), so
-        // reaching here at all means a client got its protocol wrong.
+        // Mid-handshake replies belong to `cordon bless`'s own connection; reaching here
+        // means a client got the protocol wrong.
         Response::BlessPending { .. } | Response::BlessMinted(_) => {
             eprintln!("cordon: unexpected mid-handshake reply outside `cordon bless`")
         }

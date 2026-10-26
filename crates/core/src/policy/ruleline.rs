@@ -21,8 +21,7 @@
 //!
 //! This module is *only* surface syntax: each field becomes the same [`Token`] list a
 //! `[[rule]]` field produces, so [`super::resolve`] and everything downstream are
-//! unchanged. The literal-string content is a verbatim slice of the source, so byte
-//! offsets here map to exact file positions for diagnostics.
+//! unchanged.
 
 use super::parse::{ParsedRule, Token};
 use super::{LineIndex, PolicyName};

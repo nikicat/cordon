@@ -2,21 +2,14 @@
 //!
 //! A blessing is a **carrier cgroup** (`cordon-bless-<id>.<class>`, placed by
 //! [`carrier_parent`]) whose kernel id is registered in `MAP_BLESSED` → the class's dense
-//! [`ClassId`]. The unprivileged CLI joins the target to it through the carrier's
-//! `cgroup.procs` descriptor, which the daemon opens as root and passes back; membership
-//! is the boundary — the dirs are root-owned, so a non-root process can't join otherwise.
+//! [`ClassId`]. Every mutation runs on the backend thread, through the same single writer
+//! as the rule maps (see [`Maps`]).
 //!
-//! Backend-thread state, like the rule maps: every mutation (mint / revoke / GC /
-//! remap / reconcile) runs on the backend thread via the one control channel, so the
-//! single-writer discipline holds for `MAP_BLESSED` too.
-//!
-//! Lifecycle: **mint** (mkdir + register) → the CLI joins the target → … → the last
-//! member exits (`cgroup.events populated 0`) → **GC** (unregister + rmdir). A mint
-//! grace window covers the gap where a fresh carrier is still empty because the CLI
-//! hasn't joined the target yet; `revoke` kills the whole carrier tree (`cgroup.kill`)
-//! and lets the same GC finish. At startup, **reconcile** adopts leftover carriers
-//! from a previous daemon run (its map entries died with it — a blessing only ever
-//! grants again if its class is still declared).
+//! Lifecycle: [`Blessings::mint`] → the CLI joins the target → … → the last member exits
+//! (`cgroup.events populated 0`) → [`Blessings::gc`] (unregister + rmdir).
+//! [`Blessings::revoke`] kills the carrier tree and lets the same GC finish. An apply
+//! re-points live blessings ([`Blessings::remap`]); at startup [`Blessings::reconcile`]
+//! adopts the carriers a previous run left behind.
 
 use super::seed::Maps;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
@@ -29,9 +22,10 @@ use tracing::{debug, info, warn};
 
 /// How long a fresh, never-populated carrier is left alone before GC may reap it.
 /// Load-bearing: a carrier is empty from mint until the CLI's `pre_exec` writes the
-/// target pid into it — without the grace, the 500ms GC tick would reap it first.
-/// Generous because the cost of a leak is one empty cgroup dir for 30s; a CLI that
-/// died before joining is cleaned up right after.
+/// target pid into it, and GC runs on every serve tick (`POLL_TIMEOUT_MS`, 500ms), so
+/// without the grace it would reap the carrier first. Generous because the cost of a leak
+/// is one empty cgroup dir for 30s; a CLI that died before joining is cleaned up right
+/// after.
 const MINT_GRACE: Duration = Duration::from_secs(30);
 
 /// The cgroup2 mount. Both the daemon's own cgroup and a requester's session scope are
@@ -60,20 +54,18 @@ struct Blessing {
     /// The daemon-assigned handle (`bless list`/`revoke <id>`); also embedded in the
     /// carrier's directory name, which is how it survives a daemon restart.
     id: BlessId,
-    /// The blessing class it was minted for — the *name* is the durable identity: an
-    /// apply renumbers `ClassId`s, and [`Blessings::remap`] re-resolves this name.
+    /// The blessing class it was minted for. The *name* is the durable identity (see
+    /// [`Blessings::remap`]).
     class: ClassName,
-    /// The carrier cgroup directory (root-owned; membership is the boundary).
+    /// The carrier cgroup directory (root-owned, see [`Blessings::mint`]).
     dir: PathBuf,
-    /// Who asked for it — the requester's kernel-attested uid. Only they and root may
-    /// revoke it. A blessing adopted from a previous daemon run has no recorded owner
-    /// (`None`): the requester is long gone, so revoking it is root's call.
+    /// Who asked for it: the requester's kernel-attested uid, checked by [`may_revoke`].
+    /// `None` for a blessing adopted from a previous daemon run.
     owner: Option<Uid>,
     /// The carrier's kernel cgroup id — the `MAP_BLESSED` key.
     cgroup: CgroupId,
-    /// Whether a `MAP_BLESSED` entry currently exists for it. `false` when the class
-    /// vanished on an apply: the entry is inert (grants nothing) but kept for GC —
-    /// never kill a tree just because policy changed under it.
+    /// Whether a `MAP_BLESSED` entry currently exists for it. `false` once its class
+    /// vanished (see [`Remap`]): the blessing grants nothing but is kept for GC.
     registered: bool,
     /// The carrier has had a member at some point — from then on, `populated 0` means
     /// "everything exited", not "the CLI hasn't joined yet".
@@ -104,9 +96,11 @@ impl Blessings {
         }
     }
 
-    /// Mint a blessing: create the carrier cgroup, register it in `MAP_BLESSED`, and
-    /// return it together with its `cgroup.procs` opened for write. The caller execs the
-    /// target into the carrier by writing the child's pid through that fd.
+    /// Mints a blessing: creates the carrier cgroup as root, registers it in
+    /// `MAP_BLESSED`, and returns it together with its `cgroup.procs` opened for write.
+    /// The caller execs the target into the carrier by writing the child's pid through that
+    /// fd. Membership is the boundary: the carrier is root-owned, so a non-root process can
+    /// write its `cgroup.procs` only through that descriptor.
     pub(super) fn mint(
         &mut self,
         maps: &mut Maps,
@@ -132,8 +126,7 @@ impl Blessings {
         }
 
         let id = self.next;
-        // In the requester's own session scope or user slice where possible, so the
-        // blessed process keeps its logind session and polkit/run0 keep working inside it.
+        // In the requester's own user subtree where possible (see `carrier_parent`).
         let dir = carrier_parent(requester, root).join(dir_name(id, &class));
         std::fs::create_dir(&dir).with_context(|| format!("bless: mkdir {}", dir.display()))?;
         // The carrier's kernel cgroup id: cgroup2 (kernfs) guarantees st_ino == the id
@@ -148,9 +141,7 @@ impl Blessings {
             }
         };
         // Open `cgroup.procs` here, as root, before handing anything back: this fd *is*
-        // the grant (DESIGN §16.4). cgroup-v2 checks migration permission against the
-        // opener's credentials, so the unprivileged CLI can write its child's pid through
-        // it without ever holding privilege — and never needs the path at all.
+        // the grant (see `CarrierProcs`).
         let procs = match std::fs::File::options()
             .write(true)
             .open(dir.join("cgroup.procs"))
@@ -208,10 +199,11 @@ impl Blessings {
             .collect()
     }
 
-    /// Kill a blessing's carrier tree (`cgroup.kill`); the regular GC observes the
+    /// Kills a blessing's carrier tree (`cgroup.kill`); the regular GC observes the
     /// resulting `populated 0` and finishes (unregister + rmdir).
     ///
-    /// `by` is the caller's kernel-attested uid — root, or the uid that minted it.
+    /// Errors when there is no such blessing or `by` (the caller's kernel-attested uid)
+    /// may not revoke it ([`may_revoke`]); both read the same.
     pub(super) fn revoke(&mut self, id: BlessId, by: Uid) -> Result<()> {
         let b = self
             .live
@@ -233,10 +225,9 @@ impl Blessings {
         Ok(())
     }
 
-    /// Reap dead carriers — run on every serve tick (≤500ms cadence). A carrier is
-    /// reaped once it reads `populated 0` *and* that emptiness is meaningful:
-    /// something ran and exited, it was revoked, or the mint grace expired (the CLI
-    /// died before joining). Reaping = `MAP_BLESSED` remove + rmdir + drop.
+    /// Reaps dead carriers; runs on every serve tick. A carrier is reaped once it reads
+    /// `populated 0` *and* that emptiness is meaningful ([`should_reap`]). Reaping =
+    /// `MAP_BLESSED` remove + rmdir + drop.
     pub(super) fn gc(&mut self, maps: &mut Maps) {
         self.live.retain_mut(|b| {
             match read_populated(&b.dir) {
@@ -259,11 +250,10 @@ impl Blessings {
         });
     }
 
-    /// Re-point every live blessing at the new compile's `ClassId`s — **by class
-    /// name**. Called from the apply path: `policy apply` renumbers ids (dense,
-    /// name-sorted), so without this a live blessing silently changes meaning. A
-    /// vanished class unregisters the map entry (the blessing grants nothing) but the
-    /// carrier is left to GC — never kill the tree because policy changed under it.
+    /// Re-points every live blessing at the new compile's `ClassId`s, **by class name**.
+    /// Called from the apply path: every compile renumbers the ids (see `ClassRegistry`),
+    /// so without this a live blessing silently changes meaning. What each blessing's
+    /// entry becomes is [`remap_plan`]'s decision.
     pub(super) fn remap(&mut self, maps: &mut Maps, registry: &ClassRegistry) {
         for b in &mut self.live {
             match remap_plan(b.registered, registry.id(&b.class)) {
@@ -292,21 +282,13 @@ impl Blessings {
         }
     }
 
-    /// Adopt carriers left over from a previous daemon run (its `MAP_BLESSED` entries
-    /// died with it — the map is not pinned). Empty leftovers are removed; a populated
-    /// carrier whose class is still declared is re-registered (a blessing only ever
-    /// *grants*, and its class was human-authorized); a populated carrier of a
-    /// vanished class is adopted inert, for GC only. Never fails startup.
-    ///
-    /// **Only root-owned directories are adopted.** Re-registering is a *grant*, so this
-    /// has to be at least as strict as [`carrier_parent`], which refuses to create a
-    /// carrier under a parent it doesn't trust. Every legitimate carrier was created by
-    /// this daemon and is root-owned; anything else in the search space was planted, and
-    /// adopting it would register a cgroup whose membership someone else controls —
-    /// self-bless. Unreachable on a default systemd (every scanned level is root-owned
-    /// and unwritable), which is exactly why it is worth asserting rather than assuming:
-    /// a `Delegate=yes` drop-in or a wider [`carrier_roots`] would make it reachable
-    /// without anything here looking different.
+    /// Adopts the carriers a previous daemon run left behind, searching
+    /// [`carrier_roots`]. This run's `MAP_BLESSED` starts empty (see `PinDir::pin_links`),
+    /// so nothing grants until this re-registers it. Only [`adoptable`] (root-owned)
+    /// carriers are considered. Empty leftovers are removed; a populated carrier whose
+    /// class is still declared is re-registered (a blessing only ever *grants*, and its
+    /// class was human-authorized); a populated carrier of a vanished class is adopted
+    /// inert, for GC only. Never fails startup.
     pub(super) fn reconcile(&mut self, maps: &mut Maps, registry: &ClassRegistry) {
         let Some(root) = self.root.clone() else {
             return;
@@ -315,8 +297,8 @@ impl Blessings {
             .iter()
             .flat_map(|dir| scan(dir))
         {
-            // One stat serves both checks: who owns it, and its inode — which on cgroup2
-            // *is* the id `bpf_get_current_cgroup_id()` reports.
+            // One stat serves both checks: who owns it, and its inode, which is the cgroup
+            // id (see `Blessings::mint`).
             let meta = match std::fs::metadata(&found.dir) {
                 Ok(meta) => meta,
                 Err(e) => {
@@ -388,7 +370,7 @@ fn reap(maps: &mut Maps, b: &Blessing) {
 
 /// Checks whether `by` may revoke a blessing that `owner` minted. Root always may, and
 /// otherwise only the minting uid. A blessing adopted by reconcile has no recorded owner,
-/// because its requester died with the previous daemon, so only root may revoke it.
+/// because its requester is gone with the previous daemon, so only root may revoke it.
 fn may_revoke(owner: Option<Uid>, by: Uid) -> bool {
     by == Uid::ROOT || owner == Some(by)
 }
@@ -402,6 +384,8 @@ fn should_reap(saw_populated: bool, revoked: bool, age: Duration) -> bool {
 
 /// The pure remap decision for one live blessing on `policy apply`: what its
 /// (possibly renumbered / vanished) class name now means for its `MAP_BLESSED` entry.
+/// The carrier itself is never killed because policy changed under it; an inert one is
+/// left to GC.
 enum Remap {
     /// Class still declared → (re-)insert with the new id. Unconditional: the insert
     /// is idempotent and also heals a previously-failed remove/insert.
@@ -521,8 +505,7 @@ fn valid_class_dirname(class: &str) -> bool {
 /// The path is **relative to the cgroup2 mount** despite its leading slash — `/` alone
 /// *is* the root — so it reaches the filesystem only through [`CgroupPath::under`], never
 /// a bare `join`, which would discard the base. That is the whole reason this is a type:
-/// as a `&Path` it is indistinguishable from an absolute one, and the two joins that need
-/// the distinction used to spell it out separately.
+/// as a `&Path` it is indistinguishable from an absolute one.
 #[derive(Debug, PartialEq, Eq)]
 struct CgroupPath(PathBuf);
 
@@ -591,10 +574,15 @@ fn carrier_root() -> Result<PathBuf> {
         .map_err(|reason| Error::msg(format!("/proc/self/cgroup: {reason}")))
 }
 
-/// Whether a leftover carrier directory may be adopted by [`Blessings::reconcile`] — the
-/// same trust question [`usable_session_scope`] asks of a parent, asked of the carrier
-/// itself. Root-owned only: this daemon creates carriers as root, so anything else was
-/// planted by whoever owns it.
+/// Checks whether a leftover carrier directory may be adopted by [`Blessings::reconcile`].
+/// Adoption re-registers the carrier, which is a grant, so it is held to the same trust
+/// check [`carrier_parent`] applies to a parent: root-owned only. This daemon creates
+/// carriers as root, so anything else in the search space was planted, and adopting it
+/// would register a cgroup whose membership someone else controls (self-bless).
+/// Unreachable on a default systemd, where every scanned level is root-owned and
+/// unwritable, which is why it is asserted rather than assumed: a `Delegate=yes` drop-in
+/// or a wider [`carrier_roots`] would make it reachable with nothing here looking
+/// different.
 fn adoptable(owner: Uid) -> bool {
     owner == Uid::ROOT
 }
@@ -675,8 +663,8 @@ fn owner_uid(path: &Path) -> Option<Uid> {
 /// running, a non-empty child keeps systemd from removing the enclosing slice or scope at
 /// logout, and — worse — the id allocator never advances past it, so the *next* mint
 /// computes the same `cordon-bless-<id>.<class>` name under the same parent and fails
-/// `EEXIST` forever. That is not hypothetical: widening `CgroupPath::placement` to the
-/// user slice without widening this function did exactly that.
+/// `EEXIST` forever. Widening `CgroupPath::placement` without widening this function is
+/// exactly how that happens.
 fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![daemon_cgroup.to_path_buf()];
     let children = |dir: PathBuf, keep: fn(&str) -> bool| -> Vec<PathBuf> {
@@ -859,11 +847,10 @@ mod tests {
 
     /// Where a carrier goes, from the cgroup shapes that actually occur.
     ///
-    /// The desktop row is the one that matters and the one an earlier version of this got
-    /// wrong: on a modern systemd a terminal is **not** in the session scope — it is under
-    /// the delegated `user@UID.service`, with no session scope anywhere above it. Placing
-    /// only-if-session-scope sent those blessings to the daemon's cgroup, where logind
-    /// cannot attribute the process to a user at all and polkit therefore refuses.
+    /// Guards the desktop row in particular: a terminal under the delegated
+    /// `user@UID.service`, with no session scope above it, must still be placed in its
+    /// user slice rather than fall back to the daemon's cgroup (see
+    /// [`CgroupPath::placement`]).
     #[test]
     fn placement_covers_the_cgroup_shapes_that_actually_occur() {
         let rel = |p: &str| CgroupPath::new(p).placement();
@@ -906,9 +893,7 @@ mod tests {
 
     /// The placement decision end to end, with the filesystem injected — so the
     /// ownership refusal, which is the security-relevant half, is asserted without needing
-    /// a cgroup hierarchy or root. The previous version of this called the real
-    /// `carrier_parent` against `/proc` and `/sys` and could only assert an invariant,
-    /// because what it exercised depended on where the test runner happened to sit.
+    /// a cgroup hierarchy or root, and independently of where the test runner sits.
     #[test]
     fn placement_requires_a_root_owned_parent() {
         let mount = Path::new("/fake/cgroup");
@@ -920,8 +905,7 @@ mod tests {
             resolve_placement(&desktop, mount, root_owned),
             Ok(mount.join("user.slice/user-1000.slice"))
         );
-        // A parent the requester's own user owns is refused: they could rmdir an empty
-        // carrier and mkdir a replacement onto a recycled inode still live in BLESSED.
+        // A parent the requester's own user owns is refused (see `carrier_parent`).
         assert_eq!(
             resolve_placement(&desktop, mount, |_| Some(Uid(1000))),
             Err("chosen parent is not root-owned")
@@ -952,14 +936,11 @@ mod tests {
         assert_eq!(usable_session_scope(Pid(0)), Err("cgroup unreadable"));
     }
 
-    /// **Regression test.** Reconcile's search space must cover every parent
-    /// [`CgroupPath::placement`] can choose — they are two halves of one rule, and
-    /// widening placement to the user slice without widening this left desktop carriers
-    /// unreachable: never reaped, and the id allocator never advancing past them, so the
-    /// next mint collided on the same directory name and failed `EEXIST` forever.
+    /// Guards the pairing [`carrier_roots`] documents: reconcile's search space must cover
+    /// every parent [`CgroupPath::placement`] can choose.
     ///
     /// Asserted as that pairing rather than as a list of paths, so the two cannot drift
-    /// apart again: for each shape a requester can be in, whatever placement picks must be
+    /// apart: for each shape a requester can be in, whatever placement picks must be
     /// somewhere reconcile looks.
     #[test]
     fn reconcile_scans_every_parent_placement_can_choose() {
@@ -998,8 +979,8 @@ mod tests {
         assert_eq!(unique, roots, "reconcile would scan a directory twice");
     }
 
-    /// Adoption is a *grant*, so it is gated on the same trust question placement asks:
-    /// a carrier this daemon did not create as root is not ours to re-register.
+    /// A carrier this daemon did not create as root is not ours to re-register (see
+    /// [`adoptable`]).
     #[test]
     fn only_root_owned_carriers_are_adoptable() {
         assert!(adoptable(Uid::ROOT));

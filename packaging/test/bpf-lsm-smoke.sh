@@ -8,8 +8,8 @@
 # non-root cgroup — the stricter case, since the cgroup2 root is exempt from the "no
 # internal processes" rule).
 #
-# Needs guest-root and a kernel with CONFIG_BPF_LSM=y *and* `bpf` in the active LSM
-# list (boot `lsm=…,bpf`). Run under virtme-ng via packaging/test/run-bpf-lsm-vm.sh.
+# Needs guest-root and the kernel from the README's Requirements. Run under virtme-ng via
+# packaging/test/run-bpf-lsm-vm.sh.
 set -uo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -21,9 +21,9 @@ if ! grep -qw bpf /sys/kernel/security/lsm; then
     echo "       boot with lsm=…,bpf (the hook loads but never mediates otherwise)." >&2
     exit 1
 fi
-# bpffs holds the pinned LSM links, which is how enforcement outlives the daemon (M5).
-# A hard precondition, not a per-scenario SKIP: the daemon pins unconditionally, so
-# without bpffs *nothing* here can run. virtme-ng gives us a bare /sys, so mount it.
+# bpffs holds the pinned LSM links. A hard precondition, not a per-scenario SKIP: the
+# daemon pins unconditionally, so without bpffs *nothing* here can run. virtme-ng gives
+# us a bare /sys, so mount it.
 if [ "$(stat -f -c %t /sys/fs/bpf 2>/dev/null)" != "cafe4a11" ]; then
     mkdir -p /sys/fs/bpf 2>/dev/null
     mount -t bpf bpf /sys/fs/bpf 2>/dev/null
@@ -133,19 +133,16 @@ rule() {
 }
 
 # Write the policy (rules on stdin) + a matching config. Absolute paths only, so no `~`
-# ambiguity. There is no global mode — the per-rule `policy` is the only enforcement
-# level (DESIGN §15.6).
+# ambiguity.
 write_policy() { # rules on stdin
     cat > "$TMP/policy.toml"
     write_config "$TMP/policy.toml"
 }
 
 # Start the daemon (env assignments as args). With `$DCGROUP` set, it is started *inside*
-# that cgroup — the production shape under `Delegate=yes`, where carriers are created in a
-# **nested** cgroup rather than the cgroup2 root. Worth reproducing precisely because the
-# root cgroup is *exempt* from cgroup-v2's "no internal processes" rule and a nested one is
-# not, so this is the stricter case. The daemon must already be in the cgroup when it
-# starts (it resolves its carrier root from /proc/self/cgroup), hence join-then-exec.
+# that cgroup (the nested shape from the header). The daemon must already be in the cgroup
+# when it starts (it resolves its carrier root from /proc/self/cgroup), hence
+# join-then-exec.
 daemon_start() {
     if [ -n "$DCGROUP" ]; then
         mkdir -p "$DCGROUP"
@@ -163,11 +160,10 @@ socket_or_exit() { [ -S "$SOCK" ] || gone "$DPID"; }
 daemon_stop() {
     [ -n "$DPID" ] && { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
     DPID=""
-    # Killing the daemon no longer stops enforcement — the pinned links keep the boundary
-    # up with no process holding it. Without this, each scenario would leave a live
-    # boundary whose PROTECTED entries name inodes the `rm -rf` below is about to free,
-    # and inode reuse would contaminate the next scenario. Runs before the config it reads
-    # is deleted; the singleton lock is free now that the daemon is reaped.
+    # Stopping the daemon does not stop enforcement. Without this, each scenario would
+    # leave a live boundary whose PROTECTED entries name inodes the `rm -rf` below is
+    # about to free, and inode reuse would contaminate the next scenario. Runs before the
+    # config it reads is deleted; the singleton lock is free now that the daemon is reaped.
     [ -n "$TMP" ] && [ -f "$TMP/config.toml" ] && "$CORDOND" --teardown >/dev/null 2>&1
     if [ -n "$DCGROUP" ]; then
         # Best-effort: the daemon's own cgroup is empty once it exits; a carrier that
@@ -176,10 +172,9 @@ daemon_stop() {
         rmdir "$DCGROUP" 2>/dev/null
         DCGROUP=""
     fi
-    # Retried, because teardown is asynchronous: unlinking the pin only drops the link's
-    # last reference and the kernel frees it (detaching the hooks) on a workqueue. Until
-    # that lands the workspace is still protected and the unlink is refused — which is
-    # itself a small proof that the pins were doing their job.
+    # Retried, because teardown is asynchronous (see `PinDir::teardown`). Until it lands
+    # the workspace is still protected and the unlink is refused — itself a small proof
+    # that the pins were doing their job.
     if [ -n "$TMP" ]; then
         wait_until 50 rm -rf "$TMP" 2>/dev/null
     fi
@@ -222,9 +217,8 @@ expect_log() {
     echo "  FAIL: $label — no such log record"; sed 's/^/  daemon| /' "$LOG"; return 1
 }
 expect_allow() { local l="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  OK: $l (allowed)"; else echo "  FAIL: $l — denied, expected ALLOW"; return 1; fi; }
-# Like expect_allow, but tolerant of the teardown lag: the kernel drops a link when its
-# last reference goes, and unlinking the bpffs pin defers that to a workqueue — so the
-# hooks stay attached for a moment after `--teardown` returns.
+# Like expect_allow, but tolerant of the teardown lag: the hooks stay attached for a
+# moment after `--teardown` returns (see `PinDir::teardown`).
 expect_allow_eventually() {
     local l="$1"; shift
     if wait_until 50 "$@" >/dev/null 2>&1; then echo "  OK: $l (allowed)"; return 0; fi
@@ -346,7 +340,7 @@ EOF
     return $fail
 }
 
-# DESIGN §15.6 step 2 / PLAN refinement 2: a concrete subject outranks a `who="*"`
+# DESIGN §15.6 step 2: a concrete subject outranks a `who="*"`
 # catch-all on the SAME object. Both rules sit on $VAULT; without subject-specificity,
 # deny>allow would sort the wildcard deny first and block the owner too. Proven by
 # outcome (no log timing): owner allowed, scraper denied.
@@ -383,10 +377,9 @@ EOF
     return $fail
 }
 
-# Replaces the old global-permissive scenario. There is no enforce/permissive/off mode
-# (DESIGN §15.6): observe-vs-enforce is per object, flipped by editing that object's
-# rule. A `who="*" … audit` catch-all logs every read but blocks nothing; flipping the
-# same rule to `deny` (a runtime `policy apply`) makes the identical access block + log.
+# Observe-vs-enforce is per object, flipped by editing that object's rule. A
+# `who="*" … audit` catch-all logs every read but blocks nothing; flipping the same rule
+# to `deny` (a runtime `policy apply`) makes the identical access block + log.
 scenario_audit_then_deny() {
     echo "### scenario: audit → deny (observe with a catch-all, then enforce by flipping it)"
     ws_new
@@ -437,7 +430,7 @@ EOF
     return $fail
 }
 
-# `cordon policy apply` re-seeds the live maps at runtime via the atomic double-buffer swap
+# `cordon policy apply` re-seeds the live maps at runtime (`Maps::seed`)
 # (a previously-unprotected dir becomes protected with no restart), and `policy show`
 # reflects it.
 scenario_apply() {
@@ -479,8 +472,8 @@ EOF
 }
 
 # a tight loop of identical denied opens collapses to a handful of ring records (the
-# in-kernel 1s suppressor), and the folded `suppressed` count is carried into a record so
-# volume stays visible (M1 §1g).
+# in-kernel suppressor, `throttle`), and the folded `suppressed` count is carried into a
+# record so volume stays visible.
 scenario_coalesce() {
     echo "### scenario: coalescing (a repeat-open burst collapses to a few records + a count)"
     ws_new
@@ -489,9 +482,8 @@ $(rule "$SCRAPER" "$VAULT" read deny)
 EOF
     daemon_start; started || return 1
     local fail=0 n=40
-    # A tight loop of denied reads of the SAME (exe, object, action): the in-kernel
-    # suppressor (1s window) emits the first and folds the rest, so the ring sees a
-    # handful of records, not `n`.
+    # A tight loop of denied reads of the SAME (exe, opened file, action) — one suppressor
+    # key — so the ring sees a handful of records, not `n`.
     for _ in $(seq 1 "$n"); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; done
     # Cross the window, then one more open flushes the held-back count.
     sleep 1.2
@@ -511,9 +503,8 @@ EOF
 }
 
 # audit one exe over a dir; opening distinct files under it yields distinct records each
-# carrying the ACTUAL opened path (DESIGN §15.10 flow B), incl. a depth-2 nested file. The
-# kernel walks d_name (no bpf_d_path at file_open); the suppressor keys on the opened file,
-# so siblings don't coalesce away.
+# carrying the ACTUAL opened path (DESIGN §15.10 flow B), incl. a depth-2 nested file, and
+# siblings don't coalesce away (the suppressor keys on the opened file, see `SuppressKey`).
 scenario_leaf_path() {
     echo "### scenario: leaf-path reconstruction (distinct files surface with their real path)"
     ws_new
@@ -700,12 +691,9 @@ RACER
 }
 
 # --- bless scenarios: shared helpers -----------------------------------------
-# The smoke runs as root, so the CLI is invoked directly (peer uid 0 — the daemon's
-# SO_PEERCRED gate passes), and the blessed child stays root; `bless_unprivileged`
-# covers the real `sudo` shape by setting SUDO_UID/SUDO_GID, which is the *entire*
-# interface between sudo and the CLI (crates/cli/src/bless.rs reads nothing else from it)
-# — the same substitution the policy-edit scenarios already make. All of them run the
-# daemon in a nested cgroup ($DCGROUP), reproducing `Delegate=yes` without systemd.
+# The smoke runs as root, so most bless scenarios invoke the CLI directly (peer uid 0)
+# and the blessed child stays root; `scenario_bless_unprivileged` runs it as an ordinary
+# uid. All of them run the daemon in the nested cgroup $DCGROUP (see the header).
 
 # The daemon's cgroup for the bless scenarios — stands in for the systemd service cgroup.
 BLESS_DCGROUP="/sys/fs/cgroup/cordon-smoke.scope"
@@ -722,12 +710,11 @@ cgroup2_ready() {
         fi
     fi
     DCGROUP="$BLESS_DCGROUP"
-    # `cordon bless` runs unprivileged and proves human presence by spawning
-    # `$CORDON_SUDO cordon bless-helper` and requiring THAT to reach the daemon as root.
+    # `cordon bless` proves human presence through `$CORDON_SUDO` (crates/cli/src/bless.rs).
     # There is no sudo in the guest, and the suite already runs as root, so `env` is a
-    # faithful stand-in: the helper really does connect as uid 0. Scenario 23 replaces
-    # this with a wrapper that elevates from an unprivileged CLI, which is the shape a
-    # real sudo provides.
+    # faithful stand-in: the helper really does connect as uid 0. `fake_sudo_start`
+    # replaces it with a wrapper that elevates from an unprivileged CLI, which is the
+    # shape a real sudo provides.
     export CORDON_SUDO="env"
     return 0
 }
@@ -803,7 +790,8 @@ bless_none_left() { [ -z "$(bless_dirs)" ] && [ -z "$(bless_ids)" ]; }
 # `deny * read V` + `allow @blessed-ro read V` + a second protected V2: a blessed read of V
 # is allowed (a concrete blessing outranks the catch-all), the SAME blessed exe is denied on
 # V2 (the grant's scope is the object column), and the unblessed exe stays denied on V.
-# End-to-end proof that mkdir-inode == bpf_get_current_cgroup_id.
+# This is also the end-to-end proof that the mkdir'd carrier's st_ino equals what
+# bpf_get_current_cgroup_id() sees.
 scenario_bless_scope() {
     echo "### scenario: bless scope (blessed read allowed on V, denied on V2, unblessed denied)"
     ws_new
@@ -829,9 +817,7 @@ EOF
     else
         echo "  FAIL: carrier root is $(bless_root), expected the nested $BLESS_DCGROUP"; fail=1
     fi
-    # The blessed read must outrank the who="*" deny on the same object (B1 decision #5)
-    # — this is also the end-to-end proof that the mkdir'd carrier's st_ino equals what
-    # bpf_get_current_cgroup_id() sees.
+    # The blessed read must outrank the who="*" deny on the same object.
     expect_allow "blessed exe reads V (grant outranks the catch-all deny)" bless_read_as ro "$OWNER" "$SECRET" || fail=1
     expect_deny  "same exe unblessed is denied V"                          read_as "$OWNER" "$SECRET"          || fail=1
     expect_deny  "blessed exe denied V2 (grant scope = the object column)" bless_read_as ro "$OWNER" "$vault2/secret" || fail=1
@@ -897,8 +883,8 @@ EOF
     local fail=0
     # The blessed child spawns a GRANDCHILD to do the read — cgroup membership (hence
     # the blessing) is inherited by the whole tree. The trailing sleep outlives a GC
-    # tick (500ms) so the daemon observes the carrier populated; without that, a fast
-    # exit would defer the reap to the 30s mint grace and stall this scenario.
+    # tick so the daemon observes the carrier populated; without that, a fast exit would
+    # defer the reap to the mint grace (`MINT_GRACE`) and stall this scenario.
     cat > "$TMP/blessed-read.sh" <<EOF
 #!/bin/bash
 bash -c 'exec 3<"$SECRET"'
@@ -980,15 +966,11 @@ EOF
     return $fail
 }
 
-# The B2 inversion, and the regression test for the whole milestone. `cordon bless` now
-# runs as YOU: it never holds privilege, it proves human presence by spawning
-# `$CORDON_SUDO cordon bless-helper` (here a FIFO wrapper that reaches root without
-# setuid or a real sudo), and it joins the carrier through a cgroup.procs DESCRIPTOR the
-# daemon passed over SCM_RIGHTS. Three things follow, and 18–22 can show none of them
-# because they run the CLI as root:
-#   * the blessed child runs as the invoking uid — by construction now, not by a drop;
-#   * an environment variable set before the call SURVIVES into it (the old shape was
-#     re-parented through sudo/run0, which scrubbed the env and cost it $DISPLAY);
+# Runs `cordon bless` as an ordinary uid, with `$CORDON_SUDO` a FIFO wrapper that reaches
+# root without setuid or a real sudo (the design is in crates/cli/src/bless.rs). The other
+# bless scenarios run the CLI as root, so only this one guards that:
+#   * the blessed child runs as the invoking uid;
+#   * an environment variable set before the call survives into it;
 #   * the blessed read still works, which proves an UNPRIVILEGED process successfully
 #     wrote its pid into a root-owned cgroup.procs — the fd-delegation property.
 scenario_bless_unprivileged() {
@@ -1041,8 +1023,7 @@ EOF
         echo "  FAIL: \$CORDON_CANARY=${got_canary:-<empty>} — the environment was scrubbed"; fail=1
     fi
     # And the security property the seam rests on: a faked elevation that never reaches
-    # root produces a non-root helper, whose approval the daemon refuses. Security is the
-    # daemon's uid check, never the client's choice of elevation tool.
+    # root produces a non-root helper, whose approval the daemon refuses.
     local refused="$TMP/refused.log"
     CORDON_SUDO="setpriv --reuid $buid --regid $bgid --clear-groups" \
         "$CORDON" bless --class ro -- /bin/true >"$refused" 2>&1 && fail=1
@@ -1054,11 +1035,9 @@ EOF
     return $fail
 }
 
-# The socket is 0666 so any local user can `connect(2)` — which needs *write*, and without
-# it even the ungated read verbs were root-only in practice, making `cordon bless list`
-# unusable from a user account. The file mode therefore carries NO security weight: the
-# boundary is the daemon's `authorize()` peer-uid gate. This asserts both halves at once —
-# an unprivileged uid can read (status / policy show / bless list) and CANNOT apply.
+# The socket is 0666 and its mode carries no security weight; the daemon's `authorize()`
+# decides. This asserts both halves at once — an unprivileged uid can read (status /
+# policy show / bless list) and CANNOT apply.
 scenario_socket_authz() {
     echo "### scenario: socket authorization — unprivileged reads work, apply is refused"
     ws_new
@@ -1086,7 +1065,7 @@ EOF
     expect_allow "unprivileged policy show" as_uid policy show || fail=1
     expect_allow "unprivileged bless list"  as_uid bless list  || fail=1
     # The write. It must fail *in the daemon*, naming root — not fail to connect, and not
-    # succeed: before this gate existed, "whoever can reach the socket can apply" was true.
+    # succeed: guards against "whoever can reach the socket can apply".
     local out; out="$(as_uid policy apply 2>&1)"
     if [ -n "$out" ] && ! as_uid policy apply >/dev/null 2>&1 && printf '%s' "$out" | grep -q "requires root"; then
         echo "  OK: unprivileged policy apply refused by the daemon (peer uid gate)"
@@ -1096,13 +1075,8 @@ EOF
     return $fail
 }
 
-# `cordon bless` hands the nonce it receives to a process it is about to elevate to root.
-# If it took that nonce from whoever answers the socket, a local user who leaves a
-# listener at the client's socket path could park its OWN request on the real daemon,
-# answer the victim with THAT nonce, and have the victim's authentication mint a carrier
-# for the attacker — the human authenticates, but not for their own request.
-#
-# So the CLI checks SO_PEERCRED on the daemon end first. Here a genuinely unprivileged
+# The CLI must refuse a daemon end that isn't root (the confused-deputy reasoning is on
+# `require_root_daemon` in crates/cli/src/bless.rs). Here a genuinely unprivileged
 # process squats a socket and the CLI must refuse it — and crucially must refuse BEFORE
 # spawning the elevation helper, so the human is never even prompted. The wrapper drops a
 # marker file when it runs; the absence of that marker is the assertion.
@@ -1164,27 +1138,6 @@ while True: s.accept()
 }
 
 # --- scenario: the carrier lands where the user is still attributable ------
-# The fix that makes a blessed shell usable. logind attributes a process to a user — and
-# thence to a session, which is what polkit needs to find an auth agent — purely from its
-# cgroup path: `cg_path_get_owner_uid` keys on a `user-<uid>.slice` component, and
-# `cg_path_get_session` on a `session-N.scope` one. A carrier under cordond.service has
-# NEITHER, so logind says "doesn't own any suitable session" and every run0/pkexec inside
-# the blessed shell fails.
-#
-# So the daemon reads the REQUESTER's pid from SO_PEERCRED and creates the carrier inside
-# that process's own user subtree. This exercises the shapes that actually occur, because
-# an earlier version of this test only built the tty shape and so passed while the real
-# desktop case was broken:
-#
-#   a) DESKTOP — the terminal is under the *delegated* user@UID.service/app.slice, with no
-#      session scope anywhere above it. This is the common case and the one that regressed.
-#   b) TTY — the requester is in a session-N.scope; the carrier goes there (more precise).
-#   c) NO USER SUBTREE — a requester under system.slice falls back to the daemon's cgroup.
-#   d) USER-OWNED parent — refused; an invoker who can rmdir an empty carrier and mkdir a
-#      replacement could land on a recycled inode, i.e. a cgroup id still in BLESSED.
-#
-# The assertion in (a) and (b) is the property logind consumes, not just a path: the
-# carrier's cgroup must still contain `user-<uid>.slice`.
 # Build a fake user subtree in the shapes a real desktop and a real tty produce, and set
 # the P_* globals naming each requester cgroup. `user-N.slice` is root-owned as systemd
 # leaves it; `user@N.service` is chowned to the user, because it is *delegated* — that is
@@ -1244,17 +1197,16 @@ expect_placement() { # $1 requester cgroup  $2 expected parent (mount-relative) 
     esac
 }
 
-# The fix that makes a blessed shell usable. logind attributes a process to a user — and
-# thence to a session, which is what polkit needs to find an auth agent — purely from its
-# cgroup path: `cg_path_get_owner_uid` keys on a `user-<uid>.slice` component, and
-# `cg_path_get_session` on a `session-N.scope` one. A carrier under cordond.service has
-# NEITHER, so logind says "doesn't own any suitable session" and every run0/pkexec inside
-# the blessed shell fails.
-#
-# So the daemon reads the REQUESTER's pid from SO_PEERCRED and creates the carrier inside
-# that process's own user subtree. All four shapes that occur are covered, because an
-# earlier version of this test built only the tty one and so passed while the real desktop
-# case was broken.
+# Each requester shape must get a carrier logind can still attribute to the user (why:
+# `carrier_parent` in crates/daemon/src/backend/bpf_lsm/bless.rs):
+#   a) DESKTOP — the terminal is under the *delegated* user@UID.service/app.slice, with no
+#      session scope anywhere above it → the user slice.
+#   b) TTY — the requester is in a session-N.scope → that scope (more precise).
+#   c) NO USER SUBTREE — a requester under system.slice → the daemon's cgroup.
+#   d) USER-OWNED parent — refused → the daemon's cgroup.
+# All four are covered because a tty-only test passes while the desktop case is broken.
+# The assertion in (a) and (b) is the property logind consumes, not just a path: the
+# carrier's cgroup must still contain `user-<uid>.slice`.
 scenario_bless_placement() {
     echo "### scenario: the carrier lands where logind can still attribute the user"
     ws_new
@@ -1277,7 +1229,7 @@ EOF
     local slice="/user.slice/user-$P_UID.slice"
 
     # The desktop shape: no session scope anywhere above the requester. This is the common
-    # case and the one that regressed — the carrier must still land in the user slice.
+    # case — the carrier must still land in the user slice.
     expect_placement "$P_DESKTOP" "$slice" \
         "desktop requester (delegated user@.service, no session scope) → the user slice" || fail=1
     # A tty login has a session scope, which is more precise, so it wins.
@@ -1286,17 +1238,13 @@ EOF
     # Nothing user-attributable at all ⇒ the daemon's cgroup.
     expect_placement "$DCGROUP" "${DCGROUP#/sys/fs/cgroup}" \
         "requester with no user subtree → the daemon's cgroup" || fail=1
-    # A user-owned parent is refused however plausible its name: its owner could rmdir an
-    # empty carrier and mkdir a replacement onto a recycled inode still live in BLESSED.
+    # A user-owned parent is refused however plausible its name.
     expect_placement "$P_ROGUE" "${DCGROUP#/sys/fs/cgroup}" \
         "user-owned session scope is refused → falls back to the daemon's cgroup" || fail=1
     return $fail
 }
 
-# On restart the daemon re-registers leftover carriers in BLESSED — which is a *grant*, so
-# it must be at least as strict as placement, which refuses parents it doesn't trust. A
-# carrier this daemon created is root-owned; anything else was planted, and adopting it
-# would register a cgroup whose membership someone else controls, i.e. self-bless.
+# On restart the daemon adopts only root-owned leftover carriers (see `adoptable`).
 #
 # Plant two populated carriers in a session scope before the daemon starts: one root-owned,
 # one chowned to a user. Exactly the first may come back in `bless list`.
@@ -1310,9 +1258,8 @@ scenario_bless_reconcile_ownership() {
     if ! mkdir -p "$scope" 2>/dev/null; then
         echo "  SKIP: cannot create a session scope under /sys/fs/cgroup"; return 0
     fi
-    # Both placements must be scanned. The user slice is the desktop one, and reconcile
-    # missing it does not merely leak the carrier: the id allocator never advances past it,
-    # so the next mint recomputes the same directory name and fails EEXIST forever.
+    # Both placements must be scanned (see `carrier_roots`); the user slice is the desktop
+    # one.
     local ours="$scope/cordon-bless-70.ro" theirs="$scope/cordon-bless-71.ro"
     local desktop="$uslice/cordon-bless-72.ro"
     mkdir -p "$ours" "$theirs" "$desktop"
@@ -1359,8 +1306,9 @@ EOF
 # is the only hook the kernel fires for it. Both cases below are invisible to the
 # source/destination-*directory* classification — one looks like an internal shuffle, the
 # other like nothing protected moving at all — so only the destination dentry's own lookup
-# sees them. The daemon self-test covers the mechanism on a deny-all probe; this covers the
-# two shapes that matter under a real policy, and the atomic-save case the fix must NOT break.
+# sees them (see `decide_reparent`). The daemon self-test covers the mechanism on a
+# deny-all probe; this covers the two shapes that matter under a real policy, and the
+# atomic-save case that must NOT break.
 #
 # `who = "*"` throughout: the question here is which *object* answers for the destination,
 # not which subject asked, so plain `mv` is the right actor and needs no exe copy.
@@ -1381,15 +1329,15 @@ EOF
     echo save > "$VAULT/.save"
     expect_allow "atomic save inside the vault (temp beside target, rename over)" \
         mv -f "$VAULT/.save" "$SECRET" || fail=1
-    # Same shuffle, but the destination carries a tighter rule of its own. Pre-fix this was
-    # allowed as an internal shuffle and silently destroyed the more-specific object.
+    # Same shuffle, but the destination carries a tighter rule of its own. Guards against
+    # allowing it as an internal shuffle, which would destroy the more-specific object.
     echo t > "$VAULT/.t"
     expect_deny "rename over a nested, more-specific object" \
         mv -f "$VAULT/.t" "$VAULT/token" || fail=1
     [ -f "$VAULT/.t" ] && echo "  OK: the source survived (no copy+unlink fallback)" \
         || { echo "  FAIL: the source is gone — the rename took effect"; fail=1; }
-    # A protected *file* whose parent is not protected: both walks miss, so pre-fix this was
-    # the `(None, None)` allow — `rm lonely` refused while `mv x lonely` destroyed it.
+    # A protected *file* whose parent is not protected: both walks miss. Guards against the
+    # `(None, None)` allow — `rm lonely` refused while `mv x lonely` destroys it.
     echo evil > "$TMP/evil"
     expect_deny "rename over a file object whose parent is unprotected" \
         mv -f "$TMP/evil" "$lonely" || fail=1
@@ -1401,11 +1349,8 @@ EOF
 }
 
 # --- scenario: bprm_check_security -------------------------------------------
-# `execute` is its own capability. The exec *open* is an ordinary `file_open`, so an object
-# that denies reads already refuses to run its contents; what this hook adds is the converse
-# — readable but not runnable. Expressing that needs an explicit `deny`, not a narrower
-# `allow`: copy-down puts the parent's rules in the child's bucket too, and a child rule that
-# doesn't *match the action* simply falls through to them.
+# `execute` is its own capability (see `decide_exec`): this checks readable but not
+# runnable, expressed with an explicit `deny`.
 scenario_execute() {
     echo "### scenario: execute is a capability distinct from read"
     ws_new
@@ -1428,9 +1373,9 @@ EOF
 }
 
 # --- scenario: inode_mkdir ---------------------------------------------------
-# `rmdir` was gated and `mkdir` was not, so a subject that could not remove a directory
-# inside an object could still add one. The new dentry is negative, so the verdict comes
-# from the *parent* — which is what this checks, on both polarities, in one policy.
+# Guards that a subject that cannot remove a directory inside an object cannot add one
+# either. The verdict comes from the *parent* (see `decide_create`) — which is what this
+# checks, on both polarities, in one policy.
 scenario_mkdir() {
     echo "### scenario: mkdir inside a protected object takes the parent's verdict"
     ws_new
@@ -1510,9 +1455,8 @@ EOF
 }
 
 # --- fail-safe pinning: the boundary outlives the daemon --------------------
-# The M5 property, and the one thing no other scenario can show: every other scenario
-# proves the boundary works *while the daemon runs*. Until pinning, killing the daemon
-# detached every hook and the box silently stopped enforcing.
+# The one thing no other scenario can show: every other scenario proves the boundary works
+# *while the daemon runs*. This one guards that killing the daemon leaves it enforcing.
 scenario_pinned_survives_daemon_death() {
     echo "### scenario: fail-safe pinning (SIGKILL the daemon — the verdicts stand; teardown lifts them)"
     ws_new
@@ -1529,8 +1473,7 @@ EOF
     fi
     echo "  OK: links pinned under $PIN_DIR ($(ls "$PIN_DIR"))"
 
-    # SIGKILL, not SIGTERM: nothing runs on the way out, so this is the *crash* path —
-    # precisely the case that used to drop the boundary on the floor.
+    # SIGKILL, not SIGTERM: nothing runs on the way out, so this is the *crash* path.
     kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=""
     if "$CORDON" status >/dev/null 2>&1; then
         echo "  FAIL: the daemon still answers — the kill did not take"; fail=1
@@ -1538,7 +1481,7 @@ EOF
         echo "  OK: the daemon is gone (nothing answers the socket)"
     fi
 
-    # The assertion the milestone exists for: no process holds the boundary, and it holds.
+    # No process holds the boundary, and it holds.
     expect_deny  "scraper STILL denied with NO daemon"  read_as "$SCRAPER" "$SECRET" || fail=1
     expect_allow "owner STILL allowed with NO daemon"   read_as "$OWNER"   "$SECRET" || fail=1
 
@@ -1551,10 +1494,10 @@ EOF
         echo "  FAIL: --teardown errored"; sed 's/^/  daemon| /' "$t1"; fail=1
     fi
 
-    # Teardown reports the *posture*, and the two cases are not the same event. A blind
-    # count made both runs print "enforcement torn down — the boundary is OFF", which on an
-    # already-unenforced box is a false statement about a security boundary. Both halves are
-    # asserted: checking only the second would pass if BOTH said "already off".
+    # Teardown reports the *posture* (see `Swept`): guards against both runs printing
+    # "enforcement torn down — the boundary is OFF", a false statement on an
+    # already-unenforced box. Both halves are asserted: checking only the second would pass
+    # if BOTH said "already off".
     "$CORDOND" --log-format json --teardown >"$t2" 2>&1
     if [ -n "$(records "$t1" '.event == "teardown" and .generations > 0')" ]; then
         echo "  OK: the teardown that removed pins reports a disarm"
@@ -1573,12 +1516,9 @@ EOF
 }
 
 # --- upgrade under a running daemon -----------------------------------------
-# Regression: `Maps::seed` stamps the daemon's own identity (pid + exe FileId) into
-# SETTINGS, and that exe lookup used to be re-done on every seed. A package upgrade renames
-# a new binary over the running daemon's, after which /proc/<pid>/exe reads "… (deleted)"
-# and canonicalization fails — so the next `policy apply` was refused with an error nobody
-# could act on. The identity is now resolved once, since mm->exe_file is fixed for the life
-# of the process.
+# Guards the upgrade case: a package upgrade renames a new binary over the running
+# daemon's, after which /proc/<pid>/exe reads "… (deleted)"; the next `policy apply` must
+# still re-seed (the identity is resolved once, see `daemon_exe`).
 scenario_apply_survives_binary_upgrade() {
     echo "### scenario: upgrade under a running daemon (binary replaced; policy apply still works)"
     ws_new
@@ -1608,7 +1548,7 @@ EOF
         return 1
     fi
 
-    # THE assertion: the daemon can still re-seed. Pre-fix this failed on the exe lookup.
+    # THE assertion: the daemon can still re-seed.
     cat > "$TMP/new.toml" <<EOF
 $(rule "$SCRAPER" "$VAULT" read allow)
 EOF
@@ -1628,9 +1568,8 @@ EOF
 }
 
 # --- singleton: one daemon per socket ---------------------------------------
-# Before the flock guard a second daemon unlinked the first one's *live* socket and bound
-# its own, leaving the first running with a listener nobody could reach. With pinning the
-# two would also fight over the pin paths.
+# Guards against a second daemon unlinking the first one's *live* socket and binding its
+# own (see `acquire_singleton`).
 scenario_singleton_refuses_a_second_daemon() {
     echo "### scenario: singleton (a second cordond refuses to start; the first is untouched)"
     ws_new

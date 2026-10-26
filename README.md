@@ -97,7 +97,7 @@ policy.toml ──parse──> resolve groups ──compile──> flat per-obje
   one word, so policy is never half-applied.
 - **Quiet by construction.** Tools re-open one config hundreds of times per run (helm: 464×
   `~/.kube/config`), so an in-kernel LRU suppressor emits at most one event per
-  `(exe, object, action, path)` per second and folds the rest into a count.
+  `(exe, opened file, action)` per second and folds the rest into a count.
 
 Full design, threat model and rationale: [`docs/DESIGN.md`](docs/DESIGN.md).
 

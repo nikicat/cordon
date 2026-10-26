@@ -30,12 +30,14 @@ carry a source `Pos`. The compiled form is the contract in
 **Precedence** is object depth → **subject specificity** → deny>allow. There is **no global
 mode**: the per-rule `policy` is the only enforcement level, so `audit` observes an object
 and `deny` enforces it, per object — which is what makes the audit→admit→enforce flow
-(§15.10) work one object at a time. "Off" is an empty policy or a stopped daemon.
+(§15.10) work one object at a time. "Off" is an empty policy or `cordond --teardown`;
+stopping the daemon leaves enforcement up (see *Fail-safe pinning* below).
 
 **In-kernel** (`crates/bpf`, `file_open`): dentry walk → deepest `PROTECTED` object, action
 from `f_mode`/`f_flags`, **first-match** scan of the packed `RULES` bucket, default-deny.
-Records carry the **actual opened path**, reconstructed by walking `d_name` up to the matched
-object (`bpf_d_path` is unavailable at `file_open`) through a per-CPU scratch map.
+Records carry the **actual opened path**, rebuilt from `d_name` up to the matched object
+(`fill_comps` in `crates/bpf/src/kernel.rs`), since `bpf_d_path` is unavailable at
+`file_open`.
 
 **Sound directory objects** (`inode_link`/`inode_rename`/`inode_unlink`/`inode_rmdir`). A
 directory protects its children by *ancestry*, so a second name for a protected inode — a
@@ -46,42 +48,41 @@ exemption; **clobber** and **destroy** are ordinary writes and take the subject'
 `audit` objects keep working. An internal rename short-circuits, which is what keeps
 atomic-save alive inside a protected dir. `inode_mkdir` joins them by classifying off the
 *parent*, since a to-be-created dentry is negative and matches nothing itself. Every mutation
-program shares `find_object`, so entry is
-a dentry rather than a `struct file`. A rename **over** an existing name is a fourth case,
-classified off the destination *dentry* rather than its directory: it destroys that inode and
-`inode_rename` is the only hook the kernel fires for it, so without it `mv anything secret`
-did what `rm secret` is refused. DESIGN §15.5.
+program shares `find_object`, so entry is a dentry rather than a `struct file`. A rename
+**over** an existing name is a fourth case, classified off the destination *dentry* rather
+than its directory: it destroys that inode and `inode_rename` is the only hook the kernel
+fires for it, so without it `mv anything secret` would do what `rm secret` is refused
+(`decide_reparent` in `crates/bpf/src/main.rs`). DESIGN §15.5.
 
 **Volume control**, because tools re-open one config hundreds of times per run (helm: 464×
-`~/.kube/config`): an in-kernel LRU suppressor keyed by `(exe, ObjId, action, leaf)` emits at
-most one event per key per second and folds the rest into a `suppressed` count, and the
-daemon coalesces each drain batch into one journal line.
+`~/.kube/config`): an in-kernel LRU suppressor keyed on `SuppressKey` — `(exe, opened file,
+action)`, so sibling files under one object surface separately — emits at most one event per
+key per second and folds the rest into a `suppressed` count (`throttle` in
+`crates/bpf/src/kernel.rs`), and the daemon's `coalesce` folds each drain batch into one
+journal line per key.
 
-**Atomic apply.** The three rule maps are **banked**; `seed_policy` fills the inactive bank
-and flips `Settings.active_bank` in one write, so a re-seed is never half-visible.
-Single-writer by construction — the `&mut Ebpf` lives on one backend thread.
+**Atomic apply.** The three rule maps are **banked**, so a re-seed is never half-visible;
+`Maps::seed` in `crates/daemon/src/backend/bpf_lsm/seed.rs` fills the inactive bank and flips
+`Settings.active_bank`. Single-writer by construction: every map write goes through the one
+`ControlMsg` channel to the backend thread that owns the `&mut Ebpf`.
 
-**Fail-safe pinning (M5).** The seven LSM links are pinned to bpffs under
-`<bpf_pin_dir>/<pid>/`, and that is *all* that is pinned: a pinned link holds its program
-and a program holds its maps, so the whole apparatus — including the seeded policy — stays
-alive and enforcing with **no holding process**. Nothing is adopted on startup. A restarting
-daemon loads its own object with its own private maps exactly as before, so the single-writer
-invariant is untouched and an upgraded package can never end up driving the old kernel
-program. The handover is ordered attach → self-test → seed → **pin** → sweep older
-generations, so the previous boundary stands until the replacement is *proven*; a daemon that
-aborts on a bad policy leaves enforcement up rather than tearing it down for a replacement
-that never arrived. The generation subdirectory exists because `BPF_OBJ_PIN` fails `EEXIST`
-on a taken path, and reusing one directory would force a detach-then-attach gap. Two
-consequences that surprise people: **`systemctl stop cordond` does not stop enforcement**
-(that is `cordond --teardown`, which refuses while a daemon runs), and teardown is
-**asynchronous** — unlinking a pin drops the link's last reference and the kernel detaches
-from a workqueue, so anything that must see the boundary down has to poll.
+**Fail-safe pinning.** The seven LSM links are pinned to bpffs, and nothing else is: a
+pinned link holds its program and a program holds its maps, so the boundary — seeded policy
+included — stays up with **no holding process**, and a restarting daemon adopts nothing, which
+keeps the single-writer invariant and means an upgrade never drives the old kernel program.
+The handover order and the per-run generation directory are `PinDir::pin_links` in
+`crates/daemon/src/backend/bpf_lsm/pin.rs`; what it buys is that the previous boundary stands
+until the replacement is *proven*, so a daemon that aborts on a bad policy leaves enforcement
+up. Two consequences that surprise people: **`systemctl stop cordond` does not stop
+enforcement** (that is `cordond --teardown`, which refuses while a daemon runs), and teardown
+is **asynchronous** (`PinDir::teardown`), so anything that must see the boundary down has to
+poll.
 
-**One daemon per socket.** Startup takes an exclusive `flock` on `<socket>.lock` and refuses
-if it is held. Required by pinning (two daemons would race over the pin paths, and removing
-a pin to place your own detaches a boundary its owner still believes in) and a bug fix in its
-own right: `serve` unlinks any socket inode it finds without checking whether anyone is
-listening, so a second daemon used to steal the first one's live socket silently.
+**One daemon per socket** (`acquire_singleton` in `crates/daemon/src/main.rs`). Required by
+pinning (two daemons would race over the pin paths, and removing a pin to place your own
+detaches a boundary its owner still believes in), and by the socket itself: `serve` unlinks
+any socket inode it finds, so without the lock a second daemon would silently steal the first
+one's live socket.
 
 **Policy tiers.** Effective policy is system ⊕ user tier. A system fragment pulls in a
 user-tier file via `[[include]] user = … path = …`; the included file is **home-scoped** (its
@@ -95,10 +96,12 @@ same-uid box is an escalation, DESIGN §2), then validates and, if it compiles, 
 saves in one step. Bare `edit` opens your own tier; `--system` and `--user NAME` name the
 others.
 
-**Socket authorization.** Every write (`PolicyApply`, `BlessMint`, `BlessRevoke`) requires
-peer uid 0 via `SO_PEERCRED`; every read is open. `authorize()` is a pure table with an
-**exhaustive** match, so a new verb cannot be added without picking a side. The socket is
-`0666` — the mode decides who can reach the daemon, the table decides what they may do.
+**Socket authorization** (`authorize` in `crates/daemon/src/ipc.rs`). `PolicyApply` and
+`BlessApprove` require peer uid 0 via `SO_PEERCRED`; reads and `BlessRequest` are open (a
+request is inert until approved); `BlessRevoke` is open at the socket and ownership-checked in
+the backend (root, or the uid that minted it). The match is **exhaustive**, so a new verb
+cannot be added without picking a side. The socket is `0666` — the mode decides who can reach
+the daemon, the table decides what they may do.
 
 **Blessing** (`cordon bless`) is one more `SubjectMatch` predicate, so a blessing rule is an
 ordinary rule and its scope is the rule's object column. `cordon bless` runs **unprivileged**:
@@ -183,7 +186,7 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
   its maps — so there is nothing left for adoption to buy. What adoption *costs* is real: a
   mandatory cross-process writer lock on the banked flip, a stale-program-after-upgrade trap
   needing an ABI/build-id check plus a replace path as fallback, and a direct conflict with
-  the startup self-test, which writes bank 0 and `SETTINGS` before `seed_policy` and would
+  the startup self-test, which writes bank 0 and `SETTINGS` before `Maps::seed` and would
   transiently clobber a live adopted policy. Replace-on-start has none of that and is
   gap-free anyway (attach the new generation before sweeping the old).
 - **"Pin the policy maps only — a pinned `BLESSED` means grants that never expire" is
@@ -228,12 +231,9 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
   executable, `readlink` gives `…/cordond (deleted)` and **`std::fs::canonicalize` fails
   `ENOENT`** — so `proc::file_id`, which canonicalizes before consulting the mount table,
   returns `None`. `stat` *through* the magic link still reports the original inode, but the
-  path-based route is what cordon uses. This is why `seed::daemon_exe` memoizes in a
-  `OnceLock` instead of re-reading per seed: re-resolving would either fail a post-upgrade
-  `policy apply` for no actionable reason, or (if it resolved) name the **new** inode, which
-  this process never exec'd — silently breaking the fast-allow the daemon needs for its own
-  I/O. `mm->exe_file` is fixed for the life of a process, so the value is a constant; do not
-  "simplify" it back into a per-call lookup.
+  path-based route is what cordon uses. This is why `seed::daemon_exe` resolves once and
+  memoizes (its doc has the full argument); do not "simplify" it back into a per-call
+  lookup.
 - `bpf_d_path` is **not allowed** at `file_open`, so identity is inode `(dev,inode)`, never a
   path — resolved by the daemon at seed time.
 - The daemon takes the device from the **mount table** (`/proc/self/mountinfo`), which matches

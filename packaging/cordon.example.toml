@@ -4,26 +4,23 @@
 # Precedence: CLI flag  >  this file  >  default. String values may interpolate
 # ${ENV} from the environment.
 #
-# The *enforcement* policy — the rules (and their per-rule `policy`, the only
-# enforcement level; there is no global mode) — is NOT here: it lives in the root-owned
-# text policy file (see `policy` below and cordon.example.policy.toml), applied with
+# The *enforcement* policy — the rules — is NOT here: it lives in the root-owned text
+# policy file (see `policy` below and cordon.example.policy.toml), applied with
 # `cordon policy apply`.
 #
 # Default location: /etc/cordon/config.toml (root) or
 # $XDG_CONFIG_HOME/cordon/config.toml (user). Override with --config / $CORDON_CONFIG.
 
-# Enforcement backend — only "bpf-lsm" (Linux, root: CAP_BPF + CAP_MAC_ADMIN). The
-# hardened boundary: the verdict is returned in-kernel from BPF maps. Needs a kernel
-# with CONFIG_BPF_LSM=y and `bpf` in the active LSM list (`lsm=…,bpf` on the kernel
-# cmdline), the daemon's bpf-lsm backend (built in by default), and the eBPF object built
-# via `just build-ebpf` (see bpf_object below).
+# Enforcement backend — only "bpf-lsm": the verdict is returned in-kernel from BPF maps.
+# Kernel and privilege requirements are in the README (Requirements); the eBPF object is
+# built via `just build-ebpf` (see bpf_object below).
 backend = "bpf-lsm"
 
 # IPC socket. Default: /run/cordon.sock (root); $XDG_RUNTIME_DIR/cordon.sock (user).
 # socket = "${XDG_RUNTIME_DIR}/cordon.sock"
 
-# Reserved for autolearn (M4): the roots where learning may propose rules. Accepted
-# but unused by M1 enforcement.
+# Reserved for autolearn: the roots where learning may propose rules. Accepted but
+# unused by enforcement.
 # zones = ["${HOME}", "${HOME}/.config"]
 
 # --- bpf-lsm backend ---------------------------------------------------------
@@ -32,10 +29,8 @@ backend = "bpf-lsm"
 # it at the `just build-ebpf` output:
 # bpf_object = "${PWD}/target/bpf/cordon.bpf.o"
 #
-# bpffs directory the LSM links are pinned under, one subdirectory per daemon run. This
-# is what makes enforcement fail-SAFE (DESIGN §4): the pinned links hold the programs and
-# their maps, so the boundary survives the daemon crashing, being killed, or being
-# restarted — with no gap. Default: /sys/fs/bpf/cordon.
+# bpffs directory the LSM links are pinned under, so the boundary outlives the daemon
+# (DESIGN §4). Default: /sys/fs/bpf/cordon.
 #
 # Consequence worth knowing before you meet it: `systemctl stop cordond` does NOT stop
 # enforcement. Turning it off is `cordond --teardown`.
@@ -43,7 +38,7 @@ bpf_pin_dir = "/sys/fs/bpf/cordon"
 #
 # The root-owned text policy (the flat rule model — see cordon.example.policy.toml)
 # the bpf-lsm backend compiles at startup and seeds the maps from. May be a single
-# file or a conf.d *directory* of *.toml fragments merged in name order (each may carry
+# file or a conf.d *directory* of *.toml fragments, loaded in name order (each may carry
 # a `user = "name"` header so `~` resolves under the root daemon). Default:
 # /etc/cordon/policy.toml. Typical layouts:
 # policy = "/etc/cordon/conf.d"                          # a directory of fragments

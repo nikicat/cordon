@@ -6,7 +6,7 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 4 are committed. Step 5 (smoke-suite helpers) is in the
+> **Status:** steps 0 through 5 are committed. Step 6.1 (one owner per fact) is in the
 > working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
@@ -127,7 +127,7 @@ parameter into a struct the caller builds once:
      error kind on the wire and distinct CLI exit codes. That is a protocol change, not
      taken here.
 
-## 5. Smoke-suite helpers (done, unstaged)
+## 5. Smoke-suite helpers (done)
 
 `bpf-lsm-smoke.sh` gains:
 - `rule WHO WHERE ACTION POLICY`, which renders a `[[rule]]` table (space-separated values
@@ -146,17 +146,20 @@ described, and its numbering, stale since four scenarios were added unnumbered, 
 ## 6. Doc pass
 
 Two commits:
-1. **One owner per fact.** Each fact that is restated in three to nine places (no
-   `bpf_d_path` at `file_open`, the bank flip, `CarrierProcs` as the grant, teardown being
-   explicit, the bless handshake, ClassIds being renumbered, and so on) is kept on the item
-   that decides it, and the other sites point there. History and milestone notes leave the
-   code.
+1. **One owner per fact** (done, unstaged). A survey of the current tree found 92 facts
+   restated at about 560 sites and 110 history or milestone notes in code. Each fact is
+   now stated on the item that decides it, and the other sites point there or are gone;
+   regression notes stay as present-tense statements of what they guard. The pass also
+   fixed about 25 statements that contradicted the code (the suppressor key, "off is a
+   stopped daemon", a `BlessMint` verb and two `policy check` lints that don't exist, the
+   pinning of maps, `/dev/urandom` for the nonce, and others). It adds no rustdoc
+   error: the `--document-private-items` run has 30, all pre-existing.
 2. **House style.** Every flagged doc is rewritten as plain, verb-first Google-style
    reference text, with "Errors when…" for the error contract. Entity docs state the item's
    place in the system instead of listing its fields.
 
 ## Out of scope
 
-- Rustdoc's `-D warnings` run has 33 pre-existing errors (private and unresolved intra-doc
+- Rustdoc's `-D warnings` run has 30 pre-existing errors (private and unresolved intra-doc
   links). CI does not run rustdoc. The doc pass will not add any; fixing them is a separate
   decision.

@@ -3,9 +3,9 @@
 //! `repr(transparent)` newtypes over integers: they compile to byte-identical BPF
 //! (a `Dev` *is* its `u64`), so the kernel verifier and the map's byte-level key
 //! comparison are unaffected — the cost is zero. They just stop a device number, an
-//! inode, an owner id, and a path hash from being four interchangeable bare
-//! integers. Because the layout is unchanged, the map key/value/record structs that
-//! embed them stay POD (`aya::Pod`).
+//! inode, a pid, a uid and the rest from being interchangeable bare integers. Because
+//! the layout is unchanged, the map key/value/record structs that embed them stay POD
+//! (`aya::Pod`).
 
 /// Filesystem device number, in the **kernel's** `s_dev` encoding (see the daemon's
 /// `proc::mkdev`, which re-packs a mount's major and minor numbers to match).
@@ -25,12 +25,12 @@ pub struct Ino(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Pid(pub u32);
 
-/// A **real** user id — always kernel-attested, never client-asserted. Two capture
-/// sites, one type: the eBPF program reads `bpf_get_current_uid_gid()` (low 32 bits) into
-/// [`crate::DecisionEvent`], so the daemon can name the user on the audit line and
-/// collapse a path under that user's home to `~`; the IPC server reads `SO_PEERCRED` to
-/// authorize a request. `u32` to match the kernel/passwd width. `Ord` so a uid can be
-/// range-checked against the regular-account window (`cordon_core`'s `REGULAR_UID_RANGE`).
+/// A **real** user id, read from the kernel and never from a client. Two capture sites,
+/// one type: the eBPF program reads `bpf_get_current_uid_gid()` (low 32 bits) into
+/// [`crate::DecisionEvent`] for the audit line, and the IPC server reads `SO_PEERCRED`
+/// (`cordon_core`'s `Conn::peer_uid`) to authorize a request. `u32` to match the
+/// kernel/passwd width. `Ord` so a uid can be range-checked against the regular-account
+/// window (`cordon_core`'s `REGULAR_UID_RANGE`).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Uid(pub u32);
@@ -51,29 +51,25 @@ impl core::fmt::Display for Uid {
 }
 
 /// A cgroup-v2 id, as returned by `bpf_get_current_cgroup_id()` — the kernel-assigned,
-/// per-directory unique handle for a cgroup. The `cgroup` subject predicate
-/// ([`crate::SubjectMatch::cgroup`], M2) matches it directly, and it is the key of
-/// [`crate::policy_maps::MAP_BLESSED`] (`cgroup → ClassId`, DESIGN §16.3): a
-/// **per-invocation** blessed cgroup's id resolves to the [`ClassId`](crate::ClassId) it
-/// was minted with. `u64` to match the helper's width; a newtype so it can't be confused
-/// with an [`Ino`]/[`Nanos`]/raw count.
+/// per-directory unique handle for a cgroup. It is the key of
+/// [`crate::policy_maps::MAP_BLESSED`], and the type of the reserved `cgroup` subject
+/// predicate ([`crate::SubjectMatch::cgroup`]). `u64` to match the helper's width; a
+/// newtype so it can't be confused with an [`Ino`]/[`Nanos`]/raw count.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CgroupId(pub u64);
 
-/// How many identical opens the in-kernel suppressor folded into one emit since the last
-/// ring record for a `(exe, leaf, action)` key (M1 §1g): `0` on a first occurrence,
-/// nonzero when a repeat burst was collapsed. Carried on the wire in
-/// [`crate::DecisionEvent`] and held in [`crate::SuppressVal`] so the daemon can surface
-/// the *true* volume a single line stands for. `u32` to match the per-key kernel counter;
-/// the daemon widens to `u64` only when summing many of these across a drain batch.
+/// How many identical decisions the in-kernel suppressor folded since the last ring record
+/// for one [`crate::SuppressKey`]: `0` on a first occurrence. Carried on the wire in
+/// [`crate::DecisionEvent`] and held in [`crate::SuppressVal`]. `u32` to match the per-key
+/// kernel counter; a sum across a drain batch is a [`SuppressedTotal`].
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Suppressed(pub u32);
 
-/// The daemon's running total of folded opens across one drain batch: it sums one wire
-/// [`Suppressed`] per coalesced `(exe, leaf, action)` key. A single per-window count fits
-/// `u32` ([`Suppressed`]); their *sum* over a whole batch wants the headroom, so the total
+/// The daemon's running total of folded decisions behind one coalesced journal line: the
+/// sum of the wire [`Suppressed`] counts it folds (see the daemon's `coalesce`). A single
+/// per-window count fits `u32`; a sum over a whole batch wants the headroom, so the total
 /// is its own `u64` type — the two are different quantities, not one widened. Userspace
 /// only (never on the wire), but it lives here with [`Suppressed`] so the suppressor's
 /// counters stay documented together.
@@ -146,34 +142,38 @@ impl Nanos {
 }
 
 /// Which generation of the double-buffered rule table is live (DESIGN §15.8). The
-/// kernel reads `Settings.active_bank`; a `cordon policy apply` fills the other bank
-/// and [`flip`](Bank::flip)s to it in one atomic `SETTINGS` write. Only `0`/`1` are
-/// valid. It is a `repr(transparent)` integer rather than an enum because it is read out
-/// of map memory, so every bit pattern must be a sound value; [`index`](Bank::index)
-/// masks a garbage read back into range.
+/// kernel reads [`Settings::active_bank`](crate::Settings::active_bank); a
+/// `cordon policy apply` fills the other bank and [`flip`](Bank::flip)s to it in one
+/// `SETTINGS` write (the daemon's `Maps::seed`). Only `active_bank` changes in that record
+/// after startup, so the flip's only moving part is these 4 bytes, which can't tear, and
+/// the kernel never sees a half-filled table.
+///
+/// Only `0`/`1` are valid. It is a `repr(transparent)` integer rather than an enum because
+/// it is read out of map memory, so every bit pattern must be a sound value; see
+/// [`masked`](Bank::masked) for what a garbage read does.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Bank(pub u32);
 
 impl Bank {
-    /// The generation a fresh fill targets first (startup's initial active bank, with
-    /// `SETTINGS` zero-initialized).
+    /// Bank `0`: what a zero-initialized `SETTINGS` reads as, so the first apply fills
+    /// bank `1`.
     pub const ZERO: Bank = Bank(0);
 
-    /// The *other* generation: an `apply` fills this, then flips the active bank to it.
+    /// Returns the *other* generation.
     pub const fn flip(self) -> Bank {
         Bank(self.index() ^ 1)
     }
 
-    /// The bank as an array index, masked to a valid generation (`0`/`1`) so a stray
-    /// value read from map memory can't push a [`crate::rule_slot`] index out of range.
+    /// Returns the bank as an array index, masked to `0`/`1` so a stray value read from
+    /// map memory can't push a [`crate::rule_slot`] index out of range.
     pub const fn index(self) -> u32 {
         self.0 & 1
     }
 
-    /// This value normalized to a valid generation (`0`/`1`) — what the kernel keys the
-    /// banked maps with, so a torn/garbage `active_bank` read degrades to an empty
-    /// bucket (fail-open allow) rather than a wild lookup.
+    /// Returns this value normalized to `0`/`1`. The kernel keys the banked maps with it,
+    /// so a garbage `active_bank` read degrades to an empty bucket (fail-open allow)
+    /// rather than a wild lookup.
     pub const fn masked(self) -> Bank {
         Bank(self.index())
     }

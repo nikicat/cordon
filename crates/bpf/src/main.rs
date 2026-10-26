@@ -1,31 +1,27 @@
-//! cordon's eBPF data plane: the `file_open` LSM hook that returns the access
-//! verdict **in-kernel** (DESIGN §4, §15). The userspace daemon (`crates/daemon`,
-//! `bpf-lsm` backend) compiles the text policy, loads this object, fills its maps,
-//! and drains its ring buffer — but it is this program, not the daemon, that decides.
+//! cordon's eBPF data plane: the LSM hooks (`file_open`, the inode mutation hooks and
+//! `bprm_check_security`) that return the access verdict **in-kernel** (DESIGN §4, §15).
+//! The userspace daemon (`crates/daemon`, `bpf-lsm` backend) compiles the text policy,
+//! loads this object, fills its maps, and drains its ring buffer — but it is this
+//! program, not the daemon, that decides.
 //!
-//! ## The decision (rule model, M1)
-//! For each `open` (reading the live double-buffer `bank` from `SETTINGS.active_bank`,
-//! so a `policy apply` flips the whole table atomically — DESIGN §15.8):
-//!   1. Fast-allow the daemon's own pid (never deadlock on our own opens).
+//! ## The decision
+//! For each `open`, against the live bank read from `SETTINGS.active_bank` (see [`Bank`]):
+//!   1. Fast-allow the daemon itself (see [`live_bank`]).
 //!   2. Walk the opened file's dentry ancestors; the first one whose **(bank, dev,
 //!      ino)** is in `PROTECTED` is the most-specific protected object → its `ObjId`. No
-//!      match ⇒ unprotected ⇒ allow (DESIGN §15.6.4 — the filesystem can't be
-//!      default-denied).
-//!   3. Derive the requested **action** from `f_mode`/`f_flags` (read/write/create). An
-//!      open that is none of these (e.g. `O_PATH`) reads no content ⇒ allow.
+//!      match ⇒ unprotected ⇒ allow.
+//!   3. Derive the requested **action** ([`requested_action`]); an empty one ⇒ allow.
 //!   4. Scan the object's pre-sorted rule bucket (`RULE_COUNT[(bank,obj)]` entries in
 //!      the packed `RULES` array, bounded by `MAX_RULES_PER_OBJ`) and apply the
 //!      **first** rule whose action mask intersects and whose subject matches. Copy-down
 //!      resolved all precedence in userspace, so first-match is correct (DESIGN §15.3).
-//!   5. No matching rule ⇒ **default-deny** (DESIGN §15.6.3). The per-rule `policy` is
-//!      the only enforcement level — there is no global mode (§15.6): a denying policy
-//!      always blocks. When the matched policy logs (`audit`/`deny`), the in-kernel
-//!      suppressor throttles a repeat burst to one `DecisionEvent` + a folded count
-//!      (M1 §1g) before emitting.
+//!   5. No matching rule ⇒ **default-deny**. The matched policy blocks iff it
+//!      [`denies`](Policy::denies) and is journaled, through the suppressor
+//!      (`kernel::throttle`), iff it [`logs`](Policy::logs).
 //!
-//! Anything we can't read fails **open** (a `None` becomes allow). All `unsafe`
-//! (kernel reads, ring writes) lives in [`kernel`]; this file is the decision flow.
-//! Field offsets come from the running kernel at load time (see [`kernel`]).
+//! Anything unreadable fails open (see [`clamped`]). All `unsafe` (kernel reads, ring
+//! writes) lives in [`kernel`]; this file is the decision flow. Field offsets come from
+//! the running kernel at load time (see [`kernel`]).
 
 #![no_std]
 #![no_main]
@@ -70,9 +66,8 @@ const FMODE_WRITE: u32 = 0x2;
 const O_CREAT: u32 = 0o100;
 
 // ---- policy maps (filled by the daemon from the compiled policy) ----------
-// All three rule maps are double-buffered: keyed/indexed by `(bank, …)`, with
-// `SETTINGS.active_bank` selecting the live generation. The kernel reads only the
-// active bank; the daemon fills the inactive one and flips (DESIGN §15.8).
+// All three rule maps are banked: keyed/indexed by `(bank, …)`, with
+// `SETTINGS.active_bank` selecting the live generation (see `Bank`).
 
 /// Every protected object's `(bank, dev, ino)` → its dense `ObjId`.
 #[map]
@@ -87,20 +82,19 @@ static RULES: Array<CompiledRule> =
 #[map]
 static RULE_COUNT: HashMap<BankedObj, u32> =
     HashMap::with_max_entries((NUM_BANKS * MAX_OBJECTS) as u32, 0);
-/// The one-element control record (daemon pid + live bank).
+/// The one-element control record ([`Settings`]).
 #[map]
 static SETTINGS: Array<Settings> = Array::with_max_entries(1, 0);
 
-/// Live blessings (DESIGN §16.3): a blessed cgroup's id → its [`ClassId`]. Written by the
-/// daemon at `cordon bless` mint, cleared at GC — **unbanked** runtime state, so a bless
-/// never recompiles policy and a `policy apply` never disturbs a live bless. Empty until the
-/// daemon writes it, so absent a bless every caller resolves to [`ClassId::UNBLESSED`].
+/// Live blessings: a blessed cgroup's id → its [`ClassId`] (see `MAP_BLESSED`). Empty
+/// until the daemon writes it, so absent a bless every caller resolves to
+/// [`ClassId::UNBLESSED`].
 #[map]
 static BLESSED: HashMap<CgroupId, ClassId> = HashMap::with_max_entries(MAX_BLESSED as u32, 0);
 
 /// The matched protected object, plus what leaf-path reconstruction needs: the opened
-/// file's own identity (`leaf`, the suppressor/coalesce key) and the matched object's
-/// dentry (the stop point of the `d_name` walk).
+/// file's own identity (`leaf`) and the matched object's dentry (the stop point of the
+/// `d_name` walk).
 struct Match {
     obj: ObjId,
     object: FileId,
@@ -124,8 +118,10 @@ struct Match {
 ///
 /// Every program funnels through here — a new hook cannot forget the clamp and then fail
 /// to load only on the pinned CI kernel.
+///
+/// A `None` verdict means something in the decision flow was unreadable, and fails
+/// **open**: an unreadable kernel never blocks an access.
 fn clamped(verdict: Option<Verdict>) -> i32 {
-    // `None` anywhere in a decision flow ⇒ couldn't decide ⇒ fail open.
     let ret = verdict.unwrap_or(Verdict::Allow).to_lsm();
     let ret = core::hint::black_box(ret);
     if ret < -4095 || ret > 0 { 0 } else { ret }
@@ -137,11 +133,9 @@ pub fn file_open(ctx: LsmContext) -> i32 {
 }
 
 // The mutation hooks. Argument positions come from the kernel's LSM prototypes and are
-// **not** type-checked here: reading an `inode *` slot as a dentry yields a pointer whose
-// field reads fail, which fails *open* and silently. `Dentry::from_arg` is called with a
-// literal index at each entry point (never threaded through a shared fn) so the verifier
-// sees a constant offset into the context, and the daemon's self-test exercises every hook
-// so a wrong index fails loudly at startup rather than quietly forever.
+// not type-checked (see `Dentry::from_arg`). `Dentry::from_arg` is called with a literal
+// index at each entry point (never threaded through a shared fn) so the verifier sees a
+// constant offset into the context.
 
 /// `inode_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry)`
 #[lsm(hook = "inode_link")]
@@ -191,18 +185,19 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
 /// Settings + the daemon's own-I/O fast path. `None` ⇒ the caller allows: either we can't
 /// read settings (fail open) or this *is* the daemon (never deadlock on its own I/O).
 ///
-/// The daemon is its **pid and its exe**, not the pid alone. Since M5 the links are
-/// bpffs-pinned, so this record — and the bypass it grants — outlives the process that
-/// wrote it; a pid-only test would hand a total bypass of every protected object to
-/// whatever recycles that pid while the daemon is down. `&&` short-circuits on the pid, so
-/// the two extra derefs cost nothing for every caller that isn't the daemon.
+/// The daemon is its **pid and its exe**, never the pid alone. The LSM links are
+/// bpffs-pinned, so `SETTINGS` — and the bypass it grants — outlives the process that
+/// wrote it, and a pid is a recyclable name: a pid-only test would hand a total, unlogged
+/// bypass of every protected object to whatever lands on that pid while the daemon is
+/// down. The exe compare narrows that to "and it is also running cordond", using the same
+/// `mm->exe_file` read every subject match already makes. `&&` short-circuits on the pid,
+/// so the extra derefs cost nothing for every caller that isn't the daemon.
 fn live_bank(pid: Pid) -> Option<Bank> {
     let settings = settings()?;
     if pid == settings.daemon_pid && kernel::caller_exe() == Some(settings.daemon_exe) {
         return None;
     }
-    // Masked to a valid bank — a torn/garbage read can't escape the array, it just
-    // resolves to an empty bucket → fail-open allow.
+    // See `Bank::masked`.
     Some(settings.active_bank.masked())
 }
 
@@ -210,15 +205,17 @@ fn live_bank(pid: Pid) -> Option<Bank> {
 /// rename, the old name goes away). Three questions, in order:
 ///
 /// 1. **Destroy** — is the destination name *already taken*, by an inode inside a protected
-///    object? Only `rename` can be — `link`'s target is always negative — and `vfs_rename`
-///    unlinks that inode. This hook is the *only* one the kernel fires for it:
-///    `inode_unlink` is reachable solely from `vfs_unlink`, and `do_renameat2`'s own target
-///    check is DAC-only `may_delete()`. Unclassified, `mv anything secret` would do exactly
-///    what `rm secret` is refused, and the `PROTECTED` entry it dangles is permanent, since
-///    objects resolve once. It takes the destroyed side's own `write` verdict — the most
-///    specific object in play on the destination (§15.6) — and it is asked *before* the
-///    internal shuffle below, because a more-specific object nested inside the one being
-///    shuffled within is precisely what that short-circuit would otherwise swallow.
+///    object? Only `rename` can be — `link`'s target is always negative, because the VFS
+///    resolves it with `LOOKUP_CREATE`, so an existing name is `EEXIST` before this hook
+///    runs — and `vfs_rename` unlinks that inode. This hook is the *only* one the kernel
+///    fires for it: `inode_unlink` is reachable solely from `vfs_unlink`, and
+///    `do_renameat2`'s own target check is DAC-only `may_delete()`. Unclassified,
+///    `mv anything secret` would do exactly what `rm secret` is refused, and the
+///    `PROTECTED` entry it dangles is permanent, since objects resolve once. It takes the
+///    destroyed side's own `write` verdict — the most specific object in play on the
+///    destination (§15.6) — and it is asked *before* the internal shuffle below, because a
+///    more-specific object nested inside the one being shuffled within is precisely what
+///    that short-circuit would otherwise swallow.
 /// 2. **Escape** — is a protected inode acquiring a name *outside* its object? Refused
 ///    unconditionally, with no rule lookup and no subject check. A second name in an
 ///    unprotected directory makes the inode readable by every subject, forever, and
@@ -297,9 +294,9 @@ fn decide_remove(dentry: kernel::Dentry, op: Action) -> Option<Verdict> {
 /// **`execute` is a distinct capability, not implied by `read`.** The exec open itself
 /// already passes through `file_open` (it is a real open, with `FMODE_EXEC | FMODE_READ`),
 /// so an object that denies reads already refuses to run its contents. What this hook adds
-/// is the *converse*: an object may be readable and still not runnable. Which means a rule
-/// granting only `read` no longer lets a subject execute the object's contents — that now
-/// falls to default-deny, and a policy that wants both must say `["read", "execute"]`.
+/// is the *converse*: an object may be readable and still not runnable. So a rule granting
+/// only `read` does not let a subject execute the object's contents — that falls to
+/// default-deny, and a policy that wants both must say `["read", "execute"]`.
 fn decide_exec(ctx: &LsmContext) -> Option<Verdict> {
     let pid = kernel::current_pid();
     let bank = live_bank(pid)?;
@@ -367,7 +364,7 @@ fn deny_escape(matched: &Match, op: Action, pid: Pid, bank: Bank) -> Verdict {
 }
 
 fn decide(ctx: &LsmContext) -> Option<Verdict> {
-    // (1) settings + our own I/O → allow (never deadlock on the daemon's own opens).
+    // (1) settings; the daemon itself is allowed (see `live_bank`).
     let pid = kernel::current_pid();
     let bank = live_bank(pid)?;
 
@@ -398,9 +395,8 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
 /// than the one it is named for. Keeping this in one place means deny/log semantics cannot
 /// drift apart per hook.
 ///
-/// **Five arguments is the ceiling**: BPF passes at most five in registers and has no
-/// stack for the rest, so a sixth turns this from a subprogram call into a link error.
-/// Fold anything further into [`Match`].
+/// **Five arguments is the ceiling** (see [`kernel::Record`]); a sixth turns this from a
+/// subprogram call into a link error. Fold anything further into [`Match`].
 fn consult(
     matched: &Match,
     requested: Action,
@@ -408,28 +404,20 @@ fn consult(
     pid: Pid,
     bank: Bank,
 ) -> Option<Verdict> {
-    // First matching rule, else default-deny (a distinct cause from an explicit `deny`, so
-    // the journal can tell "no rule" apart from "you blocked it"). The subject is the exe
-    // plus the caller's resolved blessing class (DESIGN §16.3), the latter read once here
-    // from its cgroup; both are matched per-rule by `subject_matches`.
+    // First matching rule, else `Policy::DEFAULT_DENY`. The subject is the exe plus the
+    // caller's resolved blessing class, the latter read once here from its cgroup; both
+    // are matched per-rule by `subject_matches`.
     let exe = kernel::caller_exe()?;
     let class = current_class();
     let policy =
         match_rule(matched.obj, requested, exe, class, bank).unwrap_or(Policy::DEFAULT_DENY);
 
-    // The per-rule policy is the only enforcement level (no global mode): a denying
-    // policy blocks outright.
     let blocked = policy.denies();
-    // Emit only when the policy logs *and* the suppressor (keyed on the affected file, so
-    // distinct leaves surface) lets this one through — a tight repeat-open burst collapses
-    // to its first event + a folded `suppressed` count.
+    // Emit only when the policy logs *and* the suppressor lets this one through.
     if policy.logs() {
         if let Some(suppressed) = kernel::throttle(exe, matched.leaf, logged) {
-            // `emit` assembles the record off-stack (per-CPU scratch) and reconstructs the
-            // affected file's path relative to the protected object (DESIGN §15.10 flow B)
-            // — no `bpf_d_path` here, so it walks `d_name` from the leaf to
-            // `object_dentry`. The uid is read only on the logged path, so the unprotected
-            // majority pays nothing for it.
+            // The uid is read only on the logged path, so the unprotected majority pays
+            // nothing for it.
             kernel::emit(&kernel::Record {
                 pid,
                 uid: kernel::current_uid(),
@@ -491,8 +479,10 @@ fn find_object(leaf_dentry: kernel::Dentry, bank: Bank) -> Option<Match> {
     None
 }
 
-/// The requested action(s) for this open, from `f_mode` (read/write) + `f_flags`
-/// (`O_CREAT` → create).
+/// Returns the requested action(s) for this open: `FMODE_READ` → read, `FMODE_WRITE` →
+/// write, `O_CREAT` → create. An `O_PATH` open sets none of them, requests nothing and is
+/// allowed without a rule scan. A directory open requests read, so `Action::LISTDIR` is
+/// never requested here.
 fn requested_action(file: kernel::File) -> Option<Action> {
     let mode = file.f_mode()?;
     let flags = file.f_flags()?;
@@ -535,10 +525,10 @@ fn match_rule(
 }
 
 /// Whether a subject predicate matches the caller: each non-wildcard predicate must equal
-/// the caller's value (ANDed). M1 matches on `exe`; the `blessing` class (DESIGN §16.3) is
-/// matched here too — a blessing rule clears `BLESSING_ANY` and names a class, so it fires
-/// only for a caller in a blessed cgroup of that class. `uid`/`cgroup` matching is M2 (the
-/// compiler never emits non-wildcard `uid`/`cgroup` yet, so they stay wildcard).
+/// the caller's value (ANDed). Compares `exe` and the `blessing` class (DESIGN §16.3) — a
+/// blessing rule clears `BLESSING_ANY` and names a class, so it fires only for a caller in
+/// a blessed cgroup of that class. `uid` and `cgroup` are not compared: they are reserved
+/// and the compiler always leaves them wildcard.
 fn subject_matches(subject: SubjectMatch, exe: FileId, class: ClassId) -> bool {
     let exe_ok = subject.flags.contains(SubjectFlags::EXE_ANY) || subject.exe == exe;
     let blessing_ok =
@@ -547,9 +537,8 @@ fn subject_matches(subject: SubjectMatch, exe: FileId, class: ClassId) -> bool {
 }
 
 /// The caller's blessing class (DESIGN §16.3), resolved once per decision from its cgroup
-/// via `BLESSED`, or [`ClassId::UNBLESSED`] when the cgroup is not a live blessing. Absent
-/// any bless, `BLESSED` is empty so this is always `UNBLESSED` — every rule's blessing axis
-/// is wildcard then, so the match is unchanged from M1.
+/// via `BLESSED`, or [`ClassId::UNBLESSED`] when the cgroup is not a live blessing (so only
+/// blessing-wildcard rules can match).
 fn current_class() -> ClassId {
     blessed_class(kernel::current_cgroup_id()).unwrap_or(ClassId::UNBLESSED)
 }
@@ -564,7 +553,7 @@ fn blessed_class(cgroup: CgroupId) -> Option<ClassId> {
 // mutable map memory); copying the value out behind a safe fn keeps the decision flow
 // `unsafe`-free. `Array::get` is already safe (bounds-checked).
 
-/// The one-element settings record (daemon pid + live bank).
+/// The one-element [`Settings`] record.
 fn settings() -> Option<Settings> {
     SETTINGS.get(0).copied()
 }

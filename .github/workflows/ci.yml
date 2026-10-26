@@ -12,8 +12,8 @@ on:
 # `dtolnay/rust-toolchain` selects the toolchain from the *ref* (`@stable`), which a
 # SHA can't express — so the `toolchain:` input says it explicitly instead.
 jobs:
-  # Unprivileged: the policy core, store, decision flow, and IPC e2e. Covers
-  # everything except the kernel interception (mock backend stands in).
+  # Unprivileged: fmt, clippy and the workspace tests — everything except the in-kernel
+  # boundary, which the VM job below covers.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -27,14 +27,11 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # (The `fanotify-vm` job was removed: the fanotify backend was retired with the
-  # owner model in M1 1f. `bpf-lsm` is the only kernel backend, validated below.)
-
   # Privileged boundary: the bpf-lsm backend, in a virtme-ng VM booting a pinned
   # kernel with `bpf` added to the active LSM list (`lsm=…,bpf`). Adds the eBPF
   # toolchain — the pinned nightly (crates/bpf/rust-toolchain.toml, fetched on demand)
-  # and bpf-linker — to build the in-kernel object. The kernel needs CONFIG_BPF_LSM=y
-  # (set in the Ubuntu mainline build).
+  # and bpf-linker — to build the in-kernel object. The Ubuntu mainline kernel build
+  # sets CONFIG_BPF_LSM=y.
   bpf-lsm-vm:
     runs-on: ubuntu-latest
     needs: test

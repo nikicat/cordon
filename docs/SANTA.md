@@ -7,6 +7,13 @@ latest **2026.5 (2026-06-08)**, monthly CalVer cadence. This is the closest
 existing tool to cordon; this doc records what it does, where it overlaps, and why
 we still build.
 
+> **Dated comparison.** The cordon side below is the owner model as of the research date
+> (TOFU creator-owns, an interactive prompt, a SQLite rule store), since superseded by the
+> rule model in DESIGN §15: static root-owned text policy, no interactive prompt, plus the
+> runtime `cordon bless` grant (§16). The Santa findings stand; read the cordon column
+> against §15, where FAA's static-policy model is much closer to cordon's than this table
+> suggests.
+
 ## TL;DR verdict
 - **Linux:** Santa is **macOS-only with no cross-platform plans** → irrelevant;
   cordon's Linux (bpf-lsm) backend must be built regardless. This alone justifies

@@ -192,9 +192,10 @@ holds its maps, so seven pinned links keep the programs *and* the seeded policy 
 no holding process. The startup sequence is attach → self-test → seed → **pin** →
 sweep older generations: the previous generation keeps enforcing until the new one is
 *proven*, so there is no instant with nothing attached and an abort on a bad policy leaves the
-boundary up. Pins live at `<bpf_pin_dir>/<pid>/<hook>` — a generation subdirectory, because
+boundary up. Pins live in a per-run generation subdirectory of `bpf_pin_dir`, because
 `BPF_OBJ_PIN` fails `EEXIST` on a taken path and one shared directory would force a
-detach-then-attach gap.
+detach-then-attach gap; the code that owns the layout and the order is `PinDir::pin_links`
+in `crates/daemon/src/backend/bpf_lsm/pin.rs`.
 
 - **Adopt-existing-pins was specified here and deliberately dropped.** It buys nothing the
   link pins don't already give, and costs a mandatory cross-process writer lock, an

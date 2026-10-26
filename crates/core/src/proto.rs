@@ -1,13 +1,9 @@
-//! The IPC protocol between the `cordon` CLI and the `cordond` daemon — the
-//! control/management plane, *not* the data path of a gated `open()` (that is
-//! returned in-kernel by the bpf-lsm program).
+//! The IPC protocol between the `cordon` CLI and the `cordond` daemon — the control
+//! plane only; no verdict crosses it.
 //!
 //! Wire format: one JSON value per line (newline-delimited), synchronous RPC. Types
 //! here are runtime-agnostic so the same `Request`/`Response`/`handle` logic works
 //! whether the accept loop is threads or async.
-//!
-//! The flat **rule model** (DESIGN §15): policy is authored in a root-owned text file
-//! and pushed with `policy apply`; there are no per-object owner mutations on the wire.
 
 use crate::policy::{ClassName, Diagnostic};
 use crate::{Context, Result};
@@ -24,55 +20,50 @@ pub enum Request {
     Status,
     /// Compile + apply a policy, atomically replacing the live one. The CLI sends the
     /// **fragments** it read from the policy path (one for a file, many for a conf.d
-    /// directory): the daemon resolves each fragment's `user =` home, merges, compiles
-    /// with its own mount-aware resolver, and swaps the in-kernel maps.
+    /// directory); the daemon compiles them
+    /// ([`compile_fragments`](crate::policy::compile_fragments)) and swaps the in-kernel
+    /// maps.
     PolicyApply {
         sources: Vec<crate::policy::PolicySource>,
     },
     /// The effective (currently-loaded) compiled policy.
     PolicyShow,
     /// Ask for a blessing under `class` (`None` → the sole declared class) — the
-    /// **unprivileged** half of the mint handshake (DESIGN §16.5).
+    /// unprivileged half of the mint handshake (DESIGN §16.5).
     ///
-    /// Ungated on purpose: this connection's only power is to *ask*. The daemon replies
-    /// [`Response::BlessPending`] with a single-use [`Nonce`] and **keeps the connection
-    /// open**; nothing is minted until a uid-0 peer sends the matching [`Self::BlessApprove`]
-    /// on a second connection, at which point the carrier and its `cgroup.procs` come back
-    /// down *this* one. Reading the session placement from this peer, which cannot lie
-    /// about its own credentials, is why the daemon is the rendezvous rather than the
-    /// elevation helper.
+    /// The daemon replies [`Response::BlessPending`] with a [`Nonce`] and keeps this
+    /// connection open; once a matching [`Self::BlessApprove`] arrives on a second
+    /// connection, [`Response::BlessMinted`] comes back down this one. The handshake is
+    /// the daemon's `Ctx::serve_bless_request`; which verbs need root is its `authorize`.
     BlessRequest { class: Option<ClassName> },
-    /// Approve a pending [`Self::BlessRequest`] — the human-presence half. **Root-gated**
-    /// (`SO_PEERCRED` uid 0): reaching uid 0 is what proves a human authenticated, whatever
-    /// tool did the elevating. Single-use; the nonce is consumed whether or not the mint
-    /// then succeeds.
+    /// Approve a pending [`Self::BlessRequest`] — the human-presence half, root-gated by
+    /// the daemon's `authorize`. The nonce is spent whether or not the mint then succeeds.
     BlessApprove { nonce: Nonce },
-    /// The live blessings (carrier cgroup, member pids, age). Ungated — read-only,
-    /// parity with `PolicyShow`.
+    /// The live blessings (carrier cgroup, member pids, age).
     BlessList,
-    /// Kill a live blessing's carrier cgroup and unregister it. Allowed for uid 0 **or the
-    /// uid that requested the blessing** — having minted one unprivileged, you must be able
-    /// to revoke it the same way.
+    /// Kill a live blessing's carrier cgroup and unregister it. Who may: the daemon's
+    /// `may_revoke`.
     BlessRevoke { id: BlessId },
 }
 
 /// A single-use handle binding an unprivileged [`Request::BlessRequest`] to the root
 /// [`Request::BlessApprove`] that authorizes it.
 ///
-/// 128 bits from `/dev/urandom`, hex. It must be **unguessable**, which is the whole reason
+/// 128 bits from `getrandom(2)`, hex. It must be **unguessable**, which is the whole reason
 /// it isn't a counter: with a predictable value an attacker could register their own
 /// request, predict the nonce your session is about to be issued, and have *your*
 /// authenticated helper approve *their* request — handing them the carrier. Knowing an
 /// already-issued nonce is harmless by contrast: approving it still requires uid 0, and the
 /// carrier descriptor goes back down the requester's own connection, never to whoever
-/// approved.
+/// approved. Single-use: the daemon's `Ctx::approve` removes it before releasing the
+/// requester, so a replay finds nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Nonce(String);
 
 impl Nonce {
-    /// Bytes of entropy behind a nonce. 16 = 128 bits: far past guessing, and the value
-    /// only has to survive the seconds between a request and its approval.
+    /// Bytes of entropy behind a nonce: far past guessing, for a value that only has to
+    /// survive the seconds between a request and its approval.
     const BYTES: usize = 16;
 
     /// Mint a fresh nonce from the kernel CSPRNG, via `getrandom(2)`.
@@ -153,17 +144,15 @@ pub enum Response {
     },
     /// The effective policy (`PolicyShow`), or `None` if none is loaded.
     PolicyView(Option<PolicyView>),
-    /// A `BlessRequest` is registered and awaiting approval. The connection stays open;
-    /// the requester spawns an elevation helper with this nonce and then blocks for the
-    /// [`Self::BlessMinted`] that follows.
+    /// A `BlessRequest` is registered and awaiting approval; [`Self::BlessMinted`]
+    /// follows on the same connection once it is approved.
     BlessPending {
         nonce: Nonce,
     },
     /// A `BlessApprove` was accepted: the waiting requester has been released.
     BlessApproved,
     /// A freshly-minted blessing, sent to the **requester** once approval landed. Carries
-    /// the carrier's `cgroup.procs` out-of-band as `SCM_RIGHTS` ([`CarrierProcs`]) — the
-    /// descriptor, not the path, is the grant.
+    /// the carrier's `cgroup.procs` out-of-band as `SCM_RIGHTS` ([`CarrierProcs`]).
     BlessMinted(BlessingView),
     /// The live blessings (`BlessList`).
     Blessings(Vec<BlessingView>),
@@ -258,7 +247,7 @@ pub struct StatusInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyView {
     pub objects: Vec<ObjectView>,
-    /// Policy paths that don't exist yet (not enforced until created + re-applied).
+    /// Policy paths that don't resolve yet, so are not enforced (see `Compiler::objects`).
     pub pending: Vec<PathBuf>,
 }
 
@@ -301,9 +290,7 @@ impl Conn {
     ///
     /// Used from **both** ends, and for the same reason each way. The daemon asks who is
     /// calling, so it can gate the writes. The client asks who answered, because a socket
-    /// path is not proof of a daemon: `cordon bless` hands the reply's nonce to a process it
-    /// then elevates to root, so it must know it is talking to the real root daemon and not
-    /// to something a local user left listening at the same path (DESIGN §16.5).
+    /// path is not proof of a daemon (the CLI's `require_root_daemon`).
     ///
     /// This is the only identity in the protocol that isn't asserted by the party it
     /// describes — which is exactly why every authorization decision rests on it. Off
@@ -316,7 +303,8 @@ impl Conn {
     /// blessing carrier in that process's own logind session scope (DESIGN §16.6).
     ///
     /// **Weaker than [`peer_uid`](Self::peer_uid), and the difference matters.** The kernel
-    /// records this at `connect(2)`, so no client asserts it — but what it records is a
+    /// records this at `connect(2)`, so no client asserts it (a client-supplied pid would
+    /// let a caller aim the carrier at another user's session) — but what it records is a
     /// *number*, and pid numbers are recycled once the task is reaped. Between the connect
     /// and the daemon's `/proc/<pid>/cgroup` read sits the whole approval wait, so a pid
     /// that has since been reused names a different process. `SO_PEERPIDFD` (Linux 6.5) is
@@ -325,8 +313,8 @@ impl Conn {
     /// It doesn't today, because placement is not authorization: the grant is gated on a
     /// uid-0 `BlessApprove`, and anyone able to complete one already has root. A stale pid
     /// resolves to nothing, or to a cgroup with no session scope, and placement falls back
-    /// to the daemon's own cgroup — the safe, pre-B2 behaviour. Off Linux it is 0, which is
-    /// not a real process, so the cgroup read fails and placement falls back the same way.
+    /// to the daemon's own cgroup. Off Linux it is 0, which is not a real process, so the
+    /// cgroup read fails and placement falls back the same way.
     pub fn peer_pid(&self) -> Pid {
         self.peer_pid
     }
@@ -342,9 +330,8 @@ impl Conn {
     }
 
     /// Sends one message with `fd` attached as `SCM_RIGHTS` ancillary data — the blessing
-    /// hand-off (DESIGN §16.6): the daemon opens the carrier's `cgroup.procs` as root and
-    /// passes *only that fd*, so the CLI never needs privilege to join. The peer must read
-    /// it with [`recv_with_fd`](Self::recv_with_fd).
+    /// hand-off of a [`CarrierProcs`] (DESIGN §16.6). The peer must read it with
+    /// [`recv_with_fd`](Self::recv_with_fd).
     #[cfg(target_os = "linux")]
     pub fn send_with_fd(
         &self,
@@ -560,9 +547,7 @@ mod tests {
         assert!(matches!(msg, Response::BlessRevoked { id: BlessId(7) }));
 
         let fd = fd.expect("an fd rode along");
-        // Close-on-exec, so the carrier capability dies at the exec that starts the
-        // blessed command instead of living on inside it (DESIGN §16.4). Not the
-        // kernel's default for SCM_RIGHTS — it is `MSG_CMSG_CLOEXEC` that buys this.
+        // Close-on-exec; see `read_msg_with_fd` for why.
         let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).unwrap();
         assert!(
             nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC),
