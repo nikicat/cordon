@@ -46,6 +46,8 @@ impl Maps<'_> {
     /// the zero-initialized `SETTINGS`, so the first fill targets bank 1) and on every
     /// `cordon policy apply`.
     pub(super) fn seed(&mut self, compiled: &CompiledPolicy) -> Result<()> {
+        // Compile already reports this as an error, which refuses the apply; this guards
+        // the slot arithmetic against a caller that seeds anyway.
         if compiled.objects.len() > MAX_OBJECTS {
             return Err(Error::msg(format!(
                 "bpf-lsm: {} protected objects exceed MAX_OBJECTS ({MAX_OBJECTS})",

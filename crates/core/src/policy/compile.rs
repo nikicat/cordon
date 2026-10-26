@@ -22,7 +22,8 @@
 use super::{ClassName, Diagnostic, Loc, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
 use cordon_bpf_common::{
-    ClassId, CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectFlags, SubjectMatch,
+    ClassId, CompiledRule, FileId, MAX_OBJECTS, MAX_RULES_PER_OBJ, ObjId, SubjectFlags,
+    SubjectMatch,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -176,7 +177,7 @@ where
 {
     /// Resolves the distinct object paths. Returns the objects, numbered in path order so
     /// ObjIds don't churn across compiles of the same policy, and the paths that don't
-    /// resolve yet.
+    /// resolve yet. Reports more than `MAX_OBJECTS` objects as an error.
     fn objects(&mut self, resolved: &ResolvedPolicy) -> (Vec<Object>, Vec<PathBuf>) {
         let distinct: BTreeSet<&Path> = resolved
             .rules
@@ -196,6 +197,16 @@ where
                 }),
                 None => pending.push(path.to_path_buf()),
             }
+        }
+        if objects.len() > MAX_OBJECTS {
+            self.diagnostics.push(Diagnostic::error(
+                Loc::default(),
+                format!(
+                    "the policy protects {} objects, over the limit of {MAX_OBJECTS} \
+                     (merge objects under a common parent or raise MAX_OBJECTS)",
+                    objects.len()
+                ),
+            ));
         }
         (objects, pending)
     }
@@ -591,6 +602,29 @@ mod tests {
             p.diagnostics
                 .iter()
                 .any(|d| d.message.contains("per-object limit"))
+        );
+    }
+
+    #[test]
+    fn too_many_objects_is_an_error() {
+        let paths: Vec<String> = (0..=MAX_OBJECTS).map(|i| format!("\"/o{i}\"")).collect();
+        let text = rule(
+            "\"*\"",
+            &format!("[{}]", paths.join(",")),
+            "\"read\"",
+            "\"deny\"",
+        );
+        let resolved = resolve(&parse(&text).unwrap(), Path::new("/home/u")).unwrap();
+        let mut ino = 0;
+        let p = compile(&resolved, |_: &Path| {
+            ino += 1;
+            Some(FileId::new(Dev(0), Ino(ino)))
+        });
+        assert!(p.has_errors());
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("over the limit of"))
         );
     }
 
