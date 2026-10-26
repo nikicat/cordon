@@ -32,7 +32,7 @@ use cordon_core::policy::ClassName;
 use cordon_core::proto::{
     BlessId, CarrierProcs, Nonce, Request, Response, peer_uid, read_msg_with_fd, write_msg,
 };
-use cordon_core::{Error, Result, Uid};
+use cordon_core::{Context, Error, Result, Uid};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
@@ -97,9 +97,7 @@ fn mint_and_exec(args: &BlessArgs, cli: &Cli) -> Result<ExitCode> {
     let procs = request_and_approve(&socket, args.class.clone())?;
     let mut cmd = build_command(&args.command);
     sys::join_cgroup_on_exec(&mut cmd, procs);
-    let status = cmd
-        .status()
-        .map_err(|e| Error::msg(format!("spawn blessed command: {e}")))?;
+    let status = cmd.status().context("spawn blessed command")?;
     Ok(ExitCode::from(exit_byte(status.code(), status.signal())))
 }
 
@@ -169,8 +167,7 @@ fn require_root_daemon(stream: &UnixStream, socket: &Path) -> Result<()> {
 /// callers only ever match the replies they expect.
 fn reply(stream: &UnixStream) -> Result<(Response, Option<std::os::fd::OwnedFd>)> {
     match read_msg_with_fd::<Response>(stream)? {
-        Some((Response::Error { message }, _)) => Err(Error::msg(format!("daemon: {message}"))),
-        Some(other) => Ok(other),
+        Some((resp, fd)) => Ok((resp.into_result()?, fd)),
         None => Err(Error::msg("daemon closed the connection without replying")),
     }
 }
@@ -198,8 +195,7 @@ fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
     let program = words
         .next()
         .ok_or_else(|| Error::msg(format!("${ELEVATION_ENV} is empty")))?;
-    let me = std::env::current_exe()
-        .map_err(|e| Error::msg(format!("cannot locate the cordon binary: {e}")))?;
+    let me = std::env::current_exe().context("cannot locate the cordon binary")?;
     let status = Command::new(program)
         .args(words)
         .arg(me)
@@ -208,7 +204,7 @@ fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
         .arg("bless-helper")
         .arg(format!("--nonce={nonce}"))
         .status()
-        .map_err(|e| Error::msg(format!("spawn {program}: {e}")))?;
+        .with_context(|| format!("spawn {program}"))?;
     if !status.success() {
         return Err(Error::msg(format!(
             "elevation via {program} did not succeed ({status}) — blessing refused"

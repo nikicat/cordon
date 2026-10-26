@@ -28,7 +28,7 @@ use aya::Ebpf;
 use aya::programs::Lsm;
 use aya::programs::links::{FdLink, PinnedLink};
 use aya::programs::lsm::LsmLinkId;
-use cordon_core::{Error, Result};
+use cordon_core::{Context, Error, Result};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -66,10 +66,10 @@ pub(super) fn pin_links(
             .program_mut(hook)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: program '{hook}' vanished before pin")))?
             .try_into()
-            .map_err(|e| Error::msg(format!("bpf-lsm: '{hook}' is not an LSM program: {e}")))?;
+            .with_context(|| format!("bpf-lsm: '{hook}' is not an LSM program"))?;
         let link = program
             .take_link(id)
-            .map_err(|e| Error::msg(format!("bpf-lsm: take link {hook}: {e}")))?;
+            .with_context(|| format!("bpf-lsm: take link {hook}"))?;
         let path = generation.join(hook);
         // No bpffs pre-check: `BPF_OBJ_PIN` itself refuses any path outside a bpffs with
         // `EINVAL`, so a `statfs` here would only duplicate the kernel's own guard. What it
@@ -129,9 +129,7 @@ fn sweep(pin_dir: &Path, keep: Option<&Path>) -> Result<Swept> {
 
     let mut removed = 0;
     for entry in entries {
-        let path = entry
-            .map_err(|e| Error::msg(format!("bpf-lsm: read pin dir: {e}")))?
-            .path();
+        let path = entry.context("bpf-lsm: read pin dir")?.path();
         if keep == Some(path.as_path()) {
             continue;
         }
@@ -140,7 +138,7 @@ fn sweep(pin_dir: &Path, keep: Option<&Path>) -> Result<Swept> {
         } else {
             std::fs::remove_file(&path)
         };
-        result.map_err(|e| Error::msg(format!("bpf-lsm: unpin {}: {e}", path.display())))?;
+        result.with_context(|| format!("bpf-lsm: unpin {}", path.display()))?;
         removed += 1;
     }
     Ok(Swept::from_count(removed))

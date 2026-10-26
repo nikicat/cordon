@@ -48,7 +48,7 @@ use cordon_bpf_common::{
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, CompiledPolicy, PolicySource, Severity};
 use cordon_core::proto::{ObjectView, PolicyView};
-use cordon_core::{Error, Result};
+use cordon_core::{Context, Error, Result};
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -105,8 +105,7 @@ impl Backend for BpfLsmBackend {
         // Kernel BTF resolves the hook's BTF id for attach (and sanitizes the program's
         // own BTF). The object carries no struct layout (rustc can't emit CO-RE
         // relocations); resolve the running kernel's field offsets and inject them.
-        let btf =
-            Btf::from_sys_fs().map_err(|e| Error::msg(format!("bpf-lsm: kernel BTF: {e}")))?;
+        let btf = Btf::from_sys_fs().context("bpf-lsm: kernel BTF")?;
         let mut offsets = KernelBtf::from_running_kernel()?.offsets()?;
         maybe_poison_offsets(&mut offsets);
 
@@ -135,13 +134,13 @@ impl Backend for BpfLsmBackend {
                     Error::msg(format!("bpf-lsm: program '{hook}' missing from object"))
                 })?
                 .try_into()
-                .map_err(|e| Error::msg(format!("bpf-lsm: '{hook}' is not an LSM program: {e}")))?;
+                .with_context(|| format!("bpf-lsm: '{hook}' is not an LSM program"))?;
             program
                 .load(hook, &btf)
-                .map_err(|e| Error::msg(format!("bpf-lsm: load program {hook}: {e}")))?;
+                .with_context(|| format!("bpf-lsm: load program {hook}"))?;
             let id = program
                 .attach()
-                .map_err(|e| Error::msg(format!("bpf-lsm: attach {hook}: {e}")))?;
+                .with_context(|| format!("bpf-lsm: attach {hook}"))?;
             links.push((hook, id));
         }
         self_test(&mut ebpf)?;
@@ -322,23 +321,22 @@ fn make_probe(base: &Path) -> Result<PathBuf> {
         .recursive(true)
         .mode(0o700)
         .create(base)
-        .map_err(|e| Error::msg(format!("bpf-lsm self-test: mkdir {}: {e}", base.display())))?;
+        .with_context(|| format!("bpf-lsm self-test: mkdir {}", base.display()))?;
     let probe = base.join(format!("selftest.{}", std::process::id()));
     // A previous run that died before its cleanup leaves this behind, and pids are reused.
     let _ = std::fs::remove_dir_all(&probe);
-    std::fs::create_dir(&probe)
-        .map_err(|e| Error::msg(format!("bpf-lsm self-test: mkdir probe: {e}")))?;
+    std::fs::create_dir(&probe).context("bpf-lsm self-test: mkdir probe")?;
     // Seeded *before* the object goes live, or creating them would be denied by our own
     // rule. `over` is the rename-over target: a *positive* destination dentry, which is the
     // one shape `link` can never produce.
     for name in ["src", "over", "exe"] {
         std::fs::write(probe.join(name), b"x")
-            .map_err(|e| Error::msg(format!("bpf-lsm self-test: seed probe {name}: {e}")))?;
+            .with_context(|| format!("bpf-lsm self-test: seed probe {name}"))?;
     }
     // `exe` must carry the x bit or `do_open_execat`'s `may_open(MAY_EXEC)` refuses with
     // EACCES *before* `bprm_check_security` runs, and the probe would prove nothing.
     std::fs::set_permissions(probe.join("exe"), std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| Error::msg(format!("bpf-lsm self-test: chmod probe exe: {e}")))?;
+        .context("bpf-lsm self-test: chmod probe exe")?;
     Ok(probe)
 }
 

@@ -9,8 +9,8 @@
 //! The flat **rule model** (DESIGN §15): policy is authored in a root-owned text file
 //! and pushed with `policy apply`; there are no per-object owner mutations on the wire.
 
-use crate::Result;
 use crate::policy::{ClassName, Diagnostic};
+use crate::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -82,7 +82,7 @@ impl Nonce {
     /// fail-closed direction, and the only one that matters for an unguessable value.
     pub fn generate() -> Result<Nonce> {
         let mut buf = [0u8; Nonce::BYTES];
-        getrandom::fill(&mut buf).map_err(|e| crate::Error::msg(format!("getrandom: {e}")))?;
+        getrandom::fill(&mut buf).context("getrandom")?;
         Ok(Nonce(buf.map(|b| format!("{b:02x}")).concat()))
     }
 }
@@ -175,6 +175,16 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+impl Response {
+    /// Returns the reply, or the daemon's [`Response::Error`] as an error.
+    pub fn into_result(self) -> Result<Response> {
+        match self {
+            Response::Error { message } => Err(crate::Error::msg(format!("daemon: {message}"))),
+            other => Ok(other),
+        }
+    }
 }
 
 /// One live blessing as shown to the CLI: its handle, class, carrier cgroup directory,
@@ -291,8 +301,7 @@ pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>>
 #[cfg(target_os = "linux")]
 pub fn peer_uid(sock: &UnixStream) -> Result<crate::Uid> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let creds = getsockopt(sock, PeerCredentials)
-        .map_err(|e| crate::Error::msg(format!("SO_PEERCRED: {e}")))?;
+    let creds = getsockopt(sock, PeerCredentials).context("SO_PEERCRED")?;
     Ok(crate::Uid(creds.uid()))
 }
 
@@ -322,8 +331,7 @@ pub fn peer_uid(_sock: &UnixStream) -> Result<crate::Uid> {
 #[cfg(target_os = "linux")]
 pub fn peer_pid(sock: &UnixStream) -> Result<Pid> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let creds = getsockopt(sock, PeerCredentials)
-        .map_err(|e| crate::Error::msg(format!("SO_PEERCRED: {e}")))?;
+    let creds = getsockopt(sock, PeerCredentials).context("SO_PEERCRED")?;
     Ok(Pid::from_raw(creds.pid()))
 }
 
@@ -373,8 +381,7 @@ fn send_all_with_fd(
     while sent < bytes.len() {
         let iov = [std::io::IoSlice::new(&bytes[sent..])];
         let cmsgs: &[ControlMessage] = if sent == 0 { &scm } else { &[] };
-        sent += sendmsg::<()>(raw, &iov, cmsgs, MsgFlags::empty(), None)
-            .map_err(|e| crate::Error::msg(format!("sendmsg: {e}")))?;
+        sent += sendmsg::<()>(raw, &iov, cmsgs, MsgFlags::empty(), None).context("sendmsg")?;
     }
     Ok(())
 }
@@ -438,11 +445,8 @@ fn recv_byte_with_fd(
             Some(&mut cmsg),
             MsgFlags::MSG_CMSG_CLOEXEC,
         )
-        .map_err(|e| crate::Error::msg(format!("recvmsg: {e}")))?;
-        for c in msg
-            .cmsgs()
-            .map_err(|e| crate::Error::msg(format!("recvmsg cmsgs: {e}")))?
-        {
+        .context("recvmsg")?;
+        for c in msg.cmsgs().context("recvmsg cmsgs")? {
             if let ControlMessageOwned::ScmRights(fds) = c {
                 for got in fds {
                     // SAFETY: the kernel just installed `got` in this process as a fresh

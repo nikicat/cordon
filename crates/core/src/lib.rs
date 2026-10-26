@@ -49,3 +49,21 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Adds what was being done to a failure, so the error reads `"{what}: {cause}"`.
+pub trait Context<T> {
+    /// Returns the value, or an error naming `what` failed.
+    fn context(self, what: &str) -> Result<T>;
+    /// Like [`context`](Context::context), but builds the message only on failure.
+    fn with_context(self, what: impl FnOnce() -> String) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> Context<T> for std::result::Result<T, E> {
+    fn context(self, what: &str) -> Result<T> {
+        self.map_err(|e| Error::msg(format!("{what}: {e}")))
+    }
+
+    fn with_context(self, what: impl FnOnce() -> String) -> Result<T> {
+        self.map_err(|e| Error::msg(format!("{}: {e}", what())))
+    }
+}

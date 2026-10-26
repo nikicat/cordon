@@ -23,7 +23,7 @@ use aya::Ebpf;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
 use cordon_core::policy::{ClassName, ClassRegistry};
 use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, Pid};
-use cordon_core::{Error, Result, Uid};
+use cordon_core::{Context, Error, Result, Uid};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -136,8 +136,7 @@ impl Blessings {
         // In the requester's own session scope or user slice where possible, so the
         // blessed process keeps its logind session and polkit/run0 keep working inside it.
         let dir = carrier_parent(requester, root).join(dir_name(id, &class));
-        std::fs::create_dir(&dir)
-            .map_err(|e| Error::msg(format!("bless: mkdir {}: {e}", dir.display())))?;
+        std::fs::create_dir(&dir).with_context(|| format!("bless: mkdir {}", dir.display()))?;
         // The carrier's kernel cgroup id: cgroup2 (kernfs) guarantees st_ino == the id
         // `bpf_get_current_cgroup_id()` returns (kernel ≥5.5; BPF-LSM needs ≥5.7, and
         // st_ino is the full 64-bit id — no 32-bit truncation on a 64-bit kernel). The

@@ -31,7 +31,7 @@ pub use compile::{ClassRegistry, CompiledObject, CompiledPolicy, compile, stat_r
 pub use parse::{ParsedPolicy, parse};
 pub use resolve::{ResolvedPolicy, ResolvedRule, SubjectSpec, resolve};
 
-use crate::Result;
+use crate::{Context, Result};
 use cordon_bpf_common as bpf;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -430,11 +430,10 @@ impl PolicySource {
 /// conf.d split, DESIGN §15.8). Errors on I/O or an empty directory — a policy that
 /// resolves to no fragments is a misconfiguration, not an empty allow-all.
 pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| crate::Error::msg(format!("policy {}: {e}", path.display())))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("policy {}", path.display()))?;
     if !meta.is_dir() {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| crate::Error::msg(format!("read policy {}: {e}", path.display())))?;
+            .with_context(|| format!("read policy {}", path.display()))?;
         return Ok(vec![PolicySource::system(path.display().to_string(), text)]);
     }
     let files = fragment_paths(path)?;
@@ -448,7 +447,7 @@ pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
         .into_iter()
         .map(|p| {
             let text = std::fs::read_to_string(&p)
-                .map_err(|e| crate::Error::msg(format!("read policy {}: {e}", p.display())))?;
+                .with_context(|| format!("read policy {}", p.display()))?;
             Ok(PolicySource::system(p.display().to_string(), text))
         })
         .collect()
@@ -458,7 +457,7 @@ pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
 /// when the directory cannot be read.
 pub fn fragment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| crate::Error::msg(format!("read policy dir {}: {e}", dir.display())))?
+        .with_context(|| format!("read policy dir {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "toml"))
         .collect();

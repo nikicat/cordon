@@ -9,7 +9,7 @@
 //! The file is optional; absent ⇒ all defaults.
 
 use crate::backend::BackendKind;
-use crate::{Error, Result};
+use crate::{Context, Error, Result};
 use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -58,7 +58,7 @@ impl Config {
             .unwrap_or_else(default_config_path);
         let file = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str::<ConfigFile>(&text)
-                .map_err(|e| Error::msg(format!("config {}: {e}", path.display())))?,
+                .with_context(|| format!("config {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
             Err(e) => return Err(Error::msg(format!("config {}: {e}", path.display()))),
         };

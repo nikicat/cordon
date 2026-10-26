@@ -7,7 +7,7 @@
 //! resolution, cycles, paths — is [`super::resolve`]'s job.
 
 use super::{ClassName, GroupName, LineIndex, PolicyName, Pos, UserName};
-use crate::{Error, Result};
+use crate::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use toml::Spanned;
@@ -242,8 +242,7 @@ impl Token {
 /// (arity, unknown policy keyword, unterminated quote — a `line:col`-prefixed error
 /// pointing into the `rules` block). Both rule surfaces normalize to [`ParsedRule`].
 pub fn parse(text: &str) -> Result<ParsedPolicy> {
-    let raw: RawPolicy =
-        toml::from_str(text).map_err(|e| Error::msg(format!("policy parse error: {e}")))?;
+    let raw: RawPolicy = toml::from_str(text).context("policy parse error")?;
     let lines = LineIndex::new(text);
 
     let mut rules = Vec::with_capacity(raw.blocks.len());

@@ -3,6 +3,7 @@
 //! [`home_of`]. Both go through the same parser, so a `~` the journal renders is the `~`
 //! that user's policy expands to.
 
+use crate::Context;
 use crate::policy::UserName;
 use cordon_bpf_common::Uid;
 use std::collections::HashMap;
@@ -76,8 +77,7 @@ impl Passwd {
 /// Returns the home of the login `user`, or `None` when `/etc/passwd` has no entry for
 /// it. Errors when `/etc/passwd` can't be read.
 pub fn home_of(user: &UserName) -> crate::Result<Option<PathBuf>> {
-    let text = std::fs::read_to_string(PASSWD)
-        .map_err(|e| crate::Error::msg(format!("read {PASSWD}: {e}")))?;
+    let text = std::fs::read_to_string(PASSWD).with_context(|| format!("read {PASSWD}"))?;
     Ok(home_in(&text, user))
 }
 

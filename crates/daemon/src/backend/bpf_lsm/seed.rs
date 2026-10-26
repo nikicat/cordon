@@ -32,7 +32,7 @@ use cordon_bpf_common::{
     rule_slot,
 };
 use cordon_core::policy::CompiledPolicy;
-use cordon_core::{Error, Result};
+use cordon_core::{Context, Error, Result};
 use std::path::Path;
 use std::sync::OnceLock;
 use tracing::{info, warn};
@@ -86,10 +86,8 @@ pub(super) fn seed_policy(ebpf: &mut Ebpf, compiled: &CompiledPolicy) -> Result<
 /// reads as [`Bank::ZERO`], so the first [`seed_policy`] targets bank 1.
 fn current_bank(ebpf: &mut Ebpf) -> Result<Bank> {
     let settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
-        .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SETTINGS}: {e}")))?;
-    let s = settings
-        .get(&0, 0)
-        .map_err(|e| Error::msg(format!("bpf-lsm: read settings: {e}")))?;
+        .with_context(|| format!("bpf-lsm: {MAP_SETTINGS}"))?;
+    let s = settings.get(&0, 0).context("bpf-lsm: read settings")?;
     Ok(s.active_bank.masked())
 }
 
@@ -101,33 +99,33 @@ pub(super) fn protected_insert(
 ) -> Result<()> {
     let mut map: BpfHashMap<_, BankedFile, ObjId> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_PROTECTED)?)
-            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_PROTECTED}: {e}")))?;
+            .with_context(|| format!("bpf-lsm: {MAP_PROTECTED}"))?;
     map.insert(BankedFile::new(bank, file), obj, 0)
-        .map_err(|e| Error::msg(format!("bpf-lsm: insert protected: {e}")))
+        .context("bpf-lsm: insert protected")
 }
 
 pub(super) fn protected_remove(ebpf: &mut Ebpf, bank: Bank, file: FileId) -> Result<()> {
     let mut map: BpfHashMap<_, BankedFile, ObjId> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_PROTECTED)?)
-            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_PROTECTED}: {e}")))?;
+            .with_context(|| format!("bpf-lsm: {MAP_PROTECTED}"))?;
     map.remove(&BankedFile::new(bank, file))
-        .map_err(|e| Error::msg(format!("bpf-lsm: remove protected: {e}")))
+        .context("bpf-lsm: remove protected")
 }
 
 pub(super) fn rule_count_insert(ebpf: &mut Ebpf, bank: Bank, obj: ObjId, count: u32) -> Result<()> {
     let mut map: BpfHashMap<_, BankedObj, u32> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_RULE_COUNT)?)
-            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_RULE_COUNT}: {e}")))?;
+            .with_context(|| format!("bpf-lsm: {MAP_RULE_COUNT}"))?;
     map.insert(BankedObj::new(bank, obj), count, 0)
-        .map_err(|e| Error::msg(format!("bpf-lsm: insert rule count: {e}")))
+        .context("bpf-lsm: insert rule count")
 }
 
 pub(super) fn rule_count_remove(ebpf: &mut Ebpf, bank: Bank, obj: ObjId) -> Result<()> {
     let mut map: BpfHashMap<_, BankedObj, u32> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_RULE_COUNT)?)
-            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_RULE_COUNT}: {e}")))?;
+            .with_context(|| format!("bpf-lsm: {MAP_RULE_COUNT}"))?;
     map.remove(&BankedObj::new(bank, obj))
-        .map_err(|e| Error::msg(format!("bpf-lsm: remove rule count: {e}")))
+        .context("bpf-lsm: remove rule count")
 }
 
 /// Register a live blessing: the carrier cgroup's id → its class. `MAP_BLESSED` is
@@ -136,34 +134,33 @@ pub(super) fn rule_count_remove(ebpf: &mut Ebpf, bank: Bank, obj: ObjId) -> Resu
 pub(super) fn blessed_insert(ebpf: &mut Ebpf, cgroup: CgroupId, class: ClassId) -> Result<()> {
     let mut map: BpfHashMap<_, CgroupId, ClassId> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_BLESSED)?)
-            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_BLESSED}: {e}")))?;
+            .with_context(|| format!("bpf-lsm: {MAP_BLESSED}"))?;
     map.insert(cgroup, class, 0)
-        .map_err(|e| Error::msg(format!("bpf-lsm: insert blessed: {e}")))
+        .context("bpf-lsm: insert blessed")
 }
 
 pub(super) fn blessed_remove(ebpf: &mut Ebpf, cgroup: CgroupId) -> Result<()> {
     let mut map: BpfHashMap<_, CgroupId, ClassId> =
         BpfHashMap::try_from(map_mut(ebpf, MAP_BLESSED)?)
-            .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_BLESSED}: {e}")))?;
-    map.remove(&cgroup)
-        .map_err(|e| Error::msg(format!("bpf-lsm: remove blessed: {e}")))
+            .with_context(|| format!("bpf-lsm: {MAP_BLESSED}"))?;
+    map.remove(&cgroup).context("bpf-lsm: remove blessed")
 }
 
 pub(super) fn rules_set(ebpf: &mut Ebpf, index: u32, rule: CompiledRule) -> Result<()> {
     let mut map: Array<_, CompiledRule> = Array::try_from(map_mut(ebpf, MAP_RULES)?)
-        .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_RULES}: {e}")))?;
+        .with_context(|| format!("bpf-lsm: {MAP_RULES}"))?;
     map.set(index, rule, 0)
-        .map_err(|e| Error::msg(format!("bpf-lsm: set rule[{index}]: {e}")))
+        .with_context(|| format!("bpf-lsm: set rule[{index}]"))
 }
 
 /// Set the one-element `SETTINGS` record: the fast-allowed daemon identity and the live
 /// bank. Writing this with a flipped `bank` is the atomic policy publish.
 pub(super) fn set_settings(ebpf: &mut Ebpf, pid: Pid, exe: FileId, bank: Bank) -> Result<()> {
     let mut settings: Array<_, Settings> = Array::try_from(map_mut(ebpf, MAP_SETTINGS)?)
-        .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_SETTINGS}: {e}")))?;
+        .with_context(|| format!("bpf-lsm: {MAP_SETTINGS}"))?;
     settings
         .set(0, Settings::new(pid, bank, exe), 0)
-        .map_err(|e| Error::msg(format!("bpf-lsm: set settings: {e}")))
+        .context("bpf-lsm: set settings")
 }
 
 /// This daemon's own executable identity, the other half of the fast-allow (the kernel
@@ -199,33 +196,33 @@ fn clear_bank(ebpf: &mut Ebpf, bank: Bank) -> Result<()> {
     {
         let mut map: BpfHashMap<_, BankedFile, ObjId> =
             BpfHashMap::try_from(map_mut(ebpf, MAP_PROTECTED)?)
-                .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_PROTECTED}: {e}")))?;
+                .with_context(|| format!("bpf-lsm: {MAP_PROTECTED}"))?;
         let stale: Vec<BankedFile> = map
             .keys()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::msg(format!("bpf-lsm: list {MAP_PROTECTED}: {e}")))?
+            .with_context(|| format!("bpf-lsm: list {MAP_PROTECTED}"))?
             .into_iter()
             .filter(|k| k.bank == bank)
             .collect();
         for k in stale {
             map.remove(&k)
-                .map_err(|e| Error::msg(format!("bpf-lsm: clear {MAP_PROTECTED}: {e}")))?;
+                .with_context(|| format!("bpf-lsm: clear {MAP_PROTECTED}"))?;
         }
     }
     {
         let mut map: BpfHashMap<_, BankedObj, u32> =
             BpfHashMap::try_from(map_mut(ebpf, MAP_RULE_COUNT)?)
-                .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_RULE_COUNT}: {e}")))?;
+                .with_context(|| format!("bpf-lsm: {MAP_RULE_COUNT}"))?;
         let stale: Vec<BankedObj> = map
             .keys()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::msg(format!("bpf-lsm: list {MAP_RULE_COUNT}: {e}")))?
+            .with_context(|| format!("bpf-lsm: list {MAP_RULE_COUNT}"))?
             .into_iter()
             .filter(|k| k.bank == bank)
             .collect();
         for k in stale {
             map.remove(&k)
-                .map_err(|e| Error::msg(format!("bpf-lsm: clear {MAP_RULE_COUNT}: {e}")))?;
+                .with_context(|| format!("bpf-lsm: clear {MAP_RULE_COUNT}"))?;
         }
     }
     Ok(())

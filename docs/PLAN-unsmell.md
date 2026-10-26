@@ -6,7 +6,7 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 2.2 are committed. Step 2.3 is in the working tree, unstaged.
+> **Status:** steps 0 through 2.3 are committed. Step 2.4 is in the working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -59,15 +59,17 @@ One commit each, in this order:
    `Entry` and gains `home_of`, which `policy::home_for` calls in place of its own parser.
    The CLI's `sys::user_identity` stays separate on purpose: it asks NSS (`getpwuid`), so
    `policy edit` also works for an LDAP or other non-file account.
-3. **Located errors** (done, unstaged): `Error::at(pos, msg)` builds every positioned
+3. **Located errors** (done): `Error::at(pos, msg)` builds every positioned
    error as an `Error::Located`, and `Diagnostic` carries a `Loc` (fragment name and
    position) in place of a bare `pos`. Output changes: a fragment's error renders as
    `file:line:col: error: msg` instead of `error: file: line:col: msg`, and a compile
    warning about a rule now names the rule's fragment.
-4. **`Error::context`**: one helper replaces about 30 hand-written
-   `.map_err(|e| Error::msg(format!("<verb> {path}: {e}")))` sites, and
-   `Response::into_result` plus `read_reply` replace the three ways the CLI turns a daemon
-   error into an `Error`.
+4. **`Context`** (done, unstaged): a `Context` extension trait in core replaces all 64
+   hand-written `.map_err(|e| Error::msg(format!("<what>: {e}")))` sites, with identical
+   error text. `Response::into_result` replaces the CLI's two ways of turning a daemon
+   `Error` reply into an error (`daemon:` and `daemon error:` prefixes; now `daemon:`).
+   `read_reply` was dropped: its two callers read different frame shapes (with and without
+   a descriptor), so a shared helper would only move the one-line `None` check.
 
 ## 3. Missing receivers
 

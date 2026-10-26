@@ -16,7 +16,7 @@
 //! still found without hard-coding bindgen's `__bindgen_anon_N` names.
 
 use cordon_bpf_common::Offsets;
-use cordon_core::{Error, Result};
+use cordon_core::{Context, Error, Result};
 use std::path::Path;
 
 /// Where the kernel exports its own BTF.
@@ -82,8 +82,8 @@ impl KernelBtf {
     }
 
     fn from_path(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::msg(format!("bpf-lsm: read {}: {e}", path.display())))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("bpf-lsm: read {}", path.display()))?;
         Self::parse(&bytes)
     }
 

@@ -25,7 +25,7 @@
 
 use cordon_core::policy::{self, Diagnostic, PolicySource, SourceOrigin, UserName};
 use cordon_core::proto::{Request, Response};
-use cordon_core::{Error, Result, config};
+use cordon_core::{Context, Error, Result, config};
 use nix::unistd::{Gid, Uid};
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -433,7 +433,8 @@ impl Session {
             eprintln!("cordon: policy has errors.");
             return Ok(Verdict::Reedit);
         }
-        match crate::round_trip(&self.socket, &Request::PolicyApply { sources: candidate }) {
+        let request = Request::PolicyApply { sources: candidate };
+        match crate::round_trip(&self.socket, &request).and_then(Response::into_result) {
             Ok(Response::PolicyApplied {
                 applied: true,
                 diagnostics,
@@ -449,7 +450,6 @@ impl Session {
                 eprintln!("cordon: the daemon rejected the policy.");
                 Ok(Verdict::Reedit)
             }
-            Ok(Response::Error { message }) => Err(Error::msg(format!("daemon error: {message}"))),
             Ok(other) => Err(Error::msg(format!("unexpected daemon response: {other:?}"))),
             // The daemon isn't up; persist the validated file.
             Err(e) if is_daemon_down(&e) => Ok(Verdict::SaveOnly),
@@ -700,8 +700,7 @@ fn install_atomically(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
-            .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let mode = fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
@@ -760,7 +759,7 @@ impl TempEdit {
         DirBuilder::new()
             .mode(0o700)
             .create(&dir)
-            .map_err(|e| Error::msg(format!("create temp dir {}: {e}", dir.display())))?;
+            .with_context(|| format!("create temp dir {}", dir.display()))?;
         let basename = target
             .file_name()
             .map(Path::new)
@@ -775,22 +774,21 @@ impl TempEdit {
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp.file)
-                .map_err(|e| Error::msg(format!("create temp file: {e}")))?;
+                .context("create temp file")?;
             f.write_all(seed.as_bytes())?;
             // Hand the file to the invoking user via its **fd**, while the dir is still
             // root-owned 0700 (so the fd is still the one we created). `fchown` acts on the
             // open inode, not a name, so — unlike a path `chown` — a same-uid attacker can't
             // redirect it through a symlink once the dir becomes theirs (arbitrary-chown TOCTOU).
             if let EditorAs::User { uid, gid, .. } = editor_as {
-                sys::fchown(&f, *uid, *gid)
-                    .map_err(|e| Error::msg(format!("chown temp file: {e}")))?;
+                sys::fchown(&f, *uid, *gid).context("chown temp file")?;
             }
         }
         // The dir last, by path — a root-created entry in the sticky tmpdir, so its own path
         // can't be swapped — chowned so the dropped editor can enter it.
         if let EditorAs::User { uid, gid, .. } = editor_as {
             sys::chown(&tmp.dir, *uid, *gid)
-                .map_err(|e| Error::msg(format!("chown {}: {e}", tmp.dir.display())))?;
+                .with_context(|| format!("chown {}", tmp.dir.display()))?;
         }
         Ok(tmp)
     }
@@ -836,7 +834,7 @@ fn read_edited(path: &Path) -> Result<String> {
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+        .context("re-read edited file")?;
     if !f.metadata()?.file_type().is_file() {
         return Err(Error::msg(
             "edited file is not a regular file — refusing to read it back",
@@ -844,7 +842,7 @@ fn read_edited(path: &Path) -> Result<String> {
     }
     let mut edited = String::new();
     f.read_to_string(&mut edited)
-        .map_err(|e| Error::msg(format!("re-read edited file: {e}")))?;
+        .context("re-read edited file")?;
     Ok(edited)
 }
 

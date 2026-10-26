@@ -21,7 +21,7 @@ use cordon_bpf_common::{
 use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
 use cordon_core::policy::{ClassName, ClassRegistry, CompiledPolicy, PolicySource, UserName};
-use cordon_core::{Error, Result};
+use cordon_core::{Context, Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -80,7 +80,7 @@ pub(super) fn serve(
         ebpf.take_map(MAP_EVENTS)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: {MAP_EVENTS} missing from object")))?,
     )
-    .map_err(|e| Error::msg(format!("bpf-lsm: {MAP_EVENTS}: {e}")))?;
+    .with_context(|| format!("bpf-lsm: {MAP_EVENTS}"))?;
     let raw = ring.as_raw_fd();
     // Names callers on the audit line; reloaded only when /etc/passwd changes (per drain).
     let mut passwd = Passwd::new();
