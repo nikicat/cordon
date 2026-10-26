@@ -170,8 +170,8 @@ Left as code; each makes its doc long or awkward:
 - `events::apply`, `Resolver::expand` and `Compiler`'s steps return results through a
   parameter or side channel (`reply`, the `leaf` callback, `self.diagnostics`).
 - `Maps::seed` also rewrites the daemon's fast-allow identity on every flip.
-- `Session::open` (edit) does four jobs; `editor_identity` and `invoker_uid` both parse
-  `SUDO_UID` with the same message.
+- `Session::open` (edit) does four jobs.
+- `editor_identity` and `invoker_uid` both parsed `SUDO_UID`. Done, `SudoInvoker` owns it.
 - `decide_reparent` (eBPF) answers three questions, within the verifier's limits.
 - `OneOrMany::classified` is `tokens().to_vec()` under a misleading name.
 - `UserName::from_str` accepted the empty string and `/`. Done, it now refuses both.

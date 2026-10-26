@@ -201,40 +201,62 @@ impl EditTargetArgs {
 /// Returns the login name of the account whose tier a bare `cordon policy edit` opens.
 /// Errors as [`invoker_uid`] does, and when that uid has no passwd entry.
 fn invoking_user() -> Result<UserName> {
-    let uid = invoker_uid(
-        Uid::from_raw(config::euid()),
-        std::env::var("SUDO_UID").ok().as_deref(),
-    )?;
+    let uid = invoker_uid(Uid::from_raw(config::euid()), SudoInvoker::from_env)?;
     let (name, _home) = sys::user_identity(uid)
         .ok_or_else(|| Error::msg(format!("uid {uid} has no passwd entry")))?;
     Ok(name)
 }
 
 /// Returns the uid whose tier a bare `cordon policy edit` opens. That is `euid` when it is
-/// not root, and the `sudo_uid` invoker when it is. Errors when `sudo_uid` is malformed,
-/// or when root has no non-root `sudo_uid` (a root login, a cron job, sudo to root). Such
-/// a caller has no tier of its own, so it must name `--system` or `--user` instead of
-/// silently editing the system policy.
-fn invoker_uid(euid: Uid, sudo_uid: Option<&str>) -> Result<Uid> {
+/// not root, and the `sudo` invoker when it is. `sudo` is called only for root. Errors as
+/// `sudo` does, and when root has no invoker. Such a caller has no tier of its own, so it
+/// must name `--system` or `--user` instead of silently editing the system policy.
+fn invoker_uid(euid: Uid, sudo: impl FnOnce() -> Result<Option<SudoInvoker>>) -> Result<Uid> {
     if !euid.is_root() {
         return Ok(euid);
     }
-    let no_invoker = || {
-        Error::msg(
+    match sudo()? {
+        Some(invoker) => Ok(invoker.uid),
+        None => Err(Error::msg(
             "running as root with no invoking user — name what to edit: \
              `--system` for the system policy, or `--user NAME` for a user tier",
-        )
-    };
-    let uid = Uid::from_raw(
-        sudo_uid
-            .ok_or_else(no_invoker)?
-            .parse::<u32>()
-            .map_err(|_| Error::msg(format!("invalid SUDO_UID: {:?}", sudo_uid.unwrap())))?,
-    );
-    if uid.is_root() {
-        return Err(no_invoker());
+        )),
     }
-    Ok(uid)
+}
+
+/// The non-root user who ran `cordon` through `sudo`, as `SUDO_UID` and `SUDO_GID` name
+/// it.
+#[derive(Debug, PartialEq)]
+struct SudoInvoker {
+    uid: Uid,
+    gid: Gid,
+}
+
+impl SudoInvoker {
+    /// Returns the invoker that this process's environment names, as [`SudoInvoker::parse`]
+    /// does.
+    fn from_env() -> Result<Option<SudoInvoker>> {
+        let var = |name| std::env::var(name).ok();
+        SudoInvoker::parse(var("SUDO_UID").as_deref(), var("SUDO_GID").as_deref())
+    }
+
+    /// Returns the invoker that `uid` and `gid` name. It is `None` when either is unset or
+    /// the uid is root, as for a root login, a cron job or sudo to root. Errors when either
+    /// does not parse, so a malformed value is loud rather than ignored.
+    fn parse(uid: Option<&str>, gid: Option<&str>) -> Result<Option<SudoInvoker>> {
+        let (Some(u), Some(g)) = (uid, gid) else {
+            return Ok(None);
+        };
+        let uid = Uid::from_raw(
+            u.parse()
+                .map_err(|_| Error::msg(format!("invalid SUDO_UID: {u:?}")))?,
+        );
+        let gid = Gid::from_raw(
+            g.parse()
+                .map_err(|_| Error::msg(format!("invalid SUDO_GID: {g:?}")))?,
+        );
+        Ok((!uid.is_root()).then_some(SudoInvoker { uid, gid }))
+    }
 }
 
 /// Runs `cordon policy edit` on `target` and returns the exit code. Any error is printed
@@ -512,43 +534,29 @@ fn is_bare_name(p: &Path) -> bool {
 }
 
 /// Returns who the editor runs as, which is never root unless `root_editor` allows it. An
-/// unprivileged caller edits as itself. Under `sudo`, the editor drops to `SUDO_UID` and
-/// `SUDO_GID` with that user's own home and name.
+/// unprivileged caller edits as itself. Under `sudo`, the editor drops to the
+/// [`SudoInvoker`] with that user's own home and name.
 ///
 /// Errors on any of these:
-/// - Root has no non-root invoker (no `SUDO_UID` or `SUDO_GID`, or sudo to root) and
-///   `root_editor` is [`RootEditor::Refuse`]. A root editor is the same-uid escalation
-///   that the module doc describes.
+/// - Root has no [`SudoInvoker`] and `root_editor` is [`RootEditor::Refuse`]. A root
+///   editor is the same-uid escalation that the module doc describes.
 /// - `SUDO_UID` or `SUDO_GID` does not parse.
 /// - The invoking uid has no passwd home.
 fn editor_identity(root_editor: RootEditor) -> Result<EditorAs> {
     if !config::is_root() {
         return Ok(EditorAs::Current);
     }
-    let refuse = |what: &str| -> Result<EditorAs> {
-        match root_editor {
+    let Some(SudoInvoker { uid, gid }) = SudoInvoker::from_env()? else {
+        return match root_editor {
             RootEditor::Allow => Ok(EditorAs::Current),
-            RootEditor::Refuse => Err(Error::msg(format!(
-                "{what} — refusing to launch the editor as root (a same-uid attacker who \
-                 can write your editor config would gain root). Run as your user via \
-                 `sudo cordon policy edit`, or pass --allow-root-editor to override."
-            ))),
-        }
+            RootEditor::Refuse => Err(Error::msg(
+                "running as root with no non-root sudo invoker — refusing to launch the \
+                 editor as root (a same-uid attacker who can write your editor config would \
+                 gain root). Run as your user via `sudo cordon policy edit`, or pass \
+                 --allow-root-editor to override.",
+            )),
+        };
     };
-    let (Ok(u), Ok(g)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
-        return refuse("running as root without sudo");
-    };
-    let uid = Uid::from_raw(
-        u.parse::<u32>()
-            .map_err(|_| Error::msg(format!("invalid SUDO_UID: {u:?}")))?,
-    );
-    let gid = Gid::from_raw(
-        g.parse::<u32>()
-            .map_err(|_| Error::msg(format!("invalid SUDO_GID: {g:?}")))?,
-    );
-    if uid.is_root() {
-        return refuse("the invoking user is root");
-    }
     let (name, home) = sys::user_identity(uid)
         .ok_or_else(|| Error::msg(format!("cannot resolve home directory for uid {uid}")))?;
     Ok(EditorAs::User {
@@ -908,16 +916,33 @@ mod tests {
     fn invoker_uid_prefers_sudo_then_self() {
         let root = Uid::from_raw(0);
         let nb = Uid::from_raw(1000);
-        // An unprivileged caller is the answer, and SUDO_UID is ignored.
-        assert_eq!(invoker_uid(nb, None).unwrap(), nb);
-        assert_eq!(invoker_uid(nb, Some("0")).unwrap(), nb);
+        let sudo = |u| move || SudoInvoker::parse(u, Some("1000"));
+        // An unprivileged caller is the answer, and the invoker is never parsed.
+        assert_eq!(invoker_uid(nb, sudo(Some("junk"))).unwrap(), nb);
         // Under sudo, the answer is the invoking user.
-        assert_eq!(invoker_uid(root, Some("1000")).unwrap(), nb);
+        assert_eq!(invoker_uid(root, sudo(Some("1000"))).unwrap(), nb);
         // Real root and sudo to root have no tier of their own.
-        assert!(invoker_uid(root, None).is_err());
-        assert!(invoker_uid(root, Some("0")).is_err());
-        // A malformed SUDO_UID is loud, not silently ignored.
-        assert!(invoker_uid(root, Some("not-a-number")).is_err());
+        assert!(invoker_uid(root, sudo(None)).is_err());
+        assert!(invoker_uid(root, sudo(Some("0"))).is_err());
+    }
+
+    /// Checks that a root or missing invoker is none, and that a malformed one is loud
+    /// rather than silently ignored.
+    #[test]
+    fn sudo_invoker_parses_or_refuses() {
+        let user = SudoInvoker {
+            uid: Uid::from_raw(1000),
+            gid: Gid::from_raw(100),
+        };
+        assert_eq!(
+            SudoInvoker::parse(Some("1000"), Some("100")).unwrap(),
+            Some(user)
+        );
+        assert_eq!(SudoInvoker::parse(None, Some("100")).unwrap(), None);
+        assert_eq!(SudoInvoker::parse(Some("1000"), None).unwrap(), None);
+        assert_eq!(SudoInvoker::parse(Some("0"), Some("0")).unwrap(), None);
+        assert!(SudoInvoker::parse(Some("x"), Some("100")).is_err());
+        assert!(SudoInvoker::parse(Some("1000"), Some("x")).is_err());
     }
 
     /// Checks that a rewrite keeps an existing file's mode and that only a new file takes
