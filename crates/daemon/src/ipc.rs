@@ -94,16 +94,15 @@ impl Ctx {
         Ok(())
     }
 
-    /// Serves the unprivileged half of the mint handshake (DESIGN §16.5). Sends the
-    /// requester a nonce, mints once a uid-0 peer approves that nonce, and sends the new
-    /// carrier's `cgroup.procs` back on `conn`.
+    /// Serves the unprivileged half of the mint handshake (DESIGN §16.5). Waits for a uid-0
+    /// peer to approve this request, then mints and sends the new carrier's `cgroup.procs`
+    /// back on `conn`.
     ///
     /// One blessing spans two connections. The unprivileged `cordon bless` sends
     /// `BlessRequest` on this one and holds it open. The root helper it spawns sends
     /// `BlessApprove` with the nonce on a second one ([`Ctx::approve`]).
     ///
-    /// Errors when too many requests are already pending, when no approval arrives within
-    /// [`APPROVAL_TIMEOUT`], or when the backend refuses the mint.
+    /// Errors as [`Ctx::await_approval`] does, and when the backend refuses the mint.
     ///
     /// The daemon is the rendezvous, rather than the elevation helper forwarding the
     /// descriptor, because the helper's own credentials say nothing about whose session
@@ -111,20 +110,7 @@ impl Ctx {
     /// Here the placement rests on this peer's kernel-attested identity, and the
     /// human-presence check rests on the approver's. Neither is a client's assertion.
     fn serve_bless_request(&self, conn: &Conn, class: Option<ClassName>) -> Result<()> {
-        let nonce = Nonce::generate()?;
-        let approved = self.register_pending(nonce.clone())?;
-        let sent = conn.send(&Response::BlessPending {
-            nonce: nonce.clone(),
-        });
-        let waited = sent.and_then(|()| {
-            approved.recv_timeout(APPROVAL_TIMEOUT).map_err(|_| {
-                Error::msg("no approval within the timeout — was the elevation cancelled?")
-            })
-        });
-        // Ours to clean up on every path, including the timeout (see `Ctx::pending`).
-        self.pending.lock().unwrap().remove(&nonce);
-        waited?;
-
+        self.await_approval(conn)?;
         // The carrier's placement follows *this* peer; see `Conn::peer_pid` for why a
         // pid is good enough for placement.
         let (view, procs) = self.bless(|reply| BlessOp::Mint {
@@ -134,6 +120,28 @@ impl Ctx {
             reply,
         })?;
         conn.send_with_fd(&Response::BlessMinted(view), procs.0.as_fd())
+    }
+
+    /// Sends the requester on `conn` a fresh nonce and waits until a uid-0 peer approves
+    /// it.
+    ///
+    /// Errors when too many requests are already pending, when the nonce can't be sent, or
+    /// when no approval arrives within [`APPROVAL_TIMEOUT`].
+    fn await_approval(&self, conn: &Conn) -> Result<()> {
+        let nonce = Nonce::generate()?;
+        let approved = self.register_pending(nonce.clone())?;
+        let waited = conn
+            .send(&Response::BlessPending {
+                nonce: nonce.clone(),
+            })
+            .and_then(|()| {
+                approved.recv_timeout(APPROVAL_TIMEOUT).map_err(|_| {
+                    Error::msg("no approval within the timeout — was the elevation cancelled?")
+                })
+            });
+        // Ours to clean up on every path, including the timeout (see `Ctx::pending`).
+        self.pending.lock().unwrap().remove(&nonce);
+        waited
     }
 
     /// Parks `nonce` for an approver to release, and returns the receiver that the

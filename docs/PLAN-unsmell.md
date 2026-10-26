@@ -165,8 +165,8 @@ Two commits:
 ## Refactor candidates from the doc pass
 
 Left as code; each makes its doc long or awkward:
-- `Ctx::serve_bless_request` issues the nonce, waits for approval, mints and sends the
-  descriptor in one function.
+- `Ctx::serve_bless_request` issued the nonce, waited for approval, minted and sent the
+  descriptor in one function. Done, `Ctx::await_approval` owns the rendezvous.
 - `events::apply`, `Resolver::expand` and `Compiler`'s steps return results through a
   parameter or side channel (`reply`, the `leaf` callback, `self.diagnostics`).
 - `Maps::seed` also rewrites the daemon's fast-allow identity on every flip. Kept. The
