@@ -48,11 +48,10 @@ pub struct ResolvedRule {
 pub struct ResolvedPolicy {
     pub rules: Vec<ResolvedRule>,
     /// The blessing classes this policy **declares** (a `[group.subject.*] blessing = "…"`
-    /// predicate, DESIGN §16.3), sorted + deduped. The authoritative class vocabulary —
-    /// [`super::compile`] assigns each a dense [`bpf::ClassId`] and builds the registry the
-    /// daemon/CLI validate `cordon bless --class` against. A class may be declared without a
-    /// rule referencing it (it then grants nothing).
-    pub blessing_classes: Vec<ClassName>,
+    /// predicate, DESIGN §16.3). [`super::compile`] turns them into the
+    /// [`ClassRegistry`](super::ClassRegistry). A class may be declared without a rule
+    /// referencing it; it then grants nothing.
+    pub blessing_classes: BTreeSet<ClassName>,
 }
 
 /// Resolve every rule. Hard-errors (with a `line:col` prefix) on a cycle, an unknown
@@ -95,9 +94,8 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
 
 /// Collect the declared blessing classes (DESIGN §16.3) and validate the `blessing` predicate
 /// is well-placed: it lives only on a **subject** group, and is mutually exclusive with
-/// `members`. Returns the distinct class names, sorted (so [`super::compile`] assigns stable
-/// [`bpf::ClassId`]s).
-fn declared_classes(groups: &Groups) -> Result<Vec<ClassName>> {
+/// `members`. Returns the distinct class names.
+fn declared_classes(groups: &Groups) -> Result<BTreeSet<ClassName>> {
     // `blessing` is a subject predicate — reject it in the object/action namespaces.
     for (axis, ns) in [("object", &groups.object), ("action", &groups.action)] {
         if let Some(name) = ns
@@ -123,7 +121,7 @@ fn declared_classes(groups: &Groups) -> Result<Vec<ClassName>> {
             classes.insert(class.clone());
         }
     }
-    Ok(classes.into_iter().collect())
+    Ok(classes)
 }
 
 fn resolve_subjects(
@@ -459,7 +457,7 @@ mod tests {
             r.rules[0].subjects,
             vec![SubjectSpec::Blessed(ClassName::new("ro"))]
         );
-        assert_eq!(r.blessing_classes, vec![ClassName::new("ro")]);
+        assert_eq!(r.blessing_classes, BTreeSet::from([ClassName::new("ro")]));
     }
 
     /// A blessing class may be declared without any rule referencing it — it still appears
@@ -477,7 +475,7 @@ mod tests {
         "#;
         let r = resolve_text(text).unwrap();
         assert_eq!(r.rules[0].subjects, vec![SubjectSpec::Any]);
-        assert_eq!(r.blessing_classes, vec![ClassName::new("rw")]);
+        assert_eq!(r.blessing_classes, BTreeSet::from([ClassName::new("rw")]));
     }
 
     /// Two declarations of the same class collapse to one; distinct classes are sorted.
@@ -499,7 +497,7 @@ mod tests {
         let r = resolve_text(text).unwrap();
         assert_eq!(
             r.blessing_classes,
-            vec![ClassName::new("ro"), ClassName::new("rw")]
+            BTreeSet::from([ClassName::new("ro"), ClassName::new("rw")])
         );
     }
 

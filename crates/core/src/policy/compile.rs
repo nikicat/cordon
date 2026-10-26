@@ -24,7 +24,7 @@ use crate::paths;
 use cordon_bpf_common::{
     ClassId, CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectFlags, SubjectMatch,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The compiled policy: protected objects with their pre-merged, pre-sorted rule
@@ -38,10 +38,57 @@ pub struct CompiledPolicy {
     /// `cordon policy apply`.
     pub pending: Vec<PathBuf>,
     pub diagnostics: Vec<Diagnostic>,
-    /// The blessing class registry (DESIGN §16.3): each declared class name → its dense
-    /// [`ClassId`], sorted by name. The daemon validates `cordon bless --class` against this
-    /// and writes the `BLESSED` map at mint; [`ClassId::UNBLESSED`] (0) is never assigned.
-    pub blessing_classes: Vec<(ClassName, ClassId)>,
+    /// The declared blessing classes and the ids this compile gives them.
+    pub classes: ClassRegistry,
+}
+
+/// The declared blessing classes (DESIGN §16.3) and their dense [`ClassId`]s. The kernel
+/// knows a class only by its id, so this is how the daemon turns a requested class name
+/// into an id at mint and an id back into a name in the journal. Ids follow name order
+/// from `UNBLESSED + 1`, so every compile renumbers them; nothing may keep an id across
+/// an apply without re-resolving it by name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassRegistry(Vec<ClassName>);
+
+impl ClassRegistry {
+    /// Returns the registry of `classes`, ignoring duplicates.
+    pub fn new(classes: impl IntoIterator<Item = ClassName>) -> ClassRegistry {
+        ClassRegistry(
+            classes
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Returns the id of the class `name`, or `None` when the policy doesn't declare it.
+    pub fn id(&self, name: &ClassName) -> Option<ClassId> {
+        let i = self.0.binary_search(name).ok()?;
+        Some(ClassId(ClassId::UNBLESSED.0 + 1 + i as u32))
+    }
+
+    /// Returns the name of the class `id`, or `None` for [`ClassId::UNBLESSED`] and for an
+    /// id this compile didn't assign.
+    pub fn name(&self, id: ClassId) -> Option<&ClassName> {
+        let i = id.0.checked_sub(ClassId::UNBLESSED.0 + 1)?;
+        self.0.get(i as usize)
+    }
+
+    /// Returns every declared class with its id, in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&ClassName, ClassId)> {
+        self.0
+            .iter()
+            .filter_map(|name| Some((name, self.id(name)?)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// One protected object and its flat rule bucket (sorted, copy-down-merged, deduped,
@@ -101,16 +148,8 @@ where
 {
     let mut diagnostics = Vec::new();
 
-    // 0. Blessing class registry (DESIGN §16.3): assign each declared class a dense ClassId
-    //    starting at 1 (ClassId(0) = the UNBLESSED sentinel). `resolved.blessing_classes` is
-    //    already sorted, so the ids are stable across compiles.
-    let blessing_classes: Vec<(ClassName, ClassId)> = resolved
-        .blessing_classes
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.clone(), ClassId(i as u32 + 1)))
-        .collect();
-    let class_ids: BTreeMap<ClassName, ClassId> = blessing_classes.iter().cloned().collect();
+    // 0. The blessing class registry (DESIGN §16.3).
+    let classes = ClassRegistry::new(resolved.blessing_classes.iter().cloned());
 
     // 1. Resolve the distinct object paths → objects (sorted for stable ObjIds) +
     //    pending. A `BTreeSet` gives a deterministic order so ObjIds don't churn
@@ -146,7 +185,7 @@ where
         let subjects = lower_subjects(
             &rule.subjects,
             &mut resolve_fileid,
-            &class_ids,
+            &classes,
             rule.pos,
             &mut diagnostics,
         );
@@ -210,16 +249,16 @@ where
         objects: compiled,
         pending,
         diagnostics,
-        blessing_classes,
+        classes,
     }
 }
 
 /// Lower a rule's subjects to `SubjectMatch`es: resolve exe paths to inodes, and map a
-/// blessing class name to its dense [`ClassId`] via `class_ids` (DESIGN §16.3).
+/// blessing class name to its dense [`ClassId`] via `classes` (DESIGN §16.3).
 fn lower_subjects<R>(
     subjects: &[SubjectSpec],
     resolve_fileid: &mut R,
-    class_ids: &BTreeMap<ClassName, ClassId>,
+    classes: &ClassRegistry,
     pos: Option<super::Pos>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<SubjectMatch>
@@ -242,8 +281,8 @@ where
             },
             // `resolve` only emits a `Blessed` for a *declared* class, so the lookup always
             // hits; guard it as an internal error rather than panicking in the daemon.
-            SubjectSpec::Blessed(name) => match class_ids.get(name) {
-                Some(&id) => out.push(SubjectMatch::blessed(id)),
+            SubjectSpec::Blessed(name) => match classes.id(name) {
+                Some(id) => out.push(SubjectMatch::blessed(id)),
                 None => diagnostics.push(Diagnostic::error(
                     pos,
                     format!("internal: blessing class {name:?} is not in the registry"),
@@ -565,6 +604,21 @@ mod tests {
 
     /// A blessing rule lowers to `SubjectMatch::blessed(id)`: BLESSING_ANY cleared, the class
     /// stamped in, and the registry maps the name → a dense id ≥ 1.
+    /// Ids are dense from `UNBLESSED + 1` in name order, and map back to their names.
+    #[test]
+    fn class_registry_round_trips_ids() {
+        let reg = ClassRegistry::new(["rw", "ro", "rw"].map(ClassName::new));
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.id(&ClassName::new("ro")), Some(ClassId(1)));
+        assert_eq!(reg.id(&ClassName::new("rw")), Some(ClassId(2)));
+        assert_eq!(reg.id(&ClassName::new("nope")), None);
+        for (name, id) in reg.iter() {
+            assert_eq!(reg.name(id), Some(name));
+        }
+        assert_eq!(reg.name(ClassId::UNBLESSED), None);
+        assert_eq!(reg.name(ClassId(3)), None);
+    }
+
     #[test]
     fn blessing_rule_lowers_and_registry_is_assigned() {
         let text = r#"
@@ -584,7 +638,7 @@ mod tests {
         // Registry: both declared classes present, sorted by name, dense ids from 1
         // (ClassId(0) reserved for UNBLESSED).
         let reg: std::collections::BTreeMap<_, _> = p
-            .blessing_classes
+            .classes
             .iter()
             .map(|(n, id)| (n.as_str().to_string(), id.0))
             .collect();

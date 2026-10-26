@@ -20,10 +20,10 @@ use cordon_bpf_common::{
 };
 use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
-use cordon_core::policy::{ClassName, CompiledPolicy, PolicySource, UserName};
+use cordon_core::policy::{ClassName, ClassRegistry, CompiledPolicy, PolicySource, UserName};
 use cordon_core::{Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -36,17 +36,15 @@ use tracing::{error, info, warn};
 /// ticks the blessing GC).
 const POLL_TIMEOUT_MS: u16 = 500;
 
-/// The backend thread's per-run state beside the `Ebpf` handle: the journal's naming
-/// maps, the class registry (for mint/remap), and the live blessings table. One
+/// The backend thread's per-run state beside the `Ebpf` handle: the journal's object
+/// names, the class registry, and the live blessings table. One
 /// bundle, one owner — every mutation happens on this thread.
 pub(super) struct Runtime {
     /// `inode → path` for naming protected objects in the journal.
     pub object_paths: HashMap<FileId, PathBuf>,
-    /// `ClassId → name` for naming a blessed caller's class in the journal.
-    pub class_names: HashMap<ClassId, ClassName>,
-    /// `name → ClassId` — the compile's blessing-class registry; what mints resolve
-    /// against and what an apply remaps live blessings with.
-    pub registry: BTreeMap<ClassName, ClassId>,
+    /// The live compile's classes: mints resolve against it, an apply remaps live
+    /// blessings with it, and the journal names a blessed caller's class from it.
+    pub classes: ClassRegistry,
     pub blessings: Blessings,
 }
 
@@ -54,8 +52,7 @@ impl Runtime {
     pub(super) fn new(compiled: &CompiledPolicy) -> Runtime {
         Runtime {
             object_paths: super::object_paths(compiled),
-            class_names: super::class_names(compiled),
-            registry: super::class_registry(compiled),
+            classes: compiled.classes.clone(),
             blessings: Blessings::new(),
         }
     }
@@ -64,8 +61,7 @@ impl Runtime {
     /// follow with `blessings.remap` — ids were just renumbered.
     fn refresh(&mut self, compiled: &CompiledPolicy) {
         self.object_paths = super::object_paths(compiled);
-        self.class_names = super::class_names(compiled);
-        self.registry = super::class_registry(compiled);
+        self.classes = compiled.classes.clone();
     }
 }
 
@@ -112,7 +108,7 @@ pub(super) fn serve(
                 // record's caller from the cache.
                 passwd.refresh();
                 for record in coalesce(&batch) {
-                    record.log(&runtime.object_paths, &runtime.class_names, &passwd);
+                    record.log(&runtime.object_paths, &runtime.classes, &passwd);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -147,7 +143,7 @@ fn bless_op(ebpf: &mut Ebpf, runtime: &mut Runtime, op: BlessOp) {
         } => {
             let outcome = runtime
                 .blessings
-                .mint(ebpf, class, owner, requester, &runtime.registry)
+                .mint(ebpf, class, owner, requester, &runtime.classes)
                 .map_err(|e| e.to_string());
             let _ = reply.send(outcome);
         }
@@ -182,7 +178,7 @@ fn apply(
                 // The keystone: this compile renumbered ClassIds (dense, name-sorted),
                 // so every live blessing's MAP_BLESSED value must be re-pointed **by
                 // class name** — or a live blessing silently changes meaning.
-                runtime.blessings.remap(ebpf, &runtime.registry);
+                runtime.blessings.remap(ebpf, &runtime.classes);
                 info!(objects = compiled.objects.len(), "policy applied");
                 true
             }
@@ -246,7 +242,7 @@ impl Coalesced {
     fn log(
         &self,
         object_paths: &HashMap<FileId, PathBuf>,
-        class_names: &HashMap<ClassId, ClassName>,
+        classes: &ClassRegistry,
         passwd: &Passwd,
     ) {
         let user = CallerUser::resolve(self.uid, passwd);
@@ -259,7 +255,7 @@ impl Coalesced {
         let (count, suppressed) = (self.count(), self.suppressed);
         match (
             policy.denies(),
-            BlessingName::resolve(self.blessing, class_names),
+            BlessingName::resolve(self.blessing, classes),
         ) {
             (true, Some(blessing)) => {
                 info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, %blessing, "deny")
@@ -368,14 +364,11 @@ enum BlessingName<'a> {
 }
 
 impl<'a> BlessingName<'a> {
-    fn resolve(
-        class: ClassId,
-        class_names: &'a HashMap<ClassId, ClassName>,
-    ) -> Option<BlessingName<'a>> {
+    fn resolve(class: ClassId, classes: &'a ClassRegistry) -> Option<BlessingName<'a>> {
         if class == ClassId::UNBLESSED {
             return None;
         }
-        Some(match class_names.get(&class) {
+        Some(match classes.name(class) {
             Some(name) => BlessingName::Named(name),
             None => BlessingName::Id(class),
         })
@@ -650,8 +643,7 @@ mod tests {
 
     #[test]
     fn blessing_name_renders_name_or_raw_id_and_nothing_when_unblessed() {
-        let mut names = HashMap::new();
-        names.insert(ClassId(1), ClassName::new("ro"));
+        let names = ClassRegistry::new([ClassName::new("ro")]);
         // A registered class renders its policy name.
         let named = BlessingName::resolve(ClassId(1), &names).expect("blessed → Some");
         assert_eq!(named.to_string(), "ro");

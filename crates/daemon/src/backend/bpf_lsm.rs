@@ -42,11 +42,11 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, Bank, ClassId, CompiledRule, Dev, FileId, Ino, ObjId, Offsets, Pid, Policy,
-    SubjectMatch, rule_slot,
+    Action, Bank, CompiledRule, Dev, FileId, Ino, ObjId, Offsets, Pid, Policy, SubjectMatch,
+    rule_slot,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
-use cordon_core::policy::{self, ClassName, CompiledPolicy, PolicySource, Severity};
+use cordon_core::policy::{self, CompiledPolicy, PolicySource, Severity};
 use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Error, Result};
 use std::collections::HashMap;
@@ -171,7 +171,7 @@ impl Backend for BpfLsmBackend {
         // registry, blessings table), then adopt any carrier cgroups a previous
         // daemon run left behind (its map entries died with it).
         let mut runtime = events::Runtime::new(&compiled);
-        runtime.blessings.reconcile(&mut ebpf, &runtime.registry);
+        runtime.blessings.reconcile(&mut ebpf, &runtime.classes);
 
         // Drain the ring buffer + honor control requests (applies, bless ops) until
         // shutdown; the apply path refreshes the runtime's maps on each re-seed.
@@ -234,24 +234,6 @@ pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
 /// the *set* of protected objects changes).
 pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
     c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
-}
-
-/// The blessing classes' `id → name` map, for naming a blessed caller's class in the
-/// journal (a `DecisionEvent` carries only the dense [`ClassId`]). The reverse of the
-/// compiler's registry. Rebuilt on every apply — ids are renumbered per compile
-/// (dense, name-sorted), so a stale map would name the wrong class.
-pub(super) fn class_names(c: &CompiledPolicy) -> HashMap<ClassId, ClassName> {
-    c.blessing_classes
-        .iter()
-        .map(|(name, id)| (*id, name.clone()))
-        .collect()
-}
-
-/// The compile's blessing-class registry (`name → ClassId`) — what `cordon bless`
-/// resolves `--class` against and what an apply remaps live blessings with. A
-/// `BTreeMap` so error messages list the classes in stable (name) order.
-pub(super) fn class_registry(c: &CompiledPolicy) -> std::collections::BTreeMap<ClassName, ClassId> {
-    c.blessing_classes.iter().cloned().collect()
 }
 
 /// Where `~` in the (system-wide, root-owned) policy expands to. M1 uses the daemon's

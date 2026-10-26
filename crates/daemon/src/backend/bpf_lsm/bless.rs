@@ -21,10 +21,9 @@
 use super::seed;
 use aya::Ebpf;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
-use cordon_core::policy::ClassName;
+use cordon_core::policy::{ClassName, ClassRegistry};
 use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, Pid};
 use cordon_core::{Error, Result, Uid};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -115,7 +114,7 @@ impl Blessings {
         class: Option<ClassName>,
         owner: Uid,
         requester: Pid,
-        registry: &BTreeMap<ClassName, ClassId>,
+        registry: &ClassRegistry,
     ) -> Result<(BlessingView, CarrierProcs)> {
         let root = self.root.as_ref().ok_or_else(|| {
             Error::msg("blessing unavailable: the daemon's cgroup was unresolvable at startup")
@@ -267,9 +266,9 @@ impl Blessings {
     /// name-sorted), so without this a live blessing silently changes meaning. A
     /// vanished class unregisters the map entry (the blessing grants nothing) but the
     /// carrier is left to GC — never kill the tree because policy changed under it.
-    pub(super) fn remap(&mut self, ebpf: &mut Ebpf, registry: &BTreeMap<ClassName, ClassId>) {
+    pub(super) fn remap(&mut self, ebpf: &mut Ebpf, registry: &ClassRegistry) {
         for b in &mut self.live {
-            match remap_plan(b.registered, registry.get(&b.class).copied()) {
+            match remap_plan(b.registered, registry.id(&b.class)) {
                 Remap::Register(class_id) => match seed::blessed_insert(ebpf, b.cgroup, class_id) {
                     Ok(()) => b.registered = true,
                     Err(e) => {
@@ -310,7 +309,7 @@ impl Blessings {
     /// and unwritable), which is exactly why it is worth asserting rather than assuming:
     /// a `Delegate=yes` drop-in or a wider [`carrier_roots`] would make it reachable
     /// without anything here looking different.
-    pub(super) fn reconcile(&mut self, ebpf: &mut Ebpf, registry: &BTreeMap<ClassName, ClassId>) {
+    pub(super) fn reconcile(&mut self, ebpf: &mut Ebpf, registry: &ClassRegistry) {
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -341,8 +340,8 @@ impl Blessings {
                 continue;
             }
             let cgroup = CgroupId(std::os::unix::fs::MetadataExt::ino(&meta));
-            let registered = match registry.get(&found.class) {
-                Some(&class_id) => match seed::blessed_insert(ebpf, cgroup, class_id) {
+            let registered = match registry.id(&found.class) {
+                Some(class_id) => match seed::blessed_insert(ebpf, cgroup, class_id) {
                     Ok(()) => true,
                     Err(e) => {
                         warn!(dir = %found.dir.display(), error = %e, "bless: reconcile re-register failed; adopted inert");
@@ -426,18 +425,18 @@ fn remap_plan(registered: bool, new_id: Option<ClassId>) -> Remap {
 /// picks the sole declared class, anything else is an error naming the choices.
 fn resolve_class(
     requested: Option<ClassName>,
-    registry: &BTreeMap<ClassName, ClassId>,
+    registry: &ClassRegistry,
 ) -> Result<(ClassName, ClassId)> {
     let declared = || {
         registry
-            .keys()
-            .map(ClassName::as_str)
+            .iter()
+            .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     };
     match requested {
-        Some(name) => match registry.get(&name) {
-            Some(&id) => Ok((name, id)),
+        Some(name) => match registry.id(&name) {
+            Some(id) => Ok((name, id)),
             None if registry.is_empty() => Err(Error::msg(format!(
                 "unknown blessing class '{name}': the policy declares no blessing classes"
             ))),
@@ -449,8 +448,8 @@ fn resolve_class(
         None => match registry.len() {
             0 => Err(Error::msg("the policy declares no blessing classes")),
             1 => {
-                let (name, id) = registry.first_key_value().expect("len checked");
-                Ok((name.clone(), *id))
+                let (name, id) = registry.iter().next().expect("len checked");
+                Ok((name.clone(), id))
             }
             _ => Err(Error::msg(format!(
                 "multiple blessing classes declared ({}); pass --class",
@@ -786,9 +785,9 @@ mod tests {
     fn resolve_class_defaults_and_errors() {
         let ro = ClassName::new("ro");
         let rw = ClassName::new("rw");
-        let one: BTreeMap<_, _> = [(ro.clone(), ClassId(1))].into();
-        let two: BTreeMap<_, _> = [(ro.clone(), ClassId(1)), (rw.clone(), ClassId(2))].into();
-        let none = BTreeMap::new();
+        let one = ClassRegistry::new([ro.clone()]);
+        let two = ClassRegistry::new([ro.clone(), rw.clone()]);
+        let none = ClassRegistry::default();
 
         // Explicit + declared → that class.
         assert_eq!(resolve_class(Some(ro.clone()), &two).unwrap().1, ClassId(1));

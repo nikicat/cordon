@@ -27,7 +27,7 @@ mod parse;
 mod resolve;
 mod ruleline;
 
-pub use compile::{CompiledObject, CompiledPolicy, compile, stat_resolver};
+pub use compile::{ClassRegistry, CompiledObject, CompiledPolicy, compile, stat_resolver};
 pub use parse::{ParsedPolicy, parse};
 pub use resolve::{ResolvedPolicy, ResolvedRule, SubjectSpec, resolve};
 
@@ -516,7 +516,7 @@ where
 {
     let mut rules = Vec::new();
     // Declared blessing classes, merged across fragments (a class declared in two fragments
-    // collapses to one); `BTreeSet` keeps them sorted so the compiler's `ClassId`s are stable.
+    // collapses to one).
     let mut blessing_classes = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
     for src in sources {
@@ -551,7 +551,7 @@ where
     }
     let resolved = ResolvedPolicy {
         rules,
-        blessing_classes: blessing_classes.into_iter().collect(),
+        blessing_classes,
     };
     let mut compiled = compile(&resolved, resolve_fileid);
     // Surface per-fragment parse/resolve errors ahead of the compile diagnostics.
