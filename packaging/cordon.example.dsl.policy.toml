@@ -1,7 +1,7 @@
-# cordon policy — the flat rule model (DESIGN §15), authored in the compact rule DSL.
-# Same model as cordon.example.policy.toml (the verbose `[[rule]]` form); this file
-# shows the line-oriented alternative. Both surfaces may be mixed in one file and
-# compile identically.
+# A cordon policy in the flat rule model (DESIGN §15), written in the compact rule DSL.
+# It is the same model as cordon.example.policy.toml, which uses the verbose `[[rule]]`
+# form. This file shows the line-oriented alternative. Both forms may be mixed in one
+# file and compile identically.
 #
 # The rule block is one rule per line:
 #
@@ -15,43 +15,46 @@
 #   OBJECT  — a file or directory (matched recursively as a subtree), or `@object-group`.
 #             `*` is NOT allowed.
 #
-# Fields are whitespace-separated (align the columns however you like); list items use
-# commas with no spaces; `"…"` quotes a token that contains spaces, and inside the
-# quotes `*`/`@` are literal (the way to name a path that starts with those). `#` starts
-# a comment; blank lines are ignored.
+# Fields are separated by whitespace, so you can align the columns however you like. List
+# items use commas with no spaces. `"…"` quotes a token that contains spaces. Inside the
+# quotes, `*` and `@` are literal, which is how you name a path that starts with one of
+# them. `#` starts a comment, and blank lines are ignored.
 #
-# Precedence and enforcement levels are exactly as in the `[[rule]]` example — see
+# Precedence and enforcement levels work exactly as in the `[[rule]]` example,
 # cordon.example.policy.toml.
 #
-# For a root-owned, per-user policy, declare whose home `~` expands against (looked up
-# in /etc/passwd) so you can write `~/.ssh` instead of `/home/<name>/.ssh`:
+# For a root-owned policy that belongs to one user, name the user whose home `~` expands
+# to. The home is looked up in /etc/passwd, so you can write `~/.ssh` instead of
+# `/home/<name>/.ssh`:
 #
 #     user = "alice"
 #
-# Without it, `~` expands against the daemon's own $HOME (a root daemon → /root), so a
+# Without it, `~` expands to the daemon's own $HOME, which is /root for a root daemon. So a
 # system-wide policy uses absolute paths. Like `rules`, `user` is a top-level key.
 #
-# NOTE: the `rules` block is a top-level key, so it must precede any `[group.*]` header
-# (a bare top-level key binds to the last table otherwise). Rules first, groups below.
+# The `rules` block is a top-level key, so it must come before any `[group.*]` header.
+# Otherwise TOML binds it to the last table above it. Put the rules first and the groups
+# below.
 
 rules = '''
-# ssh tooling may read ~/.ssh; every other opener there is default-denied.
+# The ssh tools may read ~/.ssh. Every other opener there is default-denied.
 allow    @ssh-tools     @ro          ~/.ssh
 
-# a `cordon bless --class ro` process may read the cloud creds (a runtime grant; DESIGN
-# §16). It outranks the `*` audit catch-all below, which keeps logging everyone else.
+# A process run with `cordon bless --class ro` may read the cloud creds. This is a runtime
+# grant (DESIGN §16). It outranks the `*` audit catch-all below, which keeps logging
+# everyone else.
 allow    @blessed-ro    @ro          @cloud-creds
 
-# the aws cli reads + writes its own creds.
+# The aws CLI reads and writes its own creds.
 allow    /usr/bin/aws   read,write   ~/.aws
 
-# log (but allow) every *other* reader of the cloud-credential dirs — preview who
-# touches them before tightening to a deny.
+# Log, but allow, every other reader of the cloud-credential dirs. This previews who
+# touches them before you tighten the rule to a deny.
 audit    *              read         @cloud-creds
 
-# copy-down exception: aws may read ~/.aws (above), but never this one stashed token,
-# and silently (deny + no log line); the more-specific object wins, but only for this
-# file and only for aws.
+# A copy-down exception. aws may read ~/.aws (above), but never this one stashed token,
+# and the denial is silent (no log line). The more specific object wins, but only for
+# this file and only for aws.
 silence  /usr/bin/aws   *            ~/.aws/.danger-token
 '''
 
@@ -59,16 +62,16 @@ silence  /usr/bin/aws   *            ~/.aws/.danger-token
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
-# A blessing class (DESIGN §16): a subject group with a `blessing = "<name>"` predicate
-# instead of `members`. `cordon bless --class ro -- <cmd>` tags its cgroup `ro`; the rule
-# above grants such a process read access to the cloud creds (and only those).
+# A blessing class (DESIGN §16) is a subject group with a `blessing = "<name>"` predicate
+# instead of `members`. `cordon bless --class ro -- <cmd>` tags the cgroup of <cmd> `ro`.
+# The rule above lets such a process read the cloud creds, and only those.
 [group.subject.blessed-ro]
 blessing = "ro"
 
 [group.object.cloud-creds]
 members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
 
-# `read` is what grants listing; `listdir` alone grants nothing (see the same group in
-# cordon.example.policy.toml).
+# `read` is what grants listing, and `listdir` alone grants nothing. The same group in
+# cordon.example.policy.toml explains why.
 [group.action.ro]
 members = ["read", "listdir"]

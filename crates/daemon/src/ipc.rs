@@ -1,12 +1,9 @@
-//! The IPC server — a blocking thread-per-connection Unix-socket loop and the
-//! request dispatcher — as methods on [`Ctx`]. (`Ctx` is declared in `main.rs`.)
+//! The daemon's control socket, served as methods on [`Ctx`]. Every request from the CLI
+//! and the bless helper arrives here, and it reaches the backend thread only through the
+//! control channel that `Ctx` holds. The verdict path is in-kernel, so none of this is on
+//! it.
 //!
-//! Requests: `Status`, `PolicyShow` (read the effective compiled policy), `PolicyApply`
-//! (hand the policy text to the backend thread and wait for the compile/seed outcome),
-//! and the bless ops (`BlessRequest`/`BlessApprove`/`BlessList`/`BlessRevoke`, DESIGN
-//! §16). The verdict path is in-kernel — none of this is on it.
-//!
-//! Every request passes [`authorize`] before dispatch; the socket's file mode decides only
+//! Every request passes [`authorize`] before dispatch. The socket's file mode decides only
 //! who can reach the daemon (see `Ctx::serve`). A blessing spans two connections (see
 //! `Ctx::serve_bless_request`).
 
@@ -23,22 +20,25 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{error, warn};
 
-/// How long a request waits for the backend thread's reply (compile + seed for an
-/// apply; a map write + mkdir for a bless op) before giving up.
+/// How long a request waits for the backend thread's reply before giving up. The reply
+/// covers a compile and a seed for an apply, and a map write and a mkdir for a bless op.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a `BlessRequest` waits for its approval before giving up. Generous because a
-/// human is in the loop: a polkit dialog or a mistyped password burns real seconds, and
-/// the cost of waiting is one parked thread the requester is holding open anyway.
+/// How long a `BlessRequest` waits for its approval before giving up. It is generous
+/// because a human is in the loop, and a polkit dialog or a mistyped password burns real
+/// seconds. Waiting costs one parked thread, which the requester holds open anyway.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How many requests may await approval at once. `BlessRequest` is ungated on a
-/// world-connectable socket, so the table needs a ceiling; concurrent *pending* blessings
-/// on one machine is a handful at most.
+/// The most requests that may await approval at once. Any local user can send
+/// `BlessRequest`, so the table needs a ceiling. One machine rarely has more than a
+/// handful of blessings pending at the same time.
 const MAX_PENDING: usize = 16;
 
 impl Ctx {
-    /// Bind the socket and accept connections forever, one handler thread each.
+    /// Binds the socket and serves every connection on it, each on its own thread. Replaces
+    /// a stale socket file left at the path.
+    ///
+    /// Errors when the socket cannot be bound or opened to every local user.
     pub fn serve(self: Arc<Self>) -> Result<()> {
         let socket = self.socket.clone();
         if let Some(dir) = socket.parent()
@@ -46,7 +46,7 @@ impl Ctx {
         {
             std::fs::create_dir_all(dir)?;
         }
-        // Remove a stale socket from a prior (possibly un-graceful) run.
+        // A prior run, even one that crashed, may have left its socket behind.
         if let Ok(meta) = std::fs::symlink_metadata(&socket)
             && meta.file_type().is_socket()
         {
@@ -54,13 +54,14 @@ impl Ctx {
         }
 
         let listener = UnixListener::bind(&socket)?;
-        // Open the socket (`0666`) to every local user: `connect(2)` needs *write*, so
-        // without this even the ungated read verbs are root-only in practice. The mode
-        // carries no security weight; authorization is `authorize()`'s job. (A multi-user
-        // host that must not disclose protected paths to every local account wants `0660`
-        // + a `cordon` group instead, DESIGN §15.8.) Widening after `bind` is safe: until
-        // this lands the mode is `0777 & ~umask`, which is narrower, so there is no window
-        // where the socket is more open than intended.
+        // Open the socket to every local user (`0666`). `connect(2)` needs write
+        // permission, so without this even the ungated read verbs are root-only in
+        // practice. The mode carries no security weight, because authorization is
+        // `authorize()`'s job. A multi-user host that must not disclose protected paths to
+        // every local account wants `0660` and a `cordon` group instead (DESIGN §15.8).
+        // Widening the mode after `bind` is safe. Until this call the mode is
+        // `0777 & ~umask`, which is narrower, so the socket is never more open than
+        // intended.
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))?;
         for conn in listener.incoming() {
             match conn {
@@ -93,20 +94,22 @@ impl Ctx {
         Ok(())
     }
 
-    /// Serves the unprivileged half of the mint handshake (DESIGN §16.5). One blessing
-    /// spans **two** connections: the unprivileged `cordon bless` sends `BlessRequest` on
-    /// this one and holds it open; the root helper it spawns sends `BlessApprove` with the
-    /// nonce on a second one ([`Ctx::approve`]).
+    /// Serves the unprivileged half of the mint handshake (DESIGN §16.5). Sends the
+    /// requester a nonce, mints once a uid-0 peer approves that nonce, and sends the new
+    /// carrier's `cgroup.procs` back on `conn`.
     ///
-    /// Registers a nonce, hands it to the requester, and blocks until a **uid-0** peer
-    /// approves it. Only then mints, and sends the carrier's `cgroup.procs` back down this
-    /// connection.
+    /// One blessing spans two connections. The unprivileged `cordon bless` sends
+    /// `BlessRequest` on this one and holds it open. The root helper it spawns sends
+    /// `BlessApprove` with the nonce on a second one ([`Ctx::approve`]).
     ///
-    /// The daemon is the rendezvous — rather than the elevation helper forwarding the
-    /// descriptor — because the helper's own credentials say nothing about *whose* session
-    /// this is: under `run0` it lives in a transient unit with no session at all. Here the
-    /// placement decision rests on this peer's kernel-attested identity, and the human
-    /// presence check rests on the approver's. Neither is a client's assertion.
+    /// Errors when too many requests are already pending, when no approval arrives within
+    /// [`APPROVAL_TIMEOUT`], or when the backend refuses the mint.
+    ///
+    /// The daemon is the rendezvous, rather than the elevation helper forwarding the
+    /// descriptor, because the helper's own credentials say nothing about whose session
+    /// this is. Under `run0` the helper lives in a transient unit with no session at all.
+    /// Here the placement rests on this peer's kernel-attested identity, and the
+    /// human-presence check rests on the approver's. Neither is a client's assertion.
     fn serve_bless_request(&self, conn: &Conn, class: Option<ClassName>) -> Result<()> {
         let nonce = Nonce::generate()?;
         let approved = self.register_pending(nonce.clone())?;
@@ -133,8 +136,10 @@ impl Ctx {
         conn.send_with_fd(&Response::BlessMinted(view), procs.0.as_fd())
     }
 
-    /// Park a nonce for an approver to release. Bounded: `BlessRequest` is ungated on a
-    /// world-connectable socket, so the table must not be a place anyone can pile into.
+    /// Parks `nonce` for an approver to release, and returns the receiver that the
+    /// release signals.
+    ///
+    /// Errors when [`MAX_PENDING`] requests are already parked.
     fn register_pending(&self, nonce: Nonce) -> Result<mpsc::Receiver<()>> {
         let (tx, rx) = mpsc::channel();
         let mut pending = self.pending.lock().unwrap();
@@ -147,25 +152,31 @@ impl Ctx {
         Ok(rx)
     }
 
-    /// Release the requester waiting on `nonce`. Removing before signalling is what makes
-    /// a nonce single-use: a replay finds nothing parked.
+    /// Releases the requester waiting on `nonce` and spends the nonce, so a replay finds
+    /// nothing parked.
+    ///
+    /// Errors when no request waits on `nonce`, or when its requester has already given up.
     fn approve(&self, nonce: &Nonce) -> Result<Response> {
+        // Removing before signalling is what makes a nonce single-use.
         let waiting = self
             .pending
             .lock()
             .unwrap()
             .remove(nonce)
             .ok_or_else(|| Error::msg("no blessing request is waiting for that nonce"))?;
-        // A dropped receiver means the requester gave up first; the nonce is spent either
-        // way, and there is nothing left to mint for.
+        // A dropped receiver means the requester gave up first. The nonce is spent either
+        // way, and nothing is left to mint for.
         waiting
             .send(())
             .map_err(|_| Error::msg("the blessing request was abandoned"))?;
         Ok(Response::BlessApproved)
     }
 
-    /// Send one bless op to the backend thread (which owns the maps and the carrier
-    /// cgroups) and block on its reply — the same round trip as `PolicyApply`.
+    /// Sends one bless op to the backend thread, which owns the maps and the carrier
+    /// cgroups, and returns its reply. It is the same round trip as `PolicyApply`.
+    ///
+    /// Errors when the backend thread is gone, does not reply within [`REPLY_TIMEOUT`],
+    /// or refuses the op.
     fn bless<T>(
         &self,
         op: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> BlessOp,
@@ -209,8 +220,8 @@ impl Ctx {
             }
 
             Request::PolicyApply { sources } => {
-                // Hand the fragments to the backend thread (which owns the BPF maps)
-                // and block on its compile + re-seed outcome.
+                // The backend thread owns the BPF maps, so it compiles and re-seeds while
+                // this thread waits for the outcome.
                 let (reply_tx, reply_rx) = mpsc::channel();
                 self.control
                     .msg_tx
@@ -247,34 +258,33 @@ impl Ctx {
     }
 }
 
-/// Checks one request against its peer's uid, before dispatch. The writes (`PolicyApply`,
-/// `BlessApprove`) require the peer to be **root**, kernel-attested via `SO_PEERCRED`.
-/// Reads (`Status`, `PolicyShow`, `BlessList`) are open, and so are `BlessRequest` and
-/// `BlessRevoke`, for the reasons on their arm. This gate answers "may this uid speak this
-/// verb", not "is this particular object yours". The match is deliberately
-/// **exhaustive** (no `_` arm) so a new verb cannot be added without choosing a side.
+/// Checks whether the peer with `peer_uid` may send `req` at all. The writes
+/// (`PolicyApply`, `BlessApprove`) need a root peer, as `SO_PEERCRED` attests it, and every
+/// other request is open. Whether a particular object belongs to the peer is not checked
+/// here.
 ///
 /// Errors when the peer may not speak the verb.
 fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
     if peer_uid == Uid::ROOT {
         return Ok(());
     }
+    // No `_` arm, so a new verb cannot be added without choosing a side.
     match req {
-        // The human-presence check: reaching uid 0 is what proves someone authenticated,
-        // whatever tool did the elevating. A same-uid scraper reaching the socket directly
-        // cannot approve its own request.
+        // This is the human-presence check. Reaching uid 0 proves that someone
+        // authenticated, whatever tool did the elevating. A same-uid scraper that reaches
+        // the socket directly cannot approve its own request.
         Request::BlessApprove { .. } => Err(Error::msg(
             "approving a blessing requires root — `cordon bless` spawns this via $CORDON_SUDO",
         )),
-        // The policy is root-owned; this gate is what lets the socket be world-
-        // connectable without handing everyone the boundary.
+        // The policy is root-owned. This gate is what lets the socket be
+        // world-connectable without handing everyone the boundary.
         Request::PolicyApply { .. } => Err(Error::msg(
             "applying policy requires root — invoke via `sudo cordon policy apply`",
         )),
-        // Reads stay open, the parity `BlessList` was specced with (DESIGN §16.5).
-        // `BlessRequest` joins them: asking is not minting — the request is inert until a
-        // uid-0 peer approves it. `BlessRevoke` is ownership-checked in the backend, which
-        // is where the live table is.
+        // Reads stay open, as `BlessList` was specified (DESIGN §16.5). `BlessRequest` is
+        // open too, because asking is not minting. The request stays inert until a uid-0
+        // peer approves it. The backend checks ownership for `BlessRevoke`, because the
+        // live table lives there.
         Request::Status
         | Request::PolicyShow
         | Request::BlessList
@@ -292,8 +302,8 @@ mod tests {
         Nonce::generate().expect("/dev/urandom")
     }
 
-    /// The authorization table. The security-critical row is `BlessApprove`: it is the
-    /// human-presence check, so a same-uid scraper reaching the now-world-connectable
+    /// Checks the authorization table. The security-critical row is `BlessApprove`. It is
+    /// the human-presence check, so a same-uid scraper that reaches the world-connectable
     /// socket must not be able to approve its own request.
     #[test]
     fn authorize_gates_writes_on_root() {
@@ -320,8 +330,8 @@ mod tests {
         }
     }
 
-    /// A nonce must survive the round trip through argv — the helper is spawned with
-    /// `--nonce=<value>` and parses it back — and must reject anything else.
+    /// Checks that a nonce survives the round trip through argv and that parsing rejects
+    /// anything else. The helper is spawned with `--nonce=<value>` and parses it back.
     #[test]
     fn nonce_round_trips_and_rejects_junk() {
         let n = a_nonce();

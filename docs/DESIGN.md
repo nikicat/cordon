@@ -1,159 +1,163 @@
 # cordon — design
 
-Working name: **cordon** (object-centric: you *cordon off* the secret dirs).
-Deliberately outside the `gate`/`Gatekeeper` namespace.
+The working name is cordon. It is object-centric, because you *cordon off* the secret
+directories. It is deliberately outside the `gate`/`Gatekeeper` namespace.
 
-Language: **Rust**. Policy: a **root-owned text file** compiled to in-kernel BPF maps (§15).
+The language is Rust. The policy is a root-owned text file, compiled to in-kernel BPF maps
+(§15).
 
-> **Reading guide.** **§15 is the current architecture** — the flat *rule model*,
-> implemented in M1 (see [`PLAN-rule-model.md`](PLAN-rule-model.md) for the milestones).
-> **§16 specifies *blessing*** — the runtime, human-authenticated access grant
-> (`cordon bless`), shipped through B2 — unprivileged CLI, elevation-gated mint; remaining
-> milestones in [`PLAN-bless.md`](PLAN-bless.md).
-> §1–§14 are the foundational design and its evolution: the v1 **owner model** (owners /
-> TOFU / interactive prompts) and the **fanotify** backend they describe were **retired**
-> in the rule-model migration and no longer exist in the code. Those sections are kept for
-> the durable rationale they still carry (threat model, object-centric insight, identity
-> forgeability, prior art). Read §2–§4 and §15 for the live design. Wherever a section
-> still describes the owner model, TOFU, interactive prompts, or the fanotify backend, that
-> is **history** — carried under a *superseded by §15* note (most concentrated in §5, §6,
-> §8.2, §12).
+> **Reading guide.** §15 is the current architecture. It describes the flat *rule model*,
+> which M1 implemented (see [`PLAN-rule-model.md`](PLAN-rule-model.md) for the milestones).
+> §16 specifies *blessing*, the runtime access grant that a human authenticates
+> (`cordon bless`). Blessing has shipped through B2, with an unprivileged CLI and a mint that
+> is gated on elevation. The remaining milestones are in [`PLAN-bless.md`](PLAN-bless.md).
+> §1 to §14 are the foundational design and its evolution. The rule-model migration retired
+> the v1 owner model (owners, TOFU and interactive prompts) and the fanotify backend that those
+> sections describe, and neither exists in the code any more. The sections are kept for the
+> durable rationale they still carry: the threat model, the object-centric insight, identity
+> forgeability, and prior art. Read §2 to §4 and §15 for the live design. Wherever a section
+> still describes the owner model, TOFU, interactive prompts or the fanotify backend, that text
+> is history, and it sits under a *superseded by §15* note. Such text is most concentrated in
+> §5, §6, §8.2 and §12.
 
 ---
 
 ## 1. Goal
 
-Make secret-bearing config directories **readable only by the tool that owns
-them**, transparently to that tool (it reads its config at the normal path,
-unmodified). Everything else running as the same user sees the directories as
-denied/empty.
+Make secret-bearing config directories readable only by the tool that owns them. The owning
+tool notices nothing, because it reads its config at the normal path, unmodified. Everything
+else running as the same user sees the directories as denied or empty.
 
 ## 2. Threat model
 
-**In scope — defeat these:** one-shot **scrapers** — run once, scan paths,
-exfiltrate, exit; same UID as you. Rungs: hardcoded path lists; directory
-walkers / content greppers; `environ` readers following path-like values.
+**In scope (defeat these).** One-shot scrapers, which run once, scan paths, exfiltrate and
+exit, with the same UID as you. They come in rungs: hardcoded path lists, directory walkers and
+content greppers, and `environ` readers that follow path-like values.
 
-**Out of scope — conceded:** **root**, **resident/persistent** (ptrace, wait for
-unlocks, replace binaries, kill the daemon, double-fork to launder ancestry),
-**targeted** reverse-engineering of this setup. We raise cost and bound blast
-radius, no more.
+**Out of scope (conceded).** Root is out of scope. So is a resident or persistent attacker,
+who can ptrace, wait for unlocks, replace binaries, kill the daemon, or double-fork to launder
+ancestry. Targeted reverse-engineering of this setup is out of scope too. We raise the cost
+and bound the blast radius, and no more.
 
-Enabling simplification: we **never confine the adversary**. We protect the
-*resource* and serve the *owner*; the scraper finds nothing.
+The simplification that makes this possible is that we never confine the adversary. We
+protect the *resource* and serve the *owner*, and the scraper finds nothing.
 
 ## 3. Key insights
 
-1. **Unix DAC can't separate two same-UID processes.** Add an **object-centric
-   authorizer**: protect the resource, deny all subjects by default, allow only
-   the owning identity.
-2. **Enforcement lives outside the confined process** → a privileged daemon, not
-   an in-process `LD_PRELOAD` trick.
-3. **Object-centric beats subject-centric.** One rule over the resource covers
-   all subjects, including unknown future scrapers — vs. AppArmor/SELinux's
-   profile-per-tool with unprofiled = unconfined.
-4. **The gater alone meets the threat model — no crypto, no relocation.** Files
-   stay plaintext in place; the gater denies non-owner `open()`. Because nothing
-   is moved or encrypted, **transparency is automatic**. Encryption/broker/shim
-   are an optional later bundle (§7), not v1.
-5. **Identity is a predicate set, not exe alone.** Shebang tools exec as their
-   interpreter (`python3`, not `aws`), and helpers/installers read configs they didn't
-   create. The subject is a *conjunction* of cheap predicates — exe, uid, cgroup, and
-   (opt-in) content hash / argv0 / ancestor — ANDed in-kernel (§15.4). The parent chain
-   disambiguates the interpreter case but is best-effort (evadable by double-fork), so it
-   raises cost, it isn't a boundary.
+1. **Unix DAC can't separate two processes with the same UID.** So we add an object-centric
+   authorizer. It protects the resource, denies all subjects by default, and allows only the
+   owning identity.
+2. **Enforcement lives outside the confined process.** So it is a privileged daemon, not an
+   in-process `LD_PRELOAD` trick.
+3. **Object-centric beats subject-centric.** One rule over the resource covers all subjects,
+   including unknown future scrapers. AppArmor and SELinux instead need a profile for each
+   tool, and a tool without a profile is unconfined.
+4. **The gater alone meets the threat model, with no crypto and no relocation.** Files stay
+   plaintext in place, and the gater denies `open()` to anyone but the owner. Because nothing
+   is moved or encrypted, transparency is automatic. Encryption, a broker and a shim are an
+   optional later bundle (§7), not part of v1.
+5. **Identity is a predicate set, not the exe alone.** Shebang tools exec as their interpreter
+   (`python3`, not `aws`), and helpers and installers read configs they didn't create. So the
+   subject is a conjunction of cheap predicates, ANDed in the kernel (§15.4). They are the
+   exe, the uid and the cgroup, plus an opt-in content hash, argv0 and ancestor. The parent
+   chain disambiguates the interpreter case, but it is best-effort, because a double fork
+   evades it. So it raises the cost, and it isn't a boundary.
 
 ### 3.1 What the incumbents actually do to a scraper
 
-Insight 3 is checkable, so check it. Against the in-scope adversary — a scraper running at
-your uid that copies `~/.aws/credentials` and Chrome's cookie DB — **stock AppArmor and
-SELinux do essentially nothing**, with enforcement fully on and no denial logged:
+Insight 3 is checkable, so check it. The in-scope adversary is a scraper running at your uid
+that copies `~/.aws/credentials` and Chrome's cookie DB. Against it, stock AppArmor and SELinux
+do essentially nothing, with enforcement fully on and no denial logged:
 
-- **Fedora/RHEL targeted policy** runs the login session as `unconfined_t` and labels
-  everything in `$HOME` `user_home_t`. `unconfined_t` reads `user_home_t`. Confined user
-  domains (`user_u`, `staff_u`, `xguest_u`) exist, are opt-in, and are rarely deployed; even
-  under `staff_u` one user app is not separated from another's data by default.
-- **Ubuntu's AppArmor** ships profiles for daemons and a handful of apps. Anything else —
-  `curl`, a pip install, a binary you downloaded — has no profile, and **unprofiled means
-  unconfined**.
+- **Fedora and RHEL targeted policy** runs the login session as `unconfined_t` and labels
+  everything in `$HOME` as `user_home_t`. `unconfined_t` can read `user_home_t`. Confined user
+  domains (`user_u`, `staff_u`, `xguest_u`) exist, but they are opt-in and rarely deployed.
+  Even under `staff_u`, one user app is not separated from another app's data by default.
+- **Ubuntu's AppArmor** ships profiles for daemons and a handful of apps. Anything else, such
+  as `curl`, a pip install or a binary you downloaded, has no profile, and a program without a
+  profile is unconfined.
 
-This is not an oversight, it is the model: confinement is a property of the *program*, and
-the default for an unknown program is none. A scraper is definitionally an unprofiled
-program, so the entire class sits outside the deployment. That is insight 3 restated as an
+This is not an oversight. It is the model. Confinement is a property of the *program*, and the
+default for an unknown program is no confinement. A scraper is by definition a program without
+a profile, so the entire class sits outside the deployment. That is insight 3, restated as an
 observation rather than a claim. Both systems *can* express "only Firefox reads the cookie
-DB" — it is a policy-coverage gap, not a capability limit — but expressing it means confining
-the user, retyping the object, and writing a domain for every legitimate reader.
+DB". The gap is in policy coverage, not in capability. But expressing it means confining the
+user, retyping the object, and writing a domain for every legitimate reader.
 
-Credit where due: containing a compromised *service* is what they were built for and they do
-it well — `httpd_t` cannot read `user_home_t`, so an nginx or mysqld exploit does not become a
-home-directory sweep. Note that where a browser profile does ship it runs in the **opposite
-direction** to what we want: it protects the system from Firefox, not Firefox's cookie DB from
-everything else.
+Credit where it is due. Containing a compromised *service* is what these systems were built
+for, and they do it well. `httpd_t` cannot read `user_home_t`, so an nginx or mysqld exploit
+does not become a sweep of home directories. Where a browser profile does ship, it points in
+the opposite direction to what we want. It protects the system from Firefox, not Firefox's
+cookie DB from everything else.
 
-**Android is the counterexample, and it is SELinux.** Per-app uids + per-app domains +
-default-deny is this exact protection, working, at scale. The mechanism is therefore proven;
-what Android has and a desktop does not is an **install-time identity assignment step**.
-Desktop programs arrive by tarball, pip, npm, `curl | sh`, so no such step exists — which is
+**Android is the counterexample, and it is SELinux.** Per-app uids, per-app domains and default
+deny together are this exact protection, and it works at scale. So the mechanism is proven.
+What Android has and a desktop does not is a step that assigns identity at install time.
+Desktop programs arrive by tarball, pip, npm and `curl | sh`, so no such step exists. That is
 why cordon assigns identity to the *object* instead and lets subjects stay anonymous.
 
-**Prior art that does solve it, and what to take from each:**
+**This prior art does solve the problem, and each piece has something to take from it:**
 
-- **Flatpak / snap** genuinely confine (a Flatpak cannot see `~/.ssh`; file access goes
-  through portals) but are gated on packaging, and a scraper will not arrive as a Flatpak.
-- **macOS TCC** is the closest existing thing to this design: object-side gating, per-app
-  grants, prompt on first access. Mainstream and effective. Its two failure modes are ours to
-  avoid — **consent fatigue** (§15.10's audit→admit→enforce exists partly for this: admit
-  from observed evidence, not from a modal prompt) and **identity resting on a code
-  signature**, which is the same question [PLAN-rule-model](PLAN-rule-model.md) M6 is chewing
-  on.
-- **Windows has the right shape twice, pointed at the wrong verb both times.** *Controlled
-  Folder Access* is almost exactly this design — designated folders, an app allowlist — but
-  gates **writes only**, because it was built against ransomware; a scraper reads, so CFA
-  never sees it. *WDAC/AppLocker* is genuinely default-deny and, with DLL-level enforcement,
-  is the closest shipping analogue to M6's fixed-code invariant (an unsigned DLL cannot load
-  into a signed process) — but it governs **what may execute**, not what a running program may
-  read, and consumer machines effectively never run it in enforcement. *Credential Guard*
-  shows Microsoft can do hard isolation when a target matters enough (VBS puts LSA secrets in
-  VTL1, out of reach of admin) and that it was done per-target, not as a general mechanism.
+- **Flatpak and snap** genuinely confine. A Flatpak cannot see `~/.ssh`, and its file access
+  goes through portals. But they are gated on packaging, and a scraper will not arrive as a
+  Flatpak.
+- **macOS TCC** is the closest existing thing to this design. It gates on the object side,
+  grants per app, and prompts on first access. It is mainstream and effective. Its two failure
+  modes are ours to avoid. The first is consent fatigue. §15.10's audit, admit, enforce flow
+  exists partly for this, because it admits from observed evidence rather than from a modal
+  prompt. The second is identity that rests on a code signature, which is the same question
+  that [PLAN-rule-model](PLAN-rule-model.md) M6 is working through.
+- **Windows has the right shape twice, and points it at the wrong verb both times.**
+  *Controlled Folder Access* is almost exactly this design, with designated folders and an app
+  allowlist. But it gates writes only, because it was built against ransomware. A scraper
+  reads, so CFA never sees it. *WDAC/AppLocker* is genuinely default-deny. With DLL-level
+  enforcement it is the closest shipping analogue to M6's fixed-code invariant, because an
+  unsigned DLL cannot load into a signed process. But it governs what may execute, not what a
+  running program may read, and consumer machines effectively never run it in enforcement
+  mode. *Credential Guard* shows that Microsoft can do hard isolation when a target matters
+  enough. VBS puts the LSA secrets in VTL1, out of reach of an admin. It also shows that this
+  was done for one target, not as a general mechanism.
 - **Chrome's app-bound encryption** (Windows, 2024) is the piece of prior art that tried
-  *this* architecture and is therefore the most instructive. Shipped because infostealers were
-  reading the cookie DB — the threat is real and unaddressed at the OS layer — it replaced
-  DPAPI's user-bound key (any process at your uid could decrypt: our problem, with encryption
-  that does not move the trust boundary) with a **privileged SYSTEM service that validates the
-  calling executable before returning the key**. That is insight 2, implemented at scale by
-  someone else. **It was bypassed within months**, by injecting into Chrome and asking as an
-  authorized process, by abusing the elevation service, and by simply running elevated. Google
-  has kept hardening since and the current state is not verified here — but the lesson is
-  stable and is the strongest external argument for M6: *a privileged broker that
-  authenticates by executable identity is only as strong as its code-identity story, and
-  injection into the authorized process defeats it.* Our `allow /usr/bin/ssh read ~/.ssh` is
-  structurally the same grant and fails the same way, which is why M6 is not an optional
-  hardening pass. On Linux Chrome uses the login keyring, reachable over D-Bus by any process
-  at your uid, so the file gate is the only control available there at all.
-- **Per-app file gating exists commercially** — ThreatLocker's Storage Control and Ringfencing,
-  AppGuard, and the previous generation of HIPS products (Comodo, Online Armor) which a decade
-  ago let you write "only firefox.exe may read this path". The category is largely dead, and it
-  died of **prompt fatigue and rule-management burden**, not of being wrong. Same verdict as
-  TCC, from a second direction, and the same reason audit→admit→enforce is the interesting part
-  of this design rather than the enforcement primitive.
+  *this* architecture, so it is the most instructive. It shipped because infostealers were
+  reading the cookie DB, which shows that the threat is real and unaddressed at the OS layer.
+  It replaced DPAPI's user-bound key, which any process at your uid could use to decrypt.
+  That was our problem, with encryption that does not move the trust boundary. The
+  replacement is a privileged SYSTEM service that validates the calling executable before it
+  returns the key. That is insight 2, implemented at scale by someone else. It was bypassed
+  within months. Attackers injected into Chrome and asked as an authorized process, abused the
+  elevation service, or simply ran elevated. Google has kept hardening it since, and its
+  current state is not verified here. But the lesson is stable, and it is the strongest
+  external argument for M6: *a privileged broker that authenticates by executable identity is
+  only as strong as its code-identity story, and injection into the authorized process
+  defeats it.* Our `allow /usr/bin/ssh read ~/.ssh` is structurally the same grant and fails
+  the same way. That is why M6 is not an optional hardening pass. On Linux, Chrome uses the
+  login keyring, which any process at your uid can reach over D-Bus. So the file gate is the
+  only control available there at all.
+- **Per-app file gating exists commercially.** Examples are ThreatLocker's Storage Control and
+  Ringfencing, AppGuard, and the previous generation of HIPS products (Comodo, Online Armor).
+  A decade ago those products let you write "only firefox.exe may read this path". The
+  category is largely dead. It died of prompt fatigue and the burden of managing rules, not of
+  being wrong. That is the same verdict as for TCC, reached from a second direction. It is
+  also the same reason why the audit, admit, enforce flow is the interesting part of this
+  design, rather than the enforcement primitive.
 - **EDR behavioural detection** (CrowdStrike, SentinelOne, Defender for Endpoint) is the
-  mainstream commercial answer and is not signature-based: it flags a process opening
-  `Login Data`, archiving, then egressing. But it races exfiltration rather than bounding it —
-  it kills the process *after* the read. A boundary and a detector are different products; we
-  are the former, and the journal is not a detector.
+  mainstream commercial answer, and it is not signature-based. It flags a process that opens
+  `Login Data`, archives it and then sends it out. But it races the exfiltration rather than
+  bounding it, because it kills the process after the read. A boundary and a detector are
+  different products. We are the former, and the journal is not a detector.
 
-**The approach actually winning is orthogonal: make the loot worthless.** Device Bound
-Session Credentials tie a session cookie to a TPM key so a stolen cookie will not
-authenticate elsewhere, and a passkey's private key never leaves the secure element. That is
-the strongest structural answer to *credential* theft on any OS, and it is complementary
-rather than competitive — it covers session secrets and does nothing for `~/.aws/credentials`,
-SSH keys, `.env` files, or a password store, which is most of what `@secrets` names. Where a
-secret *can* be made non-exfiltratable, prefer that over gating it.
+**The approach that is actually winning is orthogonal: make the loot worthless.** Device Bound
+Session Credentials tie a session cookie to a TPM key, so a stolen cookie will not authenticate
+elsewhere. A passkey's private key never leaves the secure element. That is the strongest
+structural answer to *credential* theft on any OS. It complements cordon rather than competing
+with it. It covers session secrets, and it does nothing for `~/.aws/credentials`, SSH keys,
+`.env` files or a password store, which is most of what `@secrets` names. Where a secret *can*
+be made impossible to exfiltrate, prefer that over gating it.
 
-The gap this project targets is therefore specific: **object-first default-deny for same-uid
-desktop programs.** Android proves the enforcement works, TCC proves the model is usable,
-Windows shows the two halves shipping separately and never joined, and none of it exists for
-Linux desktop.
+So the gap this project targets is specific: object-first default deny for desktop programs
+that share a uid. Android proves that the enforcement works, and TCC proves that the model is
+usable. Windows ships the two halves separately and never joins them, and none of it exists for
+the Linux desktop.
 
 ## 4. Architecture
 
@@ -174,649 +178,690 @@ Linux desktop.
 Files stay in place, plaintext. A rule allows → reads unmodified.
 ```
 
-The gater is **not** an AppArmor analog — it's a programmable authorizer (cousin
-of LSM-BPF). The AppArmor analog on macOS is Seatbelt/SBPL, unused.
+The gater is not an AppArmor analog. It is a programmable authorizer, a cousin of LSM-BPF.
+The AppArmor analog on macOS is Seatbelt/SBPL, and cordon does not use it.
 
-**Enforcement posture.** With `bpf-lsm` the verdict is in-kernel, so it does **not**
-depend on the daemon being up. The links are **bpffs-pinned** (M5), so enforcement is
-**fail-safe** — it survives daemon death, and a crash or a restart leaves the boundary
+**Enforcement posture.** With `bpf-lsm` the verdict is made in the kernel, so it does not
+depend on the daemon being up. The links are pinned to bpffs (M5), so enforcement is
+fail-safe. It survives the daemon's death, and a crash or a restart leaves the boundary
 standing with no gap.
 
 ### Optional later bundle (only to cover un-gated reads — §7)
-Relocate + encrypt → needs a **key** → held by a resident **broker** → needs a
-**transparency layer** (`fuse-t`, or seccomp `ADDFD` under `cordon run`). All
-three or none.
+Relocating and encrypting the files needs a key. The key has to be held by a resident broker.
+And the broker needs a transparency layer (`fuse-t`, or seccomp `ADDFD` under `cordon run`).
+So it is all three or none.
 
 ### Optional, orthogonal
-**Capability brokering** for tools with a credential-helper seam (git, AWS
-`credential_process`, docker, kube): hand back **short-lived** creds. Per-tool.
+Capability brokering serves tools that have a credential-helper seam (git, AWS
+`credential_process`, docker, kube). The broker hands back short-lived credentials. It works
+one tool at a time.
 
 ### Privilege model — pluggable backends
-The **policy core** (the §15 compiler, IPC, the `cordon` CLI) is
-**privilege-agnostic**. Only the *enforcement backend* — the thing that mediates opens
-and carries out allow/deny — needs privilege, and it sits behind one interface:
+The policy core (the §15 compiler, IPC and the `cordon` CLI) is privilege-agnostic. Only the
+enforcement backend needs privilege. The backend is the part that mediates opens and carries
+out allow and deny, and it sits behind one interface:
 
 | Backend | Privilege | Scope | Boundary? | Status |
 |---|---|---|---|---|
-| `bpf-lsm` | **root** (CAP_BPF + CAP_MAC_ADMIN) | system-wide | **yes** (fail-safe: bpffs-pinned) | Linux production — **the boundary** |
-| `endpoint-security` | **root** + entitlement | system-wide | **yes** | macOS — planned (§12, Phase 4) |
-| `mock` / `fanotify` / `seccomp-unotify` | — | — | no | **removed / dropped** — see note |
+| `bpf-lsm` | root (CAP_BPF + CAP_MAC_ADMIN) | system-wide | yes (fail-safe, because it is pinned to bpffs) | Linux production, and the boundary |
+| `endpoint-security` | root plus an entitlement | system-wide | yes | macOS, planned (§12, Phase 4) |
+| `mock` / `fanotify` / `seccomp-unotify` | — | — | no | removed or dropped (see the note below) |
 
-The build splits along this seam: the core + CLI compile on stable with no kernel deps;
-the daemon's `bpf-lsm` feature (on by default, Linux-only) links the aya loader and
-enforces. macOS will add an ES backend behind the same interface.
+The build splits along this seam. The core and the CLI compile on stable Rust with no kernel
+dependencies. The daemon's `bpf-lsm` feature, which is on by default and Linux-only, links the
+aya loader and enforces. macOS will add an ES backend behind the same interface.
 
 > **Retired backends (history, kept as design contrast).** Earlier iterations shipped a
-> `mock` backend (synthetic events for logic tests) and a root **`fanotify`**
-> `FAN_OPEN_PERM` backend — a fast, portable MVP that enforced *while running* but was
-> **never a boundary**: it fails open (daemon down ⇒ every open allowed), decides in
-> userspace on the open-time path (the rename-out-of-zone bypass below), reads identity
-> best-effort from `/proc`, and needs `CAP_SYS_ADMIN` for its system-wide veto power (the
-> unprivileged `FAN_REPORT_FID` mode is notify-only — useless for gating). So **user-mode
-> cannot enforce system-wide** — that motivated the move in-kernel. A `seccomp-unotify`
-> `cordon run -- <tool>` sandbox was also evaluated and scoped out (subject-centric,
-> opt-in, real `unsafe`). All three were removed in the rule-model migration; **`bpf-lsm`
-> is the sole Linux backend.** The in-kernel LSM verdict (below) is the answer to
-> fanotify's wrong shape for per-object policy.
+> `mock` backend, which produced synthetic events for logic tests. They also shipped a root
+> `fanotify` `FAN_OPEN_PERM` backend. It was a fast, portable MVP that enforced while it ran,
+> but it was never a boundary. It fails open, so every open is allowed while the daemon is
+> down. It decides in userspace on the open-time path, which allows the rename-out-of-zone
+> bypass described below. It reads identity best-effort from `/proc`. And it needs
+> `CAP_SYS_ADMIN` for its system-wide veto power, because the unprivileged `FAN_REPORT_FID`
+> mode only notifies and is useless for gating. So user mode cannot enforce system-wide, and
+> that motivated the move into the kernel. A `seccomp-unotify` sandbox (`cordon run --
+> <tool>`) was also evaluated and scoped out. It was subject-centric and opt-in, and it needed
+> real `unsafe` code. All three were removed in the rule-model migration, and `bpf-lsm` is the
+> sole Linux backend. The in-kernel LSM verdict described below answers fanotify's wrong shape
+> for per-object policy.
 
 ### BPF-LSM — the hardened Linux boundary
-**BPF-LSM is the Linux mechanism that fits per-object policy**, and is cordon's sole Linux
-backend. eBPF programs attach to LSM hooks (`file_open`, `inode_create`/`inode_rename`/
-`inode_unlink`, `sb_mount`, `bprm_check_security`) and **return the verdict in-kernel**
-(`0` allow / `-EPERM` deny); policy lives in **BPF maps** the daemon fills from the compiled
-text policy — *no recompile/reload per rule.* Mediating the operation itself means there
-are no per-directory marks to keep race-free and no whole-filesystem funnel through
-userspace (the wrong-shape traps of a userspace open-notifier).
+BPF-LSM is the Linux mechanism that fits per-object policy, and it is cordon's sole Linux
+backend. eBPF programs attach to LSM hooks (`file_open`, `inode_create`, `inode_rename`,
+`inode_unlink`, `sb_mount`, `bprm_check_security`) and return the verdict in the kernel (`0`
+to allow, `-EPERM` to deny). The policy lives in BPF maps that the daemon fills from the
+compiled text policy, so a rule change needs no recompile or reload. Because the hooks
+mediate the operation itself, there are no per-directory marks to keep race-free, and there is
+no funnel of the whole filesystem through userspace. Those are the traps that a userspace
+open-notifier falls into because of its shape.
 
-cordon returns the verdict **in-kernel** (no synchronous block-and-ask), sidestepping the
-*one* thing BPF-LSM can't do (suspend a syscall pending a userspace answer). What the
-in-kernel LSM shape buys:
-- **No marking → no recursive-mark race.** Hooks fire on the operation; a freshly
-  `mkdir`'d / `mv`'d-in / `mount`-ed-in subtree is covered the instant it exists.
-- **Structural ops are gateable** (`inode_rename`, `inode_create`, `sb_mount`…), closing
-  the **rename-out-of-zone bypass**: a same-uid tool can't rename a secret out of a
-  protected subtree and reopen it at an unprotected path — the rename itself is vetoed (and
-  identity is keyed on the inode, not the path).
-- **In-kernel matching → no funnel.** The program walks the opened file's dentry
-  ancestors by **`(dev,inode)`** and allows non-zone opens *without leaving the
-  kernel* — no whole-`/` funnel; the hot path never crosses into userspace. Path
-  *strings* are out: `bpf_d_path` is **not allowed at the `file_open` hook** (a
-  verifier discovery — `security_file_open` isn't in `btf_allowlist_d_path`), so
-  matching is inode-based. The daemon resolves paths → `(dev,inode)` at seed time,
-  taking the device from the **mount table** so it agrees with the kernel's `sb->s_dev`
-  on overlayfs/btrfs, where `stat`'s per-layer/-subvolume device does not (`proc::file_id`
-  in `crates/daemon/src/proc.rs`).
-- **Stronger identity, in-kernel.** Caller exe identity is its **`(dev,inode)`**,
-  read straight from `task->mm->exe_file` — race-free, no `/proc` readlink. The
-  hardening beyond that is a **content digest** of the opener via
-  `bpf_ima_file_hash()` (IMA) or `bpf_get_fsverity_digest()` (fs-verity) —
-  identifying the binary by *what it is*: surviving an inode change (package
-  upgrade) and resisting copy-to-a-blessed-path, against a hash not a spoofable
-  path. (IMA *appraisal* + a keyring gets "verified-signed-by-key," the closest
-  Linux analog to ES code-signing — enterprise setup, not free.)
-- **Fail-safe, not fail-open — implemented (M5).** The `bpf_link`s are pinned to **bpffs**
-  and enforcement persists with **no holding process** — the daemon can crash/restart with
-  *zero* enforcement gap. Only the links are pinned (a link holds its program and a program
-  holds its maps, so the seeded policy stays resident too), so no map is ever shared between
-  processes; the layout and handover are `PinDir::pin_links` in
-  `crates/daemon/src/backend/bpf_lsm/pin.rs`. Turning it off is the explicit
-  `cordond --teardown`.
+cordon returns the verdict in the kernel and never blocks a syscall to ask userspace. That
+sidesteps the one thing BPF-LSM can't do, which is to suspend a syscall until userspace
+answers. The in-kernel LSM shape buys the following:
+- **No marking, so no recursive-mark race.** Hooks fire on the operation. A subtree is
+  covered the instant it exists, whether it was just made by `mkdir`, moved in with `mv`, or
+  mounted.
+- **Structural operations are gateable** (`inode_rename`, `inode_create`, `sb_mount` and so
+  on). That closes the rename-out-of-zone bypass. A same-uid tool can't rename a secret out of
+  a protected subtree and reopen it at an unprotected path, because the rename itself is
+  vetoed. Identity is also keyed on the inode, not on the path.
+- **Matching happens in the kernel, so there is no funnel.** The program walks the ancestors
+  of the opened file's dentry by `(dev,inode)`, and it allows opens outside any zone without
+  leaving the kernel. There is no funnel of all of `/`, and the hot path never crosses into
+  userspace. Path strings are ruled out, because `bpf_d_path` is not allowed at the
+  `file_open` hook. That was a verifier discovery, since `security_file_open` isn't in
+  `btf_allowlist_d_path`. So matching is inode-based. The daemon resolves paths to
+  `(dev,inode)` at seed time. It takes the device from the mount table, so the device agrees
+  with the kernel's `sb->s_dev` on overlayfs and btrfs. There, `stat` reports a device for
+  each layer or subvolume, which does not agree (`proc::file_id` in
+  `crates/daemon/src/proc.rs`).
+- **Identity is stronger and lives in the kernel.** The caller's exe identity is its
+  `(dev,inode)`, read straight from `task->mm->exe_file`. That is race-free and needs no
+  `/proc` readlink. The hardening beyond that is a content digest of the opener, made with
+  `bpf_ima_file_hash()` (IMA) or `bpf_get_fsverity_digest()` (fs-verity). It identifies the
+  binary by what it is. So the identity survives an inode change such as a package upgrade,
+  and it resists a copy to a blessed path, because it checks a hash rather than a path that
+  can be spoofed. IMA appraisal plus a keyring gets "verified as signed by this key", which is
+  the closest Linux analog to ES code signing. That is an enterprise setup, and it is not
+  free.
+- **Fail-safe, not fail-open, as implemented in M5.** The `bpf_link`s are pinned to bpffs,
+  and enforcement persists with no process holding it. So the daemon can crash or restart
+  with zero gap in enforcement. Only the links are pinned. A link holds its program and a
+  program holds its maps, so the seeded policy stays resident too, and no map is ever shared
+  between processes. `PinDir::pin_links` in `crates/daemon/src/backend/bpf_lsm/pin.rs` owns
+  the layout and the handover. Turning enforcement off is the explicit `cordond --teardown`.
 
-**Implemented (M1 — validated in a VM, see STATUS / [`PLAN-rule-model.md`](PLAN-rule-model.md)):**
-the `file_open` verdict over the **flat rule table** — deepest protected object via the
-`(dev,inode)` dentry walk, exe-`(dev,inode)` subject match, action from `f_mode`/`f_flags`
-(read/write/create), first-match on the copy-down-resolved bucket, default-deny, the
-per-rule `policy` the only enforcement level (no global mode, §15.6); the **text policy**
-compiled + seeded at startup and re-seeded by `cordon policy apply` via an **atomic
-double-buffer swap**; and the
-ring-buffer learn path with **in-kernel event coalescing**. **Structural-op gating** (M3 —
-closing the rename bypass, plus `execute`) and **fail-safe pinning** (M5) have since shipped
-too, so `bpf-lsm` mediates opens *and* mutations and keeps enforcing when the daemon dies.
-**Content-digest identity** (§15.4) remains unshipped, and is not what closes the
-`LD_PRELOAD` hole — see M6.
+**Implemented in M1, and validated in a VM (see STATUS and [`PLAN-rule-model.md`](PLAN-rule-model.md)).**
+M1 delivers the `file_open` verdict over the flat rule table. The program finds the deepest
+protected object with the `(dev,inode)` dentry walk, matches the subject by the exe's
+`(dev,inode)`, and derives the action (read, write or create) from `f_mode` and `f_flags`. It
+takes the first match in the bucket that copy-down resolved, and denies by default. The
+per-rule `policy` is the only enforcement level, and there is no global mode (§15.6). M1 also
+delivers the text policy, which is compiled and seeded at startup and re-seeded by
+`cordon policy apply` with an atomic double-buffer swap. And it delivers the ring-buffer learn
+path, with event coalescing in the kernel. Structural-operation gating (M3, which closes the
+rename bypass and adds `execute`) and fail-safe pinning (M5) have shipped since. So `bpf-lsm`
+mediates opens and mutations, and it keeps enforcing when the daemon dies. Content-digest
+identity (§15.4) remains unshipped, and it is not what closes the `LD_PRELOAD` hole (see
+M6).
 
-**Deny/learn delivery — decoupled from the verdict.** The in-kernel program has already
-decided; observability rides a **BPF ring buffer** (`BPF_MAP_TYPE_RINGBUF`): on a
-`deny` or `audit` the hook emits a record (pid, exe `(dev,inode)`, object
-`(dev,inode)`, the opened file's reconstructed leaf path, action, decision), **coalesced
-by an in-kernel suppressor** (`SuppressKey`: keyed on the opened file, so distinct leaves
-surface), and the daemon drains it asynchronously. It does **not** block the syscall.
-Lossy under flood = you drop *observability records*, never *enforcement*: a full ring
-loses the record silently (`emit` in `crates/bpf/src/kernel.rs`).
+**Deny and learn records are delivered separately from the verdict.** The in-kernel program
+has already decided, and observability rides on a BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`).
+On a `deny` or an `audit`, the hook emits a record. The record holds the pid, the exe's
+`(dev,inode)`, the object's `(dev,inode)`, the reconstructed leaf path of the opened file, the
+action and the decision. An in-kernel suppressor coalesces the records. Its key,
+`SuppressKey`, includes the opened file, so distinct leaves surface separately. The daemon
+drains the ring asynchronously, and it does not block the syscall. Under a flood, the losses
+are observability records and never enforcement. A full ring loses the record silently
+(`emit` in `crates/bpf/src/kernel.rs`).
 
-**Control plane vs data plane** — the daemon leaves the hot path entirely:
-> **Data plane = in-kernel BPF** — every open, every verdict — *always on,
-> daemon-independent.*
-> **Control plane = the root-owned text policy (durable source of truth) + a thin,
-> restartable daemon** that (a) compiles the policy and seeds the maps at startup and on
-> `cordon policy apply`, and (b) **drains the ring buffer to the journal.** Off the hot
-> path; its absence costs observability, **never** enforcement — not even across a restart,
-> since the links are pinned. *The daemon is still required* — to ship ring-buffer events to
-> the journal and to apply policy changes.
+**Control plane and data plane.** The daemon leaves the hot path entirely:
+> The data plane is in-kernel BPF. It handles every open and every verdict, and it is always
+> on and independent of the daemon.
+> The control plane is the root-owned text policy, which is the durable source of truth, plus
+> a thin daemon that can restart. The daemon (a) compiles the policy and seeds the maps at
+> startup and on `cordon policy apply`, and (b) drains the ring buffer to the journal. It is
+> off the hot path. Its absence costs observability and never enforcement, not even across a
+> restart, because the links are pinned. The daemon is still required, to ship ring-buffer
+> events to the journal and to apply policy changes.
 
-**Map concurrency** is handled by map semantics + RCU, not hand-rolled locks: a
-single-element `bpf_map_update_elem` is atomic (a reader sees old-or-new, never torn;
-element lifetime is RCU). The atomic *multi-entry* policy swap on `apply` uses exactly the
-**generation-counter / double-buffer** this called for (§15.8): the three rule maps are
-banked, and `Maps::seed` fills the inactive bank then flips `Settings.active_bank` in one
-update, RCU-style. `bpf_spin_lock` is available if a value ever needs in-program
-read-modify-write.
+**Map concurrency** is handled by map semantics and RCU, not by hand-rolled locks. A
+single-element `bpf_map_update_elem` is atomic. A reader sees the old value or the new one,
+never a torn one, and element lifetime is managed by RCU. The atomic multi-entry policy swap
+on `apply` uses exactly the generation counter, or double buffer, that this design called for
+(§15.8). The three rule maps are banked. `Maps::seed` fills the inactive bank and then flips
+`Settings.active_bank` in one update, in the style of RCU. `bpf_spin_lock` is available if a
+value ever needs an in-program read-modify-write.
 
-**Durability.** BPF maps are ephemeral (lost on reboot / program reload), but the **text
-policy is the durable source of truth** — the daemon recompiles and re-seeds it at startup,
-so nothing is lost. (The owner model's hazard of an in-kernel TOFU claim not yet persisted
-is gone with TOFU itself; autolearn (§15.9) keeps its *proposals* in a separate db, never
-the enforced source.)
+**Durability.** BPF maps are ephemeral, and they are lost on a reboot or a program reload. But
+the text policy is the durable source of truth, and the daemon recompiles and re-seeds it at
+startup, so nothing is lost. The owner model had a hazard where an in-kernel TOFU claim was
+not yet persisted. That hazard went away with TOFU itself. Autolearn (§15.9) keeps its
+proposals in a separate database, which is never the enforced source.
 
-**Requirements / cost.** `CONFIG_BPF_LSM=y` **and** `bpf` in the active LSM list
-(`CONFIG_LSM=` / `lsm=` boot param — common but not universal); kernel ≥ 5.7 (the
-content-hash helpers are ≥ 5.11 / 6.x); `CAP_BPF` + `CAP_MAC_ADMIN`. The program is
-verifier-friendly, and — since rustc can't emit CO-RE relocations,
-<https://github.com/rust-lang/rust/issues/158412> — a userspace shim reads the running
-kernel's BTF and injects field offsets into the program's `.rodata`, so one object runs on
-any kernel. **Additive** to existing LSMs — it can only *further* restrict, never loosen
-(a SELinux/AppArmor deny still denies). So `bpf-lsm` is the hardened production boundary
-where available; on older kernels (or with `bpf` absent from the LSM list) there is **no
-hardened Linux boundary**. Real precedent for exactly this allow/deny use: **KubeArmor**,
-**Tetragon**, **bpflock** (§13).
+**Requirements and cost.** The kernel needs `CONFIG_BPF_LSM=y`, and `bpf` in the active LSM
+list (`CONFIG_LSM=` or the `lsm=` boot parameter). That is common but not universal. The
+kernel must be 5.7 or later, and the content-hash helpers need 5.11 or 6.x. The daemon needs
+`CAP_BPF` and `CAP_MAC_ADMIN`. The program is friendly to the verifier. rustc can't emit CO-RE
+relocations (<https://github.com/rust-lang/rust/issues/158412>), so a userspace shim reads
+the running kernel's BTF and injects field offsets into the program's `.rodata`. That way one
+object runs on any kernel. BPF-LSM adds to the existing LSMs. It can only restrict further and
+never loosens, so a SELinux or AppArmor deny still denies. So `bpf-lsm` is the hardened
+production boundary where it is available. On older kernels, or with `bpf` absent from the LSM
+list, there is no hardened Linux boundary. KubeArmor, Tetragon and bpflock are real precedent
+for exactly this allow and deny use (§13).
 
-**Lineage is subsumed here (cancels the standalone cache, §8.2/§12).** Because the
-backend already runs in-kernel, the §8.2 ancestry hardening is *folded in*, not a
-separate proc-connector subsystem: a live `task->real_parent` walk gives the same
-best-effort chain for free at decision time, and durable-across-exit lineage is
-just `sched_process_{fork,exec}` tracepoints writing `(pid, starttime)`→parent
-into a BPF map *within this backend*. Ceiling unchanged: a real `exec` of a
-blessed binary (the **construction** attack, §8.1) is still faithfully recorded,
-so ancestry stays best-effort, never the boundary.
+**Lineage is subsumed here, which cancels the standalone cache (§8.2, §12).** The backend
+already runs in the kernel, so the ancestry hardening of §8.2 is folded in rather than built
+as a separate proc-connector subsystem. A live walk of `task->real_parent` gives the same
+best-effort chain for free at decision time. Lineage that lasts past a process's exit only
+needs `sched_process_{fork,exec}` tracepoints that write `(pid, starttime)` to parent into a BPF
+map within this backend. The ceiling is unchanged. A real `exec` of a blessed binary (the
+construction attack, §8.1) is still recorded faithfully, so ancestry stays best-effort and is
+never the boundary.
 
-Locations: the root system service listens on `/run/cordon.sock` and compiles its policy
-(`/etc/cordon/policy.toml`, or a `/etc/cordon/conf.d/` directory of per-user fragments —
-§15.8; both root-owned), with operational settings in `/etc/cordon/config.toml`. A
-user-session dev daemon can override these to `$XDG_RUNTIME_DIR`/`$XDG_CONFIG_HOME` (the
-`cordon` CLI auto-detects), but it is **not** a boundary — only the root service enforces.
+**Locations.** The root system service listens on `/run/cordon.sock`. It compiles its policy
+from `/etc/cordon/policy.toml`, or from a `/etc/cordon/conf.d/` directory of per-user fragments
+(§15.8), and both are root-owned. Operational settings live in `/etc/cordon/config.toml`. A
+dev daemon in a user session can move these to `$XDG_RUNTIME_DIR` and `$XDG_CONFIG_HOME`, and
+the `cordon` CLI detects that automatically. But such a daemon is not a boundary, and only the
+root service enforces.
 
-**Operational config** is an optional TOML file (`backend`, `socket`, the eBPF-object /
-policy-file paths), `${ENV}`-interpolated, precedence CLI > file > default. The
-*enforcement policy* — the rules — is **not** here: it lives in the root-owned text policy
-(§15.8), applied with `cordon policy apply`. There is no global mode; observe-vs-enforce is
-the per-rule `audit`/`deny` choice (§15.6). See `packaging/cordon.example.toml` +
-`cordon.example.policy.toml`.
+**Operational config** is an optional TOML file. It holds `backend`, `socket`, and the paths
+of the eBPF object and the policy file. Values are interpolated from `${ENV}`, and the
+precedence is the CLI first, then the file, then the default. The enforcement policy, meaning
+the rules, is not here. It lives in the root-owned text policy (§15.8), and
+`cordon policy apply` applies it. There is no global mode. Whether to observe or enforce is
+the per-rule choice between `audit` and `deny` (§15.6). See `packaging/cordon.example.toml`
+and `cordon.example.policy.toml`.
 
-Terminology: this daemon is the **gater**. The **broker** (§7) is the separate,
-deferred key-holder.
+**Terminology.** This daemon is the gater. The broker (§7) is the separate key holder, which
+is deferred.
 
 ## 5. Coverage & ownership model
 
-> **Superseded by §15 — historical.** This section describes the v1 *owner* model as
-> shipped in Phases 0–1. The flat **rule model** in §15 (shipped in M1) replaces it,
-> subsuming owners, explicit rules, and TOFU into one concept (§15.1 explains why). The
-> owner model — owners, the SQLite store, TOFU, interactive prompts — was **removed** in
-> the migration; what follows is the record of what those phases did, not current behavior.
+> **Superseded by §15 (historical).** This section describes the v1 *owner* model as it
+> shipped in Phases 0 and 1. The flat rule model in §15, which shipped in M1, replaces it. The
+> rule model folds owners, explicit rules and TOFU into one concept, and §15.1 explains why.
+> The migration removed the owner model, including owners, the SQLite store, TOFU and
+> interactive prompts. What follows records what those phases did, and it is not current
+> behavior.
 
-Two rule sources; explicit wins over auto.
+There were two sources of rules, and an explicit rule won over an automatic one.
 
 ### Explicit rules (highest precedence)
-`identity → allowed paths/globs + modes`, e.g. `aws : rw ~/.aws/**`. Includes
-both allow and **deny** (so a user can revoke an owner). Root-owned config.
+An explicit rule mapped an identity to the paths or globs it was allowed and their modes, for
+example `aws : rw ~/.aws/**`. Rules could allow or deny, so a user could revoke an owner. They
+lived in a root-owned config.
 
 ### TOFU auto-ownership (creator-owns)
-- **Zones** — configured *traversable-but-never-owned* roots (`~`, `~/.config`,
-  `~/.local/share`, `~/.cache`). The first subtree level inside is claimable; the
-  zone root itself never is. (Named "zones" in code — `container` was avoided as
-  it reads as Docker/OCI.)
-- **Claim on create, never on read.** An exe that *creates* a new path in an
-  unclaimed zone subtree becomes its owner (`O_CREAT` / `FAN_CREATE`),
-  **never on read** — stops a scraper claiming a pre-existing secret.
-- **Pre-existing paths** have no auto-owner: handled by interactive mode (§6) or
-  `cordon adopt`. Never auto-assigned on first access.
-- **Inheritance** — files under an owned subtree inherit its owner group.
+- **Zones** were configured roots that could be traversed but were never owned (`~`,
+  `~/.config`, `~/.local/share`, `~/.cache`). The first subtree level inside a zone could be
+  claimed, and the zone root itself never could. The code called them "zones", because
+  `container` reads as Docker or OCI.
+- **A claim happened on create and never on read.** An exe that *created* a new path in an
+  unclaimed zone subtree became its owner (`O_CREAT` / `FAN_CREATE`). Reading never claimed a
+  path, which stopped a scraper from claiming a pre-existing secret.
+- **Pre-existing paths** had no automatic owner. Interactive mode (§6) or `cordon adopt`
+  handled them, and they were never assigned on first access.
+- **Inheritance.** Files under an owned subtree inherited its owner group.
 
 ### Identity
-- **Granularity (default `path`):** owner = exe path. Survives upgrades;
-  weak only against replacing the binary file (root/resident → out of scope).
-  Per-rule override to `path+inode` or `signature` for stricter dirs.
-- **Ancestry (parent chain):** owner-match succeeds if the caller **or an
-  ancestor within the session boundary** is in the owner group. Solves the
-  interpreter problem (caller exe = `python3`; ancestor/launcher = the tool) and
-  helper/creator≠reader. Captured at event time (pidfd + start-time validation),
-  walk bounded at session leader / first uid change. **Best-effort:** double-fork
-  launders ancestry; argv is *not* trusted (caller-controlled). macOS exposes
-  parent + "responsible" pid natively in ES.
-- **Tool-groups:** an owner is a named identity set, auto-seeded with the
-  creator, expandable (`cordon claim <subtree> --add <id>`).
+- **Granularity (default `path`).** The owner was the exe path. That survived upgrades, and it
+  was weak only against replacing the binary file, which needs root or a resident attacker and
+  is out of scope. A rule could override it to `path+inode` or `signature` for stricter
+  directories.
+- **Ancestry (the parent chain).** An owner match succeeded if the caller, or an ancestor
+  within the session boundary, was in the owner group. That solved the interpreter problem,
+  where the caller's exe is `python3` and the ancestor that launched it is the tool. It also
+  solved the case where the helper that creates a file is not the tool that reads it. The
+  chain was captured at event time, with a pidfd and start-time validation, and the walk
+  stopped at the session leader or at the first uid change. It was best-effort. A double fork
+  launders ancestry, and argv is *not* trusted, because the caller controls it. macOS exposes
+  the parent pid and a "responsible" pid natively in ES.
+- **Tool groups.** An owner was a named set of identities. It was seeded automatically with
+  the creator and could be expanded (`cordon claim <subtree> --add <id>`).
 
 ### Ownership / rules store
-SQLite **owned by the daemon (root), not user-writable** — else a scraper writes
-itself in as owner. Mutated only via the privileged `cordon` CLI → daemon IPC.
+The store was SQLite, owned by the root daemon and not writable by the user. Otherwise a
+scraper could have written itself in as an owner. Only the privileged `cordon` CLI could change
+it, through the daemon's IPC.
 
 ## 6. Decision flow & interactive mode
 
-> **Superseded by §15.6 — historical.** The owner-model decision flow and interactive
-> deny-and-learn below were **removed** with the owner model. The live decision flow is
-> §15.6: most-specific protected object → first-match on the copy-down bucket →
-> default-deny, the per-rule `policy` the only enforcement level (no global mode), with the
-> verdict returned **in-kernel** (so there is no synchronous prompt). TOFU's successor is
-> **autolearn**
-> (§15.9) — an explicit, reviewed training mode, not a per-open prompt (the deadline-safety
-> problem below is exactly why). Kept for that rationale and the prompt-UX design.
+> **Superseded by §15.6 (historical).** The owner-model decision flow and the interactive
+> deny-and-learn described below were removed together with the owner model. The live decision
+> flow is §15.6. It finds the most specific protected object, takes the first match in the
+> copy-down bucket, and denies by default. The per-rule `policy` is the only enforcement level,
+> and there is no global mode. The verdict is returned in the kernel, so there is no
+> synchronous prompt. TOFU's successor is autolearn (§15.9), an explicit training mode whose
+> results are reviewed, not a prompt on each open. The deadline-safety problem below is exactly
+> why. The section is kept for that rationale and for the design of the prompt UX.
 
 ### Decision flow (evaluated per gated open)
-1. Path not under any protected subtree → **allow** (unmediated).
-2. Explicit rule matches → **allow/deny** (user rules win → revocation works).
-3. Caller *or ancestor* in the subtree's owner group → **allow**.
-4. `O_CREAT` of a new path in an unclaimed zone subtree → **TOFU claim** →
-   allow.
-5. Else (protected, unowned/non-matching, not a create) → **interactive prompt**
-   if a session agent is present, else the configured default (**deny**).
+1. If the path is not under any protected subtree, allow it without mediation.
+2. If an explicit rule matches, allow or deny as it says. User rules win, which makes
+   revocation work.
+3. If the caller or an ancestor is in the subtree's owner group, allow.
+4. If the open is an `O_CREAT` of a new path in an unclaimed zone subtree, make a TOFU claim
+   and allow.
+5. Otherwise (the path is protected, it is unowned or the owner does not match, and the open is
+   not a create), show an interactive prompt if a session agent is present. Without an agent,
+   apply the configured default, which is deny.
 
 ### Interactive mode
-On step 5, ask the user — but the AUTH path is **synchronous with a deadline**
-(ES kills clients that miss it; blocking an `open()` on human reaction time hangs
-tools and risks deadlock — Santa's ES authorizer survives this with a secondary
-dispatch that returns the default just before the deadline, a pattern we reuse;
-see `docs/SANTA.md`). So the model is **deny-and-learn**:
+On step 5 the daemon asks the user. But the AUTH path is synchronous and has a deadline. ES
+kills clients that miss it, and blocking an `open()` on human reaction time hangs tools and
+risks deadlock. Santa's ES authorizer survives this with a secondary dispatch that returns the
+default just before the deadline, and we reuse that pattern (see `docs/SANTA.md`). So the
+model is deny-and-learn:
 
-> Deny *this* access to meet the deadline, prompt the user **asynchronously**,
-> **persist the choice**, honor it on subsequent accesses. Optional: a short
-> synchronous hold (≤ a couple seconds, well under the deadline) so a fast answer
-> lets even the first access through; deny-and-learn is the fallback.
+> Deny *this* access to meet the deadline. Prompt the user asynchronously, persist the
+> choice, and honor it on later accesses. Optionally, hold the open synchronously for a short
+> time (a couple of seconds at most, well under the deadline), so that a fast answer lets even
+> the first access through. Deny-and-learn is the fallback.
 
-Consequence: a brand-new tool errors *once* until approved, then works. TOFU
-covers tools that create their own config (no prompt), so prompts mostly fire on
-**pre-existing/ambiguous** paths — letting "approve permanently" subsume
+The consequence is that a brand-new tool errors once until it is approved, and then it works.
+TOFU covers tools that create their own config without a prompt. So prompts mostly fire on
+paths that already existed or are ambiguous, and that lets "approve permanently" subsume
 `cordon adopt`.
 
-**Prompt outcomes → rules:**
+**How prompt outcomes become rules:**
 | Choice | Effect |
 |---|---|
-| Deny once | ephemeral; this event only |
-| Deny permanently | explicit deny rule (identity → subtree) |
-| Approve once | ephemeral allow (this process instance) |
-| Approve for X min | TTL allow rule, expires at now+X |
-| Approve permanently | explicit allow / add identity to owner group |
+| Deny once | ephemeral, for this event only |
+| Deny permanently | an explicit deny rule (identity to subtree) |
+| Approve once | an ephemeral allow (for this process instance) |
+| Approve for X min | a TTL allow rule that expires at now+X |
+| Approve permanently | an explicit allow, or the identity added to the owner group |
 
-The prompt shows **who** (exe + ancestry chain), **what** (file/subtree), and the
-proposed rule scope (per-subtree, not per-file, so it doesn't re-ask).
+The prompt shows who is asking (the exe and its ancestry chain), what is asked for (the file or
+subtree), and the proposed rule scope. The scope is per subtree, not per file, so the prompt
+doesn't ask again.
 
-**Agent architecture:** the root daemon can't draw UI → delegates to an
-**unprivileged per-session prompt agent** (polkit-agent style) over IPC, routed
-to the user owning the triggering session. Notification channel is the
-per-OS-specific bit (libnotify/dbus vs UserNotifications).
+**Agent architecture.** The root daemon can't draw UI. So it delegates to an unprivileged
+prompt agent in each session, in the style of a polkit agent, over IPC. The request is routed
+to the user who owns the triggering session. The notification channel is the part that differs
+by OS (libnotify or D-Bus on Linux, UserNotifications on macOS).
 
 ## 7. Do we encrypt anything? (what "keys" meant)
 
-**v1: no.** The gater denies the live scraper's `open()`; plaintext-in-place is
-fine. Encryption only protects reads the gater *doesn't* mediate:
+**Not in v1.** The gater denies the live scraper's `open()`, so plaintext in place is fine.
+Encryption only protects reads that the gater *doesn't* mediate:
 
 | Un-gated read | In scope? | Already covered by |
 |---|---|---|
-| stolen / offline disk | physical → no | FileVault / LUKS |
-| pre-daemon boot window | no (scraper is interactive, post-login) | — |
-| gater bug / bypass | defense-in-depth only | — |
+| stolen / offline disk | no, because it is physical | FileVault / LUKS |
+| pre-daemon boot window | no (a scraper is interactive and runs after login) | — |
+| gater bug / bypass | defense in depth only | — |
 
-So it adds ~nothing in scope and drags in keys + broker + shim. Deferred. "Keys"
-only exist if we later encrypt: a master key the broker holds in RAM, unlocked
-once per session.
+So encryption adds almost nothing in scope, and it drags in keys, a broker and a shim. It is
+deferred. "Keys" only exist if we encrypt later. There would be a master key that the broker
+holds in RAM and that is unlocked once per session.
 
 ## 8. Caller identity (mechanics)
 
-> **Mechanics updated by §15.4.** In the in-kernel backend the caller's identity is its
-> exe `(dev,inode)` read straight from `task->mm->exe_file` — race-free, no `/proc`
-> readlink, no `FAN_REPORT_PIDFD` — plus the other predicates in §15.4 (uid, cgroup, opt-in
-> hash/argv0/ancestor). The fanotify pidfd / `/proc` mechanics below are the retired
-> userspace path; the **forgeability analysis in §8.1 is model-agnostic and still
-> load-bearing** — §15.4's argv0/ancestor predicates rest on it.
+> **§15.4 updates these mechanics.** In the in-kernel backend, the caller's identity is its
+> exe `(dev,inode)`, read straight from `task->mm->exe_file`. That is race-free and needs no
+> `/proc` readlink and no `FAN_REPORT_PIDFD`. The other predicates of §15.4 add to it (uid,
+> cgroup, and an opt-in hash, argv0 or ancestor). The fanotify pidfd and `/proc` mechanics
+> below are the retired userspace path. But the forgeability analysis in §8.1 does not depend
+> on the model, and it still carries weight, because §15.4's argv0 and ancestor predicates rest
+> on it.
 
-- **Race-free id:** Linux `FAN_REPORT_PIDFD` → pidfd → exe; macOS per-connection
-  audit token → code requirement. Don't re-`readlink` `/proc/pid/exe` after the
-  fact (PID may have exec'd).
-- **Chain walk:** from the triggering pidfd, read ppid (`/proc/<pid>/stat`),
-  validate each hop by start-time, bound at session leader / uid change. Snapshot
-  at event receipt. Best-effort (see §5 caveats).
-- **hardening-vs-injectability tension** & **confused-deputy ceiling**: relevant
-  only if we ever add the transparency shim (§7); v1 gates only.
+- **Race-free identity.** On Linux, `FAN_REPORT_PIDFD` gives a pidfd, and the pidfd gives the
+  exe. On macOS, the audit token of each connection gives a code requirement. Don't
+  re-`readlink` `/proc/pid/exe` after the fact, because the PID may have exec'd.
+- **Chain walk.** Starting from the triggering pidfd, read the ppid (`/proc/<pid>/stat`), and
+  validate each hop by its start time. Stop at the session leader or at a uid change. Take the
+  snapshot when the event arrives. The walk is best-effort (see the caveats in §5).
+- **The tension between hardening and injectability, and the confused-deputy ceiling.** These
+  matter only if we ever add the transparency shim (§7). v1 only gates.
 
 ### 8.1 Caller vs. ancestry forgeability (sharpened)
-Treat the **immediate caller** and the **ancestry chain** as different security
-objects:
-- **Immediate caller — strong & race-free.** It is suspended in the kernel
-  awaiting our verdict, so it cannot exit/exec under us. Linux: exe path is
-  kernel-truth (race-free while blocked). macOS: the per-event `audit_token`
-  yields *cryptographic* code identity (`cdhash`/`team_id`/`signing_id`,
-  validated via `SecCodeCheckValidity`) — strictly stronger than a path, and the
-  real ES win.
-- **Ancestry — best-effort, two distinct attacks:**
-  - **Removal** (`double-fork` → reparent to init): erases the chain on Linux.
-    macOS resists this — `original_ppid` and the *responsible* audit token survive
+Treat the immediate caller and the ancestry chain as different security objects:
+- **The immediate caller is strong and race-free.** It is suspended in the kernel while it
+  waits for our verdict, so it cannot exit or exec under us. On Linux, the exe path is
+  kernel truth, and it is race-free while the caller is blocked. On macOS, the per-event
+  `audit_token` yields a *cryptographic* code identity (`cdhash`, `team_id`, `signing_id`,
+  validated with `SecCodeCheckValidity`). That is strictly stronger than a path, and it is the
+  real win of ES.
+- **Ancestry is best-effort, and it faces two distinct attacks:**
+  - **Removal.** A double fork reparents the process to init and erases the chain on Linux.
+    macOS resists this, because `original_ppid` and the *responsible* audit token survive
     reparenting.
-  - **Construction** (`fork(scraper); exec(real blessed binary)` in the parent):
-    builds *genuine* ancestry whose ancestor really is the blessed tool. This
-    defeats ancestry on **both** platforms and is **not** fixed by stricter
-    identity (`path+inode`/`signature` or macOS code-signing) — it is the
-    authentic binary, attested truthfully. Only a liveness window (the blessed
-    ancestor must be alive at access time) bounds it. macOS "responsible process"
-    attribution is also launcher-influenceable (`posix_spawn` disclaim
-    attributes), so it is not unforgeable either.
-- **Interpreter problem persists on macOS:** a script tool surfaces as
-  `/usr/bin/python3` (an Apple *platform binary*), so the strong code-identity is
-  the interpreter's, not the tool's — pushing you back onto the weaker
-  ancestry/responsible-pid link, as on Linux.
-- **Conclusion:** ancestry **raises cost, is never a boundary**; the construction
-  attacker is the conceded targeted-RE class (§2). The object-centric deny is the
-  boundary.
+  - **Construction.** The attacker runs `fork(scraper); exec(real blessed binary)` in the
+    parent. That builds a *genuine* ancestry whose ancestor really is the blessed tool. It
+    defeats ancestry on both platforms. Stricter identity does not fix it, whether that is
+    `path+inode`, `signature` or macOS code signing, because the binary is authentic and is
+    attested truthfully. Only a liveness window bounds it, where the blessed ancestor must be
+    alive at access time. The launcher can also influence macOS's "responsible process"
+    attribution (through the `posix_spawn` disclaim attributes), so that is not unforgeable
+    either.
+- **The interpreter problem persists on macOS.** A script tool surfaces as `/usr/bin/python3`,
+  which is an Apple *platform binary*. So the strong code identity belongs to the interpreter,
+  not the tool. That pushes you back onto the weaker link of ancestry or the responsible pid,
+  as on Linux.
+- **Conclusion.** Ancestry raises the cost and is never a boundary. The construction attacker
+  belongs to the targeted reverse-engineering class that §2 concedes. The object-centric deny
+  is the boundary.
 
 ### 8.2 Better Linux lineage sources (beyond the /proc snapshot)
-The `/proc` ppid walk is a snapshot taken *after* reparenting has already
-destroyed information. Stronger sources, weakest→strongest:
-- **Start-time keying** (`/proc/<pid>/stat` field 22): key each hop by
-  `(pid, starttime)`; a changed starttime ⇒ pid was recycled ⇒ reject. Kills
-  pid-reuse. (Cheap; DESIGN already assumes this.)
-- **pidfd**: free for the caller via `FAN_REPORT_PIDFD`; `pidfd_open(ppid)` +
-  starttime recheck pins ancestors. Race-free, but still a decision-time snapshot.
-- **`loginuid`/`sessionid`**: set at login, immutable without `CAP_AUDIT_CONTROL`,
-  inherited by all descendants — a fence the scraper can't shed (unlike `setsid`).
-  A robust *bound* on the walk, though it doesn't identify the tool.
-- **Proc connector** (`NETLINK_CONNECTOR`/`CN_IDX_PROC`) **or eBPF**
-  (`sched_process_{fork,exec}`, BPF-LSM): subscribe at startup, maintain a
-  lineage cache keyed by `(pid, starttime)`. Recording the parent **at fork time**
-  captures the *original* lineage **before** a later double-fork can erase it —
-  defeating the **removal** attack. eBPF is the high-fidelity option (also gets
-  argv/cwd/creds at exec); it's how Tetragon/Falco/Sysdig build process trees
-  (§13). Root-only — already required.
-- **Ceiling:** lineage tracking defeats *removal* + *reuse*, never *construction*
-  (a real `exec` is faithfully recorded as a genuine blessed ancestor). Not log
-  sources (`auditd` is async, log-only), not `/proc/.../children` (wrong
-  direction), not cgroup/session grouping (CLI tools share the shell's cgroup).
+The `/proc` ppid walk is a snapshot, taken *after* reparenting has already destroyed the
+information. Stronger sources exist. From weakest to strongest, they are:
+- **Start-time keying** (`/proc/<pid>/stat` field 22). Key each hop by `(pid, starttime)`. A
+  changed starttime means the pid was recycled, so the hop is rejected. This kills pid reuse.
+  It is cheap, and the design already assumes it.
+- **pidfd.** The caller's pidfd comes free with `FAN_REPORT_PIDFD`. `pidfd_open(ppid)` plus a
+  starttime recheck pins the ancestors. That is race-free, but it is still a snapshot taken at
+  decision time.
+- **`loginuid` and `sessionid`.** They are set at login, they can't change without
+  `CAP_AUDIT_CONTROL`, and all descendants inherit them. So they are a fence the scraper can't
+  shed, unlike `setsid`. They give the walk a robust bound, though they don't identify the
+  tool.
+- **The proc connector** (`NETLINK_CONNECTOR`/`CN_IDX_PROC`) **or eBPF**
+  (`sched_process_{fork,exec}`, BPF-LSM). Subscribe at startup, and maintain a lineage cache
+  keyed by `(pid, starttime)`. Recording the parent at fork time captures the *original*
+  lineage before a later double fork can erase it, which defeats the removal attack. eBPF is
+  the high-fidelity option, because it also gets argv, cwd and credentials at exec. It is how
+  Tetragon, Falco and Sysdig build process trees (§13). It needs root, which is already
+  required.
+- **Ceiling.** Lineage tracking defeats removal and reuse, and never construction, because a
+  real `exec` is faithfully recorded as a genuine blessed ancestor. Log sources don't help,
+  because `auditd` is asynchronous and only logs. `/proc/.../children` points in the wrong
+  direction. Grouping by cgroup or session doesn't help either, because CLI tools share the
+  shell's cgroup.
 
-> **Superseded as a standalone deliverable.** With the **BPF-LSM backend (§4)** this is
-> *folded into the backend*, not a separate proc-connector subsystem: a live
-> `task->real_parent` walk is free at decision time, and durable-across-exit lineage is
-> just `sched_process_{fork,exec}` hooks writing `(pid, starttime)`→parent into a BPF map
-> there (a later increment; ancestry is one of §15.4's opt-in predicates, never the
-> boundary, §8.1). So the once-planned event-sourced **proc-connector lineage cache is
-> dropped.** The in-kernel walk is *also* best-effort: a parent that already exited is
-> already reparented, so only fork-time recording defeats **removal** — the
-> **construction** ceiling stands regardless.
+> **Superseded as a standalone deliverable.** With the BPF-LSM backend (§4), this work is
+> folded into the backend rather than built as a separate proc-connector subsystem. A live
+> walk of `task->real_parent` is free at decision time. Lineage that lasts past a process's
+> exit only needs `sched_process_{fork,exec}` hooks there that write `(pid, starttime)` to
+> parent into a BPF map. That is a later increment. Ancestry is one of §15.4's opt-in
+> predicates and never the boundary (§8.1). So the once-planned event-sourced proc-connector
+> lineage cache is dropped. The in-kernel walk is best-effort too. A parent that has already
+> exited has already been reparented, so only recording at fork time defeats removal. The
+> construction ceiling stands regardless.
 
 ## 9. Cross-platform primitive map
 
 | Need | Linux | macOS |
 |---|---|---|
-| Object-centric open authorizer | **BPF-LSM** `file_open` (in-kernel verdict) | **Endpoint Security** `AUTH_OPEN` |
-| Testing without host root | **virtme-ng VM** runs the real `bpf-lsm` backend; `cargo test` covers the compiler/control plane | `mock` only (no unpriv intercept) |
-| Caller id (race-free) | exe `(dev,inode)` from `task->mm->exe_file` (in-kernel) | per-conn audit token → code req |
-| Parent chain | `task->real_parent` walk (in-kernel) + start-time | ES process struct (parent + responsible pid) |
-| Create signal (autolearn / mutation) | `inode_create` hook (§15, M3) | ES create/exec events |
-| Prompt channel (deferred — no interactive mode in the rule model) | per-session agent + dbus/libnotify | per-session agent + UserNotifications |
+| Object-centric open authorizer | BPF-LSM `file_open` (in-kernel verdict) | Endpoint Security `AUTH_OPEN` |
+| Testing without host root | a virtme-ng VM runs the real `bpf-lsm` backend, and `cargo test` covers the compiler and the control plane | `mock` only (no unprivileged intercept) |
+| Caller id (race-free) | exe `(dev,inode)` from `task->mm->exe_file` (in the kernel) | the audit token of each connection, checked against a code requirement |
+| Parent chain | a `task->real_parent` walk (in the kernel) plus start time | the ES process struct (parent and responsible pid) |
+| Create signal (autolearn / mutation) | the `inode_create` hook (§15, M3) | ES create and exec events |
+| Prompt channel (deferred, because the rule model has no interactive mode) | a per-session agent plus D-Bus or libnotify | a per-session agent plus UserNotifications |
 | Key custody (only if encrypting) | kernel keyring / Secret Service | Keychain / Secure Enclave |
 | Declarative MAC we're *not* using | AppArmor / SELinux | Seatbelt / SBPL |
 
-Same shape both OSes: a root **in-kernel authorizer** + a **root-owned text policy** +
-the `cordon` CLI. Per-protected-dir cost = a rule, not a per-tool profile.
+Both OSes have the same shape: a root in-kernel authorizer, a root-owned text policy, and the
+`cordon` CLI. Protecting a directory costs one rule, not a profile for each tool.
 
 ## 10. Honest limitations
-- **~~Fail-open until pinned.~~ Closed (M5).** The LSM links are bpffs-pinned (§4), so a
-  daemon crash, kill or restart leaves enforcement standing with no gap. The residue is a
-  usability edge rather than a hole: `systemctl stop cordond` no longer stops enforcement
-  (`cordond --teardown` does), and teardown is asynchronous — the kernel detaches from a
-  workqueue once the pin's reference goes. On kernels without BPF-LSM (`CONFIG_BPF_LSM` off,
-  or `bpf` not in the LSM list) there is still no hardened Linux boundary at all.
-- **Open-time only (so far).** M1 mediates `file_open` (read/write/create); the structural
-  ops (unlink/rename/… — closing the rename-out-of-zone bypass) and `execute` are later
-  hooks (§15.5). Until then a same-uid tool can rename a secret out of a protected subtree
-  and open it at an unprotected path.
-- **Identity is best-effort beyond exe.** The exe `(dev,inode)` is race-free, but the
-  parent chain is laundered by double-fork and argv is untrusted; interpreted tools surface
-  as their interpreter (`python3`), needing the opt-in argv0/ancestor or hash predicates
-  (§15.4). Ancestry raises cost, never the boundary (§8.1).
-- **First-access friction.** A tool with no matching rule hitting a protected object is
-  default-denied; granting access means editing the root-owned policy + `cordon policy
-  apply` (autolearn, §15.9, is the assisted path). There is no interactive per-open prompt.
-- **Confused-deputy:** gating ≠ stopping a tool's own export surface (out of scope).
-- **Only the root `bpf-lsm` backend is a boundary** — a user-session dev daemon is for
-  iteration, not protection; the boundary runs as a root service with `CAP_BPF` +
-  `CAP_MAC_ADMIN` (macOS ES needs a restricted entitlement).
-- **macOS backend (planned) shares ES's ceiling** — open()-time mediation only (no
-  `read(2)` event), symlinks not followed, ES "default mute set" binaries unmediated.
-  Same limits Santa's FAA hits (`docs/SANTA.md`); inherent to ES.
+- **~~Fail-open until pinned.~~ Closed (M5).** The LSM links are pinned to bpffs (§4), so a
+  daemon crash, kill or restart leaves enforcement standing with no gap. What remains is a
+  usability edge rather than a hole. `systemctl stop cordond` no longer stops enforcement,
+  and `cordond --teardown` does. Teardown is also asynchronous, because the kernel detaches
+  the hooks from a workqueue once the pin's reference goes. On kernels without BPF-LSM
+  (`CONFIG_BPF_LSM` off, or `bpf` not in the LSM list), there is still no hardened Linux
+  boundary at all.
+- **Only some operations are mediated.** The program hooks `file_open`, link, rename,
+  unlink, rmdir, mkdir and exec (§15.5; the list is `HOOKS` in
+  crates/daemon/src/backend/bpf_lsm.rs). Other operations on a protected inode are not
+  hooked. These include changing its mode or owner, changing its extended attributes, and
+  truncating it by path.
+- **Identity beyond the exe is best-effort.** The exe `(dev,inode)` is race-free. But a double
+  fork launders the parent chain, and argv is untrusted. Interpreted tools surface as their
+  interpreter (`python3`), so they need the opt-in argv0, ancestor or hash predicates
+  (§15.4). Ancestry raises the cost, and it is never the boundary (§8.1).
+- **First-access friction.** When a tool with no matching rule hits a protected object, it is
+  denied by default. Granting access means editing the root-owned policy and running
+  `cordon policy apply`. Autolearn (§15.9) is the assisted path. There is no interactive
+  prompt on each open.
+- **Confused deputy.** Gating an open does not stop a tool's own export surface, and that is
+  out of scope.
+- **Only the root `bpf-lsm` backend is a boundary.** A dev daemon in a user session is for
+  iteration, not protection. The boundary runs as a root service with `CAP_BPF` and
+  `CAP_MAC_ADMIN`, and macOS ES needs a restricted entitlement.
+- **The planned macOS backend shares ES's ceiling.** It mediates only at `open()` time, because
+  ES has no `read(2)` event. It does not follow symlinks, and binaries in the ES "default mute
+  set" are not mediated. Santa's FAA hits the same limits (`docs/SANTA.md`), and they are
+  inherent to ES.
 
 ## 11. Testing strategy — internal fixtures
 
-> **Definition of done — every change is VM-validated locally before it's complete.** Run
-> `packaging/test/run-bpf-lsm-vm.sh` (default = the CI-pinned kernel, currently `v6.12`) and
-> confirm **all** `bpf-lsm-smoke.sh` scenarios pass — *including for userspace-only changes*
-> (policy compiler, CLI, daemon control plane): the VM is the one tier that exercises the
-> real kernel boundary end-to-end, and a userspace change can still break seeding, the IPC
-> apply path, or a policy shape. `cargo test` (the unprivileged tier) is necessary but **not
-> sufficient**. When a change adds or alters enforcement behavior, add or extend a scenario
-> so the suite still covers it. The same harness + pinned kernel run locally and in CI, so a
-> green local VM run is the gate, not a courtesy.
+> **Definition of done: every change is validated in a VM locally before it is complete.**
+> Run `packaging/test/run-bpf-lsm-vm.sh`, which defaults to the CI-pinned kernel (currently
+> `v6.12`), and confirm that all `bpf-lsm-smoke.sh` scenarios pass. This holds for
+> userspace-only changes too, such as the policy compiler, the CLI or the daemon's control
+> plane. The VM is the one tier that exercises the real kernel boundary end to end, and a
+> userspace change can still break seeding, the IPC apply path, or a policy shape. `cargo
+> test` (the unprivileged tier) is necessary but not sufficient. When a change adds or alters
+> enforcement behavior, add or extend a scenario so that the suite still covers it. The same
+> harness and the same pinned kernel run locally and in CI, so a green local VM run is the
+> gate, not a courtesy.
 
-The kernel-backed smoke (`bpf-lsm-smoke.sh`) drives the rule model end-to-end with
-distinct-inode exes (copies of `bash`, so each is its own subject) reading/writing secrets
-under a protected subtree, against a policy file:
-- an **owner** exe allowed to read its secret; a **scraper** with no matching rule →
-  default-deny (`EPERM`), reported on the ring buffer with the object inode + action;
-- per-action (read allowed, write default-denied on the same object), subject + object
-  **groups**, **deny > allow** ties, **copy-down** precedence (subtree allow + a
-  file-specific deny for one subject, the sibling still readable), **audit→deny** (observe
-  with a catch-all, then enforce by flipping that one rule — no global mode), **silence**
-  (denied, not logged), runtime **`policy apply`**, and **event coalescing**.
+The kernel-backed smoke test (`bpf-lsm-smoke.sh`) drives the rule model end to end against a
+policy file. Its subjects are exes with distinct inodes (copies of `bash`, so each is its own
+subject) that read and write secrets under a protected subtree. It covers:
+- an owner exe that is allowed to read its secret, and a scraper with no matching rule that
+  is denied by default (`EPERM`) and reported on the ring buffer with the object inode and the
+  action;
+- per-action rules (read allowed and write denied by default on the same object), subject and
+  object groups, and ties where deny beats allow. It also covers copy-down precedence, where
+  a subtree allow is combined with a file-specific deny for one subject and the sibling file
+  stays readable. Then there is audit to deny, which observes with a catch-all and then
+  enforces by flipping that one rule, with no global mode. Finally it covers silence (denied
+  but not logged), runtime `policy apply`, and event coalescing.
 
-Asserts: the right subject reads, the wrong one is denied **in-kernel**, precedence
-resolves as §15.6 says, and a tight open-loop collapses to a few records — all on a real
-kernel (the unprivileged `cargo test` tier covers the parser + copy-down compiler).
+The suite asserts that the right subject reads, that the wrong one is denied in the kernel,
+that precedence resolves as §15.6 says, and that a tight loop of opens collapses to a few
+records. All of this runs on a real kernel. The unprivileged `cargo test` tier covers the
+parser and the copy-down compiler.
 
 ### Test tiers (by privilege)
-- **Unprivileged (no kernel backend):** the policy parser + copy-down compiler and the
-  IPC types — `cargo test` (`--all-features` also builds and unit-tests the `bpf-lsm`
-  control plane, incl. event coalescing), CI-friendly, no root. Covers everything but
-  the in-kernel hook itself.
-- **The `bpf-lsm` boundary in a VM, without host root → virtme-ng.** Loading the LSM
-  program needs `CAP_BPF`+`CAP_MAC_ADMIN` plus `bpf` in the active LSM list — both come
-  from a **virtme-ng VM** (`packaging/test/run-bpf-lsm-vm.sh`) booting a **pinned
-  upstream kernel** (Ubuntu mainline, e.g. `v6.12`) as guest-root with `lsm=…,bpf`,
-  needing only `/dev/kvm` (group `kvm`), no host root. The VM runs qemu **directly** (no
-  container) and virtme-ng reuses the host userspace, so there is no rootfs to build and
-  no glibc mismatch — the *same* harness + kernel run locally and in CI, so the kernel
-  never diverges. (`CORDON_VM_KERNEL` selects the pinned version; unset = the host
-  kernel for fast local iteration.)
-- **Why not libkrun/krunvm:** evaluated and dropped — getting `krunvm` onto a CI runner
-  means nesting it *inside a container*, stacking two user namespaces (`buildah unshare`)
-  under the libkrun VMM, which fails **differently per environment** (`gid_map: operation
-  not permitted` locally vs `memfd_create: EINVAL` on GitHub) — non-reproducible.
-  virtme-ng collapses the stack to a single `/dev/kvm` dependency.
-- `bpf-lsm-smoke.sh` proves the rule model end-to-end (allow/deny, per-action, subject +
-  object groups, copy-down precedence, audit→deny, silence, runtime `policy apply`, event
-  coalescing) through a real kernel — green in the virtme-ng VM (host kernel + pinned
-  `v6.12`, booted `lsm=…,bpf`).
+- **Unprivileged, with no kernel backend.** `cargo test` covers the policy parser, the
+  copy-down compiler and the IPC types. With `--all-features` it also builds and unit-tests
+  the `bpf-lsm` control plane, including event coalescing. It is CI-friendly and needs no
+  root, and it covers everything except the in-kernel hook itself.
+- **The `bpf-lsm` boundary in a VM, without host root, through virtme-ng.** Loading the LSM
+  program needs `CAP_BPF` and `CAP_MAC_ADMIN`, plus `bpf` in the active LSM list. A virtme-ng
+  VM (`packaging/test/run-bpf-lsm-vm.sh`) provides both. It boots a pinned upstream kernel
+  (Ubuntu mainline, for example `v6.12`) with `lsm=…,bpf` and runs as root in the guest. It
+  needs only `/dev/kvm` (group `kvm`) and no host root. The VM runs qemu directly, with no
+  container, and virtme-ng reuses the host userspace. So there is no rootfs to build and no
+  glibc mismatch. The same harness and kernel run locally and in CI, so the kernel never
+  diverges. `CORDON_VM_KERNEL` selects the pinned version, and leaving it unset selects the
+  host kernel for fast local iteration.
+- **Why not libkrun or krunvm.** They were evaluated and dropped. Getting `krunvm` onto a CI
+  runner means nesting it inside a container. That stacks two user namespaces
+  (`buildah unshare`) under the libkrun VMM, and the stack fails differently in each
+  environment (`gid_map: operation not permitted` locally, and `memfd_create: EINVAL` on
+  GitHub). So it is not reproducible. virtme-ng collapses the stack to a single dependency on
+  `/dev/kvm`.
+- `bpf-lsm-smoke.sh` proves the rule model end to end through a real kernel. It covers allow
+  and deny, per-action rules, subject and object groups, copy-down precedence, audit to deny,
+  silence, runtime `policy apply` and event coalescing. It is green in the virtme-ng VM, on
+  both the host kernel and the pinned `v6.12`, booted with `lsm=…,bpf`.
 
 ## 12. Phased plan
 
-> **Superseded by [`PLAN-rule-model.md`](PLAN-rule-model.md) + §15.11 — historical.** The
-> phases below are the *owner-model* roadmap. They shipped through Phase 1, after which the
-> owner model + fanotify were **removed**; the **current** roadmap is the rule-model
-> milestones M1–M6 (M1, M3 and M5 done) in PLAN-rule-model.md, summarized in §15.11. Kept for the
-> design history and the macOS/ES notes (Phase 4), which still apply.
+> **Superseded by [`PLAN-rule-model.md`](PLAN-rule-model.md) and §15.11 (historical).** The
+> phases below are the roadmap of the *owner model*. They shipped through Phase 1, and after
+> that the owner model and fanotify were removed. The current roadmap is the rule-model
+> milestones M1 to M6 in PLAN-rule-model.md, of which M1, M3 and M5 are done, and §15.11
+> summarizes them. This section is kept for the design history and for the macOS and ES notes
+> (Phase 4), which still apply.
 
-- **Phases 0–3 (owner model — shipped, then retired).** Phase 0 built the
-  privilege-agnostic core + a SQLite store + the `cordon` CLI on a `mock` backend; Phase 1
-  added the root **`fanotify`** `FAN_OPEN_PERM` backend (TOFU-on-create read from
-  `/proc/<pid>/syscall`, ancestry from `/proc`), VM-validated; Phase 3 moved the verdict
-  **in-kernel** (the bpf-lsm backend, then keyed on `subtrees` + `owner_identities`). Phase
-  2 (interactive deny-and-learn + ancestry hardening) was specced, not built. The
-  rule-model migration (§15) replaced this whole line — detail in git history; the
-  interactive/prompt design survives as the §6 record and **autolearn** (§15.9), the
-  ancestry analysis as §8.1/§8.2.
-- **Phase 4 — macOS gater.** Bespoke ES `AUTH_OPEN` client — **decided**: Santa's
-  FAA can't do dynamic, reviewable policy + autolearn (`docs/SANTA.md`). Reuse Santa's
-  Apache-2.0 source as a reference (deadline-safety dispatch, multi-ES-client
-  layout, identity matching). Same policy + CLI abstraction behind the backend interface.
-- **Phase 5 — (optional) at-rest bundle; capability brokering; canaries.**
+- **Phases 0 to 3 (the owner model, shipped and then retired).** Phase 0 built the
+  privilege-agnostic core, a SQLite store and the `cordon` CLI on a `mock` backend. Phase 1
+  added the root `fanotify` `FAN_OPEN_PERM` backend, which was VM-validated. It read
+  TOFU-on-create from `/proc/<pid>/syscall` and ancestry from `/proc`. Phase 3 moved the
+  verdict into the kernel, with the bpf-lsm backend, which was then keyed on `subtrees` and
+  `owner_identities`. Phase 2 (interactive deny-and-learn plus ancestry hardening) was
+  specified but not built. The rule-model migration (§15) replaced this whole line, and the
+  detail is in git history. The interactive prompt design survives as the record in §6 and as
+  autolearn (§15.9), and the ancestry analysis survives as §8.1 and §8.2.
+- **Phase 4: the macOS gater.** It will be a bespoke ES `AUTH_OPEN` client. That is decided,
+  because Santa's FAA can't do dynamic, reviewable policy or autolearn (`docs/SANTA.md`). We
+  reuse Santa's Apache-2.0 source as a reference for the deadline-safety dispatch, the layout
+  with several ES clients, and identity matching. The policy and the CLI abstraction stay the
+  same, behind the backend interface.
+- **Phase 5 (optional): the at-rest bundle, capability brokering, and canaries.**
 
 ## 13. Related work / prior art
 
-References we draw from, and why none is a drop-in for "deny non-owner reads of
-secret config dirs — transparently, cross-platform, zero per-tool policy."
+These are the references we draw from. None of them is a drop-in for "deny reads of secret
+config directories to everyone but the owner, transparently, cross-platform, with no per-tool
+policy."
 
 ### Closest architectural cousins (authorizer daemon + rule store)
-- **Santa** (macOS, North Pole Security) — the closest existing tool. Its **File
-  Access Authorization (FAA)** is a real object-centric, code-identity-keyed file
-  gater on Endpoint Security (~80% of our macOS gater). But it's **macOS-only**
-  (no cross-platform plans), and FAA is **static admin policy** — no interactive
-  prompt, no TOFU, poll-reloaded (≥15s); its interactive TOFU (standalone mode) is
-  **execution-only**. So it can't do cordon's dynamic creator-owns +
-  deny-and-learn for files. **Full functionality + roadmap analysis and the
-  reuse-vs-build decision: `docs/SANTA.md`.** (We borrow its ES deadline-safety
-  pattern and identity-match schema; Apache-2.0.)
-- **OpenSnitch** (Linux) / **Little Snitch**, **LuLu** (macOS) — interactive
-  application *firewalls*. The reference for our deny-and-learn UX (allow once /
-  for-X-min / forever, by-exe rules) and per-process attribution. But they gate
-  **network egress**, not file reads: they'd catch an exfil *connection*, yet a
-  scraper that stages to a local file, or leaves over an already-allowed channel
-  (the browser, DNS), slips by. Complementary layer, not a substitute.
+- **Santa** (macOS, North Pole Security) is the closest existing tool. Its File Access
+  Authorization (FAA) is a real object-centric file gater on Endpoint Security, keyed on code
+  identity. It covers about 80% of our macOS gater. But Santa is macOS-only, with no
+  cross-platform plans. And FAA is static admin policy. It has no interactive prompt and no
+  TOFU, and it reloads by polling (every 15 seconds at the fastest). Its interactive TOFU
+  (standalone mode) covers execution only. So it can't do cordon's dynamic creator-owns and
+  deny-and-learn for files. The full analysis of its functionality and roadmap, and the
+  decision between reuse and building our own, are in `docs/SANTA.md`. We borrow its ES
+  deadline-safety pattern and its identity-match schema, which are Apache-2.0.
+- **OpenSnitch** (Linux), **Little Snitch** and **LuLu** (macOS) are interactive application
+  *firewalls*. They are the reference for our deny-and-learn UX (allow once, for X minutes or
+  forever, with rules by exe) and for attribution to a process. But they gate network egress,
+  not file reads. They would catch an exfiltration *connection*. Yet a scraper that stages to a
+  local file, or leaves over a channel that is already allowed (the browser, DNS), slips by.
+  They are a complementary layer, not a substitute.
 
 ### Mandatory Access Control (the per-tool-policy family we reject as primary)
-- **AppArmor / SELinux / macOS Seatbelt (`sandbox-exec`)** — see §3/§9.
-  Subject-centric: a profile/policy **per program**, and unprofiled = unconfined
-  (an unknown scraper is unrestricted). SELinux *can* be object-centric via
-  labels, but it's compiled + per-domain-transition + Linux-only. We want one
-  object-centric rule that covers all subjects, including unknown ones.
-- **Landlock** (Linux, unprivileged LSM) — a process restricts **its own** (and
-  children's) FS access. Modern and root-free, but it's *self*-confinement:
-  useless against a scraper that won't opt in. The inverse of what we need.
-- **bubblewrap / firejail / Flatpak** — namespace sandboxes; Flatpak even gives
-  each app its own data dir (`~/.var/app/<id>`) — the per-app-isolation north
-  star. But subject-centric and opt-in per app; CLI dev tools aren't packaged,
-  and you can't wrap a scraper you've never seen.
+- **AppArmor, SELinux and macOS Seatbelt (`sandbox-exec`)**: see §3 and §9. They are
+  subject-centric. Each program needs its own profile or policy, and a program without a
+  profile is unconfined, so an unknown scraper is unrestricted. SELinux *can* be
+  object-centric through labels. But its policy is compiled, it works through domain
+  transitions, and it is Linux-only. We want one object-centric rule that covers all subjects,
+  including unknown ones.
+- **Landlock** (Linux, an unprivileged LSM) lets a process restrict its own file system access
+  and its children's. It is modern and needs no root. But it is *self*-confinement, so it is
+  useless against a scraper that won't opt in. It is the inverse of what we need.
+- **bubblewrap, firejail and Flatpak** are namespace sandboxes. Flatpak even gives each app its
+  own data directory (`~/.var/app/<id>`), which is the north star for per-app isolation. But
+  they are subject-centric and opt-in for each app. CLI dev tools aren't packaged, and you
+  can't wrap a scraper you've never seen.
 
 ### Secret brokers / keystores (our deferred §7 + orthogonal capability brokering)
-- **ssh-agent / gpg-agent** — never release the key; perform the op. The broker
-  pattern in miniature, but ssh/gpg-only and protocol-bound.
-- **HashiCorp Vault (+agent), aws-vault, envchain, 1Password CLI,
-  git-credential-manager** — short-lived-credential brokering with OS-keystore
-  custody, several cross-platform. We borrow the short-lived-capability idea, but
-  each needs **per-tool integration** and none transparently protects the long
-  tail of existing flat config files.
-- **OS keystores** (Keychain / Secret Service / kernel keyring) and **SOPS / age
-  / git-crypt** — "the secret isn't a readable file" / encrypt-at-rest. Borrowed
-  for the deferred at-rest bundle, but tools must adopt them and they don't gate
-  live reads of dirs that already exist.
+- **ssh-agent and gpg-agent** never release the key, and perform the operation instead. That
+  is the broker pattern in miniature, but it covers only ssh and gpg and is bound to their
+  protocols.
+- **HashiCorp Vault (with its agent), aws-vault, envchain, the 1Password CLI and
+  git-credential-manager** broker short-lived credentials and keep custody in an OS keystore.
+  Several are cross-platform. We borrow the idea of a short-lived capability. But each one
+  needs integration with each tool, and none of them transparently protects the long tail of
+  existing flat config files.
+- **OS keystores** (Keychain, Secret Service, the kernel keyring) and **SOPS, age and
+  git-crypt** make the secret something other than a readable file, or encrypt it at rest. We
+  borrow them for the deferred at-rest bundle. But tools must adopt them, and they don't gate
+  live reads of directories that already exist.
 
 ### Filesystem-view / redirection (evaluated and rejected earlier)
-- **fakechroot / proot** — `LD_PRELOAD` / `ptrace` path remapping. Cooperative or
-  same-UID-bypassable → not a boundary (see the preload discussion).
-- **FUSE: bindfs / gocryptfs / fuse-t** — a userspace FS can gate on the caller's
-  pid, and **fuse-t** does it on macOS without a kext. But the mount is global
-  (not per-process), PID identity is racy, and macFUSE's kext *lowers* platform
-  security. We use a kernel authorizer (bpf-lsm/ES) instead; `fuse-t` is kept
-  only for the deferred transparency layer.
+- **fakechroot and proot** remap paths with `LD_PRELOAD` or `ptrace`. They are cooperative, or
+  a same-UID process can bypass them, so they are not a boundary (see the preload discussion).
+- **FUSE (bindfs, gocryptfs, fuse-t).** A userspace file system can gate on the caller's pid,
+  and fuse-t does it on macOS without a kext. But the mount is global rather than per
+  process, PID identity is racy, and macFUSE's kext *lowers* platform security. We use a
+  kernel authorizer (bpf-lsm or ES) instead, and keep fuse-t only for the deferred
+  transparency layer.
 
 ### Observability & eBPF enforcement
-- **auditd / fanotify-notify / inotify** — can *watch* file access by path, but
-  **cannot deny**. We need the permission (veto) path, not just logging.
-- **Tetragon / Falco** (eBPF, LSM-BPF) — runtime security; Tetragon can even
-  enforce (override/kill). Architecturally this **is** our LSM-BPF alternative
-  backend — but it's container/k8s-oriented and heavyweight to drive as a
-  per-user desktop secret gate.
+- **auditd, fanotify in notify mode, and inotify** can *watch* file access by path, but they
+  cannot deny. We need the permission path, which can veto, and not just logging.
+- **Tetragon and Falco** (eBPF, LSM-BPF) do runtime security, and Tetragon can even enforce,
+  by overriding or killing. Architecturally, Tetragon is the same as our LSM-BPF backend. But
+  it is oriented to containers and Kubernetes, and it is heavyweight to drive as a secret gate
+  for one desktop user.
 
 ### aya-ecosystem peers (our toolchain — pure-Rust eBPF via aya)
-The eBPF enforcers above (Tetragon/Falco/KubeArmor/bpflock) are the **mechanism**
-precedent but all **Go/libbpf**. The projects that share cordon's actual *toolchain*
-— a `no_std` `aya-ebpf` kernel crate + an `aya` userspace loader, maps/ring-buffers,
-and the same CO-RE/BTF offset problem (rustc can't emit CO-RE relocations,
-<https://github.com/rust-lang/rust/issues/158412>) — live in
-[`aya-rs/awesome-aya`](https://github.com/aya-rs/awesome-aya), and **every security
-one is subject-centric, most observe-only**. None is an object-centric file
-authorizer for a personal box, so cordon shares their plumbing, not their shape:
-- **lockc** — eBPF **LSM-MAC** for *containers* (Docker/k8s), Rust/aya. Closest
-  cousin by mechanism (LSM hooks → MAC), but **container/profile-centric** and
-  audit-framed/experimental — it restricts the confined workload, not an *object*
-  the way we protect a subtree.
-- **suidsnoop** — aya **LSM programs**, the only peer that actually **denies**
-  (audit-or-enforce) — but scoped to **suid `execve`** and keyed on **uid**
-  (subject-centric); a research demo, not a file-read gate.
-- **bombini** — aya **LSM-BPF**, but **observe-only**: modular "detectors"
-  (exec / connect / file-access) emit JSON, no veto. Subject-centric, k8s runtime-sec.
-- **kunai** — aya, kprobes/tracepoints (not LSM enforcement); **observe-only** host
-  threat-hunting (Sysmon-for-Linux). The most mature of the set and the **least**
-  like cordon — it logs events, it doesn't gate opens.
+The eBPF enforcers above (Tetragon, Falco, KubeArmor and bpflock) are the precedent for the
+mechanism, but all of them use Go and libbpf. Some projects share cordon's actual toolchain:
+a `no_std` `aya-ebpf` kernel crate, an `aya` userspace loader, maps and ring buffers, and the
+same CO-RE and BTF offset problem (rustc can't emit CO-RE relocations,
+<https://github.com/rust-lang/rust/issues/158412>). They are listed in
+[`aya-rs/awesome-aya`](https://github.com/aya-rs/awesome-aya). Every security project there is
+subject-centric, and most only observe. None is an object-centric file authorizer for a
+personal box. So cordon shares their plumbing, not their shape:
+- **lockc** is an eBPF LSM-based MAC for *containers* (Docker, Kubernetes), written in Rust
+  with aya. It is the closest cousin by mechanism, because it turns LSM hooks into MAC. But it
+  is centred on containers and profiles, and it is framed around audit and experimental. It
+  restricts the confined workload, not an *object* the way we protect a subtree.
+- **suidsnoop** uses aya LSM programs, and it is the only peer that actually denies, with an
+  audit or enforce mode. But it is scoped to suid `execve` and keyed on the uid, so it is
+  subject-centric. It is a research demo, not a gate on file reads.
+- **bombini** uses aya LSM-BPF, but it only observes. Its modular "detectors" (exec, connect,
+  file access) emit JSON and never veto. It is subject-centric runtime security for
+  Kubernetes.
+- **kunai** uses aya with kprobes and tracepoints, not LSM enforcement. It only observes, for
+  host threat hunting, like Sysmon for Linux. It is the most mature of the set and the least
+  like cordon, because it logs events and doesn't gate opens.
 
-So in the aya world cordon's niche is empty: object-centric, enforcing,
-personal-desktop, TOFU + interactive. The precedent for the *use* (allow/deny on LSM
-hooks) is the Go tools above; the precedent for the *stack* is these — and they all
-answer "what may this subject do?", never "who may touch this resource?"
+So cordon's niche in the aya world is empty. That niche is object-centric, enforcing, on a
+personal desktop, with TOFU and interaction. The Go tools above are the precedent for the
+*use*, which is allow and deny on LSM hooks. These aya projects are the precedent for the
+*stack*. They all answer "what may this subject do?", and never "who may touch this
+resource?"
 
 ### Authorization-agent architecture
-- **polkit** — privileged daemon + **unprivileged per-session agent** that draws
-  the prompt. Exactly our daemon/agent split (§6). But polkit authorizes D-Bus
-  privileged *actions*, not file reads.
+- **polkit** pairs a privileged daemon with an unprivileged agent in each session that draws
+  the prompt. That is exactly our split between daemon and agent (§6). But polkit authorizes
+  privileged D-Bus *actions*, not file reads.
 
 ## 14. Open decisions
 See `STATUS.md`.
 
 ## 15. The rule model — current architecture (supersedes §1–§14)
 
-The flat **rule model** — `(who, where, action, policy)`, in the SELinux/AppArmor lineage
-— is cordon's architecture, **shipped in M1**. It subsumes the v1 owner model's owners,
-explicit rules, and TOFU (§5) into one concept, enforced uniformly in-kernel. This section
-is the design; milestone-by-milestone status is in
-[`PLAN-rule-model.md`](PLAN-rule-model.md) (M1, M3 and M5 done; M6 is the remaining must-have).
+The flat rule model is cordon's architecture, and it shipped in M1. A rule is
+`(who, where, action, policy)`, in the lineage of SELinux and AppArmor. The model folds the v1
+owner model's owners, explicit rules and TOFU (§5) into one concept, and the kernel enforces
+it uniformly. This section is the design. The status of each milestone is in
+[`PLAN-rule-model.md`](PLAN-rule-model.md), where M1, M3 and M5 are done and M6 is the
+remaining must-have.
 
 ### 15.1 Why
-The owner entity is reducible to allow-rules: `owner_match` ≡ "an allow rule exists for
-(caller-exe, subtree)." Owner groups bought grouping / dedup / naming — but a general
-**group** mechanism (§15.7) gives that for *all* axes, symmetrically, so a dedicated
-owner table was incidental complexity. Collapsing it also closed a real gap: the
-owner-model bpf-lsm backend enforced only `subtrees` + `owner_identities`, **not** the
-`rules` table, so `cordon add` allow/deny and TOFU were silently unenforced in-kernel.
-One model, now enforced uniformly.
+The owner entity reduces to allow rules. `owner_match` means the same as "an allow rule
+exists for this caller exe and this subtree." Owner groups bought grouping, deduplication and
+naming. But a general group mechanism (§15.7) gives that on all axes, symmetrically, so a
+dedicated owner table was incidental complexity. Collapsing it also closed a real gap. The
+owner model's bpf-lsm backend enforced only `subtrees` and `owner_identities`, and not the
+`rules` table. So `cordon add` allow and deny rules and TOFU were silently not enforced in the
+kernel. Now there is one model, enforced uniformly.
 
 ### 15.2 The rule
-`(who, where, action, policy)`:
-- **who** — subject: a *conjunction of predicates*, not just an exe (§15.4).
-- **where** — object: a file, directory, or **subtree** (recursive). Matched in-kernel
-  by the dentry ancestor walk (most-specific wins).
-- **action** — `read | write | create | execute | listdir | unlink | mkdir | rmdir |
-  rename | link` (extensible). Each maps to an LSM hook (§15.5).
-- **policy** — `allow | deny | audit | silence` = `{allow,deny} × {log,silent}`:
-  allow=allow+silent, audit=allow+log, deny=deny+log, silence=deny+silent.
+A rule is `(who, where, action, policy)`:
+- **who** is the subject. It is a *conjunction of predicates*, not just an exe (§15.4).
+- **where** is the object. It is a file, a directory, or a recursive subtree. The kernel
+  matches it with the walk over dentry ancestors, and the most specific object wins.
+- **action** is one of `read | write | create | execute | listdir | unlink | mkdir | rmdir |
+  rename | link`, and the list can grow. Each action maps to an LSM hook (§15.5).
+- **policy** is one of `allow | deny | audit | silence`. The four are the product of
+  `{allow,deny}` and `{log,silent}`. `allow` allows silently, `audit` allows and logs, `deny`
+  denies and logs, and `silence` denies silently.
 
 ### 15.3 The compile principle (load-bearing)
-**Groups, nesting, defaults, and precedence are resolved entirely in userspace at
-compile time; the kernel evaluates a flat, pre-resolved decision table.** cordond
-parses the text policy → expands groups → resolves paths→`(dev,ino)` → flattens to a
-per-object rule table → loads BPF maps. Like SELinux's `checkpolicy`: expressive
-source, dumb-fast binary form. The eBPF program never sees a group or a nested ref,
-so it stays small and verifier-friendly no matter how expressive authoring gets.
+**Userspace resolves groups, nesting, defaults and precedence entirely at compile time, and
+the kernel evaluates a flat decision table that is already resolved.** cordond parses the text
+policy, expands the groups, and resolves paths to `(dev,ino)`. It then flattens the result to
+a rule table for each object and loads the BPF maps. This works like SELinux's `checkpolicy`,
+with an expressive source and a simple, fast binary form. The eBPF program never sees a group
+or a nested reference. So it stays small and friendly to the verifier, however expressive the
+authoring gets.
 
 ### 15.4 Subject = predicate set (the identity frontier)
-`who` is a conjunction of cheap-to-check predicates, ANDed:
-- `exe` — path/inode (cheap)
-- `uid` / `gid` — cheap (`bpf_get_current_uid_gid`)
-- `cgroup` / unit — cheap (`bpf_get_current_cgroup_id`); names a systemd service
-- `exe-hash` — content identity via **IMA/fsverity** (kernel-measured), *not* hashed in
-  BPF; survives upgrades, resists binary swap
-- `argv0` / `ancestor-exe` — moderate cost; the only real fix for the **interpreter
-  problem** (`~/.aws` is opened by `python3`, not `aws` — match "python3 whose
-  argv0/ancestor is aws", not all python)
+`who` is a conjunction of predicates that are cheap to check, ANDed together:
+- `exe` is the path or inode, and it is cheap.
+- `uid` and `gid` are cheap (`bpf_get_current_uid_gid`).
+- `cgroup` or unit is cheap (`bpf_get_current_cgroup_id`), and it names a systemd service.
+- `exe-hash` is the content identity, which IMA or fsverity measures in the kernel. It is
+  *not* hashed in BPF. It survives upgrades and resists a binary swap.
+- `argv0` and `ancestor-exe` cost more. They are the only real fix for the interpreter
+  problem. `~/.aws` is opened by `python3`, not by `aws`. So the rule must match "python3
+  whose argv0 or ancestor is aws", and not every python.
 
-v1 ships `exe`+`uid`+`cgroup`; hash/argv/ancestor are opt-in later. No rule grammar
-fixes identity granularity — this axis is where the security actually lives.
+v1 ships `exe`, `uid` and `cgroup`, and the hash, argv and ancestor predicates are opt-in
+later. No rule grammar fixes the granularity of identity. This axis is where the security
+actually lives.
 
 ### 15.5 Action ↔ hook map (actions are not uniform)
 | action | LSM hook | notes |
 |---|---|---|
-| read / write / create | `file_open` | one program; `f_flags`/`f_mode` already encode RDONLY/WRONLY/RDWR/`O_CREAT` — three actions free at open time |
-| execute | `bprm_check_security` | exec of a binary — **not implied by `read`**, see below |
-| unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | second program; fire on mutation (cheap) |
-| **link** | **`inode_link`** | **a distinct hook — `rename` does not cover it (see below)** |
-| listdir | `file_open` of a directory (coarse) | **compiles but never fires** — see below; finer needs the hot `file_permission` |
+| read / write / create | `file_open` | One program. `f_flags` and `f_mode` already encode RDONLY, WRONLY, RDWR and `O_CREAT`, so three actions come free at open time. |
+| execute | `bprm_check_security` | The exec of a binary. It is not implied by `read` (see below). |
+| unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | A second program. It fires on a mutation, which is cheap. |
+| link | `inode_link` | A distinct hook. `rename` does not cover it (see below). |
+| listdir | `file_open` of a directory (coarse) | It compiles but never fires (see below). Anything finer needs the hot `file_permission` hook. |
 
-**The second-name escape — why `link` is not optional.** A *directory* object protects its
-children by **ancestry**: the kernel walks `d_parent` from the opened file up to a
-`PROTECTED` `(dev,ino)`. A file's membership is therefore positional, and **any second name
-for the same inode outside the object has a different ancestry and matches nothing**:
+**The second-name escape, and why `link` is not optional.** A *directory* object protects its
+children by ancestry. The kernel walks `d_parent` from the opened file up to a `PROTECTED`
+`(dev,ino)`. So a file's membership depends on its position. Any second name for the same
+inode outside the object has a different ancestry and matches nothing:
 
 ```
 open ~/.ssh/id_ed25519 → leaf ino (miss) → .ssh ino (HIT)  → deny
@@ -824,159 +869,173 @@ ln ~/.ssh/id_ed25519 ~/x
 open ~/x               → leaf ino (miss) → ~ (miss) → / (miss) → unprotected → ALLOW
 ```
 
-Both `rename` and `link` create that second name, and **`link` is the cheaper attack**:
-`rename(2)` needs write+execute on *both* directories and is destructive (the secret
-vanishes from `~/.ssh`, the owning tool breaks, you notice), while `link(2)` needs write
-only on the *destination* directory, requires no read on the secret, and leaves the
-original untouched — silent and non-destructive. `protected_hardlinks=1` does not help: it
-restricts only linking files the caller does not own, and here the adversary *is* the owner.
+Both `rename` and `link` create that second name, and `link` is the cheaper attack.
+`rename(2)` needs write and execute permission on both directories, and it is destructive.
+The secret vanishes from `~/.ssh`, the owning tool breaks, and you notice. `link(2)` needs
+write permission only on the destination directory. It needs no read permission on the
+secret, and it leaves the original untouched, so it is silent and non-destructive.
+`protected_hardlinks=1` does not help. It only restricts linking files that the caller does
+not own, and here the adversary *is* the owner.
 
-So the invariant is not "gate rename" but **a protected inode must not acquire a name
-outside its object** — which needs `inode_link` *and* `inode_rename`.
+So the invariant is not "gate rename". The invariant is that a protected inode must not
+acquire a name outside its object, and that needs both `inode_link` and `inode_rename`.
 
-**Shipped.** Both hooks, plus `inode_unlink`/`inode_rmdir`/`inode_mkdir`, share one resolver
-over `find_object`. Four cases. `dst` is the destination **directory**
-(`new_dentry.parent()`); `target` is the destination **dentry itself**, which is a distinct
-question — see below:
+**Shipped.** Both hooks, plus `inode_unlink`, `inode_rmdir` and `inode_mkdir`, share one
+resolver built on `find_object`. There are four cases. `dst` is the destination directory
+(`new_dentry.parent()`). `target` is the destination dentry itself, which is a distinct
+question (see below):
 
 | | condition | verdict |
 |---|---|---|
-| **destroy** | `target` protected (rename over an existing name) | that object's `write` verdict — asked **first**, before the shuffle short-circuit |
-| internal | `src == dst` | allow — an atomic save (temp beside the target, rename over it) must keep working inside a protected dir |
-| **escape** | `src` protected, `dst != src` | **deny, unconditionally** |
-| clobber | `src` unprotected, `dst` protected | the subject's `create`/`write` verdict on `dst` |
+| **destroy** | `target` is protected (a rename over an existing name) | That object's `write` verdict. It is asked first, before the shuffle short-circuit. |
+| internal | `src == dst` | Allow. An atomic save writes a temp file beside the target and renames it over the target, and that must keep working inside a protected directory. |
+| **escape** | `src` is protected, and `dst != src` | Deny, unconditionally. |
+| clobber | `src` is unprotected, and `dst` is protected | The subject's `create` or `write` verdict on `dst`. |
 
-`inode_unlink`/`inode_rmdir` have no destination, so they take the subject's `write`
-verdict — gated because objects resolve **once**, at `policy apply`, and nothing re-checks
-them: `rm -rf ~/.ssh && mkdir ~/.ssh` would otherwise dangle the `PROTECTED` entry and leave
-the path unprotected forever.
+`inode_unlink` and `inode_rmdir` have no destination, so they take the subject's `write`
+verdict. They are gated because objects resolve once, at `policy apply`, and nothing checks
+them again. Without the gate, `rm -rf ~/.ssh && mkdir ~/.ssh` would leave the `PROTECTED`
+entry dangling and the path unprotected forever.
 
-**`listdir` does not fire, and the failure is a trap worth naming.** There is no per-`getdents`
-hook, so listing a directory *is* `file_open` on it — and `requested_action` derives only
-`read`/`write`/`create` from `f_mode`/`f_flags`. A directory open therefore requests **`read`**,
-and `listdir` is requested by nothing.
+**`listdir` does not fire, and the failure is a trap worth naming.** There is no hook for each
+`getdents`, so listing a directory *is* a `file_open` on it. `requested_action` derives only
+`read`, `write` and `create` from `f_mode` and `f_flags`. So a directory open requests `read`,
+and nothing ever requests `listdir`.
 
 The consequence is not a no-op. A rule that names only `listdir` matches no request, so the
-open falls through to default-deny: `allow @tools listdir @secrets` **denies** the listing it
-looks like it grants. It fails *closed*, so this is a usability trap rather than a hole, but
-policy must currently spell directory listing as `read`. Making it fire means tagging the
-request when the opened inode is a directory (`i_mode & S_IFMT`), which costs one more BTF
-offset — deliberately not done yet, since `read` already covers the case correctly.
+open falls through to the default deny. `allow @tools listdir @secrets` therefore denies the
+listing that it looks like it grants. It fails *closed*, so this is a usability trap rather
+than a hole. But for now, a policy must spell directory listing as `read`. Making `listdir`
+fire means tagging the request when the opened inode is a directory (`i_mode & S_IFMT`), and
+that costs one more BTF offset. It is deliberately not done yet, because `read` already covers
+the case correctly.
 
-**`execute` is its own capability.** An exec *opens* the file (`FMODE_EXEC | FMODE_READ`), so
-`file_open` already refuses to run the contents of an object that denies reads;
-`bprm_check_security` adds the converse — an object may be **readable and not runnable**. The
-subject is the process *performing* the exec, since at that hook the caller is still its old
-image. Note the interaction with copy-down: a narrower `allow` on a child does **not** remove
-a capability the parent granted, because a child rule that doesn't match the requested action
-falls through to the parent's. "Readable but not runnable" is therefore written as an explicit
-`deny` on `execute`, not as an `allow` that omits it.
+**`execute` is its own capability.** An exec *opens* the file (`FMODE_EXEC | FMODE_READ`). So
+`file_open` already refuses to run the contents of an object that denies reads.
+`bprm_check_security` adds the converse, so an object may be readable and not runnable. The
+subject is the process that *performs* the exec, because at that hook the caller still has its
+old image. Note how this interacts with copy-down. A narrower `allow` on a child does not
+remove a capability that the parent granted, because a child rule that doesn't match the
+requested action falls through to the parent's rules. So "readable but not runnable" is
+written as an explicit `deny` on `execute`, not as an `allow` that leaves `execute` out.
 
-`inode_mkdir` is the mirror of `rmdir` and the one hook whose dentry is **negative**: there is
-no inode yet, so it matches nothing itself and the verdict comes from its **parent**, like the
-clobber arm above. Adding a name inside an object is an ordinary `create`/`write` on it. Note
-this does *not* cover the `rm -rf` case above — once the object's own directory is gone there
-is no protected ancestor left to find, which is exactly why `rmdir` is the hook that closes it.
+`inode_mkdir` is the mirror of `rmdir`, and it is the one hook whose dentry is negative. There
+is no inode yet, so the dentry matches nothing itself, and the verdict comes from its parent,
+like the clobber case above. Adding a name inside an object is an ordinary `create` or `write`
+on that object. Note that this does *not* cover the `rm -rf` case above. Once the object's own
+directory is gone, there is no protected ancestor left to find, and that is exactly why
+`rmdir` is the hook that closes the case.
 
 **Why escape consults no rule.** An escape publishes the inode to *every* subject,
-permanently, and silently — afterwards `find_object` misses, so nothing is ever logged
-again. Gating it on the acting subject's read verdict was considered and rejected: `allow
-/usr/bin/ssh read ~/.ssh` would then let a scriptable or `LD_PRELOAD`-ed allowed subject
-convert a scoped, logged grant into an unscoped permanent one. So no subject may escape —
-not an allowed exe, not a blessed session. Blessing grants *read*, not re-parenting.
+permanently and silently. Afterwards `find_object` misses, so nothing is ever logged again.
+Gating the escape on the acting subject's read verdict was considered and rejected. With that
+gate, `allow /usr/bin/ssh read ~/.ssh` would let an allowed subject that is scriptable or
+running under `LD_PRELOAD` convert a scoped, logged grant into an unscoped, permanent one. So
+no subject may escape, not an allowed exe and not a blessed session. Blessing grants *read*,
+not re-parenting.
 
-The cost is deliberate and one-sided: this enforces on `audit` objects too, which otherwise
-never enforce, so renames *out of* `~/.config` now fail with `EPERM` (app config migrations,
-manual `mv ~/.config/foo ~/backup/`). Internal renames are unaffected, which is the common
-case. Whether an escape is *journaled* still follows the object's policy, so a `silence`
-object refuses it silently and the `{allow,deny}×{log,silent}` split holds. If the cost ever
-bites, the one-line softening is to allow the escape where a `*` subject may already read
-the object. The journal cause is a distinct synthetic `escape-deny` (like `default-deny`),
-because "structurally refused" and "a rule of yours blocked it" want different fixes.
+The cost is deliberate and one-sided. This rule enforces on `audit` objects too, which
+otherwise never enforce. So renames *out of* `~/.config` now fail with `EPERM`, for example in
+an app's config migration or a manual `mv ~/.config/foo ~/backup/`. Renames inside the object
+are unaffected, and they are the common case. Whether an escape is *journaled* still follows
+the object's policy. So a `silence` object refuses it silently, and the split between
+`{allow,deny}` and `{log,silent}` holds. If the cost ever bites, a one-line softening would be
+to allow the escape where a `*` subject may already read the object. The journal cause is a
+distinct synthetic `escape-deny` (like `default-deny`), because "structurally refused" and "a
+rule of yours blocked it" need different fixes.
 
-Also note the asymmetry the walk creates: the leaf's own id is tested *first*, so a rule
-naming a **file** matches that inode by any name and was hardlink-proof even before these
-hooks; a rule naming a **directory** protects children only by ancestry. Enumerating secret
-files as objects was therefore a real mitigation, and was rejected anyway: it requires
+Also note an asymmetry that the walk creates. The leaf's own id is tested first. So a rule
+that names a file matches that inode under any name, and it was hardlink-proof even before
+these hooks. A rule that names a directory protects children only by ancestry. Listing secret
+files as objects was therefore a real mitigation, and it was rejected anyway. It requires
 listing every secret, so a key generated tomorrow would be silently unprotected. Directory
 objects had to become sound on their own.
 
-*Not* bypasses, for contrast: **symlinks** (`file_open` sees the resolved target dentry),
-**`/proc/PID/fd/N` reopen** (same), **bind mounts** (`d_parent` is filesystem-level, not
-mount-level — walking the dentry chain instead of a path string buys this for free), and
-**copying** (needs a read, which is mediated). **Overlayfs in a user namespace was measured,
-not assumed** (2026-07-27, 7.1.4-zen): mounting an overlay over `$HOME` and reading through
-it journaled `object=~/.config path=~/.config/dconf/user`, i.e. the ancestor walk resolved
-the *real* object and the path reconstruction walked the *real* dentry chain. Overlayfs
-presents the underlying dentry to `security_file_open`, so it is mediated and needs no
-`sb_mount` gating.
+For contrast, these are *not* bypasses:
+- **Symlinks**, because `file_open` sees the dentry of the resolved target.
+- **A reopen through `/proc/PID/fd/N`**, for the same reason.
+- **Bind mounts**, because `d_parent` belongs to the file system, not to the mount. Walking
+  the dentry chain instead of a path string buys this for free.
+- **Copying**, because a copy needs a read, which is mediated.
+- **Overlayfs in a user namespace.** This was measured rather than assumed (2026-07-27,
+  7.1.4-zen). Mounting an overlay over `$HOME` and reading through it journaled
+  `object=~/.config path=~/.config/dconf/user`. So the ancestor walk resolved the *real*
+  object, and the path reconstruction walked the *real* dentry chain. Overlayfs presents the
+  underlying dentry to `security_file_open`, so the read is mediated and needs no `sb_mount`
+  gating.
 
-**Why the destination is classified twice.** The destination *directory* answers escape and
-clobber, but it cannot answer for the name being overwritten. `rename(2)` onto an existing
-name **destroys** that inode, and `security_inode_rename` is the only hook the kernel fires
-for it: `security_inode_unlink` is reachable solely from `vfs_unlink`, and `do_renameat2`'s
-own target check is `may_delete()`, which is DAC-only. Left unclassified, the
-`inode_unlink` gate would be bypassable by its sibling syscall,
-`rm secret` refused while `mv anything secret` destroys the same inode and dangles the
-`PROTECTED` entry permanently. Two shapes, both invisible to the directory-pair
-classification:
+**Why the destination is classified twice.** The destination directory answers the escape and
+clobber cases, but it cannot answer for the name being overwritten. `rename(2)` onto an
+existing name destroys that inode, and `security_inode_rename` is the only hook the kernel
+fires for it. `security_inode_unlink` is reachable only from `vfs_unlink`, and
+`do_renameat2`'s own target check is `may_delete()`, which checks DAC only. If the target were
+left unclassified, its sibling syscall could bypass the `inode_unlink` gate. `rm secret` would
+be refused, while `mv anything secret` destroyed the same inode and left the `PROTECTED` entry
+dangling permanently. Two shapes are invisible to the classification by directory pair:
 
-- **the destination is an object whose parent is not** — `deny * * ~/.ssh/authorized_keys`
-  with no rule on `~/.ssh`: both directory walks miss, so the pair reads as `(None, None)`,
-  "nothing protected is moving".
-- **the destination is a nested, more specific object** — `mv ~/.aws/tmp ~/.aws/.danger-token`
-  reads as an *internal shuffle*, both sides resolving to `~/.aws`, while the `silence` object
-  it overwrites is a different and tighter one. Precedence (§15.6) says the more specific
-  object wins; taking the directory's verdict inverts that.
+- **The destination is an object whose parent is not.** Take `deny * * ~/.ssh/authorized_keys`
+  with no rule on `~/.ssh`. Both directory walks miss, so the pair reads as `(None, None)`,
+  meaning "nothing protected is moving".
+- **The destination is a nested object that is more specific.**
+  `mv ~/.aws/tmp ~/.aws/.danger-token` reads as an internal shuffle, because both sides
+  resolve to `~/.aws`. But the `silence` object it overwrites is a different and tighter one.
+  Precedence (§15.6) says that the more specific object wins, and taking the directory's
+  verdict inverts that.
 
 So `find_object` runs on `new_dentry` itself, first, before the shuffle short-circuit. A hit
-takes that object's own `write` verdict — the same treatment `inode_unlink` gives, because it
-is the same event. `link` is unaffected: its target is always negative (`do_linkat` resolves
-with `LOOKUP_CREATE`, so an existing name is `EEXIST` before the hook runs), and
-`Dentry::inode` returns `None` on a NULL `d_inode`, so the walk yields nothing on its first
-step. **Atomic save still works**: a rename over a name in an object the subject may already
-write takes that same `allow`, so the shuffle proceeds — it bites only where the destination
-carries a tighter rule, which is the case worth biting on.
+takes that object's own `write` verdict. That is the same treatment `inode_unlink` gives,
+because it is the same event. `link` is unaffected, because its target is always negative.
+`do_linkat` resolves with `LOOKUP_CREATE`, so an existing name fails with `EEXIST` before the
+hook runs. And `Dentry::inode` returns `None` on a NULL `d_inode`, so the walk yields nothing
+on its first step. Atomic save still works. A rename over a name in an object that the
+subject may already write takes that same `allow`, so the shuffle proceeds. The check bites
+only where the destination carries a tighter rule, which is the case worth biting on.
 
-`renameat2(RENAME_EXCHANGE)` re-parents both inodes rather than destroying one, so the
-destroy check alone does not cover it: the protected side moving *out* needs the
-unconditional escape refusal. It gets it because `security_inode_rename` calls the hook a
-second time with the pair swapped when `RENAME_EXCHANGE` is set — verified in the VM, and
-pinned by the smoke suite's `rename_exchange` scenario, which runs against a *writable*
-object so that the destroy and clobber checks cannot refuse first and hide a missing second
+`renameat2(RENAME_EXCHANGE)` re-parents both inodes rather than destroying one, so the destroy
+check alone does not cover it. The protected side that moves *out* needs the unconditional
+escape refusal. It gets that refusal, because `security_inode_rename` calls the hook a second
+time with the pair swapped when `RENAME_EXCHANGE` is set. This was verified in the VM, and the
+smoke suite's `rename_exchange` scenario pins it. The scenario runs against a *writable*
+object, so that the destroy and clobber checks cannot refuse first and hide a missing second
 call.
 
-`file_permission` / `inode_permission` (per-I/O) are hot paths → any per-access action
-is opt-in. **Identity is inode across all hooks** (the dentry walk), never path (§4).
+`file_permission` and `inode_permission` run on every I/O, so they are hot paths, and any
+action checked on each access is opt-in. Identity is the inode across all hooks, through the
+dentry walk, and never the path (§4).
 
 ### 15.6 Precedence (pin it explicitly)
-The kernel takes the **first matching rule** in the most-specific protected object's
-bucket; the compiler pre-sorts each bucket so first-match = most-specific-wins:
-1. Most-specific **where** — object depth (exact file > deeper subtree > ancestor).
-2. Most-specific **who** — a concrete subject (an `exe`; later, more predicates) beats
-   `who="*"`, so a specific `allow`/`deny` overrides a broad catch-all on the same object.
-3. **deny > allow** — fail-safe, but only as the tie-break among rules of *equal*
-   object+subject specificity (`allow X` vs `deny X` → deny; `allow *` vs `deny *` → deny).
+The kernel takes the first matching rule in the bucket of the most specific protected object.
+The compiler sorts each bucket in advance, so that the first match is also the most specific
+one:
+1. The most specific **where** wins, by object depth. An exact file beats a deeper subtree,
+   and a deeper subtree beats an ancestor.
+2. The most specific **who** wins. A concrete subject (an `exe`, and later more predicates)
+   beats `who="*"`, so a specific `allow` or `deny` overrides a broad catch-all on the same
+   object.
+3. **Deny beats allow.** That is fail-safe, but it is only the tie-break among rules whose
+   object and subject are *equally* specific. `allow X` against `deny X` gives deny, and
+   `allow *` against `deny *` gives deny.
 
-A protected object with no matching rule → **default-deny** (logged with a distinct
-`default-deny` cause, so it reads apart from an explicit `deny`). "Protected" = appears
-in/under some rule; everything else is unmediated **allow** (you cannot default-deny the
-whole filesystem).
+A protected object with no matching rule is denied by default. The denial is logged with a
+distinct `default-deny` cause, so it reads apart from an explicit `deny`. An object is
+"protected" when it appears in some rule or lies under one. Everything else is allowed without
+mediation, because you cannot default-deny the whole file system.
 
-**No global mode — the per-rule `policy` *is* the enforcement level.** `audit` (allow+log)
-*observes* an object; `deny` (block+log) *enforces* it — so observe-vs-enforce is
-per-object, flipped by editing that object's catch-all rule, not a system-wide switch. This
-deliberately drops SELinux's `enforce|permissive|off`: cordon's user is their *own* policy
-admin iterating live on one box, not an admin staging policy for a fleet, so a global
-"permissive" preview + "enforce" cutover is just the **audit→deny** progression (§15.10).
-"Off" is an empty policy, or `cordond --teardown`; stopping the daemon leaves the pinned
-boundary enforcing (§4). The kernel blocks iff the matched rule's policy denies
-(`Policy::denies` in `crates/bpf-common/src/policy_maps.rs`).
+**There is no global mode, because the per-rule `policy` *is* the enforcement level.** `audit`
+allows and logs, so it *observes* an object. `deny` blocks and logs, so it *enforces* the
+object. So the choice between observing and enforcing is made per object, by editing that
+object's catch-all rule, and there is no system-wide switch. This deliberately drops SELinux's
+`enforce|permissive|off`. cordon's user is the admin of their *own* policy, iterating live on
+one box, not an admin staging policy for a fleet. So a global "permissive" preview followed by
+an "enforce" cutover is just the progression from audit to deny (§15.10). "Off" is an empty
+policy, or `cordond --teardown`. Stopping the daemon leaves the pinned boundary enforcing (§4).
+The kernel blocks if and only if the matched rule's policy denies (`Policy::denies` in
+`crates/bpf-common/src/policy_maps.rs`).
 
 ### 15.7 Groups
-Named, nestable, **symmetric across all three axes** (subject / object / action),
-cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Example
-(TOML):
+Groups are named and can nest. They work the same way on all three axes (subject, object and
+action), and cycles are checked at load time. The v1 "owner" becomes one ordinary *subject
+group*. An example in TOML:
 ```toml
 [group.subject.ssh-tools]  members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/git"]
 [group.object.cloud-creds] members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
@@ -987,44 +1046,49 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
 ```
 
 ### 15.8 Storage
-- **Authoritative policy = a root-owned text file.** Not user-writable, else a scraper
-  writes itself in. Git-versionable, reviewable, diffable — policy as code.
-- **Two authoring surfaces, one model (✅ 2026-06-28).** Each rule is either a verbose
-  `[[rule]]` TOML table or a line in a compact `rules = '''…'''` **DSL** block —
-  `POLICY SUBJECT ACTION OBJECT`, one rule per line, columns whitespace-aligned, list
-  items comma-separated, `"…"` quoting a token with spaces (and forcing `*`/`@` literal),
-  `#` comments. A *literal* TOML string so paths keep backslashes and the DSL owns `"`/`\`;
-  its content is a verbatim source slice, so diagnostics map to exact `line:col`. Both
-  surfaces normalize to the same parsed rule and may be mixed in one file — the DSL is
-  *only* surface syntax (the kernel is unaffected), the natural form for the decision
-  table a policy actually is.
-- **Per-user `~` (✅ 2026-06-28).** An optional `user = "name"` header expands `~`
-  against that account's home (via `/etc/passwd`), so a root-owned per-user file writes
-  `~/.ssh` not `/home/<name>/.ssh` — the daemon runs as root, so absent the header `~`
-  would be `/root`.
-- **conf.d split (✅ 2026-06-28).** A policy path is a single file *or* a directory of
-  `*.toml` fragments (loaded in name order). Each fragment parses/resolves independently
-  — **file-local groups**, its own `user =` home — then the resolved rules are **merged**
-  into one table and compiled together. Precedence (object/subject specificity, then
-  deny>allow) is source-order-independent, so fragment load order can't change a verdict;
-  a flat merge is safe because every fragment is root-owned. A
-  bad fragment fails the whole apply, named in the diagnostic — never a silent partial
-  load. `apply` ships the read fragments (`Vec<PolicySource>`) to the daemon, which
-  resolves their homes and merges.
-- **System / user tiers (✅ 2026-06-29).** The effective policy is **system tier ⊕ user
-  tier**. A *system* fragment can pull in a *user-tier* file with an `[[include]]` directive
-  naming the owning user; that file's rules are **confined to that user's home** (every
-  object path must resolve under `~user`, enforced at compile — a user can't write rules
-  about `/etc` or another home). The binding lives system-side (an admin opt-in), so a user
-  file can't self-declare its own scope, and a user-tier file may not itself `[[include]]`.
-  Each `PolicySource` now carries its [`SourceOrigin`] tier; `load_policy` does the include
-  expansion (CLI on `apply`, daemon at startup). **Precedence between tiers is deferred:**
-  the intended semantics is *system-is-a-floor* (a user may tighten — add denies — but not
-  loosen a system deny), which needs the kernel to evaluate the two tiers' buckets
-  separately and combine deny-wins — **not expressible in the single first-match bucket**
-  today. It only becomes a security boundary once user files move into user-owned homes, so
-  it lands with that migration; for now the tiers merge flat (both are root-owned ⇒ equally
-  trusted), and the tier only drives `~` resolution and the home-scope lint.
+- **The authoritative policy is a root-owned text file.** It is not writable by the user,
+  because otherwise a scraper would write itself in. It can be versioned in git, reviewed and
+  diffed, so the policy is code.
+- **Two authoring surfaces share one model (✅ 2026-06-28).** Each rule is either a verbose
+  `[[rule]]` TOML table or a line in a compact `rules = '''…'''` DSL block. The DSL has the
+  form `POLICY SUBJECT ACTION OBJECT`, with one rule per line and columns aligned by
+  whitespace. List items are separated by commas. `"…"` quotes a token that contains spaces,
+  and it also forces `*` or `@` to be literal. `#` starts a comment. The block is a *literal*
+  TOML string, so paths keep their backslashes and the DSL owns `"` and `\`. Its content is a
+  verbatim slice of the source, so diagnostics map to an exact `line:col`. Both surfaces
+  normalize to the same parsed rule and may be mixed in one file. The DSL is *only* surface
+  syntax, and the kernel is unaffected. It is the natural form for the decision table that a
+  policy actually is.
+- **Per-user `~` (✅ 2026-06-28).** An optional `user = "name"` header expands `~` against that
+  account's home, as `/etc/passwd` gives it. So a root-owned file for one user can write
+  `~/.ssh` rather than `/home/<name>/.ssh`. The daemon runs as root, so without the header `~`
+  would mean `/root`.
+- **conf.d split (✅ 2026-06-28).** A policy path is either a single file or a directory of
+  `*.toml` fragments, loaded in name order. Each fragment is parsed and resolved on its own,
+  with groups local to the file and its own `user =` home. The resolved rules are then merged
+  into one table and compiled together. Precedence (object and subject specificity, then deny
+  over allow) does not depend on source order, so the load order of fragments can't change a
+  verdict. A flat merge is safe, because every fragment is root-owned. A bad fragment fails
+  the whole apply, and the diagnostic names it, so a load is never silently partial. `apply`
+  ships the fragments it read (`Vec<PolicySource>`) to the daemon, which resolves their homes
+  and merges them.
+- **System and user tiers (✅ 2026-06-29).** The effective policy is the system tier combined
+  with the user tier. A *system* fragment can pull in a *user-tier* file with an
+  `[[include]]` directive that names the owning user. That file's rules are confined to that
+  user's home. Every object path must resolve under `~user`, and the compiler enforces it, so
+  a user can't write rules about `/etc` or about another home. The binding lives on the system
+  side as an opt-in by the admin, so a user file can't declare its own scope. A user-tier file
+  may not `[[include]]` anything itself. Each `PolicySource` now carries its tier as a
+  [`SourceOrigin`]. `load_policy` expands the includes, in the CLI on `apply` and in the
+  daemon at startup.
+
+  Precedence between the tiers is deferred. The intended semantics is that the system tier is
+  a floor. A user may tighten it by adding denies, but may not loosen a system deny. That needs
+  the kernel to evaluate the two tiers' buckets separately and combine them so that deny
+  wins, which today's single first-match bucket cannot express. It only becomes a security
+  boundary once user files move into homes that the users own, so it lands with that
+  migration. For now the tiers merge flat, because both are root-owned and so equally
+  trusted. The tier only drives the resolution of `~` and the home-scope lint.
   ```toml
   # /etc/cordon/conf.d/00-users.toml  (system tier, root-authored)
   [[include]]
@@ -1038,441 +1102,477 @@ cycle-checked at load. The v1 "owner" becomes one ordinary *subject group*. Exam
   '''
   ```
   Author it with `cordon policy edit --user alice`.
-  > **Migration roadmap.** User files are root-owned under `/etc` for now (so `sudo` gates
-  > every edit). The target is to move them into `~user/.config/cordon/`, at which point
-  > **cordon must cordon its own user-policy file** — make it a protected object only an
-  > authorized editor may write — so a same-uid scraper can't author policy. That self-protection
-  > *is* the "edit without sudo" mechanism, and it's why the file belongs in the home.
-- **Applied explicitly.** `cordon policy apply` parses → lints → compiles → atomically
-  swaps the BPF maps. **No autoreload** (no inotify/SIGHUP watch): changes take effect
-  only on an explicit apply, so an edit-in-progress is never half-enforced.
-- **`cordon policy check`** — linter/compiler, daemon-free: unknown group refs and cycles,
-  exes that don't resolve (warned, rule dropped), objects that don't resolve yet (pending),
-  the per-object rule cap. Shadowed / unreachable-rule and deny-shadowed-by-allow lints are
-  not implemented yet.
-- **`cordon policy edit`** — the **sudoedit analog** (✅ 2026-06-29). `sudo cordon policy
-  edit` copies the root-owned file to a private temp, runs `$EDITOR` **as the invoking
-  user** (never root — `sudo $EDITOR policy.toml` would run the editor as root, and a
-  same-uid scraper (§2) that wrote your `.vimrc`/plugins gets root: a self-inflicted
-  escalation in cordon's own threat model), then *validates → applies → saves* in one step.
-  visudo-style: a policy that won't compile is rejected with diagnostics and re-prompts
-  rather than persisting a broken file. It writes the file **only after** the daemon accepts
-  the policy, so on-disk == live (daemon down ⇒ saved, warned "not applied"). Self-privileged
-  (the CLI stays root in the parent, drops only in the editor child); reuses `PolicyApply`,
-  no new IPC. **Bare `cordon policy edit` opens the invoker's own user tier** — the common
-  case, and the reason the dangerous target is the explicit one: `--system` edits the system
-  policy, `cordon policy edit FILE` a system file (a bare name → that conf.d fragment), and
-  `cordon policy edit --user NAME` the user-tier file a system `[[include]]` binds to `NAME`
-  (home-scope-validated). The invoker is `SUDO_UID` under sudo and the caller's own euid
-  unprivileged (which is what the future "edit without sudo" posture needs); real root with
-  neither has no own tier and must name a target. When **no** include exists yet, `--user` is
-  self-bootstrapping: it opens the file at the convention path (`…/users/NAME.toml`) and, only
-  **after** the edit validates and saves, registers the `[[include]]` in `…/conf.d/00-users.toml`
-  — so a cancelled or rejected edit never leaves a stale binding. It reaches the daemon only
-  through `PolicyApply`, so it is covered by the socket authorization below.
-- **Socket authorization** (✅ B2). The gate is `authorize` in `crates/daemon/src/ipc.rs`, a
-  pure table over the peer's `SO_PEERCRED` uid with an exhaustive match, so a new verb cannot
-  be added without choosing a side. `PolicyApply` and `BlessApprove` (the human-presence step,
-  §16.5) require **root**; the reads — `Status`, `PolicyShow`, `BlessList` — are open, and so
-  is `BlessRequest`, which is inert until a root peer approves it. `BlessRevoke` is open at
-  the socket and ownership-checked in the backend, where the live table is: root revokes
-  anything, anyone else only what they minted.
+  > **Migration roadmap.** For now, user files are root-owned under `/etc`, so `sudo` gates
+  > every edit. The target is to move them into `~user/.config/cordon/`. At that point cordon
+  > must cordon its own user-policy file. The file must become a protected object that only an
+  > authorized editor may write, so that a same-uid scraper can't author policy. That
+  > self-protection *is* the mechanism for editing without sudo, and it is why the file belongs
+  > in the home.
+- **The policy is applied explicitly.** `cordon policy apply` parses, lints and compiles the
+  policy, and then swaps the BPF maps atomically. There is no autoreload, and no inotify or
+  SIGHUP watch. Changes take effect only on an explicit apply, so an edit in progress is never
+  half-enforced.
+- **`cordon policy check`** is the linter and compiler, and it needs no daemon. It reports
+  unknown group references and cycles. It warns about exes that don't resolve and drops their
+  rules. It marks objects that don't resolve yet as pending, and it checks the cap on rules per
+  object. Lints for shadowed or unreachable rules, and for a deny shadowed by an allow, are not
+  implemented yet.
+- **`cordon policy edit`** is the sudoedit analog (✅ 2026-06-29). `sudo cordon policy edit`
+  copies the root-owned file to a private temp file and runs `$EDITOR` as the invoking user,
+  never as root. `sudo $EDITOR policy.toml` would run the editor as root. Then a same-uid
+  scraper (§2) that wrote your `.vimrc` or your editor plugins would get root, which is a
+  self-inflicted escalation in cordon's own threat model. After the editor exits, the command
+  validates, applies and saves the policy in one step. Like visudo, it rejects a policy that
+  won't compile, shows the diagnostics and prompts again, rather than saving a broken file. It
+  writes the file only after the daemon accepts the policy, so the file on disk matches the
+  live policy. If the daemon is down, the file is saved with a warning that it was not
+  applied. The command manages its own privilege. The CLI stays root in the parent and drops
+  privilege only in the editor child. It reuses `PolicyApply` and needs no new IPC.
 
-  The socket is `0666`, and this is deliberate: `connect(2)` on a Unix socket needs *write*, so
-  a `root:root` socket would make **every** verb root-only in practice, leaving
-  `cordon bless list` unusable from a user account (§16). The file mode decides who can
-  *reach* the daemon; `authorize` decides what they may do.
+  Bare `cordon policy edit` opens the invoker's own user tier. That is the common case, and
+  it is why the dangerous target is the explicit one. `--system` edits the system policy.
+  `cordon policy edit FILE` edits a system file, and a bare name means that conf.d fragment.
+  `cordon policy edit --user NAME` edits the user-tier file that a system `[[include]]` binds
+  to `NAME`, and that file is validated against the home scope. The invoker is `SUDO_UID`
+  under sudo, and the caller's own euid when unprivileged, which is what the future posture of
+  editing without sudo needs. Real root with neither has no tier of its own and must name a
+  target. When no include exists yet, `--user` bootstraps itself. It opens the file at the
+  conventional path (`…/users/NAME.toml`). Only after the edit validates and saves does it
+  register the `[[include]]` in `…/conf.d/00-users.toml`. So a cancelled or rejected edit never
+  leaves a stale binding. It reaches the daemon only through `PolicyApply`, so the socket
+  authorization below covers it.
+- **Socket authorization** (✅ B2). The gate is `authorize` in `crates/daemon/src/ipc.rs`. It
+  is a pure table over the peer's uid from `SO_PEERCRED`, with an exhaustive match, so nobody
+  can add a new verb without choosing a side. `PolicyApply` and `BlessApprove` (the
+  human-presence step, §16.5) require root. The reads (`Status`, `PolicyShow`, `BlessList`) are
+  open. So is `BlessRequest`, which does nothing until a root peer approves it. `BlessRevoke`
+  is open at the socket, and the backend checks ownership, because that is where the live
+  table is. Root may revoke anything, and anyone else may revoke only what they minted.
+
+  The socket mode is `0666`, and this is deliberate. `connect(2)` on a Unix socket needs
+  *write* permission. So a `root:root` socket would make every verb root-only in practice, and
+  `cordon bless list` would be unusable from a user account (§16). The file mode decides who
+  can *reach* the daemon, and `authorize` decides what they may do.
 
   **Deployment posture.** `0666` makes `PolicyShow` world-readable, which discloses protected
   *paths* to any local account. On a single-user workstation that is the intent. A multi-user
-  host that must not disclose them wants `0660` + a `cordon` group instead (the group created
-  by packaging, members added deliberately) — same `authorize` table, narrower reach.
-- **Atomic swap** in-kernel: the rule maps are banked, so an `apply` has no visible window
-  (the double-buffer, §4; `Maps::seed`).
-- **Learned rules** live in a *separate* SQLite db (high-churn, machine-managed),
-  **lower precedence**, never overriding a hand-written deny; promoted into the text
-  file on review (§15.9).
+  host that must not disclose them should use `0660` and a `cordon` group instead. Packaging
+  creates the group, and members are added deliberately. The `authorize` table stays the same,
+  and only the reach is narrower.
+- **The swap in the kernel is atomic.** The rule maps are banked, so an `apply` has no visible
+  window (the double buffer in §4, and `Maps::seed`).
+- **Learned rules** live in a *separate* SQLite database, because they change often and a
+  machine manages them. They have lower precedence and never override a hand-written deny.
+  They are promoted into the text file on review (§15.9).
 
 ### 15.9 Autolearn (the zones layer)
-TOFU generalized: a bounded **training mode** (AppArmor complain-mode / fapolicyd
-trust-DB lineage). `zones` = the scope where autolearn may propose rules.
-- Explicit activation (`cordon learn`), bounded window; **the trust window is the whole
-  vulnerability** (anything malicious running during learning gets trusted) — so never
-  auto-enforce, review before promote.
-- Generalize (collapse per-file opens into a subtree rule) + confidence (seen N times)
-  + dedup, or you drown in candidates.
-- Record the *rich* subject (argv0 / ancestor / hash) so promoted rules are tight, not
-  just `exe=python3`.
-- `cordon learn review` → diff of proposed rules → promote into the text file. The
-  learned db is throwaway; the text file is durable.
+Autolearn generalizes TOFU into a bounded training mode, in the lineage of AppArmor's complain
+mode and fapolicyd's trust database. `zones` are the scope where autolearn may propose rules.
+- Activation is explicit (`cordon learn`), and the window is bounded. The trust window is the
+  whole vulnerability, because anything malicious that runs during learning gets trusted. So
+  learned rules are never enforced automatically, and they are reviewed before promotion.
+- Generalize by collapsing per-file opens into a subtree rule. Track confidence by how many
+  times a pattern was seen, and deduplicate. Otherwise you drown in candidates.
+- Record the *rich* subject (argv0, ancestor, hash), so that promoted rules are tight rather
+  than just `exe=python3`.
+- `cordon learn review` shows a diff of the proposed rules and promotes them into the text
+  file. The learned database is throwaway, and the text file is durable.
 
 ### 15.10 Authoring flows
-Both flows are just *edit the root-owned text policy → `cordon policy apply`* — or, in one
-safe step, `cordon policy edit` (§15.8: edit-as-you → validate → apply → save). There is no
-global mode and no daemon-side wizard; the journal (`audit`/`deny`/`default-deny`, each with
-the caller's `user` and the matched `exe`/`object`/`action`/`policy`) is the whole feedback
-loop. The `user` is the caller's real uid resolved to a login name (captured in-kernel); for
-a *regular* user (§15.8) the `object=`/`path=` print with that user's home collapsed to `~`,
-so a `deny` line copy-pastes straight into their user-tier policy.
+Both flows come down to editing the root-owned text policy and running `cordon policy apply`.
+`cordon policy edit` does both in one safe step (§15.8). It edits as you, then validates,
+applies and saves. There is no global mode and no wizard in the daemon. The journal is the
+whole feedback loop. Its lines are `audit`, `deny` and `default-deny`, and each carries the
+caller's `user` and the matched `exe`, `object`, `action` and `policy`. The `user` is the
+caller's real uid, captured in the kernel and resolved to a login name. For a *regular* user
+(§15.8), `object=` and `path=` print with that user's home collapsed to `~`. So a `deny` line
+can be copied straight into their user-tier policy.
 
-**A. Protect a known dir — observe → admit → enforce.** *(The middle step adds static
-`allow` rules; it is unrelated to the runtime `cordon bless` grant — §16 — which is why it
-is "admit", not "bless".)*
-1. *Observe.* Add the dir with a `who="*" … policy="audit"` catch-all. Every access logs as
-   `audit`, nothing blocks — the blast-radius preview.
-2. *Admit.* For each legit `(exe → dir)` the log shows, add `who=<exe> … policy="allow"`.
-   Subject-specificity (§15.6) makes the specific allow win over the `*` catch-all, so an
-   admitted exe goes silent and the catch-all keeps logging only the not-yet-admitted.
-3. *Enforce.* When the audit stream is quiet, flip the catch-all `policy="audit"` →
-   `"deny"`: admitted exes stay silent, everything else is blocked **and logged** (`deny`),
-   so a tool you broke surfaces and you add an allow. Per dir, on your own schedule.
+**A. Protect a known directory: observe, admit, enforce.** *(The middle step adds static
+`allow` rules. It is unrelated to the runtime `cordon bless` grant of §16, which is why it is
+called "admit" and not "bless".)*
+1. *Observe.* Add the directory with a `who="*" … policy="audit"` catch-all. Every access is
+   logged as `audit`, and nothing is blocked. This previews the blast radius.
+2. *Admit.* For each legitimate exe and directory pair that the log shows, add
+   `who=<exe> … policy="allow"`. Subject specificity (§15.6) makes the specific allow win over
+   the `*` catch-all. So an admitted exe goes silent, and the catch-all keeps logging only the
+   exes not yet admitted.
+3. *Enforce.* When the audit stream is quiet, flip the catch-all from `policy="audit"` to
+   `"deny"`. Admitted exes stay silent, and everything else is blocked and logged (`deny`). So
+   a tool you broke shows up, and you add an allow for it. You do this one directory at a
+   time, on your own schedule.
 
-**B. Discover where an app hides secrets — a "smart `strace -efile`".**
-Audit one exe across your home: `who=<app> where="~" action="*" policy="audit"`. Two wins
-over `strace`: the `where="~"` scope leaves `/usr/lib/*.so`, `/dev`, `/proc` *unprotected*
-→ never logged (only home-subtree access surfaces), and coalescing prevents the flood. The
-discovered paths then graduate into `@secrets` under flow A. Each opened file surfaces
-with its real `path=`, because the record carries the leaf path rebuilt from `d_name` and
-the suppressor keys on the opened file (§4) — the same mechanism M4 autolearn needs to
-collapse per-file opens into a subtree rule.
+**B. Discover where an app hides secrets, like a smart `strace -efile`.**
+Audit one exe across your home with `who=<app> where="~" action="*" policy="audit"`. This has
+two advantages over `strace`. The `where="~"` scope leaves `/usr/lib/*.so`, `/dev` and `/proc`
+unprotected, so they are never logged, and only access inside the home surfaces. And
+coalescing prevents a flood. The discovered paths then graduate into `@secrets` under flow A.
+Each opened file surfaces with its real `path=`. That is because the record carries the leaf
+path rebuilt from `d_name`, and the suppressor keys on the opened file (§4). M4's autolearn
+needs the same mechanism to collapse per-file opens into a subtree rule.
 
 ### 15.11 Phasing (M1–M6; full status in [`PLAN-rule-model.md`](PLAN-rule-model.md))
-1. **Rule core** — **done.** Text policy + compiler (groups/precedence resolved in
-   userspace) → flat maps; open-time read/write/create via `f_flags`/`f_mode`; the per-rule
-   `policy` the only enforcement level (no global mode — `audit` observes, `deny` enforces);
-   explicit `policy apply` via an atomic double-buffer swap; in-kernel event coalescing.
-   Replaced the owner model and closed the in-kernel-rules gap.
-2. **Subject predicates** beyond exe — uid, cgroup; then IMA/fsverity hash; then
-   argv0/ancestor.
-3. **Mutation + exec hooks** — **done.** link/unlink/mkdir/rmdir/rename +
-   `bprm_check_security` (closes the rename-out-of-zone bypass and adds `execute`).
-4. **Autolearn** (separate sqlite db) + review/promote, scoped to zones.
-5. **Fail-safe pinning** — **done.** The LSM links are bpffs-pinned, so the compiled policy
-   keeps enforcing across a daemon crash, kill or restart; enforcement no longer fails open
-   on daemon exit. Shipped with the required singleton guard (an `flock` on the socket) and
-   an explicit `cordond --teardown`.
-6. **Fixed code as the precondition for a grant** — `exe` is `mm->exe_file`, the file that
-   was exec'd, not the code that runs, so `LD_PRELOAD` hijacks any static `allow`. A sticky
-   load-time taint plus an attestation lint make the subject `exe AND untainted`. The largest
-   known hole; full design in the plan.
+1. **Rule core (done).** The text policy and the compiler resolve groups and precedence in
+   userspace and produce flat maps. Read, write and create are checked at open time through
+   `f_flags` and `f_mode`. The per-rule `policy` is the only enforcement level, with no global
+   mode, so `audit` observes and `deny` enforces. `policy apply` is explicit and uses an atomic
+   double-buffer swap. Events are coalesced in the kernel. This milestone replaced the owner
+   model and closed the gap where rules were not enforced in the kernel.
+2. **Subject predicates** beyond the exe. First uid and cgroup, then an IMA or fsverity hash,
+   then argv0 and ancestor.
+3. **Mutation and exec hooks (done).** link, unlink, mkdir, rmdir and rename, plus
+   `bprm_check_security`. This closes the rename-out-of-zone bypass and adds `execute`.
+4. **Autolearn**, with a separate SQLite database and a review and promote step, scoped to
+   zones.
+5. **Fail-safe pinning (done).** The LSM links are pinned to bpffs, so the compiled policy
+   keeps enforcing across a daemon crash, kill or restart. Enforcement no longer fails open
+   when the daemon exits. This shipped with the singleton guard it requires (an `flock` on the
+   socket) and an explicit `cordond --teardown`.
+6. **Fixed code as the precondition for a grant.** `exe` is `mm->exe_file`, the file that was
+   exec'd, and not the code that runs. So `LD_PRELOAD` hijacks any static `allow`. A sticky
+   taint set at load time, plus an attestation lint, make the subject `exe AND untainted`.
+   This is the largest known hole, and the full design is in the plan.
 
-Numbering is identity, not schedule: 1, 3 and 5 are done and **6 is the only remaining
-must-have**, with 2 and 4 contributing the pieces 6 needs rather than shipping on their own.
+The numbers identify milestones and are not a schedule. 1, 3 and 5 are done, and 6 is the
+only remaining must-have. 2 and 4 contribute the pieces that 6 needs, rather than shipping on
+their own.
 
 ## 16. Blessing — runtime, authenticated access grants
 
-**Status: B1 + B2 implemented (2026-07-27), sudo-gated.** The predicate, carrier, daemon verbs
-and CLI ship and are VM-validated, and B2 made the CLI unprivileged (the `cgroup.procs`
-hand-off over `SCM_RIGHTS`); the authenticator is **sudo**, not PAM-in-the-daemon
-(§16.5 — the substitution is confined to *how the human proves presence*; everything else
-below is as specified). The remaining milestones (B3, B4) are **deferred behind the core** —
-see [`PLAN-bless.md`](PLAN-bless.md).
+**Status: B1 and B2 are implemented (2026-07-27), gated by sudo.** The predicate, the carrier,
+the daemon verbs and the CLI ship and are VM-validated. B2 made the CLI unprivileged, by handing
+off the `cgroup.procs` descriptor over `SCM_RIGHTS`. The authenticator is sudo, not PAM in the
+daemon (§16.5). That substitution is confined to how the human proves presence, and everything
+else below is as specified. The remaining milestones (B3, B4) are deferred until the core is
+done (see [`PLAN-bless.md`](PLAN-bless.md)).
 
 ### 16.1 The gap it fills
-The rule model (§15) keys the subject on `exe` (plus the §15.4 predicates). That is exactly
-wrong for the tools you reach for *interactively over secrets* — `cat`, `find`, `du`, `ls`,
-a shell. You can't write `allow /usr/bin/cat read @secrets`: it would admit **every** `cat`,
-including the one a scraper `exec`s. Generic-interpreter exes are too coarse a subject, and
-no static predicate fixes it — what you actually want to express is *"the `cat` **I** just
-launched, now,"* i.e. **provenance: a human at the keyboard chose to run this."**
+The rule model (§15) keys the subject on `exe`, plus the predicates of §15.4. That is exactly
+wrong for the tools you reach for *interactively over secrets*, such as `cat`, `find`, `du`,
+`ls` or a shell. You can't write `allow /usr/bin/cat read @secrets`, because it would admit
+every `cat`, including the one a scraper `exec`s. Generic exes like these are too coarse a
+subject, and no static predicate fixes that. What you actually want to express is *"the `cat`
+that I just launched, now"*. That is provenance, the fact that a human at the keyboard chose to
+run this.
 
 **Blessing is sudo for file reads.** `cordon bless --class <name> -- <cmd> <args>` runs `<cmd>`
-with a runtime, human-authenticated grant that lets it (and its descendants) cross the
-cordon, per a class defined *in policy* (no hardcode; class names like `ro`/`rw` are policy
-conventions, not built-ins). It is the inverse of the project's
-"never confine the adversary" stance (§2): here we **elevate the ally**. It complements, and
-does not replace, static rules and autolearn (§15.9) — those admit *known* exes durably;
-bless covers the *ad-hoc, interactive* long tail a static rule can't name.
+with a runtime grant that a human authenticated. The grant lets the command and its
+descendants cross the cordon, as a class defined *in the policy* allows. Nothing is hardcoded,
+and class names like `ro` and `rw` are policy conventions, not built-ins. Blessing inverts the
+project's stance of never confining the adversary (§2). Here we elevate the ally. It
+complements static rules and autolearn (§15.9) and does not replace them. Those admit *known*
+exes durably, and bless covers the long tail of *ad-hoc, interactive* use that a static rule
+can't name.
 
-> **Terminology.** "Blessing" / `cordon bless` is **this** runtime grant. Elsewhere the docs
-> use *blessed* adjectivally in the threat model (§8.1: a "blessed binary/ancestor" = one a
-> *static* rule trusts) — that is generic English, not this feature. Authoring flow A
-> (§15.10) was renamed observe → **admit** → enforce precisely to free the word.
+> **Terminology.** "Blessing" and `cordon bless` mean *this* runtime grant. Elsewhere, the
+> threat model uses *blessed* as an ordinary adjective. In §8.1, a "blessed binary" or
+> "blessed ancestor" is one that a *static* rule trusts. That is generic English, not this
+> feature. Authoring flow A (§15.10) was renamed to observe, admit, enforce precisely to free
+> the word.
 
 ### 16.2 Why it must authenticate a human (threat-model fit)
-A blessing is carried by something descendants inherit, so by the construction attack (§8.1)
-it is **forgeable** unless *minting* it requires something the in-scope adversary (§2:
-one-shot, non-interactive, same-uid, not root, no persistence, no targeted RE) cannot
-produce. Enumerate what that adversary lacks:
+A blessing is carried by something that descendants inherit. So by the construction attack
+(§8.1), it can be forged, unless *minting* it requires something that the in-scope adversary
+cannot produce. That adversary (§2) is one-shot, non-interactive, same-uid and not root, with no
+persistence and no targeted reverse-engineering. Here is what each candidate check would need
+from it:
 
 | Candidate distinguisher | Gates the scraper? |
 |---|---|
-| A secret in a file | ✗ same-uid reads it too (and it's circular) |
-| An agent/keyring holding a secret | ✗ same-uid client → can't tell you from the scraper without prompting a human |
-| Best-effort ancestry ("my shell launched it") | ✗ §8.1 — the scraper is also your descendant; constructible |
-| Controlling TTY + foreground pgrp | ~ kills the canonical `curl\|sh` (no tty); not a boundary |
-| **A human at the keyboard** (PAM: password / fingerprint / token) | ✓ the one-shot automated scraper has no one to answer |
+| A secret in a file | ✗ A same-uid process reads it too, and the scheme is circular. |
+| An agent or keyring that holds a secret | ✗ Its client has the same uid, so it can't tell you from the scraper without prompting a human. |
+| Best-effort ancestry ("my shell launched it") | ✗ See §8.1. The scraper is also your descendant, and ancestry can be constructed. |
+| Controlling TTY plus foreground process group | ~ It kills the canonical `curl\|sh`, which has no tty, but it is not a boundary. |
+| **A human at the keyboard** (PAM: password, fingerprint or token) | ✓ The one-shot automated scraper has no one to answer. |
 
-Everything that isn't "a human acts" collapses under same-uid — the same wall that forced
-the object-centric model (§3.1). So **the blessing's strength is exactly the human-presence
-check at mint time, and nothing else.**
+Everything that isn't "a human acts" collapses when the attacker has the same uid. That is the
+same wall that forced the object-centric model (§3.1). So the strength of a blessing is exactly
+the check for human presence at mint time, and nothing else.
 
-This is why an *unauthenticated* bless is rejected even though §2 concedes targeted RE:
-`cordon bless --` is a 13-character prefix from the README, not reverse-engineering — a
-*generic* bypass, on the wrong side of the threat-model line. A human-presence check puts it
-back on the right side, and the alignment is exact:
-- **one-shot scraper** (in scope): no human ⇒ can't mint ⇒ **defeated**;
-- **resident adversary that acts against a *live* blessed process** (ptrace it, or use its
-  open fds — §16.7) (out of scope, §2): not defeated — but already conceded (the
-  ptrace / already-open-fd class), and bounded by the blessed process's lifetime.
+This is why an *unauthenticated* bless is rejected, even though §2 concedes targeted reverse
+engineering. `cordon bless --` is a 13-character prefix from the README, not reverse
+engineering. It would be a *generic* bypass, on the wrong side of the threat-model line. A
+check for human presence puts it back on the right side, and the alignment is exact:
+- **The one-shot scraper** is in scope. It has no human, so it can't mint, and it is defeated.
+- **A resident adversary that acts against a *live* blessed process**, by ptracing it or by
+  using its open fds (§16.7), is out of scope (§2). It is not defeated. But it was already
+  conceded as the class of ptrace and already-open fds, and the blessed process's lifetime
+  bounds it.
 
-So it defeats *exactly* the in-scope adversary and concedes *exactly* the out-of-scope one —
-the strongest honest claim available. **Ideally there is no auth-cache / grace window** (every
-mint authenticates): the answer to "I need repeated access" is to `bless` a shell and work in
-it, not to cache the credential. Dropping the cache also removes the one window a resident
-adversary could otherwise ride — the only residual is acting against an *already-live* blessed
-process (§16.7), which short-lived blesses bound.
+So the check defeats *exactly* the in-scope adversary and concedes *exactly* the out-of-scope
+one, which is the strongest honest claim available. Ideally there is no authentication cache
+and no grace window, so that every mint authenticates. The answer to "I need repeated access"
+is to `bless` a shell and work in it, not to cache the credential. Dropping the cache also
+removes the one window that a resident adversary could otherwise ride. The only residual risk
+is acting against a blessed process that is *already live* (§16.7), and short-lived blesses
+bound that.
 
-> **As shipped (§16.5):** the human-presence check is `sudo`, which runs PAM itself — so this
-> argument holds unchanged for the *presence* property. The one caveat is right here: sudo
-> caches its timestamp, so the shipped flow has a grace window unless sudoers sets
-> `Defaults!/usr/bin/cordon timestamp_timeout=0`. PAM-in-the-daemon (PLAN-bless B3) closes it
-> by construction.
+> **As shipped (§16.5).** The check for human presence is `sudo`, which runs PAM itself. So
+> this argument holds unchanged for the *presence* property. The one caveat is the cache. sudo
+> caches its timestamp, so the shipped flow has a grace window, unless sudoers sets
+> `Defaults!/usr/bin/cordon timestamp_timeout=0`. PAM in the daemon (PLAN-bless B3) closes the
+> window by construction.
 
 ### 16.3 Mechanism — blessing is a subject predicate
-Mechanism and authorization are orthogonal; only authorization (§16.2) is hard. The carrier
-must be **kernel-readable at `file_open`, inherited across fork/exec, and policy-matchable** —
-that is **cgroup id** (`bpf_get_current_cgroup_id`; the §15.4 / M2 `cgroup` predicate reads the
-same value). The key design choice: **a blessing is not a separate grant table — it is one
-more `SubjectMatch` predicate (§15.4), `blessing = "<class>"`, ANDed with the rest.** That
-makes grants **fully policy-customizable and scoped** with zero new precedence machinery: a
-blessing rule is an ordinary rule, so its action, its object scope, its conjunction with other
-predicates, and its precedence all come from the existing rule model.
+The mechanism and the authorization are orthogonal, and only the authorization (§16.2) is
+hard. The carrier must be readable by the kernel at `file_open`, inherited across fork and
+exec, and matchable by policy. That is the cgroup id (`bpf_get_current_cgroup_id`). The `cgroup`
+predicate of §15.4 and M2 reads the same value. The key design choice is that a blessing is not
+a separate grant table. It is one more `SubjectMatch` predicate (§15.4), `blessing = "<class>"`,
+ANDed with the rest. That makes grants fully customizable and scoped by policy, with no new
+precedence machinery. A blessing rule is an ordinary rule. So its action, its object scope, its
+conjunction with other predicates, and its precedence all come from the existing rule model.
 
-- **Class = a named subject predicate, defined in policy.** `[group.subject.blessed-ro]
-  blessing = "ro"` declares a class; ordinary rules referencing it (`allow @blessed-ro read
-  ~/.aws`) say *exactly* what it may do and **where**. Scope is just the rule's object column —
-  not blanket. Because the predicate composes, you can also write `who = {exe = "/usr/bin/cat",
-  blessing = "ro"}` — "`cat`, but only when blessed" — which is the precise fix for the
-  coarse-exe problem (§16.1) without granting all `cat`s.
-- **Cgroup = carrier lifetime, per-invocation.** Each `cordon bless` gets a **fresh,
-  root-owned** cgroup (`cordon-bless-<id>.<class>`), tagged with its class — per-invocation (not
-  one shared cgroup per class) buys automatic teardown, a per-bless audit/revoke handle, and a
-  smaller standing surface (§16.6). Orthogonal axes: the *class* is static (a policy name), the
-  *cgroup* is per-invocation.
-- **`BLESSED` map = a tiny cgroup→class indirection.** A BPF map `HashMap<cgroup_id u64,
-  ClassId>`, written by the daemon at mint (and cleared at GC). The daemon derives the
-  carrier's id from the directory's **`st_ino`**: on cgroup2 (kernfs) that *is* the id
-  `bpf_get_current_cgroup_id()` returns, which the smoke's scoped-grant scenario proves
-  end-to-end rather than trusting. It is **not** part of the
-  banked compiled rule table (§15.8): the static `@blessed-*` rules compile into the per-object
-  buckets like any rule and only change on `policy apply`; the per-bless churn is confined to
-  this one small, unbanked, single-writer map. So a bless never recompiles policy, and policy
-  apply never disturbs a live bless.
-- **Compiler:** assigns a dense `ClassId` to each named blessing class, stamps it into the
-  `SubjectMatch` of every rule that references the class (clearing the predicate's wildcard
-  flag), and emits a `class-name → ClassId` registry on the compiled output (the daemon/CLI use
-  it to validate `--class` and to write `BLESSED` at mint). No hardcode: `ro`/`rw` are just
-  whatever names the policy declares.
+- **A class is a named subject predicate, defined in the policy.**
+  `[group.subject.blessed-ro] blessing = "ro"` declares a class. Ordinary rules that reference
+  it (`allow @blessed-ro read ~/.aws`) say exactly what it may do and where. The scope is just
+  the rule's object column, and it is not blanket. Because the predicate composes, you can
+  also write `who = {exe = "/usr/bin/cat", blessing = "ro"}`, meaning "`cat`, but only when
+  blessed". That is the precise fix for the coarse-exe problem (§16.1), and it does not grant
+  every `cat`.
+- **The cgroup is the carrier, and it lives for one invocation.** Each `cordon bless` gets a
+  fresh, root-owned cgroup (`cordon-bless-<id>.<class>`), tagged with its class. A cgroup per
+  invocation, rather than one shared cgroup per class, buys automatic teardown, a handle for
+  auditing and revoking each bless, and a smaller standing surface (§16.6). The two axes are
+  orthogonal. The *class* is static, because it is a name in the policy. The *cgroup* belongs
+  to one invocation.
+- **The `BLESSED` map is a tiny indirection from cgroup to class.** It is a BPF map
+  `HashMap<cgroup_id u64, ClassId>`. The daemon writes it at mint and clears it at GC. The
+  daemon derives the carrier's id from the directory's `st_ino`. On cgroup2 (kernfs) that *is*
+  the id that `bpf_get_current_cgroup_id()` returns, and the smoke suite's scoped-grant scenario
+  proves it end to end rather than trusting it. The map is not part of the banked compiled rule
+  table (§15.8). The static `@blessed-*` rules compile into the per-object buckets like any
+  rule, and they change only on `policy apply`. The churn of each bless is confined to this
+  one small map, which is not banked and has a single writer. So a bless never recompiles the
+  policy, and a policy apply never disturbs a live bless.
+- **The compiler** assigns a dense `ClassId` to each named blessing class. It stamps the id
+  into the `SubjectMatch` of every rule that references the class, and clears the predicate's
+  wildcard flag. It also emits a registry from class name to `ClassId` with the compiled
+  output. The daemon and the CLI use the registry to validate `--class` and to write `BLESSED`
+  at mint. Nothing is hardcoded, and `ro` and `rw` are just whatever names the policy declares.
 
-**`decide()` integration (§15 kernel flow).** No separate fast-path and no deny→allow flip —
-blessing folds into the existing first-match scan. `subject_matches` gains: resolve the
-caller's class once (`BLESSED[current_cgroup_id]`, or a "not blessed" sentinel), and a rule's
-`blessing` predicate matches iff it is wildcard or equals that class. Everything else is
-unchanged: copy-down resolves object precedence, and **subject-specificity already ranks a
-concrete `blessing` rule above a `who="*"` catch-all** (§15.6), so a blessing `allow` outranks
-the catch-all `deny` that protects the object — no special casing. Because it is a real rule,
-a blessing can also be `audit` (observe a blessed class) and is **logged like any decision**:
-`DecisionEvent` carries the matched class, so the journal shows bless-mediated access —
-bless is loud.
+**How `decide()` integrates it (the kernel flow of §15).** There is no separate fast path and no
+flip from deny to allow. Blessing folds into the existing first-match scan. `subject_matches`
+resolves the caller's class once, as `BLESSED[current_cgroup_id]` or a "not blessed" sentinel.
+A rule's `blessing` predicate matches if and only if it is a wildcard or equals that class.
+Everything else is unchanged. Copy-down resolves object precedence. Subject specificity already
+ranks a concrete `blessing` rule above a `who="*"` catch-all (§15.6), so a blessing `allow`
+outranks the catch-all `deny` that protects the object, with no special casing. Because a
+blessing rule is a real rule, it can also be `audit`, to observe a blessed class. And it is
+logged like any decision. `DecisionEvent` carries the matched class, so the journal shows access
+that went through a blessing. Bless is loud.
 
-> **Precedence note.** A `blessing` predicate counts as **one** unit of subject specificity,
-> like `exe`. So a *targeted* `deny <exe> …` and an `allow @blessed-ro …` on the same object
-> are equal-specificity → `deny>allow` wins: an explicit deny of a known-bad binary beats a
-> blessing (you can deny-list even inside blessed sessions). Conjunctions raise specificity the
-> usual way (`{exe, blessing}` = 2 beats a bare `blessing` = 1).
+> **Precedence note.** A `blessing` predicate counts as one unit of subject specificity, like
+> `exe`. So a *targeted* `deny <exe> …` and an `allow @blessed-ro …` on the same object are
+> equally specific, and deny wins over allow. An explicit deny of a known-bad binary therefore
+> beats a blessing, so you can deny-list a binary even inside blessed sessions. Conjunctions
+> raise specificity the usual way. `{exe, blessing}` counts 2 and beats a bare `blessing`,
+> which counts 1.
 
 ### 16.4 The membership boundary — what forbids other processes from joining (critical)
-Unlike exe/ancestry identity, this is a **real boundary, not best-effort**: plain DAC on a
-root-owned kernfs file, backed by cgroup-v2's delegation rule.
+Unlike identity by exe or ancestry, this is a real boundary and not best-effort. It is plain DAC
+on a root-owned kernfs file, backed by cgroup v2's delegation rule.
 
-1. The blessed cgroup is **created and owned by root** (the daemon, or a systemd transient
-   scope under a root `cordon.slice`). Its `cgroup.procs` is `root:root`, **not
-   user-writable**.
-2. cgroup v2 moves a task by **writing its PID to the destination `cgroup.procs`**. A
-   non-root, same-uid scraper **cannot open that file for write** (VFS permission) →
-   `EACCES`; the migration never begins.
-3. Defense in depth: even with a writable fd, v2's **"common ancestor" rule** additionally
-   requires an unprivileged writer to hold `MAY_WRITE` on the common ancestor's
-   `cgroup.procs`. We never delegate the subtree to the user — second closed door.
-4. `clone3(CLONE_INTO_CGROUP)` (birth a child directly into a cgroup) runs the **same**
-   write-permission check on the target — so the scraper can't sidestep by spawning into it.
-5. The cgroup **id** is kernel-assigned and unique per directory; the scraper can't forge a
-   cgroup whose id collides with a blessed one, and only daemon-created ids are in `BLESSED`.
-6. The **only** legitimate entry is **at spawn**, and only **after the human authenticates**.
-   As shipped (§16.6) the unprivileged `cordon bless` joins the carrier in the child's
-   `pre_exec` — *before* `exec`, so the target runs zero instructions unblessed, exactly the
-   property `clone3(CLONE_INTO_CGROUP)` was specced for. It can do that without being root
-   because what it holds is the *descriptor* the root daemon opened post-approval, not
-   privilege (see the delegation note below). Inheritance to children is automatic and is the
-   intended `bless -- bash` behavior.
+1. Root creates and owns the blessed cgroup. That is the daemon, or a systemd transient scope
+   under a root `cordon.slice`. Its `cgroup.procs` is `root:root`, and the user cannot write
+   it.
+2. cgroup v2 moves a task when its PID is written to the destination's `cgroup.procs`. A
+   non-root scraper with the same uid cannot open that file for writing, because the VFS
+   permission check fails with `EACCES`. So the migration never begins.
+3. As defense in depth, v2's "common ancestor" rule applies even with a writable fd. It also
+   requires an unprivileged writer to hold `MAY_WRITE` on the `cgroup.procs` of the common
+   ancestor. We never delegate the subtree to the user, so that is a second closed door.
+4. `clone3(CLONE_INTO_CGROUP)` creates a child directly inside a cgroup, and it runs the same
+   write-permission check on the target. So the scraper can't sidestep the check by spawning
+   into the cgroup.
+5. The kernel assigns the cgroup id, and it is unique to each directory. The scraper can't
+   forge a cgroup whose id collides with a blessed one, and only ids that the daemon created
+   are in `BLESSED`.
+6. The only legitimate entry is at spawn, and only after the human authenticates. As shipped
+   (§16.6), the unprivileged `cordon bless` joins the carrier in the child's `pre_exec`. That
+   happens *before* `exec`, so the target runs zero instructions unblessed, which is exactly
+   the property `clone3(CLONE_INTO_CGROUP)` was specified for. The CLI can do that without
+   being root, because what it holds is the *descriptor* that the root daemon opened after
+   approval, not privilege (see the delegation note below). Children inherit the membership
+   automatically, and that is the intended behavior of `bless -- bash`.
 
-The entire lock is: **root owns `cgroup.procs`, and only opens it post-auth.** That makes
-cgroup membership the *strongest* subject identity in the system — a same-uid process cannot
-forge it the way it forges ancestry.
+The entire lock is that root owns `cgroup.procs` and opens it only after authentication. That
+makes cgroup membership the *strongest* subject identity in the system, because a same-uid
+process cannot forge it the way it forges ancestry.
 
-> **Delegation by descriptor (B2).** The daemon does not hand back the carrier's *path*; it
-> opens `cgroup.procs` itself, as root, and passes that **descriptor** over `SCM_RIGHTS`.
-> cgroup-v2 checks migration permission against the credentials of whoever **opened** the
-> file (`cgroup_procs_write_permission()` overrides with `of->file->f_cred`) — exactly so
-> delegation-by-fd works — so the holder can join a task to the carrier without ever being
-> root. That is what lets `cordon bless` run unprivileged as an ordinary child of the user's
-> shell, which in turn is what gives the blessed process its natural environment, tty, and
-> logind session (§16.6). Point 1 above is unchanged: the *fd* is delegated, the *directory*
-> is still root-owned, and only the daemon ever opens it — post-auth.
+> **Delegation by descriptor (B2).** The daemon does not hand back the carrier's *path*. It
+> opens `cgroup.procs` itself, as root, and passes that descriptor over `SCM_RIGHTS`. cgroup v2
+> checks migration permission against the credentials of whoever *opened* the file.
+> `cgroup_procs_write_permission()` overrides the check with `of->file->f_cred`, precisely so
+> that delegation by fd works. So the holder can join a task to the carrier without ever being
+> root. That is what lets `cordon bless` run unprivileged, as an ordinary child of the user's
+> shell. And that in turn gives the blessed process its natural environment, tty and logind
+> session (§16.6). Point 1 above is unchanged. The *fd* is delegated, but the *directory* is
+> still root-owned, and only the daemon ever opens it, after authentication.
 >
-> **The honest cost:** the fd's holder can move **any task it can name** into the carrier,
-> not just its own child — the check is on the opener, so the writer's own credentials are
-> not consulted. This is not an escalation: the blessing grants only what the class's rules
-> name, DAC still applies to every object, and the holder is the invoking user, who could
-> already run those tasks. But it is a real widening of "who can be blessed" from *this
-> child* to *anything this user can name*, so the descriptor's reach is kept as short as
-> the mechanism allows: it is received **close-on-exec** (`MSG_CMSG_CLOEXEC` — *not* the
-> kernel's default for `SCM_RIGHTS`), so it dies at the `exec` that starts the blessed
-> command and never becomes a standing capability held by the blessed process itself.
+> **The honest cost.** The fd's holder can move any task it can name into the carrier, not just
+> its own child. The check is on the opener, so the writer's own credentials are not
+> consulted. This is not an escalation. The blessing grants only what the class's rules name,
+> DAC still applies to every object, and the holder is the invoking user, who could already
+> run those tasks. But it does widen "who can be blessed" from *this child* to *anything this
+> user can name*. So the descriptor's reach is kept as short as the mechanism allows. It is
+> received close-on-exec (`MSG_CMSG_CLOEXEC`, which is *not* the kernel's default for
+> `SCM_RIGHTS`). So it dies at the `exec` that starts the blessed command, and it never becomes
+> a standing capability held by the blessed process itself.
 
-> **Mechanism wrinkle.** systemd owns the unified hierarchy (single-writer; no procs in
-> inner nodes). The clean placement is a **systemd transient scope** via the daemon, or a
-> subtree **delegated** to the (root) daemon (`Delegate=yes`); a hand-rolled cgroup outside
-> systemd's knowledge invites conflicts. Either way the per-bless cgroup is root-owned.
+> **Mechanism wrinkle.** systemd owns the unified hierarchy. It is the single writer, and inner
+> nodes hold no processes. The clean placement is a systemd transient scope created through the
+> daemon, or a subtree delegated to the root daemon (`Delegate=yes`). A hand-rolled cgroup that
+> systemd doesn't know about invites conflicts. Either way, the cgroup for each bless is
+> root-owned.
 
 ### 16.5 Authentication — client-side elevation (shipped), PAM-in-daemon (future)
-The requirement from §16.2 is *a human at the keyboard proves presence at mint time*. What
-satisfies it is **reaching uid 0**: the daemon refuses to approve a mint for any other peer,
-and every elevation tool worth the name puts a human in front of that transition. Which tool
-is not cordon's business, and deliberately so: `$CORDON_SUDO` is the seam.
+The requirement from §16.2 is that a human at the keyboard proves presence at mint time. What
+satisfies it is reaching uid 0. The daemon refuses to approve a mint for any other peer, and
+every elevation tool worth the name puts a human in front of that transition. Which tool is
+used is not cordon's business, deliberately so, and `$CORDON_SUDO` is the seam.
 
-- **The boundary is `SO_PEERCRED` uid 0 on `BlessApprove`.** Kernel-attested, never asserted.
-  The rest of the verb table — `BlessRequest` open because asking is not getting,
-  `BlessRevoke` ownership-checked in the backend — is the socket authorization in §15.8.
+- **The boundary is uid 0, as `SO_PEERCRED` reports it, on `BlessApprove`.** The kernel attests
+  it, and the client never asserts it. The rest of the verb table is the socket authorization
+  in §15.8. `BlessRequest` is open, because asking is not getting, and the backend checks
+  ownership for `BlessRevoke`.
 
-- **The mint is a two-connection handshake**, because the two facts it needs come from two
-  different peers:
+- **The mint is a handshake over two connections**, because the two facts it needs come from
+  two different peers:
 
   | | connection | verb | what it establishes |
   |---|---|---|---|
-  | 1 | `cordon bless`, **the user** | `BlessRequest` → `BlessPending{nonce}` | *whose* session the carrier belongs in (§16.6) |
-  | 2 | the helper, **root** | `BlessApprove{nonce}` | that a human authenticated |
-  | 3 | back down connection 1 | `BlessMinted` + the carrier fd | — |
+  | 1 | `cordon bless`, as the user | `BlessRequest`, answered by `BlessPending{nonce}` | the session the carrier belongs in (§16.6) |
+  | 2 | the helper, as root | `BlessApprove{nonce}` | that a human authenticated |
+  | 3 | back down connection 1 | `BlessMinted` plus the carrier fd | — |
 
-  **The daemon is the rendezvous, not the helper.** The obvious shape — the root helper mints
-  and forwards the descriptor to the unprivileged parent — cannot work, because the helper's
-  own credentials say nothing about whose session this is: under `run0` it lives in a transient
-  unit with no session at all. Having the helper *claim* a pid instead would be worse, letting
-  a caller name another user's process and get a carrier created inside that user's session.
-  So each fact is read from the one peer that cannot lie about it.
+  **The daemon is the rendezvous, not the helper.** The obvious shape would have the root
+  helper mint the carrier and forward the descriptor to the unprivileged parent. That cannot
+  work, because the helper's own credentials say nothing about whose session this is. Under
+  `run0`, the helper lives in a transient unit with no session at all. Having the helper
+  *claim* a pid instead would be worse. A caller could name another user's process and get a
+  carrier created inside that user's session. So each fact is read from the one peer that
+  cannot lie about it.
 
-  The nonce is 128 bits from `getrandom(2)`, single-use, and bound to the requesting
-  connection. It need not be *secret* — approving one requires uid 0 regardless, and the
-  descriptor returns to the requester rather than the approver — but it must be **unguessable**:
-  a predictable value would let an attacker register a request and have someone else's
-  authenticated helper approve *theirs*.
+  The nonce is 128 bits from `getrandom(2)`. It is single-use and bound to the requesting
+  connection. It need not be *secret*, because approving a request requires uid 0 regardless,
+  and the descriptor returns to the requester rather than to the approver. But it must be
+  unguessable. A predictable value would let an attacker register a request and have someone
+  else's authenticated helper approve the attacker's request.
 
-- **`$CORDON_SUDO` (default `sudo`) chooses the elevation.** Not a hole, and the reason is
-  structural: a faked elevation simply yields a non-root helper whose approval the daemon
-  refuses. Security lives in the daemon's uid check, never in the client's choice of tool —
-  which is also what makes the variable safe to expose as the seam the systemd-less smoke VM
-  needs.
+- **`$CORDON_SUDO` (default `sudo`) chooses the elevation tool.** That is not a hole, and the
+  reason is structural. A faked elevation just yields a helper that is not root, and the daemon
+  refuses its approval. Security lives in the daemon's uid check, never in the client's choice
+  of tool. That is also what makes the variable safe to expose as the seam that the smoke VM
+  without systemd needs.
 
-- **The client checks the daemon too.** `cordon bless` verifies `SO_PEERCRED` uid 0 on the
-  daemon end *before* sending anything, and passes the same `--socket` to the helper. Without
-  that, the nonce is a bearer token handed to whoever answers the socket: a local user
-  squatting the client's socket path could park its own request on the real daemon, answer the
-  victim with that nonce, and let the human's authentication mint a carrier for the attacker.
-  The human really did authenticate — just not for their own request. A blessing from a
-  non-root daemon could not grant anything anyway (§16.4), so refusing costs nothing.
+- **The client checks the daemon too.** `cordon bless` checks that `SO_PEERCRED` reports uid 0
+  on the daemon's end *before* it sends anything, and it passes the same `--socket` to the
+  helper. Without that check, the nonce would be a bearer token handed to whoever answers the
+  socket. A local user squatting the client's socket path could park its own request on the
+  real daemon and answer the victim with that nonce. The human's authentication would then
+  mint a carrier for the attacker. The human really did authenticate, just not for their own
+  request. A blessing from a daemon that is not root could not grant anything anyway (§16.4),
+  so refusing costs nothing.
 
 - **Known deltas, accepted:**
-  - **An elevation tool's auth cache is a grace window.** §16.2 argues for *no* cache; sudo
-    has one (~15 min by default), so a resident adversary who runs `cordon bless` inside that
-    window mints without a human. *Deployment note:* `Defaults!/usr/bin/cordon
-    timestamp_timeout=0` in sudoers restores the no-grace property for this command.
-  - **Blessing is sudoer-only.** A non-sudoer cannot bless their own tools, because they
-    cannot reach uid 0 to approve. PAM-in-daemon authenticates *the requesting user* instead
-    and needs no admin rights at all — which is why it remains the intended upgrade.
-- **Why not PAM-in-daemon now:** implementation exploration found it much heavier than specced
-  — a PAM conversation proxied over the control socket as multi-frame IPC, stdio fd passing so
-  the modules can reach the tty, and daemon-spawned children with degraded job control — and
-  the systemd-less smoke VM cannot test transient scopes at all. The design below is retained
-  verbatim as the upgrade path.
-  > **Future (PAM upgrade).** Auth runs against a `cordon` PAM service (`/etc/pam.d/cordon`)
-  > in the **root daemon** (it needs `/etc/shadow`); the daemon's PAM *conversation function*
-  > sends prompt/info frames over the control socket to the `cordon bless` front-end, which
-  > renders them on the tty (echo-off for a password, "swipe now" for fingerprint) and returns
-  > input. A malicious front-end controls only the **I/O channel**, never the **verdict** —
-  > real modules in the daemon verify, so a wrong/absent answer simply fails. Identity still
-  > comes from `SO_PEERCRED`.
+  - **An elevation tool's authentication cache is a grace window.** §16.2 argues for *no*
+    cache, but sudo has one (about 15 minutes by default). So a resident adversary who runs
+    `cordon bless` inside that window mints without a human. *Deployment note:* setting
+    `Defaults!/usr/bin/cordon timestamp_timeout=0` in sudoers restores the no-grace property
+    for this command.
+  - **Only sudoers can bless.** A non-sudoer cannot bless their own tools, because they cannot
+    reach uid 0 to approve. PAM in the daemon would authenticate *the requesting user* instead,
+    and it needs no admin rights at all. That is why it remains the intended upgrade.
+- **Why not PAM in the daemon now.** Exploring the implementation found it much heavier than
+  specified. It needs a PAM conversation proxied over the control socket as IPC with many
+  frames, stdio fd passing so that the modules can reach the tty, and children spawned by the
+  daemon with degraded job control. The smoke VM without systemd also cannot test transient
+  scopes at all. The design below is kept verbatim as the upgrade path.
+  > **Future (PAM upgrade).** Authentication runs against a `cordon` PAM service
+  > (`/etc/pam.d/cordon`) in the root daemon, which needs access to `/etc/shadow`. The daemon's
+  > PAM *conversation function* sends prompt and info frames over the control socket to the
+  > `cordon bless` front end. The front end renders them on the tty (with echo off for a
+  > password, or "swipe now" for a fingerprint) and returns the input. A malicious front end
+  > controls only the I/O channel, never the verdict. Real modules in the daemon verify the
+  > answer, so a wrong or missing answer simply fails. Identity still comes from
+  > `SO_PEERCRED`.
   >
-  > **B2 did the structural work.** The `SCM_RIGHTS` hand-off and the unprivileged CLI this
-  > upgrade would otherwise have had to invent already ship, so B3 reduces to swapping *what
-  > proves a human is present*: replace the helper's uid-0 approval with a PAM conversation
-  > against the requesting peer. It then **relaxes** the gate rather than tightening it — a
-  > non-sudoer can bless their own tools — and restores "no grace window" by construction.
-  > *Deployment consideration:* a method needing the user's session bus (some `pam_fprintd`
-  > setups) is awkward for a system service.
+  > **B2 did the structural work.** The `SCM_RIGHTS` hand-off and the unprivileged CLI already
+  > ship, and this upgrade would otherwise have had to invent them. So B3 reduces to swapping
+  > what proves that a human is present. It replaces the helper's uid-0 approval with a PAM
+  > conversation against the requesting peer. It then relaxes the gate rather than tightening
+  > it, because a non-sudoer can bless their own tools. And it restores "no grace window" by
+  > construction. *Deployment consideration:* a method that needs the user's session bus (some
+  > `pam_fprintd` setups) is awkward for a system service.
 
 - **Environment: nothing is restored, because nothing was ever taken.** `cordon bless` runs as
-  the user, an ordinary child of their shell, so the blessed command inherits its environment,
-  cwd, tty, job control and logind session by construction. The only thing the grant adds is
-  cgroup membership. This is why the unprivileged CLI is the spawner: a target spawned by
-  the root helper would be born under a privilege tool that had already scrubbed the
-  environment, and under `run0` there would be no parent chain left to recover it from — so
-  "keep the env" is not separable from "who spawns the target". `$SHELL` is authoritative for
-  the same reason.
+  the user, as an ordinary child of their shell. So the blessed command inherits its
+  environment, cwd, tty, job control and logind session by construction. The only thing the
+  grant adds is cgroup membership. This is why the unprivileged CLI is the spawner. A target
+  spawned by the root helper would be born under a privilege tool that had already scrubbed the
+  environment. Under `run0` there would be no parent chain left to recover the environment
+  from. So keeping the environment can't be separated from who spawns the target. `$SHELL` is
+  authoritative for the same reason.
 
 ### 16.6 Lifecycle
-1. `cordon bless --class NAME -- <cmd>` — **no `sudo` prefix**; it runs as you. (`--class`
-   may be omitted when the policy declares exactly one class; with no `<cmd>`, the default is
-   `$SHELL`.)
-2. The CLI verifies the daemon is root, sends `BlessRequest`, and holds the connection open.
-   The daemon parks a single-use nonce and blocks. **Nothing is minted yet.**
+1. You run `cordon bless --class NAME -- <cmd>`, with no `sudo` prefix, and it runs as you.
+   `--class` may be omitted when the policy declares exactly one class. With no `<cmd>`, the
+   default is `$SHELL`.
+2. The CLI checks that the daemon is root, sends `BlessRequest`, and holds the connection open.
+   The daemon parks a single-use nonce and blocks. Nothing is minted yet.
 3. The CLI spawns `$CORDON_SUDO cordon bless-helper --nonce=…`. The human authenticates to
-   whatever that tool is; the helper reaches the daemon as uid 0 and approves (§16.5).
-4. The daemon validates `NAME` against the compiled class registry and creates a fresh
-   root-owned cgroup `cordon-bless-<id>.<class>` **inside the requester's own user subtree**,
-   located from that connection's `SO_PEERCRED` pid. logind attributes a process to a user —
-   and thence to a session, which is what polkit needs to find an auth agent — purely from
-   the cgroup path, so the carrier must keep one of the two components it reads:
-   - `session-N.scope` when the requester is in one (a tty or login session): most precise,
-     an exact session id;
-   - otherwise `user-<uid>.slice`. **This is the common desktop case**: on a modern systemd a
-     terminal lives under the *delegated* `user@UID.service/app.slice/app-*.scope` with no
-     session scope anywhere above it, and `cg_path_get_owner_uid` keys on the user slice to
-     resolve the user, from which logind falls back to that user's display session — exactly
-     how an ordinary unblessed shell there resolves.
+   whatever that tool is. The helper reaches the daemon as uid 0 and approves (§16.5).
+4. The daemon validates `NAME` against the compiled class registry. It creates a fresh
+   root-owned cgroup `cordon-bless-<id>.<class>` inside the requester's own user subtree, which
+   it locates from the pid that `SO_PEERCRED` reports for that connection. logind attributes a
+   process to a user purely from the cgroup path. From the user it finds a session, and polkit
+   needs the session to find an authentication agent. So the carrier must keep one of the two
+   path components that logind reads:
+   - `session-N.scope`, when the requester is in one (a tty or login session). This is the
+     most precise, because it gives an exact session id.
+   - Otherwise `user-<uid>.slice`. This is the common desktop case. On a modern systemd, a
+     terminal lives under the *delegated* `user@UID.service/app.slice/app-*.scope`, with no
+     session scope anywhere above it. `cg_path_get_owner_uid` keys on the user slice to
+     resolve the user, and from the user logind falls back to that user's display session.
+     That is exactly how an ordinary unblessed shell there resolves.
 
-   A parent that is not root-owned is refused (`user@UID.service` and everything below it is
-   delegated to the user; a user-owned parent would let the invoker rmdir an empty carrier and
-   mkdir a replacement onto a recycled inode — a cgroup id — that is still registered),
-   falling back to the daemon's own cgroup, where the blessing still *works* but the blessed
-   shell loses polkit. The daemon registers `BLESSED[cgroup_id] = ClassId(NAME)` and sends the
-   carrier's **`cgroup.procs` descriptor** back down the requester's connection (§16.4).
-5. **The CLI is the spawner, unprivileged throughout.** It forks, and the child's `pre_exec`
-   writes its own pid through that descriptor — joining *before* `exec`, so the target runs
-   zero instructions unblessed — then execs. No privilege drop, because there was never any
-   privilege: the write succeeds on the descriptor's *opener's* credentials. Environment, cwd,
-   tty, job control, signals and exit code are inherited because nothing ever moved them.
-6. Descendants inherit the cgroup ⇒ inherit the blessing (`bless -- bash` blesses the
-   subtree).
-7. **GC on exit.** The daemon watches the carrier's `cgroup.events` `populated` flag; when the
-   tree drains (`populated 0`) it removes the cgroup and drops the `BLESSED` entry — the grant
-   **evaporates with the process tree**. No standing always-armed cgroup. A mint **grace
-   window** (`MINT_GRACE`) covers the interval where a fresh carrier is legitimately empty
-   because the CLI has not joined the target yet; once it expires, a carrier whose CLI died
-   before joining is reaped.
-8. `cordon bless list` / `cordon bless revoke <id>` enumerate and tear down live blessings
-   (the per-invocation cgroup *is* the handle; revoke writes `cgroup.kill`, and the same GC
-   finishes the teardown). Revoke is allowed for root **or the uid that minted it** — having
-   minted one unprivileged, you must be able to revoke it the same way. A blessing adopted at
-   restart (step 9) has no recorded minter, so only root may revoke it (`may_revoke`).
-9. **Restart reconciliation.** Only the LSM links are pinned (§4), so a restarted daemon
-   loads a fresh, empty `BLESSED` (fail-closed). At startup it scans every directory placement
-   can choose — its own cgroup, every `user-*.slice` and every `session-*.scope`
-   (`carrier_roots`) — for leftover carriers: empty ones are removed,
-   populated ones are re-registered if their class is still declared, and populated ones whose
-   class vanished are adopted **inert** (GC only — a live process tree is never killed because
-   policy changed under it). Only **root-owned** directories are adopted: re-registering is a
-   *grant*, so it is held to the same trust check as placement in step 4.
+   A parent that is not root-owned is refused. `user@UID.service` and everything below it is
+   delegated to the user. A parent owned by the user would let the invoker rmdir an empty
+   carrier and mkdir a replacement onto a recycled inode, which is a cgroup id that is still
+   registered. In that case the daemon falls back to its own cgroup, where the blessing still
+   *works*, but the blessed shell loses polkit. The daemon registers
+   `BLESSED[cgroup_id] = ClassId(NAME)` and sends the carrier's `cgroup.procs` descriptor back
+   down the requester's connection (§16.4).
+5. **The CLI is the spawner, and it is unprivileged throughout.** It forks, and the child's
+   `pre_exec` writes the child's own pid through that descriptor and then execs. The child joins
+   *before* `exec`, so the target runs zero instructions unblessed. No privilege is dropped,
+   because there never was any privilege. The write succeeds on the credentials of the
+   descriptor's *opener*. The environment, cwd, tty, job control, signals and exit code are
+   inherited, because nothing ever moved them.
+6. Descendants inherit the cgroup, and so they inherit the blessing. `bless -- bash` blesses
+   the whole subtree.
+7. **GC on exit.** The daemon watches the `populated` flag in the carrier's `cgroup.events`.
+   When the tree drains (`populated 0`), the daemon removes the cgroup and drops the `BLESSED`
+   entry. So the grant evaporates with the process tree, and there is no standing cgroup that
+   is always armed. A mint grace window (`MINT_GRACE`) covers the interval where a fresh
+   carrier is legitimately empty, because the CLI has not joined the target yet. Once the
+   window expires, a carrier whose CLI died before joining is reaped.
+8. `cordon bless list` and `cordon bless revoke <id>` list and tear down live blessings. The
+   cgroup of each invocation *is* the handle. Revoke writes `cgroup.kill`, and the same GC
+   finishes the teardown. Root may revoke any blessing, and so may the uid that minted it,
+   because a user who minted one unprivileged must be able to revoke it the same way. A
+   blessing adopted at restart (step 9) has no recorded minter, so only root may revoke it
+   (`may_revoke`).
+9. **Restart reconciliation.** Only the LSM links are pinned (§4), so a restarted daemon loads
+   a fresh, empty `BLESSED`, which fails closed. At startup the daemon scans every directory
+   that placement can choose for leftover carriers. That is its own cgroup, every
+   `user-*.slice` and every `session-*.scope` (`carrier_roots`). Empty carriers are removed.
+   A populated carrier is registered again if its class is still declared. A populated carrier
+   whose class vanished is adopted as inert, which means it is only garbage-collected, because
+   a live process tree is never killed for a policy change under it. Only root-owned
+   directories are adopted. Registering a carrier again is a *grant*, so it is held to the
+   same trust check as placement in step 4.
 
 ```mermaid
 sequenceDiagram
@@ -1518,39 +1618,41 @@ sequenceDiagram
 ```
 
 > **Why placement is not "put it in the session scope".** On a desktop the requester is not
-> *in* the session scope, only the session leader is, so a rule keyed on the session scope
-> alone would send every desktop blessing to the daemon's cgroup — where logind cannot
-> attribute the process at all. What the carrier needs is not the session; it is to remain
-> somewhere logind can still say *whose* the process is (`CgroupPath::placement`).
+> *in* the session scope. Only the session leader is. So a rule keyed on the session scope
+> alone would send every desktop blessing to the daemon's cgroup, where logind cannot attribute
+> the process at all. What the carrier needs is not the session. It needs to stay somewhere
+> that logind can still tell *whose* process it is (`CgroupPath::placement`).
 
 > **Apply-time remap (correctness keystone).** `policy apply` recompiles, and `ClassId`s are
-> dense and name-sorted — so they *renumber*. Every apply therefore re-points live `BLESSED`
-> entries **by class name** (`Blessings::remap`) inside the same single-writer path that owns
-> the maps; a class
-> that disappeared is unregistered (the blessing goes inert) rather than left pointing at a
-> renumbered id. Without this, a live blessing would silently change meaning on an unrelated
-> policy edit.
+> dense and sorted by name, so they *renumber*. So every apply re-points the live `BLESSED`
+> entries by class name (`Blessings::remap`), inside the same single-writer path that owns the
+> maps. A class that disappeared is unregistered, and its blessing goes inert, rather than
+> being left pointing at a renumbered id. Without this remap, a live blessing would silently
+> change meaning on an unrelated policy edit.
 
 ### 16.7 Blast radius and limits (honest)
 - **`bless -- bash` trusts the whole subtree.** A scraper you run *inside* a blessed shell
-  inherits the blessing. That is the grant working as designed, not a bypass — but it means
-  bless is for tools/shells you trust *in that moment*. Prefer per-command blesses; treat a
-  blessed shell as a deliberate, loud, ideally short-lived "vault session."
-- **ptrace.** A long-lived blessed process is a fat target for the conceded resident
-  adversary (§2): same-uid ptrace → make it read the secret. Default yama `ptrace_scope ≥ 1`
-  restricts ptrace to descendants, so a *non-descendant* scraper can't touch it — recommend
-  it as a deployment note. Argues again for short-lived per-command blesses.
-- **Already-open fds (§10).** cordon gates `open()`, not `read()`. A blessed process that
-  opens a secret and passes the fd (SCM_RIGHTS, or a non-CLOEXEC leak across exec) hands the
-  content to a non-blessed process. Inherent; the blessed process is trusted not to.
-- **Every bless is journaled** (§16.3 — the matched class on `DecisionEvent`), so even the
+  inherits the blessing. That is the grant working as designed, not a bypass. But it means
+  that bless is for tools and shells you trust *in that moment*. Prefer a bless for each
+  command, and treat a blessed shell as a deliberate, loud and ideally short-lived "vault
+  session."
+- **ptrace.** A long-lived blessed process is a fat target for the conceded resident adversary
+  (§2), who can ptrace it as the same uid and make it read the secret. The default yama
+  `ptrace_scope` of 1 or more restricts ptrace to descendants, so a scraper that is *not* a
+  descendant can't touch it. We recommend that setting as a deployment note. It is one more
+  argument for short-lived blesses, one per command.
+- **Already-open fds (§10).** cordon gates `open()`, not `read()`. A blessed process that opens
+  a secret and passes the fd on hands the content to a process that is not blessed. It can pass
+  the fd with SCM_RIGHTS, or leak it across exec without CLOEXEC. This is inherent, and the
+  blessed process is trusted not to do it.
+- **Every bless is journaled.** The matched class is on `DecisionEvent` (§16.3), so even the
   conceded cases leave an audit trail.
 
 ### 16.8 Policy surface (authoring)
-A class is an ordinary **subject group** with a `blessing` predicate — symmetric with the
-§15.7 group model, no new top-level concept. **Blessings are fully policy-customizable:** their
-action, object scope, polarity, and conjunction with other predicates are all just ordinary
-rules, so the policy author declares as many classes as they like and says precisely what each
+A class is an ordinary subject group with a `blessing` predicate. That matches the group model
+of §15.7 and adds no new top-level concept. Blessings are fully customizable by policy. Their
+action, object scope, polarity and conjunction with other predicates are all ordinary rules. So
+the policy author declares as many classes as they like, and says precisely what each one
 reaches.
 ```toml
 [group.subject.blessed-ro]   blessing = "ro"
@@ -1565,23 +1667,25 @@ allow  @blessed-rw   read,write      @secrets       # …and write
 allow  @aws-rw       read,write      ~/.aws         # scoped to one dir only
 '''
 ```
-`cordon bless --class aws -- terraform apply` runs `terraform` in an `aws`-class cgroup; the
-kernel matches the `blessing="aws"` predicate on those rules, so it can read/write `~/.aws`
-**and nothing else protected** — scope is exactly the rule's object column. Because the
-predicate composes, `who = {exe = "/usr/bin/cat", blessing = "ro"}` admits *only* `cat` *only*
-when blessed; and a class may even be `audit` to observe a blessed cohort. Subject-specificity
-(§15.6) makes any concrete `blessing` rule outrank a `who="*"` catch-all on the same object,
-and the §16.3 precedence note covers the targeted-deny tie.
+`cordon bless --class aws -- terraform apply` runs `terraform` in a cgroup of class `aws`. The
+kernel matches the `blessing="aws"` predicate on those rules. So `terraform` can read and write
+`~/.aws`, and nothing else that is protected, because the scope is exactly the rule's object
+column. Because the predicate composes, `who = {exe = "/usr/bin/cat", blessing = "ro"}` admits
+only `cat`, and only when it is blessed. A class may even be `audit`, to observe a blessed
+cohort. Subject specificity (§15.6) makes any concrete `blessing` rule outrank a `who="*"`
+catch-all on the same object, and the precedence note in §16.3 covers the tie with a targeted
+deny.
 
 ### 16.9 Relationship to the rest of cordon
-- **vs. flow A "admit" (§15.10):** admit adds a *durable static* `allow` for a *known* exe;
-  bless is a *runtime, authenticated* grant for an *ad-hoc* invocation. Different lifetimes,
-  different trust basis.
-- **vs. autolearn (§15.9):** autolearn *observes* to *propose* durable rules; bless *grants*
-  immediately under human auth. Orthogonal.
-- **vs. `cordon policy edit` (§15.8):** both are privileged, authenticated mutations of *what
-  is allowed* — edit mutates the durable policy, bless mints a transient grant — and as
-  shipped both authenticate the same way (`sudo`) and share the privilege-drop discipline (run
-  the child as the invoking user, never root). One deliberate difference: the editor is
-  dropped with **no** supplementary groups (it is a hostile-input processor), while a blessed
-  session keeps the user's full group list (it is their normal session).
+- **Compared with "admit" in flow A (§15.10).** Admit adds a *durable static* `allow` for a
+  *known* exe. Bless is a *runtime, authenticated* grant for an *ad-hoc* invocation. They have
+  different lifetimes and a different basis for trust.
+- **Compared with autolearn (§15.9).** Autolearn *observes* in order to *propose* durable rules.
+  Bless *grants* immediately, under human authentication. The two are orthogonal.
+- **Compared with `cordon policy edit` (§15.8).** Both are privileged, authenticated changes to
+  *what is allowed*. Edit changes the durable policy, and bless mints a transient grant. As
+  shipped, both authenticate the same way (`sudo`), and both share the discipline of dropping
+  privilege, so the child runs as the invoking user and never as root. There is one deliberate
+  difference. The editor runs with *no* supplementary groups, because it processes hostile
+  input. A blessed session keeps the user's full group list, because it is their normal
+  session.

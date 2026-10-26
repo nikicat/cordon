@@ -1,22 +1,22 @@
-//! Stage 3 — compile a [`ResolvedPolicy`] into the flat, per-object decision table
-//! the kernel evaluates (DESIGN §15.3).
+//! Stage 3, which compiles a [`ResolvedPolicy`] into the flat per-object decision table
+//! that the kernel evaluates (DESIGN §15.3).
 //!
 //! ## Copy-down object precedence
-//! Objects (the distinct `where` paths) form a forest under the path-prefix relation.
+//! Objects, the distinct `where` paths, form a forest under the path-prefix relation.
 //! Rather than make the kernel walk every protected ancestor at decision time, the
-//! compiler folds each ancestor's rules **down** into every protected descendant's
-//! bucket (`Compiler::buckets`) in first-match order (`sort_bucket`). The kernel then
-//! does the dumb thing: find the deepest protected object in the dentry walk, scan its
-//! one bucket, apply the **first matching** rule.
+//! compiler folds each ancestor's rules down into the bucket of every protected
+//! descendant (`Compiler::buckets`), in first-match order (`sort_bucket`). At decision
+//! time the kernel only finds the deepest protected object in the dentry walk, scans
+//! that one bucket, and applies the first rule that matches.
 //!
-//! This supports per-subject sub-object exceptions that a "deepest bucket only" model
-//! breaks — e.g. `allow {a,b} read ~/.aws` + `deny evil read ~/.aws/secret`: under
-//! copy-down `a`/`b` still read `secret` (they match the inherited allow after the
-//! more-specific deny is skipped), where a shadowing model would default-deny them.
+//! This supports per-subject exceptions on a sub-object, which a model that consults
+//! only the deepest bucket breaks. Take `allow {a,b} read ~/.aws` together with
+//! `deny evil read ~/.aws/secret`. Under copy-down, `a` and `b` can still read `secret`,
+//! because they skip the more specific deny and match the inherited allow. A shadowing
+//! model would deny them by default.
 //!
-//! Paths are resolved to `(dev,ino)` by an injected resolver — the daemon's
-//! `fsid::file_id` in production, a fake in tests — so this stage stays pure and
-//! unit-testable.
+//! An injected resolver turns paths into `(dev,ino)`. It is the daemon's `fsid::file_id`
+//! in production and a fake in tests, so this stage stays pure and testable on its own.
 
 use super::{ClassName, Diagnostic, Loc, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
@@ -27,14 +27,13 @@ use cordon_bpf_common::{
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The compiled policy: protected objects with their pre-merged, pre-sorted rule
-/// buckets, plus the paths that didn't resolve and any diagnostics. The daemon loads
-/// `objects` into the BPF maps (keyed by [`FileId`], addressed by [`ObjId`]) only if
+/// The output of a compile, which the daemon loads into the BPF maps, keyed by
+/// [`FileId`] and addressed by [`ObjId`]. The daemon loads it only when
 /// [`CompiledPolicy::has_errors`] is false.
 #[derive(Clone, Debug)]
 pub struct CompiledPolicy {
     pub objects: Vec<CompiledObject>,
-    /// Object paths that don't resolve to an inode yet (see `Compiler::objects`).
+    /// The object paths that do not resolve to an inode yet (see `Compiler::objects`).
     pub pending: Vec<PathBuf>,
     pub diagnostics: Vec<Diagnostic>,
     /// The declared blessing classes and the ids this compile gives them.
@@ -42,11 +41,11 @@ pub struct CompiledPolicy {
 }
 
 /// The declared blessing classes (DESIGN §16.3) and their dense [`ClassId`]s. The kernel
-/// knows a class only by its id, so this is how the daemon turns a requested class name
-/// into an id at mint and an id back into a name in the journal. Ids follow name order
-/// from `UNBLESSED + 1`, so every compile renumbers them; nothing may keep an id across
-/// an apply without re-resolving it by name, which is why the daemon remaps the live
-/// blessings by class name after each apply (`Blessings::remap`).
+/// knows a class only by its id, so the daemon goes through this registry to turn a
+/// requested class name into an id at mint, and an id back into a name in the journal.
+/// Ids follow name order from `UNBLESSED + 1`, so every compile renumbers them. Nothing
+/// may keep an id across an apply without resolving it again by name, which is why the
+/// daemon remaps the live blessings by class name after each apply (`Blessings::remap`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClassRegistry(Vec<ClassName>);
 
@@ -91,8 +90,9 @@ impl ClassRegistry {
     }
 }
 
-/// One protected object and its flat rule bucket (sorted, copy-down-merged, deduped,
-/// `≤ MAX_RULES_PER_OBJ` unless an error diagnostic says otherwise).
+/// One protected object and its flat rule bucket. The bucket is sorted, merged by
+/// copy-down and deduplicated, and holds at most `MAX_RULES_PER_OBJ` rules unless an
+/// error diagnostic says otherwise.
 #[derive(Clone, Debug)]
 pub struct CompiledObject {
     pub id: ObjId,
@@ -103,7 +103,8 @@ pub struct CompiledObject {
 }
 
 impl CompiledPolicy {
-    /// Whether any diagnostic is an error — `cordon policy apply` must refuse if so.
+    /// Checks whether any diagnostic is an error, in which case the policy must not be
+    /// applied.
     pub fn has_errors(&self) -> bool {
         self.diagnostics
             .iter()
@@ -111,10 +112,11 @@ impl CompiledPolicy {
     }
 }
 
-/// A `stat(2)`-based resolver for **linting** (`cordon policy check`): a path's
-/// `(dev,ino)` if it exists, else `None`. Its `st_dev` can differ from the device the
-/// kernel enforces on (the daemon's `fsid::file_id` resolves that one) — fine here, where
-/// resolution only drives existence + uniqueness diagnostics.
+/// Returns the `(dev,ino)` of `path` from `stat(2)`, or `None` when the path does not
+/// exist. Its `st_dev` can differ from the device that the kernel enforces on, which the
+/// daemon's `fsid::file_id` resolves. That makes it fit only for linting
+/// (`cordon policy check`), where resolution drives just the existence and uniqueness
+/// diagnostics.
 pub fn stat_resolver(path: &Path) -> Option<FileId> {
     use cordon_bpf_common::{Dev, Ino};
     use std::os::unix::fs::MetadataExt;
@@ -127,20 +129,22 @@ struct Object {
     id: ObjId,
     file: FileId,
     path: PathBuf,
-    /// Path-component count — the specificity used to sort copied-down rules.
+    /// The number of path components, which is the specificity that sorts copied-down
+    /// rules.
     depth: usize,
 }
 
-/// A rule plus the depth of the object it was authored on (its specificity), so a
-/// rule copied down into a deeper object keeps its original, lower precedence.
+/// A rule together with the depth of the object it was authored on, so that a rule
+/// copied down into a deeper object keeps its original, lower precedence.
 #[derive(Clone)]
 struct ProvRule {
     rule: CompiledRule,
     depth: usize,
 }
 
-/// Compile `resolved` to the flat table. `resolve_fileid` maps an absolute path to its
-/// inode identity (`None` ⇒ doesn't exist / unreadable).
+/// Compiles `resolved` into the flat decision table. `resolve_fileid` maps an absolute
+/// path to its inode identity, or to `None` when the path does not exist or cannot be
+/// read. Problems end up in the result's diagnostics rather than in an error.
 pub fn compile<R>(resolved: &ResolvedPolicy, resolve_fileid: R) -> CompiledPolicy
 where
     R: FnMut(&Path) -> Option<FileId>,
@@ -161,8 +165,7 @@ where
     }
 }
 
-/// One compile's state: the path resolver, the class ids it hands out, and the
-/// diagnostics every step adds to.
+/// The state of one compile, shared by its steps so that each step can add diagnostics.
 struct Compiler<R> {
     resolve_fileid: R,
     classes: ClassRegistry,
@@ -174,10 +177,10 @@ where
     R: FnMut(&Path) -> Option<FileId>,
 {
     /// Resolves the distinct object paths. Returns the objects, numbered in path order so
-    /// ObjIds don't churn across compiles of the same policy, and the paths that don't
-    /// resolve yet. Such a path is pending: none of its rules are enforced, and the next
-    /// `cordon policy apply` resolves it again. Reports more than `MAX_OBJECTS` objects as
-    /// an error.
+    /// that ObjIds do not churn across compiles of the same policy, and the paths that do
+    /// not resolve yet. Such a path is pending. None of its rules are enforced, and the
+    /// next `cordon policy apply` resolves it again. Adds an error diagnostic when there
+    /// are more than `MAX_OBJECTS` objects.
     fn objects(&mut self, resolved: &ResolvedPolicy) -> (Vec<Object>, Vec<PathBuf>) {
         let distinct: BTreeSet<&Path> = resolved
             .rules
@@ -211,8 +214,9 @@ where
         (objects, pending)
     }
 
-    /// Returns each object's own rules, indexed like `objects`: the cross product of every
-    /// rule's subjects with that object. Warns about a rule on a pending object.
+    /// Returns each object's own rules, indexed like `objects`. They are the cross product
+    /// of every rule's subjects with that object. Adds a warning for each rule on a
+    /// pending object.
     fn own_rules(&mut self, resolved: &ResolvedPolicy, objects: &[Object]) -> Vec<Vec<ProvRule>> {
         let mut own: Vec<Vec<ProvRule>> = (0..objects.len()).map(|_| Vec::new()).collect();
         for rule in &resolved.rules {
@@ -239,9 +243,9 @@ where
         own
     }
 
-    /// Lowers a rule's subjects to `SubjectMatch`es: resolves exe paths to inodes, and maps
-    /// a blessing class name to its [`ClassId`]. Drops an exe that doesn't resolve, with a
-    /// warning; the rule still applies to its other subjects.
+    /// Returns a rule's subjects as `SubjectMatch`es, with exe paths resolved to inodes
+    /// and blessing class names mapped to their [`ClassId`]s. An exe that does not resolve
+    /// is dropped with a warning, and the rule still applies to its other subjects.
     fn lower_subjects(&mut self, subjects: &[SubjectSpec], loc: &Loc) -> Vec<SubjectMatch> {
         let mut out = Vec::new();
         for s in subjects {
@@ -257,9 +261,9 @@ where
                         ),
                     )),
                 },
-                // `resolve` only emits a `Blessed` for a *declared* class, so the lookup
-                // always hits; guard it as an internal error rather than panicking in the
-                // daemon.
+                // `resolve` only emits a `Blessed` for a declared class, so the lookup
+                // always hits. A miss is reported as an internal error rather than a panic
+                // in the daemon.
                 SubjectSpec::Blessed(name) => match self.classes.id(name) {
                     Some(id) => out.push(SubjectMatch::blessed(id)),
                     None => self.diagnostics.push(Diagnostic::error(
@@ -272,9 +276,9 @@ where
         out
     }
 
-    /// Builds each object's bucket by copy-down: its own rules plus every protected
-    /// ancestor's, sorted into first-match order and deduped. Reports a bucket over
-    /// `MAX_RULES_PER_OBJ` as an error.
+    /// Returns each object with its bucket, built by copy-down from its own rules and the
+    /// rules of every protected ancestor, in first-match order and without duplicates.
+    /// Adds an error diagnostic for a bucket over `MAX_RULES_PER_OBJ`.
     fn buckets(&mut self, objects: &[Object], own: &[Vec<ProvRule>]) -> Vec<CompiledObject> {
         let mut compiled = Vec::with_capacity(objects.len());
         for (obj, own_rules) in objects.iter().zip(own) {
@@ -318,8 +322,9 @@ where
 /// sort keeps authoring order within a precedence class, so compiles are deterministic.
 fn sort_bucket(bucket: &mut [ProvRule]) {
     bucket.sort_by(|a, b| {
-        // (1) and (2) are `b.cmp(a)` — descending, since higher is more specific; (3) is
-        // `a.cmp(b)` — `Polarity::Deny` is declared first, so ascending puts it ahead.
+        // Keys (1) and (2) compare `b` with `a`, which sorts them descending, since
+        // higher is more specific. Key (3) compares `a` with `b`, and `Polarity::Deny` is
+        // declared first, so the ascending order puts it ahead.
         b.depth
             .cmp(&a.depth)
             .then_with(|| subject_specificity(b.rule).cmp(&subject_specificity(a.rule)))
@@ -327,19 +332,20 @@ fn sort_bucket(bucket: &mut [ProvRule]) {
     });
 }
 
-/// A rule's subject specificity; see [`subject_specificity`].
+/// A rule's subject specificity, as [`subject_specificity`] counts it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Specificity(u32);
 
-/// Returns the count of non-wildcard subject predicates (DESIGN §15.6 step 2); a higher
-/// count is more specific. Each concrete predicate (`exe`, `blessing`, …) clears its
-/// wildcard bit and adds one unit, so a concrete subject outranks a `who="*"` catch-all on
-/// the same object and a specific `allow`/`deny` wins over a broad `audit`/`deny`. That is
-/// the basis of the audit→admit→enforce flow (§15.10 flow A): an admitted `allow exe=X`
-/// goes silent while the `*` catch-all keeps observing the not-yet-admitted, and a
-/// blessing `allow` outranks the catch-all the same way.
+/// Returns the number of subject predicates in `r` that are not wildcards (DESIGN §15.6
+/// step 2). A higher count is more specific. Each concrete predicate, such as `exe` or
+/// `blessing`, clears its wildcard bit and adds one, so a concrete subject outranks a
+/// `who="*"` catch-all on the same object. A specific `allow` or `deny` therefore wins
+/// over a broad `audit` or `deny`. The audit, admit and enforce flow (§15.10 flow A)
+/// rests on this. An admitted `allow exe=X` goes silent while the `*` catch-all keeps
+/// observing every program not yet admitted, and a blessing `allow` outranks the
+/// catch-all the same way.
 fn subject_specificity(r: CompiledRule) -> Specificity {
-    // All subject predicates; a rule's specificity is how many are *not* wildcard.
+    // A rule's specificity is how many of all the subject predicates are not wildcards.
     let predicates = SubjectFlags::all();
     Specificity(
         predicates.bits().count_ones()
@@ -347,8 +353,8 @@ fn subject_specificity(r: CompiledRule) -> Specificity {
     )
 }
 
-/// Allow-vs-deny polarity, the last key of [`sort_bucket`]. `Deny` is declared first so
-/// the derived `Ord` sorts it ahead of `Allow`.
+/// Whether a rule allows or denies, which is the last key of [`sort_bucket`]. `Deny` is
+/// declared first, so that the derived `Ord` sorts it ahead of `Allow`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Polarity {
     Deny,
@@ -363,10 +369,11 @@ fn polarity(r: CompiledRule) -> Polarity {
     }
 }
 
-/// Drop later duplicates of an identical [`CompiledRule`], keeping the first (highest
-/// precedence after [`sort_bucket`]). Buckets are small, so a linear scan is fine and
-/// avoids requiring `Hash` on the POD types.
+/// Removes later duplicates of an identical [`CompiledRule`] from `bucket`. The first
+/// copy stays, because it has the highest precedence after [`sort_bucket`].
 fn dedup_bucket(bucket: &mut Vec<ProvRule>) {
+    // Buckets are small, so a linear scan is fine, and it avoids requiring `Hash` on the
+    // POD types.
     let mut seen: Vec<CompiledRule> = Vec::new();
     bucket.retain(|pr| {
         if seen.contains(&pr.rule) {
@@ -385,8 +392,8 @@ mod tests {
     use cordon_bpf_common::{Action, Dev, Ino, Policy};
     use std::collections::HashMap;
 
-    /// A fake path→FileId resolver from `(path, inode)` pairs (device 0). Any path not
-    /// listed resolves to `None` (doesn't exist).
+    /// Returns a fake resolver built from `(path, inode)` pairs on device 0. A path that
+    /// is not listed resolves to `None`, as if it did not exist.
     fn resolver(pairs: &[(&str, u64)]) -> impl FnMut(&Path) -> Option<FileId> {
         let map: HashMap<PathBuf, FileId> = pairs
             .iter()
@@ -400,7 +407,8 @@ mod tests {
         compile(&resolved, resolver(pairs))
     }
 
-    /// A single `[[rule]]` block from already-quoted/-bracketed TOML fields.
+    /// Returns a single `[[rule]]` block built from TOML fields that are already quoted
+    /// or bracketed.
     fn rule(who: &str, where_: &str, action: &str, policy: &str) -> String {
         format!("[[rule]]\nwho = {who}\nwhere = {where_}\naction = {action}\npolicy = {policy}\n")
     }
@@ -427,8 +435,8 @@ mod tests {
 
     #[test]
     fn copydown_broad_allow_narrow_deny() {
-        // allow {a,b,s} read /d ; deny s read /d/f. After copy-down, /d/f's bucket must
-        // deny s first but still allow a/b (the inherited rule).
+        // allow {a,b,s} read /d, and deny s read /d/f. After copy-down, the bucket of
+        // /d/f must deny s first but still allow a and b through the inherited rule.
         let text = format!(
             "{}{}",
             rule(r#"["/a","/b","/s"]"#, "\"/d\"", "\"read\"", "\"allow\""),
@@ -440,7 +448,7 @@ mod tests {
         );
         assert!(!p.has_errors(), "{:?}", p.diagnostics);
         let f = object(&p, "/d/f");
-        // Most-specific first: the deny on s.
+        // The most specific rule, the deny on s, comes first.
         assert_eq!(f.rules[0].policy, Policy::DENY);
         assert_eq!(
             f.rules[0].subject,
@@ -458,7 +466,8 @@ mod tests {
 
     #[test]
     fn copydown_broad_deny_narrow_allow() {
-        // deny {a,b,s} read /d ; allow s read /d/f. /d/f must allow s first, deny the rest.
+        // deny {a,b,s} read /d, and allow s read /d/f. /d/f must allow s first and deny
+        // the rest.
         let text = format!(
             "{}{}",
             rule(r#"["/a","/b","/s"]"#, "\"/d\"", "\"read\"", "\"deny\""),
@@ -515,8 +524,8 @@ mod tests {
 
     #[test]
     fn concrete_allow_beats_wildcard_deny() {
-        // Specificity ranks above the deny>allow tie-break: `allow exe=X` sorts ahead of
-        // the `who="*"` deny, so X is allowed while everyone else is denied.
+        // Specificity ranks above the tie-break of deny over allow. `allow exe=X` sorts
+        // ahead of the `who="*"` deny, so X is allowed while everyone else is denied.
         let text = format!(
             "{}{}",
             rule("\"*\"", "\"/d\"", "\"read\"", "\"deny\""),
@@ -669,7 +678,7 @@ mod tests {
         let p = compile_text(text, &[("/d", 10)]);
         assert!(!p.has_errors(), "{:?}", p.diagnostics);
 
-        // Registry: both declared classes, ids in name order.
+        // The registry holds both declared classes, with ids in name order.
         let reg: std::collections::BTreeMap<_, _> = p
             .classes
             .iter()
@@ -709,7 +718,8 @@ mod tests {
         "#;
         let p = compile_text(text, &[("/d", 10)]);
         assert!(!p.has_errors());
-        // First-match = most-specific: the blessed allow beats the wildcard deny.
+        // The first match is the most specific, so the blessed allow beats the wildcard
+        // deny.
         let d = object(&p, "/d");
         assert_eq!(d.rules[0].policy, Policy::ALLOW, "{:?}", d.rules);
         assert_eq!(d.rules[0].subject, SubjectMatch::blessed(ClassId(1)));

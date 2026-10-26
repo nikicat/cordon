@@ -1,6 +1,6 @@
-//! bpffs pinning: what keeps the boundary up with no daemon running (DESIGN §4). See
-//! [`PinDir::pin_links`] for what is pinned and how a new run takes over, and
-//! [`PinDir::teardown`] for how it comes down.
+//! Keeps the boundary up with no daemon running, by pinning the LSM links in bpffs
+//! (DESIGN §4). See [`PinDir::pin_links`] for what is pinned and how a new run takes over,
+//! and [`PinDir::teardown`] for how it comes down.
 
 use super::super::Swept;
 use aya::Ebpf;
@@ -15,17 +15,18 @@ use tracing::info;
 pub struct PinDir(pub PathBuf);
 
 impl PinDir {
-    /// This run's generation directory.
+    /// Returns this run's generation directory.
     fn generation(&self) -> PathBuf {
         self.0.join(std::process::id().to_string())
     }
 
-    /// Pins this run's links, then removes every other generation.
+    /// Pins this run's links, then removes every other generation, and returns the
+    /// handles of the new pins.
     ///
     /// Only the LSM links are pinned. A pinned `bpf_link` holds its program, and a loaded
     /// program holds its maps, so the links alone keep the programs and the seeded policy
-    /// enforcing with no holding process: a stop, a restart or a crash leaves the boundary
-    /// standing. No map is pinned and nothing is adopted on startup: every run loads its
+    /// enforcing with no holding process. A stop, a restart or a crash leaves the boundary
+    /// standing. No map is pinned and nothing is adopted on startup. Every run loads its
     /// own object with its own private maps, and the pins only decide how long the
     /// previous generation keeps enforcing. That keeps [`Maps`](super::seed::Maps) the
     /// single writer of every map, and an upgraded daemon never talks to an old program.
@@ -33,17 +34,21 @@ impl PinDir {
     /// rebuild.
     ///
     /// Each run pins under its own generation directory, `<pin_dir>/<pid>/`, because
-    /// `BPF_OBJ_PIN` fails `EEXIST` on a taken path: one shared directory would force a
-    /// detach-then-attach window with nothing enforcing. The handover is attach →
-    /// self-test → seed → pin the new → sweep the old, and the order is the fail-safe
-    /// property: the previous generation is swept only after ours is pinned, so there is no
-    /// instant with nothing attached. Callers must therefore have already run the self-test
-    /// and seeded the real policy; a daemon that aborts before this point leaves the old
-    /// boundary standing rather than disarming it.
+    /// `BPF_OBJ_PIN` fails with `EEXIST` on a taken path. One shared directory would force
+    /// a window between detach and attach with nothing enforcing. The previous generation
+    /// is swept only after this one is pinned, so there is no instant with nothing
+    /// attached. That is the fail-safe property, and it is why the self-test and the real
+    /// seed come before this call. A daemon that aborts before it leaves the old boundary
+    /// standing rather than disarming it.
     ///
-    /// The returned handles are held for the daemon's lifetime. They are *not* what keeps the
-    /// links alive (the bpffs entries are), but holding them means a stray `rm` of the pin
-    /// files cannot silently detach a boundary this daemon still believes it is enforcing.
+    /// Errors when the generation directory cannot be created, a link cannot be pinned
+    /// (for example because the pin directory is not on a bpffs), or an old generation
+    /// cannot be removed.
+    ///
+    /// The daemon holds the returned handles for its lifetime. They are not what keeps the
+    /// links alive, because the bpffs entries do that. Holding them means a stray `rm` of
+    /// the pin files cannot silently detach a boundary this daemon still believes it is
+    /// enforcing.
     pub(super) fn pin_links(
         &self,
         ebpf: &mut Ebpf,
@@ -70,9 +75,9 @@ impl PinDir {
                 .take_link(id)
                 .with_context(|| format!("bpf-lsm: take link {hook}"))?;
             let path = generation.join(hook);
-            // No bpffs pre-check: `BPF_OBJ_PIN` itself refuses any path outside a bpffs with
-            // `EINVAL`, so a `statfs` here would only duplicate the kernel's own guard. What it
-            // would add is a better message, which this does instead.
+            // No bpffs pre-check, because `BPF_OBJ_PIN` itself refuses any path outside a
+            // bpffs with `EINVAL`. A `statfs` here would only duplicate the kernel's own
+            // guard. All it would add is a better message, and the error below adds that.
             pinned.push(FdLink::from(link).pin(&path).map_err(|e| {
                 Error::msg(format!(
                     "bpf-lsm: pin {}: {e} — is {} on a bpffs mount? (systemd mounts one at \
@@ -83,11 +88,12 @@ impl PinDir {
             })?);
         }
 
-        // The handover. Worth a line rather than a silent discard: this is the moment the
-        // previous boundary stops enforcing, and "did the old generation actually go away?" is
-        // the first question when a box is behaving like two policies at once.
+        // The handover. It is worth a log line rather than a silent discard, because this
+        // is the moment the previous boundary stops enforcing. "Did the old generation
+        // actually go away?" is the first question when a box behaves like two policies at
+        // once.
         match self.sweep(Some(&generation))? {
-            // First boot after a teardown or a reboot — nothing to supersede.
+            // The first boot after a teardown or a reboot has nothing to supersede.
             Swept::Nothing => {}
             Swept::Generations(n) => info!(
                 superseded = n.get(),
@@ -97,27 +103,32 @@ impl PinDir {
         Ok(pinned)
     }
 
-    /// Removes every pinned generation, disarming enforcement (`cordond --teardown`). This
-    /// is the explicit off switch: stopping the daemon deliberately is not, so a restart or
-    /// a crash is gapless and a stopped log-drainer never drops the boundary.
-    /// `cordond` refuses to run it while a daemon holds the singleton lock.
+    /// Removes every pinned generation, which disarms enforcement, and returns what was
+    /// removed. This is the explicit off switch. Stopping the daemon deliberately is not
+    /// one, so a restart or a crash leaves no gap, and a stopped log drainer never drops
+    /// the boundary.
     ///
-    /// Needs no daemon and no BPF handle, because the pins are the only state: removing the
-    /// last reference to a link detaches its program, which frees its maps.
+    /// It needs no daemon and no BPF handle, because the pins are the only state. Removing
+    /// the last reference to a link detaches its program, which frees its maps.
     ///
-    /// **Asynchronous.** Unlinking the pin only drops the reference; the kernel frees the link
-    /// — and so detaches the hooks — from a workqueue, so enforcement outlives this call by a
-    /// beat. Anything that must observe the boundary down (the smoke suite's teardown, a
-    /// script deleting a formerly-protected tree) has to poll rather than assume.
+    /// Errors when the pin directory cannot be read or a generation cannot be removed.
+    ///
+    /// The effect is asynchronous. Unlinking the pin only drops the reference, and the
+    /// kernel frees the link, which detaches the hooks, from a workqueue. So enforcement
+    /// outlives this call by a beat. Anything that must observe the boundary down, such as
+    /// the smoke suite's teardown or a script deleting a formerly protected tree, has to
+    /// poll rather than assume.
     pub fn teardown(&self) -> Result<Swept> {
         self.sweep(None)
     }
 
-    /// Remove every generation except `keep`.
+    /// Removes every generation except `keep`, and returns what was removed. A missing pin
+    /// directory counts as nothing removed.
     fn sweep(&self, keep: Option<&Path>) -> Result<Swept> {
         let entries = match std::fs::read_dir(&self.0) {
             Ok(entries) => entries,
-            // Nothing pinned yet (first run) or nothing left to tear down — both are success.
+            // Nothing is pinned yet (a first run), or nothing is left to tear down. Both
+            // are success.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Swept::Nothing),
             Err(e) => {
                 return Err(Error::msg(format!(
@@ -153,9 +164,9 @@ mod tests {
         Swept::Generations(std::num::NonZeroUsize::new(n).unwrap())
     }
 
-    /// The handover property, on a plain filesystem: sweeping keeps exactly this run's
-    /// generation and drops every other one. If this ever kept none, a restart would
-    /// silently disarm the boundary; if it kept all, dead generations would accumulate and
+    /// Checks the handover property on a plain filesystem. Sweeping keeps exactly this
+    /// run's generation and drops every other one. If this ever kept none, a restart would
+    /// silently disarm the boundary. If it kept all, dead generations would accumulate and
     /// keep enforcing a policy nobody can see.
     #[test]
     fn sweep_keeps_only_the_named_generation() {
@@ -173,7 +184,7 @@ mod tests {
         assert!(ours.exists(), "this run's generation survives");
         assert!(!pin_dir.join("999999").exists(), "the old one is gone");
 
-        // …and teardown takes ours too — that is what disarms enforcement.
+        // …and teardown takes ours too, which is what disarms enforcement.
         assert_eq!(pins.teardown().unwrap(), generations(1));
         assert!(!ours.exists());
 
@@ -181,8 +192,8 @@ mod tests {
         assert_eq!(pins.teardown().unwrap(), Swept::Nothing);
     }
 
-    /// Teardown on a box that never pinned anything is a no-op, not an error: it is the
-    /// documented "turn it off" command and must be safe to run blind.
+    /// Checks that teardown on a box that never pinned anything is a no-op, not an error.
+    /// It is the documented "turn it off" command, and it must be safe to run blind.
     #[test]
     fn teardown_of_an_absent_pin_dir_succeeds() {
         assert_eq!(

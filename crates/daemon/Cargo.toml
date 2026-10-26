@@ -11,12 +11,12 @@ name = "cordond"
 path = "src/main.rs"
 
 [features]
-# The hardened Linux `bpf-lsm` backend — the rule model's only enforcement backend, so
-# it's ON by default. It builds on **stable** (the userspace `aya` loader is stable; only
-# the eBPF *object* needs nightly, and that's built separately via `just build-ebpf`). Its
-# deps (`aya`, `cordon-bpf-common`) are Linux-only, so they're gated to the Linux target
-# below — a non-Linux `cargo build` still compiles, just with no functional backend. Opt
-# out with `--no-default-features`.
+# The hardened Linux `bpf-lsm` backend. It is the rule model's only enforcement backend,
+# so it is on by default. It builds on stable Rust, because only the eBPF object needs
+# nightly, and `just build-ebpf` builds that object separately. Its deps (`aya`,
+# `cordon-bpf-common`) are Linux-only and gated to the Linux target below, so a non-Linux
+# `cargo build` still compiles, just with no working backend. Opt out with
+# `--no-default-features`.
 default = ["bpf-lsm"]
 bpf-lsm = ["dep:aya", "dep:cordon-bpf-common"]
 
@@ -27,11 +27,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# nix `poll` drives the bpf-lsm ring-buffer reader: a safe wrapper over hand-rolled `unsafe`.
+# nix's `poll` drives the bpf-lsm ring-buffer reader, in place of hand-rolled `unsafe`.
 nix = { version = "0.31.3", features = ["poll"] }
-# bpf-lsm backend (userspace control plane): the aya loader + the map/record types shared
-# with the eBPF program. Optional + Linux-only — pulled in only by the (default) `bpf-lsm`
-# feature, and only on Linux (the one target the backend compiles on).
+# The bpf-lsm control plane needs the aya loader and the map and record types it shares
+# with the eBPF program. Only the default `bpf-lsm` feature pulls them in, and only on
+# Linux, which is the one target the backend compiles on.
 aya = { version = "0.14", optional = true }
 cordon-bpf-common = { path = "../bpf-common", features = ["user"], optional = true }
 

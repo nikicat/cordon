@@ -1,10 +1,9 @@
-//! cordon-core — the privilege-agnostic policy core.
+//! The privilege-agnostic policy core, shared by the daemon and the CLI.
 //!
-//! Everything here runs unprivileged: the flat **rule model** (`policy` — parse,
-//! resolve, compile a text policy into the kernel's flat decision table), the
-//! operational `config`, the lexical `paths` helpers the compiler uses, the IPC
-//! `proto`, and the enforcement-backend seam (`backend`). Only the backend that loads
-//! the program and seeds the maps needs privilege.
+//! Everything here runs unprivileged. That covers the flat rule model in `policy`, which
+//! compiles a text policy into the kernel's flat decision table, as well as the
+//! operational `config`, the lexical `paths` helpers, the IPC `proto`, and the `backend`
+//! seam. Only the backend that loads the program and seeds the maps needs privilege.
 //!
 //! See `docs/DESIGN.md` §15 for the model this implements.
 
@@ -17,13 +16,13 @@ pub mod proto;
 
 pub use backend::BackendKind;
 pub use config::Config;
-/// Re-exported so a `user` identity has ONE type across the tree — the kernel's audit
-/// record ([`passwd`]), the socket's `SO_PEERCRED` peer, and any future caller identity —
-/// without every consumer depending on `cordon-bpf-common` directly (the daemon pulls
-/// that in only behind its `bpf-lsm` feature).
+/// Re-exported so that a user identity has one type across the tree, whether it comes
+/// from the kernel's audit record ([`passwd`]) or from a socket peer's `SO_PEERCRED`.
+/// Consumers then need not depend on `cordon-bpf-common` directly, which the daemon pulls
+/// in only behind its `bpf-lsm` feature.
 pub use cordon_bpf_common::Uid;
 
-/// Errors surfaced by the policy core.
+/// The error that every fallible call in the policy core returns.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("io: {0}")]
@@ -52,9 +51,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Adds what was being done to a failure, so the error reads `"{what}: {cause}"`.
 pub trait Context<T> {
-    /// Returns the value, or an error naming `what` failed.
+    /// Returns the success value unchanged. Errors with `what` in front of the cause when
+    /// the result is a failure.
     fn context(self, what: &str) -> Result<T>;
-    /// Like [`context`](Context::context), but builds the message only on failure.
+    /// Behaves like [`context`](Context::context), but builds the message only on failure.
     fn with_context(self, what: impl FnOnce() -> String) -> Result<T>;
 }
 

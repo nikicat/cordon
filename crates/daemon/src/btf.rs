@@ -1,18 +1,15 @@
-//! A minimal read-only BTF parser — just enough to resolve struct field **byte
-//! offsets** from the running kernel's `/sys/kernel/btf/vmlinux`.
+//! Reads the byte offsets of kernel struct fields from the running kernel's
+//! `/sys/kernel/btf/vmlinux`. The eBPF object carries no struct layout of its own (see
+//! [`Offsets`] for why), so the daemon resolves the few field offsets the hooks chase here
+//! and injects them into the program's `.rodata` (see `backend::bpf_lsm`).
 //!
-//! The eBPF object carries no struct layout of its own (see [`Offsets`] for why), so this
-//! reads the running kernel's BTF, resolves the handful of field offsets the hooks chase,
-//! and hands them back as an [`Offsets`] the daemon injects into the program's `.rodata`
-//! (see `backend::bpf_lsm`).
-//!
-//! aya-obj already parses BTF, but its member/offset accessors are `pub(crate)`, so
-//! we parse the slice ourselves. The format is small and stable
-//! (`Documentation/bpf/btf.rst`); we implement only the type kinds we must *traverse*
-//! (STRUCT/UNION + the modifier kinds) and correctly *skip* the rest. Resolution
-//! follows member **names** and transparently descends anonymous unions/structs, so
-//! a field the kernel tucks inside an anonymous union (e.g. `mm_struct.exe_file`) is
-//! still found without hard-coding bindgen's `__bindgen_anon_N` names.
+//! aya-obj already parses BTF, but its member and offset accessors are `pub(crate)`, so
+//! this module parses the slice it needs itself. The format is small and stable
+//! (`Documentation/bpf/btf.rst`). Only the kinds that resolution traverses are kept, which
+//! are STRUCT, UNION and the modifier kinds, and every other kind is skipped. Resolution
+//! follows member names and descends anonymous unions and structs, so a field the kernel
+//! tucks inside an anonymous union (e.g. `mm_struct.exe_file`) is still found without
+//! hard-coding bindgen's `__bindgen_anon_N` names.
 
 use cordon_bpf_common::Offsets;
 use cordon_core::{Context, Error, Result};
@@ -24,7 +21,8 @@ const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 /// BTF magic (`btf_header.magic`), in the blob's own byte order.
 const BTF_MAGIC: u16 = 0xeb9f;
 
-// btf_type `info` field: kind in bits 24..=28, vlen in bits 0..=15, kind_flag bit 31.
+// A btf_type's `info` field holds the kind in bits 24..=28, vlen in bits 0..=15 and
+// kind_flag in bit 31.
 const KIND_INT: u32 = 1;
 const KIND_PTR: u32 = 2;
 const KIND_ARRAY: u32 = 3;
@@ -42,40 +40,43 @@ const KIND_DECL_TAG: u32 = 17;
 const KIND_TYPE_TAG: u32 = 18;
 const KIND_ENUM64: u32 = 19;
 
-/// One STRUCT/UNION member: its name, its type, and its bit offset within the
-/// aggregate (already masked free of any bitfield-width bits).
+/// A STRUCT or UNION member, kept so that resolution can match it by name and add up its
+/// offset. The bit offset is already masked free of any bitfield-width bits.
 struct Member {
     name_off: u32,
     type_id: u32,
     bit_offset: u32,
 }
 
-/// The slice of each BTF type we care about. Everything we neither traverse into nor
-/// follow (INT, PTR, ENUM, …) collapses to `Other` — we still parsed past its
-/// trailing bytes to stay aligned, we just keep nothing.
+/// The part of a BTF type that offset resolution reads. A kind that resolution neither
+/// descends into nor follows (INT, PTR, ENUM, …) becomes `Other`, which keeps nothing.
 enum Ty {
-    /// STRUCT or UNION (offset math is identical for both).
+    /// A STRUCT or a UNION, which take the same offset math.
     Aggregate {
         name_off: u32,
         members: Vec<Member>,
     },
-    /// A transparent wrapper (TYPEDEF/CONST/VOLATILE/RESTRICT/TYPE_TAG) → follow to
-    /// `ref_id` to reach the real aggregate.
+    /// A transparent wrapper (TYPEDEF, CONST, VOLATILE, RESTRICT or TYPE_TAG), which
+    /// resolution follows through `ref_id` to reach the real type.
     Modifier {
         ref_id: u32,
     },
     Other,
 }
 
-/// The parsed kernel BTF: types indexed by id (id 0 is the void placeholder) plus the
-/// string section names are resolved from.
+/// The running kernel's type information, parsed so that [`KernelBtf::offsets`] can
+/// resolve the fields the hooks read.
 pub struct KernelBtf {
+    /// The types indexed by BTF id, where id 0 is the void placeholder.
     types: Vec<Ty>,
+    /// The string section that type and member names point into.
     strings: Vec<u8>,
 }
 
 impl KernelBtf {
-    /// Parse the running kernel's BTF.
+    /// Returns the running kernel's BTF.
+    ///
+    /// Errors when `/sys/kernel/btf/vmlinux` cannot be read or does not parse.
     pub fn from_running_kernel() -> Result<Self> {
         Self::from_path(Path::new(VMLINUX_BTF))
     }
@@ -86,13 +87,17 @@ impl KernelBtf {
         Self::parse(&bytes)
     }
 
-    /// Parse a raw BTF blob.
+    /// Returns the BTF that the raw blob `bytes` holds.
+    ///
+    /// Errors when the blob is truncated or is not BTF.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         parse_btf(bytes).ok_or_else(|| Error::msg("bpf-lsm: malformed kernel BTF"))
     }
 
-    /// Resolve every offset the hook needs into an [`Offsets`], failing **loudly** if
-    /// any field is absent — a kernel this different is not one we silently mis-read.
+    /// Returns the offset of every field the hooks read.
+    ///
+    /// Errors when any of those fields is missing, because a kernel that different must not
+    /// be silently mis-read.
     pub fn offsets(&self) -> Result<Offsets> {
         let m = |s: &str, p: &[&str]| {
             self.member_offset(s, p)
@@ -106,8 +111,8 @@ impl KernelBtf {
             dentry_d_inode: m("dentry", &["d_inode"])?,
             dentry_d_sb: m("dentry", &["d_sb"])?,
             dentry_d_parent: m("dentry", &["d_parent"])?,
-            // `d_name` is a `struct qstr`; `name` is a NUL-terminated string pointer, read
-            // with `bpf_probe_read_kernel_str` (so no separate `len` is needed).
+            // `d_name` is a `struct qstr`. Its `name` is a NUL-terminated string pointer,
+            // read with `bpf_probe_read_kernel_str`, so no separate `len` is needed.
             dentry_d_name_name: m("dentry", &["d_name", "name"])?,
             inode_i_ino: m("inode", &["i_ino"])?,
             inode_i_sb: m("inode", &["i_sb"])?,
@@ -118,10 +123,11 @@ impl KernelBtf {
         })
     }
 
-    /// Byte offset of a nested member, named hop by hop, transparently descending
-    /// anonymous struct/union members along the way. E.g. `("file", ["f_path",
-    /// "dentry"])` sums `file`'s offset to `f_path` (wherever the kernel keeps it,
-    /// even inside an anonymous union) and `path`'s offset to `dentry`.
+    /// Returns the byte offset of the member that `path` names hop by hop inside the
+    /// struct `struct_name`, or `None` when a hop is missing. A hop may sit inside an
+    /// anonymous struct or union. For example, `("file", ["f_path", "dentry"])` adds
+    /// `file`'s offset to `f_path`, wherever the kernel keeps it, to `path`'s offset to
+    /// `dentry`.
     fn member_offset(&self, struct_name: &str, path: &[&str]) -> Option<u32> {
         let mut agg = self.named_aggregate(struct_name)?;
         let mut total = 0u32;
@@ -135,9 +141,9 @@ impl KernelBtf {
         Some(total)
     }
 
-    /// Find `want` among an aggregate's members: a direct named member wins;
-    /// otherwise descend each anonymous (`name == ""`) aggregate member, adding its
-    /// own offset. Returns the member's byte offset and its type id.
+    /// Returns the byte offset and the type id of the member called `want` in the
+    /// aggregate `agg_id`, or `None` when there is none. The member may sit inside an
+    /// anonymous member, but a direct member of that name wins.
     fn find_member(&self, agg_id: usize, want: &str) -> Option<(u32, u32)> {
         let Ty::Aggregate { members, .. } = self.types.get(agg_id)? else {
             return None;
@@ -158,8 +164,8 @@ impl KernelBtf {
         None
     }
 
-    /// Follow modifier wrappers (typedef/const/volatile/…) from a type id; if it
-    /// lands on a STRUCT/UNION, return its index, else `None`.
+    /// Returns the id of the STRUCT or UNION that `type_id` names through any modifier
+    /// wrappers, or `None` when it names another kind.
     fn aggregate_of(&self, mut type_id: u32) -> Option<usize> {
         for _ in 0..16 {
             match self.types.get(type_id as usize)? {
@@ -171,15 +177,15 @@ impl KernelBtf {
         None // modifier cycle guard
     }
 
-    /// The id of the first named STRUCT/UNION matching `name`.
+    /// Returns the id of the first STRUCT or UNION called `name`.
     fn named_aggregate(&self, name: &str) -> Option<usize> {
         self.types.iter().position(
             |t| matches!(t, Ty::Aggregate { name_off, .. } if self.name(*name_off) == name),
         )
     }
 
-    /// Resolve a name-section offset to a `&str` (empty for offset 0 / out of range /
-    /// invalid UTF-8).
+    /// Returns the string at `off` in the string section. The string is empty for offset
+    /// 0, for an offset out of range, and for invalid UTF-8.
     fn name(&self, off: u32) -> &str {
         let start = off as usize;
         let tail = self.strings.get(start..).unwrap_or(&[]);
@@ -188,7 +194,7 @@ impl KernelBtf {
     }
 }
 
-/// A bounds-checked little/big-endian cursor over the blob.
+/// A bounds-checked cursor over the blob, in either byte order.
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -220,11 +226,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parse the header + type section into [`KernelBtf`]. Returns `None` on any
-/// truncation or unknown layout (surfaced as a loud error by the caller).
+/// Returns the types and strings of the BTF blob `bytes`, or `None` when the blob is
+/// truncated or its layout is unknown.
 fn parse_btf(bytes: &[u8]) -> Option<KernelBtf> {
-    // Detect byte order from the magic (the blob is the running kernel's, so it's
-    // native — but honoring the magic costs little and avoids a latent assumption).
+    // Detect byte order from the magic. The blob is the running kernel's, so it is
+    // native, but honoring the magic costs little and avoids a latent assumption.
     let le = match bytes.get(0..2)? {
         [0x9f, 0xeb] => true,
         [0xeb, 0x9f] => false,
@@ -266,8 +272,9 @@ fn parse_btf(bytes: &[u8]) -> Option<KernelBtf> {
     Some(KernelBtf { types, strings })
 }
 
-/// Parse one `btf_type` record (the 12-byte common header + kind-specific trailing),
-/// keeping only what we traverse and skipping the rest to stay aligned.
+/// Reads one `btf_type` record and returns the part that resolution needs, or `None`
+/// when the record is truncated. A record is a 12-byte common header and a kind-specific
+/// tail, and the reader is left at the next record whatever the kind.
 fn parse_type(r: &mut Reader) -> Option<Ty> {
     let name_off = r.u32()?;
     let info = r.u32()?;
@@ -283,9 +290,9 @@ fn parse_type(r: &mut Reader) -> Option<Ty> {
                 let m_name = r.u32()?;
                 let m_type = r.u32()?;
                 let raw = r.u32()?;
-                // With kind_flag, the low 24 bits are the bit offset and the high 8
-                // are the bitfield width; without it, the whole word is the bit
-                // offset. Our target fields are never bitfields, so masking suffices.
+                // With kind_flag, the low 24 bits are the bit offset and the high 8 are
+                // the bitfield width. Without it, the whole word is the bit offset. The
+                // target fields are never bitfields, so masking is enough.
                 let bit_offset = if kind_flag { raw & 0x00ff_ffff } else { raw };
                 members.push(Member {
                     name_off: m_name,
@@ -310,7 +317,7 @@ fn parse_type(r: &mut Reader) -> Option<Ty> {
         KIND_DECL_TAG => r.skip(4).map(|()| Ty::Other),
         KIND_ENUM64 => r.skip(vlen * 12).map(|()| Ty::Other),
         KIND_PTR => Some(Ty::Other), // no trailing
-        // FWD/FUNC/FLOAT and anything else: no trailing we depend on.
+        // FWD, FUNC, FLOAT and any other kind have no tail this parser depends on.
         _ => Some(Ty::Other),
     }
 }
@@ -319,8 +326,8 @@ fn parse_type(r: &mut Reader) -> Option<Ty> {
 mod tests {
     use super::*;
 
-    /// Builder for a tiny well-formed BTF blob, so the parser is exercised against
-    /// known offsets (including an anonymous-union descent) without a real kernel.
+    /// A tiny well-formed BTF blob under construction. It exercises the parser against
+    /// known offsets, including an anonymous-union descent, without a real kernel.
     #[derive(Default)]
     struct BtfBuilder {
         types: Vec<u8>,
@@ -346,7 +353,7 @@ mod tests {
             self.types.extend_from_slice(&info.to_le_bytes());
             self.types.extend_from_slice(&size_or_type.to_le_bytes());
         }
-        /// Append a STRUCT/UNION member record (name, type, bit offset).
+        /// Appends a STRUCT or UNION member record.
         fn member(&mut self, name_off: u32, type_id: u32, bit_offset: u32) {
             self.types.extend_from_slice(&name_off.to_le_bytes());
             self.types.extend_from_slice(&type_id.to_le_bytes());
@@ -369,9 +376,10 @@ mod tests {
         }
     }
 
+    /// Returns a blob for the layout below. It exercises a direct member, a hop from one
+    /// named member to another, and descent into an anonymous union to reach `f_path`.
+    ///
     /// `file { f_inode @0; <anon union> @16 { path f_path @0 { _ mnt@0; * dentry@8 } } }`
-    /// — exercises a direct member, a named->named hop, and descent into an
-    /// anonymous union to reach `f_path`.
     fn sample() -> Vec<u8> {
         let mut b = BtfBuilder::new();
         let n_int = b.str("int");

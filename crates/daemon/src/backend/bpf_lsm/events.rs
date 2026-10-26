@@ -1,6 +1,6 @@
-//! The data plane → journal: drain the ring buffer of logged decisions and write
-//! them out. The verdict already happened in-kernel; this is the audit/observability
-//! path.
+//! Turns the decisions that the eBPF program logs into journal lines, inside the backend
+//! thread's loop that also serves control requests. The verdict already happened
+//! in-kernel, so this is only the audit path.
 //!
 //! Tools re-open the same config hundreds of times per run. The in-kernel suppressor
 //! (keyed by [`SuppressKey`](cordon_bpf_common::SuppressKey)) thins the ring, and
@@ -29,17 +29,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// Poll wakeup cadence so the reader re-checks shutdown + the control channel (and
-/// ticks the blessing GC).
+/// The longest the reader sleeps in one poll, in milliseconds. Each wakeup re-checks
+/// shutdown and the control channel, and ticks the blessing GC.
 const POLL_TIMEOUT_MS: u16 = 500;
 
-/// The backend thread's per-run state beside the `Ebpf` handle: the journal's object
-/// names, the class registry, and the live blessings table. Mutated only on that thread.
+/// The backend thread's per-run state that sits beside the `Ebpf` handle. Only that
+/// thread touches it, and each successful apply refreshes it from the new compile.
 pub(super) struct Runtime {
-    /// `inode → path` for naming protected objects in the journal.
+    /// The path of each protected object by inode, which names objects in the journal.
     pub object_paths: HashMap<FileId, PathBuf>,
-    /// The live compile's classes: mints resolve against it, an apply remaps live
-    /// blessings with it, and the journal names a blessed caller's class from it.
+    /// The class registry of the live compile. Mints resolve against it, an apply remaps
+    /// live blessings with it, and the journal names a blessed caller's class from it.
     pub classes: ClassRegistry,
     pub blessings: Blessings,
 }
@@ -53,19 +53,20 @@ impl Runtime {
         }
     }
 
-    /// Refresh the compile-derived maps after a successful apply. The caller must
-    /// follow with `blessings.remap` — ids were just renumbered.
+    /// Replaces the object paths and the class registry with those of `compiled`. The
+    /// class ids have just been renumbered, so live blessings carry stale ids until
+    /// `blessings.remap` runs.
     fn refresh(&mut self, compiled: &CompiledPolicy) {
         self.object_paths = super::object_paths(compiled);
         self.classes = compiled.classes.clone();
     }
 }
 
-/// Drain the ring buffer into the journal and honor control requests (policy applies,
-/// bless ops) until shutdown. The ring poll's timeout doubles as the control tick:
-/// each wakeup (event or `POLL_TIMEOUT_MS`) we also service pending control messages
-/// and run the blessing GC, so applies land and dead carriers are reaped within one
-/// poll interval.
+/// Writes logged decisions to the journal and serves control requests until shutdown.
+/// Applies land, and dead blessing carriers are reaped, within one poll interval
+/// ([`POLL_TIMEOUT_MS`]).
+///
+/// Errors when the object has no events ring buffer or polling it fails.
 pub(super) fn serve(
     ebpf: &mut Ebpf,
     control: &PolicyControl,
@@ -79,15 +80,18 @@ pub(super) fn serve(
     .with_context(|| format!("bpf-lsm: {MAP_EVENTS}"))?;
     let mut maps = Maps(ebpf);
     let raw = ring.as_raw_fd();
-    // Names callers on the audit line; reloaded only when /etc/passwd changes (per drain).
+    // Names callers on the audit line. It reloads at most once per drain, and only when
+    // /etc/passwd has changed.
     let mut passwd = Passwd::new();
 
+    // The ring poll's timeout doubles as the control tick. Every wakeup, by an event or by
+    // the timeout, also serves pending control messages and runs the blessing GC.
     while !shutdown.is_triggered() {
         // SAFETY: `raw` is the ring buffer's fd, owned by `ring` for this scope.
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
-            Ok(0) => {} // timeout → re-check shutdown + apply channel
+            Ok(0) => {} // A timeout only re-checks shutdown and the control channel.
             Ok(_) => {
                 // Drain the whole ready batch, then coalesce it.
                 let mut batch: Vec<DecisionEvent> = Vec::new();
@@ -100,8 +104,8 @@ pub(super) fn serve(
                         ),
                     }
                 }
-                // Refresh once per drain (cheap unless /etc/passwd changed), then name each
-                // record's caller from the cache.
+                // Refresh once per drain, which is cheap unless /etc/passwd changed, and
+                // name each record's caller from the cache.
                 passwd.refresh();
                 for record in coalesce(&batch) {
                     record.log(&runtime.object_paths, &runtime.classes, &passwd);
@@ -126,8 +130,8 @@ pub(super) fn serve(
     Ok(())
 }
 
-/// Execute one bless op against the runtime's table + maps and send the outcome back.
-/// A dropped reply receiver (CLI gone) is fine — the op has already taken effect.
+/// Applies one bless op to the blessings table and the maps, and sends the outcome on the
+/// op's reply channel. The op takes effect even when the requester no longer waits for it.
 fn bless_op(maps: &mut Maps, runtime: &mut Runtime, op: BlessOp) {
     match op {
         BlessOp::Mint {
@@ -151,9 +155,10 @@ fn bless_op(maps: &mut Maps, runtime: &mut Runtime, op: BlessOp) {
     }
 }
 
-/// Handles one `policy apply`: recompiles the text and, if it has no errors, re-seeds the
-/// maps ([`Maps::seed`]) and republishes the effective view. Always replies with the
-/// diagnostics so the CLI can show them whether or not it applied.
+/// Recompiles the policy fragments `sources`. When they have no errors, it re-seeds the
+/// maps ([`Maps::seed`]), republishes the effective view, refreshes `runtime` and remaps
+/// live blessings. Always sends the diagnostics on `reply`, with whether the policy was
+/// applied.
 fn apply(
     maps: &mut Maps,
     control: &PolicyControl,
@@ -186,51 +191,54 @@ fn apply(
     });
 }
 
-/// One [`coalesce`] key's worth of a drain batch, folded into a single journal record.
-/// `events` is how many ring records were folded (each one open that passed the in-kernel
-/// suppressor); `suppressed` is the sum of their in-kernel folded counts.
+/// The decisions in one drain batch that share a [`coalesce`] key, folded into a single
+/// journal record.
 struct Coalesced {
     exe: FileId,
-    /// The matched protected object (the rule's `where`) — for the `object=` field.
+    /// The matched protected object (the rule's `where`), which the `object=` field names.
     object: FileId,
     action: Action,
-    /// The matched policy of the representative (first) occurrence, the same across the
-    /// group because the same `(exe, leaf, action)` hits the same rule. It decides the
-    /// `deny`/`audit` message word, and names the cause (DESIGN §15.6).
+    /// The matched rule's policy, taken from the first occurrence. It is the same across
+    /// the group, because the same `(exe, leaf, action)` hits the same rule. It decides
+    /// between the `deny` and `audit` message words, and it names the cause (DESIGN §15.6).
     policy: Policy,
     pid: Pid,
-    /// The caller's real uid (representative, like `pid`: uid is not part of the
-    /// [`coalesce`] key, so a group can only carry one).
+    /// The caller's real uid, taken from the first occurrence like `pid`. The uid is not
+    /// part of the [`coalesce`] key, so a group can carry only one.
     uid: Uid,
-    /// The caller's resolved blessing class ([`ClassId::UNBLESSED`] when none). Part of the
-    /// [`coalesce`] key, and rendered by [`BlessingName`].
+    /// The caller's resolved blessing class, or [`ClassId::UNBLESSED`] when it has none. It
+    /// is part of the [`coalesce`] key, and [`BlessingName`] renders it.
     blessing: ClassId,
-    /// The opened file's path components (leaf-first) + how many are valid + truncation,
-    /// for the `path=` field. Carried verbatim from the representative event.
+    /// The opened file's path components, leaf first, for the `path=` field. `depth` says
+    /// how many are valid and `trunc` whether the walk was cut short. All three come
+    /// verbatim from the first occurrence.
     comps: [PathComp; PATH_MAX_DEPTH],
     depth: u8,
     trunc: u8,
+    /// How many ring records were folded. Each one is an open that passed the in-kernel
+    /// suppressor.
     events: u32,
+    /// The sum of the folded records' in-kernel suppressed counts.
     suppressed: SuppressedTotal,
 }
 
 impl Coalesced {
-    /// Total opens this record stands for: the ring records folded plus the opens the
-    /// in-kernel suppressor held back.
+    /// Returns the total opens that this record stands for. They are the folded ring
+    /// records plus the opens that the in-kernel suppressor held back.
     fn count(&self) -> Opens {
         Opens(u64::from(self.events) + u64::from(self.suppressed))
     }
 
-    /// Journals it at the level its decision warrants. The fields are typed (`user` via
-    /// [`CallerUser`], `object`/`path` via [`AuditPath`], `blessing` via [`BlessingName`],
-    /// `action`/`exe` via their own `Display`); `tracing` renders them lazily, with no
-    /// eager `String`s. An unblessed line carries no `blessing` field.
+    /// Writes this record to the journal as a `deny` or an `audit` line. An unblessed
+    /// line carries no `blessing` field.
     fn log(
         &self,
         object_paths: &HashMap<FileId, PathBuf>,
         classes: &ClassRegistry,
         passwd: &Passwd,
     ) {
+        // Every field is a typed value with its own `Display`, so `tracing` renders it
+        // lazily, with no eager `String`s.
         let user = CallerUser::resolve(self.uid, passwd);
         let home = user.home();
         let exe = CallerExe::resolve(self.pid, self.exe);
@@ -259,14 +267,14 @@ impl Coalesced {
     }
 }
 
-/// Collapses a drain batch to one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
-/// summing the ring-record count and the in-kernel suppressed totals, so the true volume of
-/// a record is [`Coalesced::count`]. Keyed on the opened file (`leaf`), matching the
-/// in-kernel suppressor, so distinct files under one audited root each get their own
-/// journal line (DESIGN §15.10 flow B); split by blessing (bless is loud, DESIGN §16.3) so
-/// a blessed access never folds into, or hides behind, an unblessed one. Insertion order
-/// is preserved (first occurrence wins the representative decision/pid/path). Pure: the
-/// `/proc` resolution and logging happen later, per record.
+/// Folds a drain batch into one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
+/// in the order each key first occurs. The first occurrence supplies the record's
+/// decision, pid and path, and [`Coalesced::count`] gives the record's true volume.
+///
+/// The key is the opened file (`leaf`), as in the in-kernel suppressor, so distinct files
+/// under one audited root each get their own journal line (DESIGN §15.10 flow B). The
+/// blessing is part of the key because bless is loud (DESIGN §16.3), and a blessed access
+/// must never fold into, or hide behind, an unblessed one.
 fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
     let mut records: Vec<Coalesced> = Vec::new();
     let mut index: HashMap<(FileId, FileId, Action, ClassId), usize> = HashMap::new();
@@ -298,11 +306,10 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
     records
 }
 
-/// The caller's user in the journal: the login name resolved from the kernel-captured uid
-/// (via the [`Passwd`] cache), plus the home [`AuditPath`] collapses to `~`, which
-/// `Passwd` gives only for a regular account. Falls back to the bare uid when passwd has
-/// no entry (a deleted or NSS-only account). Borrows the cache, so naming a caller costs
-/// no allocation.
+/// The caller as the journal names it. That is the login name for the kernel-captured
+/// uid, or the bare uid when passwd has no entry (a deleted or NSS-only account). A
+/// regular account also carries the home that [`AuditPath`] collapses to `~`. It borrows
+/// the [`Passwd`] cache, so naming a caller costs no allocation.
 enum CallerUser<'a> {
     Named {
         name: &'a UserName,
@@ -322,7 +329,7 @@ impl<'a> CallerUser<'a> {
         }
     }
 
-    /// The home whose prefix collapses to `~` on this caller's audit paths, if any.
+    /// Returns the home that collapses to `~` on this caller's audit paths, if it has one.
     fn home(&self) -> Option<&Path> {
         match self {
             CallerUser::Named { home, .. } => *home,
@@ -340,17 +347,19 @@ impl fmt::Display for CallerUser<'_> {
     }
 }
 
-/// The caller's blessing class in the journal: the policy **name** when the live registry
-/// knows the id, else the raw id (an apply renumbered the registry between the kernel's
-/// verdict and this drain — rare, but a blessed access must never render as unblessed).
-/// `resolve` returns `None` for [`ClassId::UNBLESSED`], so unblessed lines carry no
-/// `blessing=` field at all. Borrows the registry, like [`CallerUser`].
+/// The caller's blessing class as the journal names it. That is the policy name when the
+/// live registry knows the id, or else the raw id. The raw id shows up when an apply
+/// renumbered the registry between the kernel's verdict and this drain. That is rare, but
+/// a blessed access must never render as unblessed. It borrows the registry, like
+/// [`CallerUser`].
 enum BlessingName<'a> {
     Named(&'a ClassName),
     Id(ClassId),
 }
 
 impl<'a> BlessingName<'a> {
+    /// Returns the name of `class`, or `None` for [`ClassId::UNBLESSED`], so an unblessed
+    /// line carries no `blessing=` field at all.
     fn resolve(class: ClassId, classes: &'a ClassRegistry) -> Option<BlessingName<'a>> {
         if class == ClassId::UNBLESSED {
             return None;
@@ -371,11 +380,11 @@ impl fmt::Display for BlessingName<'_> {
     }
 }
 
-/// The caller's executable in the journal: a resolved path when `/proc/<pid>/exe` still
-/// points at the inode the kernel recorded, else the raw inode (the pid exited or was
-/// recycled, so a path would misattribute). The kernel's `FileId` is the race-free
-/// anchor; modelling "path *or* inode" as a type keeps the distinction visible instead
-/// of collapsing both into a `String`.
+/// The caller's executable as the journal names it. That is its path when
+/// `/proc/<pid>/exe` still points at the inode the kernel recorded. Otherwise it is the
+/// raw inode, because the pid exited or was recycled and a path would misattribute. The
+/// kernel's `FileId` is the race-free anchor, and the two variants keep a path and an
+/// inode distinct instead of collapsing both into a `String`.
 enum CallerExe {
     Resolved(PathBuf),
     Inode(FileId),
@@ -402,9 +411,9 @@ impl fmt::Display for CallerExe {
     }
 }
 
-/// The protected object in the journal: its policy **path** when the daemon knows the
-/// inode (it seeded the object from that path), else the raw inode. Same "path *or* inode,
-/// kept distinct" modelling as [`CallerExe`]; the kernel only ever hands us the `FileId`.
+/// The protected object as the journal names it. That is its policy path when the daemon
+/// knows the inode, because it seeded the object from that path, or else the raw inode.
+/// The kernel only ever hands over the `FileId`.
 enum ObjectName {
     Path(PathBuf),
     Inode(FileId),
@@ -418,7 +427,7 @@ impl ObjectName {
         }
     }
 
-    /// Lower to the journal renderer, collapsing `home` (if a regular user's) to `~`.
+    /// Returns the journal rendering of this name, with `home` collapsed to `~`.
     fn into_audit(self, home: Option<&Path>) -> AuditPath<'_> {
         match self {
             ObjectName::Path(path) => AuditPath::Path { path, home },
@@ -427,11 +436,11 @@ impl ObjectName {
     }
 }
 
-/// The **actual opened file** in the journal (DESIGN §15.10 flow B): the protected
-/// object's known path with the kernel-reconstructed relative path joined on
-/// (`object=~/.aws` + `config` → `path=~/.aws/config`; see [`DecisionEvent::comps`]).
-/// Falls back to the relative path alone (then the inode) when the object's base path is
-/// unknown — same "best identity we have" stance as [`ObjectName`].
+/// The file that was actually opened, as the journal names it (DESIGN §15.10 flow B). It
+/// is the protected object's known path with the relative path that the kernel rebuilt
+/// joined on, so `object=~/.aws` and `config` give `path=~/.aws/config` (see
+/// [`DecisionEvent::comps`]). When the object's path is unknown, it is the relative path
+/// alone, and when that is missing too, it is the inode.
 enum OpenedPath {
     Path(PathBuf),
     Inode(FileId),
@@ -448,7 +457,7 @@ impl OpenedPath {
         }
     }
 
-    /// Lower to the journal renderer, collapsing `home` (if a regular user's) to `~`.
+    /// Returns the journal rendering of this path, with `home` collapsed to `~`.
     fn into_audit(self, home: Option<&Path>) -> AuditPath<'_> {
         match self {
             OpenedPath::Path(path) => AuditPath::Path { path, home },
@@ -457,16 +466,15 @@ impl OpenedPath {
     }
 }
 
-/// A resolved audit path as it prints in the journal, with a regular user's home
-/// collapsed to `~` (DESIGN §15.8; which uids count is `cordon_core::passwd`'s call) so
-/// `object=`/`path=` read exactly as that user's policy would author them: a `deny` line
-/// copies straight into the user's policy.
-/// Both [`ObjectName`] and [`OpenedPath`] lower to this, so the two fields collapse
-/// identically; the inode fallback (no known path) passes through. `home` is `None` for
-/// root/system callers and unresolvable uids, leaving their paths absolute.
+/// An audit path as the journal prints it, with a regular user's home collapsed to `~`
+/// (DESIGN §15.8). `object=` and `path=` then read exactly as that user's policy would
+/// write them, so a `deny` line copies straight into the policy. Both [`ObjectName`] and
+/// [`OpenedPath`] render through this, so the two fields collapse the same way.
 enum AuditPath<'a> {
     Path {
         path: PathBuf,
+        /// The caller's home, or `None` for root, system callers and unresolvable uids,
+        /// whose paths stay absolute. `cordon_core::passwd` decides which uids count.
         home: Option<&'a Path>,
     },
     Inode(FileId),
@@ -476,7 +484,7 @@ impl fmt::Display for AuditPath<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // `strip_prefix` is component-wise, so `/home/alice` never matches a peer like
-            // `/home/alicia` — only a true home prefix collapses.
+            // `/home/alicia`. Only a true home prefix collapses.
             AuditPath::Path { path, home } => match home.and_then(|h| path.strip_prefix(h).ok()) {
                 Some(rest) if rest.as_os_str().is_empty() => f.write_str("~"),
                 Some(rest) => write!(f, "~/{}", rest.display()),
@@ -487,10 +495,11 @@ impl fmt::Display for AuditPath<'_> {
     }
 }
 
-/// Rebuild the opened file's path *relative to the matched object* from the leaf-first
-/// components: `comps[depth-1]/…/comps[0]` (reversed). `None` when `depth == 0` (the object
-/// *is* the opened file). A truncated walk (`trunc`) prefixes `…/` so a partial path never
-/// reads as exact. Component bytes are raw kernel names → [`OsStr`] (not lossy UTF-8).
+/// Returns the opened file's path relative to the matched object, built from the
+/// leaf-first components `comps`. Returns `None` when `depth` is 0, because the object is
+/// then the opened file. A truncated walk (`trunc`) starts with `…/`, so a partial path
+/// never reads as exact. The components are raw kernel names, kept as [`OsStr`] rather
+/// than lossy UTF-8.
 fn relative_path(comps: &[PathComp; PATH_MAX_DEPTH], depth: u8, trunc: bool) -> Option<PathBuf> {
     let depth = (depth as usize).min(PATH_MAX_DEPTH);
     if depth == 0 {
@@ -506,13 +515,14 @@ fn relative_path(comps: &[PathComp; PATH_MAX_DEPTH], depth: u8, trunc: bool) -> 
     Some(rel)
 }
 
-/// Reinterpret a ring-buffer record as a [`DecisionEvent`]. `None` if too short.
+/// Returns the [`DecisionEvent`] that a ring-buffer record holds, or `None` when the
+/// record is too short.
 fn parse_event(bytes: &[u8]) -> Option<DecisionEvent> {
     if bytes.len() < std::mem::size_of::<DecisionEvent>() {
         return None;
     }
-    // SAFETY: length checked; `DecisionEvent` is `repr(C)` POD and the kernel reserved
-    // exactly `size_of::<DecisionEvent>()` bytes.
+    // SAFETY: the length is checked, `DecisionEvent` is `repr(C)` POD, and the kernel
+    // reserved exactly `size_of::<DecisionEvent>()` bytes.
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const DecisionEvent) })
 }
 
@@ -521,11 +531,12 @@ mod tests {
     use super::*;
     use cordon_bpf_common::{ClassId, Dev, Ino, Policy, Suppressed, SuppressedTotal};
 
-    /// A protected root shared by the test events (the `object`); `leaf` is what varies.
+    /// The protected root (the `object`) that the test events share. Their `leaf` is what
+    /// varies.
     const OBJECT: FileId = FileId::new(Dev(1), Ino(100));
 
-    /// A `DecisionEvent` for the given exe + **opened file (leaf)** inodes, action, and
-    /// in-kernel suppressed count, unblessed.
+    /// Returns an unblessed `DecisionEvent` with the given exe and opened-file (`leaf`)
+    /// inodes, action and in-kernel suppressed count.
     fn ev(exe: Ino, leaf: Ino, action: Action, suppressed: Suppressed) -> DecisionEvent {
         DecisionEvent::new(
             Pid(1),
@@ -540,14 +551,15 @@ mod tests {
         )
     }
 
-    /// [`ev`] with the caller resolved to a blessing class (the coalesce key's 4th part).
+    /// Returns [`ev`] with the caller resolved to the blessing `class`, which is the fourth
+    /// part of the coalesce key.
     fn ev_blessed(exe: Ino, leaf: Ino, action: Action, class: ClassId) -> DecisionEvent {
         let mut e = ev(exe, leaf, action, Suppressed(0));
         e.blessing = class;
         e
     }
 
-    /// A NUL-padded path component from a short name.
+    /// Returns a NUL-padded path component that holds the short name `s`.
     fn comp(s: &str) -> PathComp {
         let mut c = PathComp::EMPTY;
         c.0[..s.len()].copy_from_slice(s.as_bytes());
@@ -593,8 +605,9 @@ mod tests {
         assert_eq!(out[0].suppressed, SuppressedTotal(2));
     }
 
-    /// The discovery property (DESIGN §15.10 flow B): two files under the *same* protected
-    /// object must NOT coalesce — they have distinct leaves, so each surfaces its own path.
+    /// Checks the discovery property (DESIGN §15.10 flow B). Two files under the same
+    /// protected object must not coalesce, because their leaves differ and each one
+    /// surfaces its own path.
     #[test]
     fn distinct_leaves_under_one_object_stay_separate() {
         let batch = vec![
@@ -604,8 +617,8 @@ mod tests {
         assert_eq!(coalesce(&batch).len(), 2);
     }
 
-    /// A blessed access must never fold into (or hide behind) an unblessed one with the
-    /// same `(exe, leaf, action)` — the blessing is part of the coalesce identity.
+    /// Checks that a blessed access never folds into, or hides behind, an unblessed one
+    /// with the same `(exe, leaf, action)`. The blessing is part of the coalesce identity.
     #[test]
     fn distinct_blessings_stay_separate_identical_ones_fold() {
         let batch = vec![
@@ -633,11 +646,11 @@ mod tests {
         // A registered class renders its policy name.
         let named = BlessingName::resolve(ClassId(1), &names).expect("blessed → Some");
         assert_eq!(named.to_string(), "ro");
-        // An id the registry doesn't know (apply renumbered mid-flight) falls back to the
-        // raw id — a blessed access must never render as unblessed.
+        // An id the registry doesn't know, because an apply renumbered it mid-flight,
+        // falls back to the raw id. A blessed access must never render as unblessed.
         let raw = BlessingName::resolve(ClassId(7), &names).expect("blessed → Some");
         assert_eq!(raw.to_string(), "7");
-        // UNBLESSED resolves to nothing: the journal line carries no `blessing=` field.
+        // UNBLESSED resolves to nothing, so the journal line carries no `blessing=` field.
         assert!(BlessingName::resolve(ClassId::UNBLESSED, &names).is_none());
     }
 
@@ -650,7 +663,7 @@ mod tests {
             relative_path(&comps, 2, false).unwrap(),
             PathBuf::from(".aws/config")
         );
-        // depth 0 ⇒ the object *is* the opened file ⇒ no relative path.
+        // At depth 0 the object is the opened file, so there is no relative path.
         assert!(relative_path(&comps, 0, false).is_none());
         // truncation prefixes `…/` so a partial path never reads as exact.
         assert_eq!(
@@ -684,14 +697,14 @@ mod tests {
             }
             .to_string()
         };
-        // A child of the home → `~/rest`; the home itself → `~`.
+        // A child of the home renders as `~/rest`, and the home itself as `~`.
         assert_eq!(render("/home/alice/.aws/config"), "~/.aws/config");
         assert_eq!(render("/home/alice"), "~");
-        // Outside the home → absolute, untouched.
+        // A path outside the home stays absolute.
         assert_eq!(render("/etc/passwd"), "/etc/passwd");
         // A peer that only shares a textual prefix must NOT collapse (component-wise strip).
         assert_eq!(render("/home/alicia/.aws"), "/home/alicia/.aws");
-        // No home (root/system/unresolved caller) → absolute, untouched.
+        // With no home (a root, system or unresolved caller), the path stays absolute.
         assert_eq!(
             AuditPath::Path {
                 path: PathBuf::from("/home/alice/.aws"),
@@ -709,8 +722,8 @@ mod tests {
 
     #[test]
     fn caller_user_renders_name_or_bare_uid() {
-        // A regular user: name shown, home kept for `~` collapse. (`CallerUser` borrows the
-        // cache, so the owned name/home outlive it here.)
+        // A regular user shows the name and keeps the home for the `~` collapse.
+        // `CallerUser` borrows the cache, so the owned name and home outlive it here.
         let (alice, alice_home) = (UserName::new("alice"), PathBuf::from("/home/alice"));
         let u = CallerUser::Named {
             name: &alice,
@@ -718,7 +731,8 @@ mod tests {
         };
         assert_eq!(u.to_string(), "alice");
         assert_eq!(u.home(), Some(Path::new("/home/alice")));
-        // Resolved but not regular (root/system): name shown, no home → paths stay absolute.
+        // A resolved user that is not regular (root or a system account) shows the name
+        // and has no home, so its paths stay absolute.
         let root = UserName::new("root");
         let u = CallerUser::Named {
             name: &root,
@@ -726,7 +740,7 @@ mod tests {
         };
         assert_eq!(u.to_string(), "root");
         assert_eq!(u.home(), None);
-        // No passwd entry → the bare uid, no home.
+        // With no passwd entry, the bare uid shows and there is no home.
         let u = CallerUser::Uid(Uid(4242));
         assert_eq!(u.to_string(), "4242");
         assert_eq!(u.home(), None);

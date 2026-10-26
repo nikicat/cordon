@@ -1,10 +1,11 @@
-//! Stage 1 — parse TOML text into a structurally-valid, span-carrying policy.
+//! Stage 1, which turns TOML text into a structurally valid policy that keeps its source
+//! spans.
 //!
-//! serde + `#[serde(deny_unknown_fields)]` does the structural validation for free
-//! (typo'd keys and bad enum values fail here, with `toml`'s own line/column in the
-//! error). Each rule and group is wrapped in [`toml::Spanned`] so later stages can
-//! point a diagnostic at the offending source line. Semantic validation — `@ref`
-//! resolution, cycles, paths — is [`super::resolve`]'s job.
+//! Serde with `#[serde(deny_unknown_fields)]` does the structural validation, so a
+//! misspelled key or a bad enum value fails here with `toml`'s own line and column. Each
+//! rule and group is wrapped in [`toml::Spanned`], so that later stages can point a
+//! diagnostic at its source line. Semantic validation, such as `@ref` resolution, cycles
+//! and paths, belongs to [`super::resolve`].
 
 use super::{ClassName, GroupName, LineIndex, PolicyName, Pos, UserName};
 use crate::{Context, Result};
@@ -12,42 +13,41 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use toml::Spanned;
 
-/// A parsed-but-unresolved policy: every rule normalized to a [`ParsedRule`] (its
-/// fields lexed to [`Token`]s, its source [`Pos`] already resolved), plus a line index
-/// the resolver still needs for *group* positions. Consumed by [`super::resolve`].
+/// A policy that is parsed but not yet resolved, which [`super::resolve`] consumes. It
+/// keeps a line index because the resolver still needs it for group positions.
 ///
-/// Both authoring surfaces land here: the verbose `[[rule]]` tables and the compact
-/// `rules = '''…'''` DSL block ([`super::ruleline`]) are normalized to the same
-/// `ParsedRule`, so everything downstream of parse is syntax-agnostic.
+/// Both authoring forms end up here. The verbose `[[rule]]` tables and the compact
+/// `rules = '''…'''` DSL block ([`super::ruleline`]) normalize to the same `ParsedRule`,
+/// so nothing after parse depends on the syntax.
 #[derive(Debug)]
 pub struct ParsedPolicy {
     pub(crate) groups: Groups,
     pub(crate) rules: Vec<ParsedRule>,
     pub(crate) lines: LineIndex,
-    /// The optional `user = "name"` header. Lets a root-owned, per-user policy file use
-    /// `~` instead of spelling out `/home/<name>` (DESIGN §15.8); [`super::home_for`]
-    /// resolves it to the home `~` expands against.
+    /// The optional `user = "name"` header. It lets a root-owned, per-user policy file
+    /// write `~` instead of `/home/<name>` (DESIGN §15.8), and [`super::home_for`] turns
+    /// it into the home that `~` expands to.
     pub(crate) user: Option<UserName>,
-    /// `[[include]]` directives: user-tier files this (system) fragment pulls in
-    /// (DESIGN §15.8). Resolved by [`super::load_policy`] at read time, not here.
+    /// The user-tier files that this system fragment pulls in with `[[include]]`
+    /// (DESIGN §15.8). [`super::load_policy`] reads them, not the parser.
     pub(crate) includes: Vec<Include>,
 }
 
 impl ParsedPolicy {
-    /// The `user =` header, if the policy declared one.
+    /// Returns the `user =` header, if the policy declared one.
     pub fn user(&self) -> Option<&UserName> {
         self.user.as_ref()
     }
 
-    /// The `[[include]]` directives this fragment declares (empty for most fragments).
+    /// Returns the `[[include]]` directives of this fragment. Most fragments have none.
     pub fn includes(&self) -> &[Include] {
         &self.includes
     }
 }
 
-/// One `[[include]]` directive — a system fragment pulling in a user-tier policy file
-/// (DESIGN §15.8): the owning `user` and the `path` to read, loaded as
-/// [`super::SourceOrigin::User`].
+/// One `[[include]]` directive, by which a system fragment pulls in a user-tier policy
+/// file (DESIGN §15.8). [`super::load_policy`] reads the file as a
+/// [`super::SourceOrigin::User`] fragment.
 #[derive(Debug)]
 pub struct Include {
     user: UserName,
@@ -63,40 +63,40 @@ impl Include {
     }
 }
 
-/// One rule, normalized from either authoring surface: each axis lexed to its
-/// [`Token`] list, the effect as a [`PolicyName`], and the source [`Pos`] of the rule
-/// (the `[[rule]]` header, or the first field of a DSL line) for diagnostics.
+/// One rule, normalized from either authoring form so that resolve handles both alike.
 #[derive(Debug)]
 pub(crate) struct ParsedRule {
     pub(crate) who: Vec<Token>,
     pub(crate) where_: Vec<Token>,
     pub(crate) action: Vec<Token>,
     pub(crate) policy: PolicyName,
+    /// The rule's source position for diagnostics, which is its `[[rule]]` header or the
+    /// first field of its DSL line.
     pub(crate) pos: Pos,
 }
 
-/// The top-level TOML shape. `[[rule]]` tables collect into `blocks`; the optional
-/// `rules = '''…'''` literal block into `rules` (the DSL, [`super::ruleline`]);
-/// `[group.{subject,object,action}.NAME]` into `group`.
+/// The top-level TOML shape of a policy, as serde reads it before normalization.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
-    /// `user = "name"` ([`ParsedPolicy::user`]). Like `rules`, a top-level key, so it
-    /// must precede any `[group.*]` header.
+    /// The `user` header ([`ParsedPolicy::user`]). Like `rules`, it is a top-level key,
+    /// so it must come before any `[group.*]` header.
     #[serde(default)]
     user: Option<UserName>,
     #[serde(default)]
     group: Groups,
     #[serde(default, rename = "rule")]
     blocks: Vec<Spanned<RuleDef>>,
-    /// The compact rule DSL. A TOML *literal* (`'''…'''`) string so paths keep their
-    /// backslashes and our own `"…"` quoting is free of TOML escape processing, and so
-    /// its content is a verbatim slice of the source: byte offsets in it map straight to
-    /// file positions. One rule per line, `POLICY SUBJECT ACTION OBJECT`. Must precede
-    /// any `[group.*]` header (a bare top-level key binds to the last table otherwise).
+    /// The compact rule DSL, with one `POLICY SUBJECT ACTION OBJECT` rule per line. It is
+    /// a TOML literal (`'''…'''`) string, so paths keep their backslashes and the DSL's
+    /// own `"…"` quoting is not subject to TOML's escape processing. Its content is also a
+    /// verbatim slice of the source, so byte offsets in it map straight to file
+    /// positions. It must come before any `[group.*]` header, because a bare top-level
+    /// key otherwise binds to the last table.
     #[serde(default)]
     rules: Option<Spanned<String>>,
-    /// `[[include]]` tables — user-tier files this system fragment pulls in (DESIGN §15.8).
+    /// The `[[include]]` tables, which name the user-tier files that this system
+    /// fragment pulls in (DESIGN §15.8).
     #[serde(default, rename = "include")]
     includes: Vec<Spanned<IncludeDef>>,
 }
@@ -109,7 +109,8 @@ struct IncludeDef {
     path: String,
 }
 
-/// The three group namespaces (DESIGN §15.7), each `name → members`.
+/// The three group namespaces (DESIGN §15.7), each mapping a group name to its
+/// definition.
 #[derive(Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Groups {
@@ -121,28 +122,27 @@ pub(crate) struct Groups {
     pub(crate) action: BTreeMap<GroupName, Spanned<GroupDef>>,
 }
 
-/// A named group. The usual form is `members` (a list of leaf tokens / nested `@ref`s). A
-/// **subject** group may instead carry a single `blessing = "<class>"` predicate (DESIGN
-/// §16.3) — declaring a blessing class referenced as `@<group>`; [`super::resolve`] rejects
-/// `blessing` on an object/action group and rejects mixing it with `members`. The other
-/// conjunctive subject predicates (`exe = … argv0 = …`, DESIGN §15.4) are not implemented,
-/// so `deny_unknown_fields` rejects them.
+/// A named group, usually a list of `members`. A subject group may instead carry a single
+/// `blessing = "<class>"` predicate (DESIGN §16.3), which declares a blessing class that
+/// rules reference as `@<group>`. [`super::resolve`] rejects `blessing` on an object or
+/// action group, and rejects it next to `members`. The other conjunctive subject
+/// predicates (`exe = … argv0 = …`, DESIGN §15.4) are not implemented, so
+/// `deny_unknown_fields` rejects them.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupDef {
-    /// Member tokens (`@ref`/`*`/leaf), each lexed to a [`Token`] at deserialize time —
-    /// they follow the same grammar as a rule field, so groups nest recursively.
+    /// The member tokens (`@ref`, `*` or a leaf). They follow the same grammar as a rule
+    /// field, so groups nest.
     #[serde(default)]
     pub(crate) members: Vec<Token>,
-    /// A blessing class this (subject) group matches (DESIGN §16.3); mutually exclusive with
-    /// `members`. `None` for an ordinary member-list group. Deserializes transparently from
-    /// the TOML string into the [`ClassName`] newtype.
+    /// The blessing class that this subject group matches (DESIGN §16.3), or `None` for
+    /// an ordinary group of members. It cannot appear together with `members`.
     #[serde(default)]
     pub(crate) blessing: Option<ClassName>,
 }
 
-/// One `[[rule]]`: who/where/action are each a single token or a list (groups,
-/// wildcards, or leaves); `policy` is one of the four effects (serde-validated).
+/// One `[[rule]]` table. Each of `who`, `where` and `action` is a single token or a list
+/// of them, and serde rejects any `policy` but the four effects.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuleDef {
@@ -153,10 +153,9 @@ pub(crate) struct RuleDef {
     pub(crate) policy: PolicyName,
 }
 
-/// A rule field that may be written as a bare value or a list — each lexed to a [`Token`]
-/// at deserialize time (via [`Token`]'s `Deserialize`). (Not `Spanned`: `toml::Spanned`
-/// does not survive `#[serde(untagged)]`, which buffers the input — so token-level
-/// positions aren't available; rule/group spans are.)
+/// A rule field, written as a bare value or as a list. It is not `Spanned`, because
+/// `toml::Spanned` does not survive `#[serde(untagged)]`, which buffers the input. So a
+/// position exists for each rule and group, but not for each token.
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub(crate) enum OneOrMany {
@@ -165,7 +164,7 @@ pub(crate) enum OneOrMany {
 }
 
 impl OneOrMany {
-    /// The tokens, as a slice (a single value is a one-element slice).
+    /// Returns the tokens as a slice, with a bare value as a one-element slice.
     pub(crate) fn tokens(&self) -> &[Token] {
         match self {
             OneOrMany::One(t) => std::slice::from_ref(t),
@@ -173,48 +172,50 @@ impl OneOrMany {
         }
     }
 
-    /// The tokens as an owned list, for [`ParsedRule`].
+    /// Returns the tokens as an owned list.
     pub(crate) fn classified(&self) -> Vec<Token> {
         self.tokens().to_vec()
     }
 }
 
-/// The text of a leaf token: an exe path, an object path or an action name. Which one it
-/// is gets decided per axis in [`super::resolve`], which turns it into a `PathBuf` or an
+/// The text of a leaf token, which is an exe path, an object path or an action name.
+/// [`super::resolve`] decides which one on each axis, and turns it into a `PathBuf` or an
 /// [`ActionName`]. It is an alias rather than a newtype because every string is a valid
 /// leaf at this lexical layer.
 pub(crate) type RawLeaf = String;
 
-/// A single token, classified by its **lexical** form only (axis-independent). The
-/// *meaning* of a [`Token::Leaf`] is axis-specific — an exe path, an object path, or an
-/// action name — and is interpreted by [`super::resolve`], which holds the `home` dir
-/// (for `~`) and the action vocabulary. Splitting it this way keeps the one
-/// `@ref`/`*`/leaf classifier in a single place while leaving semantics where the
-/// context lives.
+/// A single token, classified by its lexical form alone, the same way on every axis. The
+/// meaning of a [`Token::Leaf`] depends on the axis, where it is an exe path, an object
+/// path or an action name. [`super::resolve`] interprets it, because resolve holds the
+/// home directory for `~` and the action vocabulary. The split keeps the one classifier
+/// of `@ref`, `*` and leaf in a single place, and leaves the meaning where its context
+/// lives.
 ///
-/// A token whose first character is `@` is always a group ref (so an exe/object whose
-/// leading component is literally `@name` can't be named — an acceptable limit, same
-/// as treating `*` as the wildcard).
+/// A token whose first character is `@` is always a group reference. So an exe or object
+/// whose leading component is literally `@name` cannot be named. That limit is
+/// acceptable, just as treating `*` as the wildcard is.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {
-    /// `*` — wildcard (axis-specific: any subject / all actions; rejected for `where`).
+    /// The `*` wildcard. It means any subject or all actions, and the `where` axis
+    /// rejects it.
     Wildcard,
-    /// `@name` — a reference to a same-axis group.
+    /// A `@name` reference to a group on the same axis.
     Group(GroupName),
-    /// A literal leaf: an exe/object path or an action name (see [`RawLeaf`]).
+    /// A literal leaf, which is an exe path, an object path or an action name (see
+    /// [`RawLeaf`]).
     Leaf(RawLeaf),
-    /// A blessing class (DESIGN §16.3), **synthesized** by [`super::resolve`] when a `@ref`
-    /// resolves to a `blessing = "<class>"` group — never produced by lexing (a blessing is
-    /// not a surface token, so [`classify`](Token::classify) never returns it). The subject
-    /// axis turns it into a blessing predicate; the object/action axes reject it.
+    /// A blessing class (DESIGN §16.3). [`super::resolve`] creates it when a `@ref`
+    /// resolves to a `blessing = "<class>"` group. [`classify`](Token::classify) never
+    /// returns it, because a blessing is not a surface token. The subject axis turns it
+    /// into a blessing predicate, and the object and action axes reject it.
     Blessing(ClassName),
 }
 
 impl<'de> serde::Deserialize<'de> for Token {
-    /// Lex a TOML string into a [`Token`] at deserialize time (the `@ref`/`*`/leaf split is
-    /// purely lexical, so it is axis-independent and can run here) — so the raw policy
-    /// surfaces (`members`, a rule field) hold `Token`s, not bare strings.
+    /// Lexes a TOML string into a [`Token`]. The split into `@ref`, `*` and leaf is
+    /// purely lexical and the same on every axis, so it can run during deserialization.
+    /// The raw policy forms (`members`, a rule field) then hold tokens, not bare strings.
     fn deserialize<D>(de: D) -> std::result::Result<Token, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -235,16 +236,16 @@ impl Token {
     }
 }
 
-/// Parse policy text. Fails on a structural TOML problem (syntax, unknown key, bad
-/// enum value — `toml`'s own error, with location), or on a malformed DSL rule line
-/// (arity, unknown policy keyword, unterminated quote — a `line:col`-prefixed error
-/// pointing into the `rules` block). Both rule surfaces normalize to [`ParsedRule`].
+/// Parses policy text into a [`ParsedPolicy`]. Errors when the TOML is structurally
+/// wrong (bad syntax, an unknown key, a bad enum value), with `toml`'s own location. Also
+/// errors when a DSL rule line is malformed (a wrong field count, an unknown policy
+/// keyword, an unterminated quote), with a `line:col` prefix inside the `rules` block.
 pub fn parse(text: &str) -> Result<ParsedPolicy> {
     let raw: RawPolicy = toml::from_str(text).context("policy parse error")?;
     let lines = LineIndex::new(text);
 
     let mut rules = Vec::with_capacity(raw.blocks.len());
-    // `[[rule]]` tables → normalized rules (pos = the table header).
+    // A `[[rule]]` table's position is its header.
     for spanned in &raw.blocks {
         let rd = spanned.get_ref();
         rules.push(ParsedRule {
@@ -255,8 +256,8 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
             pos: lines.pos(spanned.span().start),
         });
     }
-    // `rules = '''…'''` DSL block → normalized rules. Its content starts at
-    // `content_start`, so byte offsets inside it map back to file positions via `lines`.
+    // The DSL block's content starts at `content_start`, so byte offsets inside it map
+    // back to file positions through `lines`.
     if let Some(block) = &raw.rules {
         let content = block.get_ref();
         let content_start = block_content_start(text, block.span().start);
@@ -288,17 +289,17 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
     })
 }
 
-/// The absolute byte offset where a multiline literal/basic string's *content* begins:
-/// past the opening `'''`/`"""` delimiter and the single newline TOML trims right after
-/// it (CRLF counts as one). For the literal (`'''`) form the content is then a verbatim
-/// slice of the source from here, so DSL offsets translate to exact source positions.
+/// Returns the absolute byte offset at which a multiline string's content begins. That is
+/// past the opening `'''` or `"""` delimiter and the one newline that TOML trims right
+/// after it, where CRLF counts as one newline. In the literal (`'''`) form, the content
+/// from there is a verbatim slice of the source, so DSL offsets map to exact positions.
 fn block_content_start(text: &str, span_start: usize) -> usize {
     let after = &text[span_start..];
     let Some(rest) = after
         .strip_prefix("'''")
         .or_else(|| after.strip_prefix("\"\"\""))
     else {
-        // A single-line string value: content begins just past one quote char.
+        // A single-line string's content begins just past its one quote character.
         return span_start + after.chars().next().map_or(0, |c| c.len_utf8());
     };
     let trimmed = if rest.starts_with("\r\n") {

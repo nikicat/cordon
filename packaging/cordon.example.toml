@@ -1,45 +1,46 @@
 # cordon daemon configuration (operational settings).
 #
-# All keys are optional; an absent file or key falls back to a built-in default.
-# Precedence: CLI flag  >  this file  >  default. String values may interpolate
+# All keys are optional, and an absent file or key falls back to a built-in default. A CLI
+# flag overrides this file, which overrides the default. String values may interpolate
 # ${ENV} from the environment.
 #
-# The *enforcement* policy — the rules — is NOT here: it lives in the root-owned text
-# policy file (see `policy` below and cordon.example.policy.toml), applied with
-# `cordon policy apply`.
+# The enforcement policy, meaning the rules, is not in this file. It lives in the
+# root-owned text policy file (see `policy` below and cordon.example.policy.toml) and is
+# applied with `cordon policy apply`.
 #
-# Default location: /etc/cordon/config.toml (root) or
-# $XDG_CONFIG_HOME/cordon/config.toml (user). Override with --config / $CORDON_CONFIG.
+# The default location is /etc/cordon/config.toml for root and
+# $XDG_CONFIG_HOME/cordon/config.toml for a user. --config or $CORDON_CONFIG overrides it.
 
-# Enforcement backend — only "bpf-lsm": the verdict is returned in-kernel from BPF maps.
-# Kernel and privilege requirements are in the README (Requirements); the eBPF object is
-# built via `just build-ebpf` (see bpf_object below).
+# The enforcement backend. The only one is "bpf-lsm", which returns the verdict in-kernel
+# from BPF maps. The kernel and privilege requirements are in the README (Requirements).
+# `just build-ebpf` builds the eBPF object (see bpf_object below).
 backend = "bpf-lsm"
 
-# IPC socket. Default: /run/cordon.sock (root); $XDG_RUNTIME_DIR/cordon.sock (user).
+# The IPC socket. The default is /run/cordon.sock for root and
+# $XDG_RUNTIME_DIR/cordon.sock for a user.
 # socket = "${XDG_RUNTIME_DIR}/cordon.sock"
 
-# Reserved for autolearn: the roots where learning may propose rules. Accepted but
-# unused by enforcement.
+# The roots where autolearn may propose rules. The key is reserved for autolearn, and
+# enforcement accepts but ignores it.
 # zones = ["${HOME}", "${HOME}/.config"]
 
 # --- bpf-lsm backend ---------------------------------------------------------
-# The compiled eBPF object the daemon loads at runtime. Default:
-# /usr/lib/cordon/cordon.bpf.o (where packaging installs it). In a dev tree, point
-# it at the `just build-ebpf` output:
+# The compiled eBPF object the daemon loads at runtime. The default is
+# /usr/lib/cordon/cordon.bpf.o, where packaging installs it. In a dev tree, point it at
+# the output of `just build-ebpf`:
 # bpf_object = "${PWD}/target/bpf/cordon.bpf.o"
 #
-# bpffs directory the LSM links are pinned under, so the boundary outlives the daemon
-# (DESIGN §4). Default: /sys/fs/bpf/cordon.
+# The bpffs directory the LSM links are pinned under, so that the boundary outlives the
+# daemon (DESIGN §4). The default is /sys/fs/bpf/cordon.
 #
-# Consequence worth knowing before you meet it: `systemctl stop cordond` does NOT stop
-# enforcement. Turning it off is `cordond --teardown`.
+# As a consequence, `systemctl stop cordond` does not stop enforcement.
+# `cordond --teardown` turns it off.
 bpf_pin_dir = "/sys/fs/bpf/cordon"
 #
-# The root-owned text policy (the flat rule model — see cordon.example.policy.toml)
-# the bpf-lsm backend compiles at startup and seeds the maps from. May be a single
-# file or a conf.d *directory* of *.toml fragments, loaded in name order (each may carry
-# a `user = "name"` header so `~` resolves under the root daemon). Default:
+# The root-owned text policy that the bpf-lsm backend compiles at startup and seeds the
+# maps from (see cordon.example.policy.toml). It may be a single file or a conf.d
+# directory of *.toml fragments, loaded in name order. Each fragment may carry a
+# `user = "name"` header so that `~` resolves under the root daemon. The default is
 # /etc/cordon/policy.toml. Typical layouts:
 # policy = "/etc/cordon/conf.d"                          # a directory of fragments
 # policy = "${PWD}/packaging/cordon.example.policy.toml" # a single file, in a dev tree

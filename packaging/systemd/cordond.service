@@ -1,13 +1,14 @@
-# cordon gater — system unit (the hardened bpf-lsm boundary).
+# The system unit that runs the cordon gater, which is the hardened bpf-lsm boundary.
 #
 # Install:  cp to /etc/systemd/system/ && systemctl daemon-reload && systemctl
 #           enable --now cordond
 #
-# Kernel and privilege requirements are in the README (Requirements). Needs the eBPF
-# object installed (default /usr/lib/cordon/cordon.bpf.o). The daemon compiles the text
-# policy at startup (/etc/cordon/policy.toml, or a /etc/cordon/conf.d/ directory of
-# *.toml fragments) and seeds the in-kernel maps; `cordon policy apply` re-seeds at runtime. Operational
-# settings come from /etc/cordon/config.toml (see packaging/cordon.example.toml).
+# The kernel and privilege requirements are in the README (Requirements). The unit needs
+# the eBPF object installed (default /usr/lib/cordon/cordon.bpf.o). The daemon compiles the
+# text policy at startup and seeds the in-kernel maps from it. The policy is
+# /etc/cordon/policy.toml or a /etc/cordon/conf.d/ directory of *.toml fragments, and
+# `cordon policy apply` re-seeds the maps at runtime. Operational settings come from
+# /etc/cordon/config.toml (see packaging/cordon.example.toml).
 
 [Unit]
 Description=cordon gater (bpf-lsm in-kernel boundary)
@@ -15,9 +16,9 @@ Description=cordon gater (bpf-lsm in-kernel boundary)
 DefaultDependencies=no
 After=local-fs.target
 Before=basic.target
-# The LSM links are pinned to bpffs so enforcement outlives this process; with
-# DefaultDependencies=no nothing would otherwise order us after the mount. systemd's
-# own sys-fs-bpf.mount provides it.
+# The LSM links are pinned to bpffs so that enforcement outlives this process. With
+# DefaultDependencies=no, nothing else orders this unit after the mount, which systemd's
+# own sys-fs-bpf.mount provides.
 RequiresMountsFor=/sys/fs/bpf
 
 [Service]
@@ -25,14 +26,14 @@ Type=simple
 ExecStart=/usr/bin/cordond
 Restart=on-failure
 RestartSec=1
-# NOTE: `systemctl stop cordond` does NOT stop enforcement (the pinned links hold it).
-# There is deliberately no ExecStopPost teardown here: turning enforcement off is an
-# explicit act, `cordond --teardown`, which refuses while the daemon is running.
+# `systemctl stop cordond` does not stop enforcement, because the pinned links hold it.
+# There is deliberately no ExecStopPost teardown. Turning enforcement off is the explicit
+# act of running `cordond --teardown`, which refuses while the daemon is running.
 AmbientCapabilities=CAP_BPF CAP_MAC_ADMIN
 # A bless carrier cgroup (`cordon-bless-<id>.<class>`) goes under the requester's session
-# scope or user slice, and under the daemon's own cgroup when neither is usable;
-# Delegate=yes hands that subtree to the daemon so systemd doesn't fight its mkdir/rmdir
-# there.
+# scope or user slice. When neither is usable, it goes under the daemon's own cgroup.
+# Delegate=yes hands that subtree to the daemon, so systemd does not fight its mkdir and
+# rmdir there.
 Delegate=yes
 
 [Install]

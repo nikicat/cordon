@@ -1,8 +1,8 @@
-//! `cordon` — the control CLI for the flat rule model (DESIGN §15).
+//! `cordon`, the command-line client for the flat rule model (DESIGN §15).
 //!
-//! Policy is authored in a root-owned text file. `policy check` lints a file locally
-//! (no daemon); `policy apply` sends its text to the daemon, which compiles + seeds
-//! the in-kernel maps; `policy show` and `status` read the effective policy.
+//! The policy lives in a root-owned text file, and this binary is how a person checks it,
+//! sends it to the daemon and reads back what is enforced. The daemon compiles the policy
+//! and seeds the in-kernel maps. Only `policy check` compiles locally, without a daemon.
 
 mod bless;
 mod edit;
@@ -21,10 +21,11 @@ use std::process::ExitCode;
     version
 )]
 struct Cli {
-    /// Config file path (to locate the socket; overrides $CORDON_CONFIG / default).
+    /// Path to the config file, which names the socket and the policy. Overrides
+    /// $CORDON_CONFIG and the default location.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Daemon socket path (overrides the config file).
+    /// Path to the daemon socket. Overrides the config file.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     /// Print the raw JSON response instead of a rendered view.
@@ -36,18 +37,19 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Daemon + effective-policy summary.
+    /// Show the daemon's state and a summary of the effective policy.
     Status,
-    /// Author/inspect the text policy (the flat rule model).
+    /// Author and inspect the text policy (the flat rule model).
     Policy {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
-    /// Run a command under a fresh blessing; also `bless list` / `bless revoke <id>`.
-    /// Runs as you — no `sudo` prefix; the human-presence check is a helper it spawns.
+    /// Run a command under a fresh blessing, or `bless list` and `bless revoke <id>`.
+    /// It runs as you, so it needs no `sudo` prefix. The human-presence check is a helper
+    /// that it spawns.
     Bless(bless::BlessArgs),
-    /// Internal: approve a pending blessing. Spawned by `cordon bless` (see
-    /// `bless::elevate`), never invoked by hand; hidden from `--help`.
+    /// Approve a pending blessing. Only `cordon bless` runs this, through its elevation
+    /// (see `bless::elevate`).
     #[command(hide = true)]
     BlessHelper {
         #[arg(long)]
@@ -57,36 +59,37 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCmd {
-    /// Parse + compile a policy file and print diagnostics (nonzero exit on error).
-    /// Local — does not contact the daemon, so it lints in CI. Inode resolution uses
-    /// `stat`, so unknown-exe / missing-path findings reflect *this* host.
+    /// Compile a policy file and print its diagnostics. Exits nonzero if the policy has
+    /// errors. It never contacts the daemon, so it works in CI. Paths resolve through
+    /// `stat` on this host, so unknown-executable and missing-path findings describe this
+    /// machine.
     Check {
         /// Policy file (default: the configured `policy` path).
         file: Option<PathBuf>,
     },
-    /// Compile + apply a policy via the daemon, atomically replacing the live one.
-    /// Nonzero exit if it has errors (the live policy is left unchanged).
+    /// Compile a policy in the daemon and atomically replace the live one with it. If the
+    /// policy has errors, the live policy stays unchanged and the exit status is nonzero.
     Apply {
         /// Policy file (default: the configured `policy` path).
         file: Option<PathBuf>,
     },
-    /// Edit a policy in `$EDITOR`, then validate + apply + save in one step — the
-    /// sudoedit analog. The editor runs as the invoking user (never root); the result is
-    /// compiled and pushed to the daemon, and the root-owned file is written only once the
-    /// daemon accepts it, or saved unapplied when no daemon is running. Run via `sudo` for
-    /// a root-owned policy.
+    /// Edit a policy in `$EDITOR`, then validate, apply and save it in one step, like
+    /// sudoedit. The editor runs as the invoking user, not as root. The result is compiled
+    /// and sent to the daemon, and the root-owned file is written only once the daemon
+    /// accepts it. When no daemon is running, a valid policy is saved without being
+    /// applied. Run it via `sudo` to edit a root-owned policy.
     ///
-    /// With nothing named, edits your own user tier; `--system` edits the system policy.
+    /// With nothing named, it edits your own user tier. `--system` edits the system policy.
     Edit {
         #[command(flatten)]
         target: edit::EditTargetArgs,
-        /// Launch the editor as root when there is no unprivileged invoker (e.g. a root
-        /// login without sudo). Off by default — running an editor as root re-opens the
-        /// same-uid escalation this command exists to avoid.
+        /// Launch the editor as root when there is no unprivileged invoker, such as on a
+        /// root login without sudo. Off by default, because an editor running as root
+        /// reopens the same-uid escalation that this command exists to prevent.
         #[arg(long)]
         allow_root_editor: bool,
     },
-    /// Show the effective (currently-loaded) compiled policy.
+    /// Print the compiled policy that the daemon has loaded.
     Show,
 }
 
@@ -94,7 +97,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let client = Client::new(&cli);
 
-    // `policy check` is local — it never touches the daemon socket.
+    // `policy check` must work without a daemon, so it never touches the socket.
     if let Cmd::Policy {
         cmd: PolicyCmd::Check { file },
     } = &cli.cmd
@@ -102,9 +105,9 @@ fn main() -> ExitCode {
         return policy_check(file.as_deref(), &client);
     }
 
-    // `policy edit` drives its own flow (editor → validate → apply → save), reaching the
-    // daemon only via the shared `PolicyApply` path, so it routes here rather than through
-    // the single-request round-trip below.
+    // `policy edit` runs its own loop of editing, validating, applying and saving. It
+    // reaches the daemon only through `PolicyApply`, so it skips the single round trip
+    // below.
     if let Cmd::Policy {
         cmd: PolicyCmd::Edit {
             target,
@@ -116,13 +119,13 @@ fn main() -> ExitCode {
         return edit::run(target.clone(), root_editor, &client);
     }
 
-    // `bless` drives its own flow (see `bless::run`); its `list`/`revoke` subcommands
-    // come back through `run_request` like any other.
+    // `bless` runs its own flow (see `bless::run`). Its `list` and `revoke` subcommands
+    // still end in `run_request`, like any other command.
     if let Cmd::Bless(args) = &cli.cmd {
         return bless::run(args, &client);
     }
 
-    // The approval half of the bless handshake (see `bless::elevate`).
+    // `bless-helper` is the approval half of the bless handshake (see `bless::elevate`).
     if let Cmd::BlessHelper { nonce } = &cli.cmd {
         return client.run_request(&Request::BlessApprove {
             nonce: nonce.clone(),
@@ -139,8 +142,9 @@ fn main() -> ExitCode {
     client.run_request(&req)
 }
 
-/// The command line and the config it names, which every command reads through. The
-/// config is loaded on first use, so a command that never needs it never fails on it.
+/// The parsed command line together with the config it names. Every command reads its
+/// settings through this type. The config loads on first use, so a command that never
+/// needs a config never fails on one.
 struct Client<'a> {
     cli: &'a Cli,
     config: std::cell::OnceCell<Config>,
@@ -165,6 +169,7 @@ impl<'a> Client<'a> {
     /// Returns the socket to dial. An explicit `--socket` wins. Otherwise it is the
     /// config's socket, chosen as
     /// [`SocketPath::for_client`](cordon_core::config::SocketPath::for_client) describes.
+    /// Errors when there is no `--socket` and the config does not load.
     fn socket(&self) -> Result<PathBuf> {
         match &self.cli.socket {
             Some(s) => Ok(s.clone()),
@@ -172,7 +177,8 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// The policy file to act on: an explicit arg, else the configured `policy` path.
+    /// Returns `file` when it is given, and the configured `policy` path otherwise. Errors
+    /// when `file` is `None` and the config does not load.
     fn policy_path(&self, file: Option<&Path>) -> Result<PathBuf> {
         match file {
             Some(p) => Ok(p.to_path_buf()),
@@ -180,8 +186,9 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// Send one request to the daemon and render the reply (honoring `--json`) — the
-    /// shared tail of every daemon-bound command.
+    /// Sends `req` to the daemon, prints the reply and returns the exit code for it. With
+    /// `--json` the reply prints as raw JSON. When the daemon can't be reached, it prints
+    /// the error with a note on enforcement and returns failure.
     fn run_request(&self, req: &Request) -> ExitCode {
         let socket = match self.socket() {
             Ok(s) => s,
@@ -211,17 +218,17 @@ impl<'a> Client<'a> {
         exit_for(&resp)
     }
 
-    /// Returns what the bpffs pins say about enforcement, for when the daemon can't be
-    /// reached.
+    /// Returns a one-line note, read from the bpffs pins, on whether enforcement is still
+    /// up while the daemon can't be reached.
     ///
     /// The pinned LSM links keep the boundary up without the daemon (see
     /// `PinDir::pin_links` in cordond), so "connection refused" must not read as "nothing
-    /// is enforced". There are three answers, because a wrong one misleads either way:
-    /// claiming the boundary is up when it isn't invites a false sense of safety, and
-    /// claiming it is down when it is up sends someone debugging a denial that is working
-    /// as designed. Pins present means active; an absent or empty pin directory means off;
-    /// an unreadable one (bpffs is root-only, so any unprivileged caller) or an unreadable
-    /// config means unknown rather than a guess.
+    /// is enforced". A wrong answer misleads either way. Claiming the boundary is up when
+    /// it is down invites a false sense of safety, and claiming it is down when it is up
+    /// sends someone to debug a denial that works as designed. So there are three answers.
+    /// Any pin in the directory means active, and an absent or empty directory means off.
+    /// An unreadable directory or config means unknown rather than a guess. The pins are
+    /// root-only on bpffs, so an unprivileged caller always gets unknown.
     fn enforcement_note(&self) -> String {
         let Ok(cfg) = self.config() else {
             return "enforcement state unknown (no readable config)".into();
@@ -249,8 +256,9 @@ impl<'a> Client<'a> {
     }
 }
 
-/// Build the IPC request for a daemon-bound command (reading the policy file for
-/// `apply`). `check` is handled locally before this is reached.
+/// Returns the request for a daemon-bound command, reading the policy file for `policy
+/// apply`. Errors when that file or the config does not load. Panics on a command that
+/// `main` handles locally.
 fn build_request(client: &Client) -> Result<Request> {
     match &client.cli.cmd {
         Cmd::Status => Ok(Request::Status),
@@ -258,8 +266,8 @@ fn build_request(client: &Client) -> Result<Request> {
             PolicyCmd::Show => Ok(Request::PolicyShow),
             PolicyCmd::Apply { file } => {
                 let path = client.policy_path(file.as_deref())?;
-                // Ship every source `load_policy` gathers; the daemon compiles them (see
-                // `compile_fragments`).
+                // The daemon compiles the sources itself (see `compile_fragments`), so
+                // every source that `load_policy` gathers is sent.
                 let sources = policy::load_policy(&path)?;
                 Ok(Request::PolicyApply { sources })
             }
@@ -271,8 +279,9 @@ fn build_request(client: &Client) -> Result<Request> {
     }
 }
 
-/// `cordon policy check` — compile a policy file locally and report diagnostics.
-/// Local + daemon-free so it lints in CI; exits non-zero if the policy has errors.
+/// Compiles a policy file locally, prints its diagnostics and a summary, and returns the
+/// exit code. The code is failure when the file or the config does not load, or when the
+/// policy has errors.
 fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
     let path = match client.policy_path(file) {
         Ok(p) => p,
@@ -370,11 +379,11 @@ fn render(resp: &Response) {
             }
         }
         Response::BlessRevoked { id } => println!("revoked: {id}"),
-        // `bless-helper` succeeding is silent on purpose — it is spawned mid-command, not
-        // run by a human, and its whole output is its exit status.
+        // A successful `bless-helper` prints nothing on purpose. `cordon bless` spawns it
+        // mid-command, and its exit status is its whole output.
         Response::BlessApproved => {}
-        // Mid-handshake replies belong to `cordon bless`'s own connection; reaching here
-        // means a client got the protocol wrong.
+        // Mid-handshake replies belong to the connection that `cordon bless` holds.
+        // Reaching this arm means a client got the protocol wrong.
         Response::BlessPending { .. } | Response::BlessMinted(_) => {
             eprintln!("cordon: unexpected mid-handshake reply outside `cordon bless`")
         }
@@ -394,7 +403,7 @@ fn exit_for(resp: &Response) -> ExitCode {
     }
 }
 
-/// `$HOME` for `~`-expansion in the policy being checked (falls back to `/`).
+/// Returns `$HOME`, or `/` when it is unset, for expanding `~` in a policy.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)

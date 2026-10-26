@@ -1,7 +1,7 @@
-//! `/etc/passwd`, the one place cordon reads accounts from. The journal names a caller by
-//! uid through the cached [`Passwd`], and the policy expands a user's `~` through
-//! [`home_of`]. Both go through the same parser, so a `~` the journal renders is the `~`
-//! that user's policy expands to.
+//! Reads user accounts from `/etc/passwd`, which is the one place cordon reads them. The
+//! journal names a caller by uid through the cached [`Passwd`], and the policy expands a
+//! user's `~` through [`home_of`]. Both go through the same parser, so the `~` that the
+//! journal renders is the same `~` that the user's policy expands to.
 
 use crate::Context;
 use crate::policy::UserName;
@@ -12,29 +12,30 @@ use std::time::SystemTime;
 
 const PASSWD: &str = "/etc/passwd";
 
-/// The conventional uid range for human login accounts — the `useradd`/`login.defs`
-/// `UID_MIN`/`UID_MAX` defaults. System accounts sit below it (`root` = 0, daemons < 1000)
-/// and `nobody`/overflow above it (65534). Only a uid in this range has its home collapsed
-/// to `~` on the audit line: a regular user's home access maps to a user-tier policy
-/// (`~`-relative), while root/system access stays absolute for the system policy.
+/// The conventional uid range of human login accounts, which matches the `UID_MIN` and
+/// `UID_MAX` defaults of `useradd` and `login.defs`. System accounts sit below it (`root`
+/// is 0, and daemons are under 1000), and `nobody` sits above it at 65534. Only a uid in
+/// this range has its home collapsed to `~` on the audit line, because a regular user's
+/// home maps to a `~`-relative user policy, while root and system access stays absolute
+/// for the system policy.
 const REGULAR_UID_RANGE: std::ops::RangeInclusive<Uid> = Uid(1000)..=Uid(60000);
 
-/// Whether `uid` names a regular (human) login account — see [`REGULAR_UID_RANGE`].
+/// Checks whether `uid` names a regular (human) login account, as
+/// `REGULAR_UID_RANGE` defines it.
 pub fn is_regular_uid(uid: Uid) -> bool {
     REGULAR_UID_RANGE.contains(&uid)
 }
 
-/// A resolved caller for the audit line: the login name, plus the home to collapse to `~`
-/// (only for a uid in `REGULAR_UID_RANGE`). Borrows the
-/// [`Passwd`] cache, so naming a caller costs no allocation.
+/// A caller resolved for the audit line. It borrows from the [`Passwd`] cache, so naming a
+/// caller costs no allocation.
 pub struct Identity<'a> {
     pub name: &'a UserName,
+    /// The home to collapse to `~`, present only for a uid in `REGULAR_UID_RANGE`.
     pub home: Option<&'a Path>,
 }
 
-/// A cached view of `/etc/passwd`, keyed by uid. Construct once ([`Passwd::new`]) and keep
-/// it for the daemon's life; [`refresh`](Passwd::refresh) before a batch of lookups reloads
-/// it only when the file changed.
+/// A cache of `/etc/passwd` keyed by uid, kept for the daemon's life so that naming a
+/// caller does not reread the file. [`refresh`](Passwd::refresh) keeps it current.
 #[derive(Default)]
 pub struct Passwd {
     by_uid: HashMap<Uid, Entry>,
@@ -42,15 +43,14 @@ pub struct Passwd {
 }
 
 impl Passwd {
-    /// An empty cache; the first [`refresh`](Passwd::refresh) populates it.
+    /// Creates an empty cache. The first [`refresh`](Passwd::refresh) fills it.
     pub fn new() -> Passwd {
         Passwd::default()
     }
 
-    /// Reload from `/etc/passwd` iff its mtime changed since the last load — cheap (one
-    /// `stat`) when unchanged, a full parse only on first call or after an edit. A failed
-    /// read leaves the previous map (and mtime) in place, so a transient error self-heals
-    /// on the next call rather than blanking the cache.
+    /// Reloads the cache from `/etc/passwd` when the cache is empty or the file's mtime
+    /// changed since the last load. A failed read keeps the previous entries, so that a
+    /// transient error heals on the next call instead of emptying the cache.
     pub fn refresh(&mut self) {
         let mtime = std::fs::metadata(PASSWD).and_then(|m| m.modified()).ok();
         if mtime == self.mtime && !self.by_uid.is_empty() {
@@ -62,9 +62,9 @@ impl Passwd {
         }
     }
 
-    /// Resolve a uid to its [`Identity`] (name + regular-user home), or `None` when the uid
-    /// has no passwd entry (a deleted or NSS-only account) — the caller then shows the bare
-    /// number. Pure (no I/O): looks up the map [`refresh`](Passwd::refresh) last loaded.
+    /// Returns the [`Identity`] of `uid` from the entries that
+    /// [`refresh`](Passwd::refresh) last loaded, without any I/O. Returns `None` when `uid`
+    /// has no passwd entry, as for a deleted or NSS-only account.
     pub fn lookup(&self, uid: Uid) -> Option<Identity<'_>> {
         let entry = self.by_uid.get(&uid)?;
         Some(Identity {
@@ -115,7 +115,7 @@ mod tests {
     const SAMPLE: &str = "root:x:0:0:root:/root:/bin/bash\n\
                           alice:x:1000:1000:Alice,,,:/home/alice:/usr/bin/fish\n";
 
-    /// A cache populated from a literal passwd (no real file).
+    /// Returns a cache filled from the passwd text `passwd`, without reading a file.
     fn db(passwd: &str) -> Passwd {
         Passwd {
             by_uid: entries(passwd).map(|e| (e.uid, e)).collect(),

@@ -1,18 +1,18 @@
-# cordon policy — the flat rule model (DESIGN §15). Root-owned, NOT user-writable
-# (else a scraper writes itself in). Authored as text, applied explicitly with
-# `cordon policy apply`; compiled in userspace and enforced in-kernel by the bpf-lsm
-# backend. Default location: /etc/cordon/policy.toml (override via the daemon's
-# `policy = …` config key).
+# A cordon policy in the flat rule model (DESIGN §15). The file is root-owned and must not
+# be writable by users, or a scraper could write itself in. You write it as text and apply
+# it explicitly with `cordon policy apply`. It is compiled in userspace and enforced
+# in-kernel by the bpf-lsm backend. The default location is /etc/cordon/policy.toml, and
+# the daemon's `policy = …` config key overrides it.
 #
 # This file uses the verbose `[[rule]]` form. The same model can be written far more
-# compactly in the line-oriented DSL — see cordon.example.dsl.policy.toml — and a
-# `user = "name"` header lets `~` resolve for a root daemon. The two surfaces compile
+# compactly in the line-oriented DSL (see cordon.example.dsl.policy.toml). A
+# `user = "name"` header lets `~` resolve for a root daemon. The two forms compile
 # identically and may be mixed.
 #
 # A rule is `(who, where, action, policy)`:
 #   who    — subject: an exe path, `*` (any), or `@subject-group`.
 #   where  — object: a file or a directory (matched recursively as a subtree). `*` is
-#            NOT allowed — the whole filesystem can't be default-denied.
+#            not allowed, because the whole filesystem cannot be default-denied.
 #   action — read | write | create | execute | listdir | unlink | mkdir | rmdir |
 #            rename | link; a single value, a list, `*` (all), or `@action-group`.
 #   policy — allow (allow, silent) | audit (allow, log) | deny (deny, log) |
@@ -27,68 +27,68 @@
 #   5. a protected object with no matching rule is default-denied;
 #   6. anything not under any rule is unmediated (allowed).
 #
-# There is no global mode (no enforce/permissive/off). Use `audit` to observe an object
-# (allow + log — the safe-rollout preview), then switch that rule to `deny` to enforce
-# it. "Off" is an empty policy, or `cordond --teardown` (stopping the daemon does not
-# stop enforcement).
+# There is no global mode such as enforce, permissive or off. To roll out safely, observe
+# an object with `audit`, which allows and logs, and later switch that rule to `deny` to
+# enforce it. "Off" is an empty policy or `cordond --teardown`, because stopping the
+# daemon does not stop enforcement.
 
 # --- groups: named, nestable, symmetric across all three axes ----------------
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
-# A blessing class (DESIGN §16): a subject group with a `blessing = "<name>"` predicate
+# A blessing class (DESIGN §16) is a subject group with a `blessing = "<name>"` predicate
 # instead of `members`. `cordon bless --class ro -- <cmd>` runs <cmd> in a cgroup tagged
-# `ro`; the rule below lets such a blessed process read the cloud creds (and only those —
-# the object column is the scope).
+# `ro`. The rule below lets such a blessed process read the cloud creds, and only those,
+# because the object column is the scope.
 [group.subject.blessed-ro]
 blessing = "ro"
 
 [group.object.cloud-creds]
 members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
 
-# `listdir` has no hook of its own yet: a directory open requests `read`, so it is `read`
-# that grants listing here. Do not write `listdir` alone — nothing requests it, so the open
-# falls to default-deny and the rule denies what it looks like it grants (DESIGN §15.5).
+# `listdir` has no hook of its own yet. A directory open requests `read`, so it is `read`
+# that grants listing here. Do not write `listdir` alone. Nothing requests it, so the open
+# falls to default-deny, and the rule denies what it looks like it grants (DESIGN §15.5).
 [group.action.ro]
 members = ["read", "listdir"]
 
 # --- rules -------------------------------------------------------------------
 
-# ssh tooling may read ~/.ssh; every other opener there is default-denied.
+# The ssh tools may read ~/.ssh. Every other opener there is default-denied.
 [[rule]]
 who = "@ssh-tools"
 where = "~/.ssh"
 action = "@ro"
 policy = "allow"
 
-# a `cordon bless --class ro` process may read the cloud creds (a runtime grant the human
-# approves through `$CORDON_SUDO`, default sudo; see DESIGN §16). The blessed allow outranks
-# the `*` audit catch-all below (precedence 3), so a blessed reader goes silent while
-# unknown ones stay logged.
+# A process run with `cordon bless --class ro` may read the cloud creds. This is a runtime
+# grant that the human approves through `$CORDON_SUDO`, which defaults to sudo (DESIGN §16).
+# The blessed allow outranks the `*` audit catch-all below (precedence 3), so a blessed
+# reader goes silent while unknown readers stay logged.
 [[rule]]
 who = "@blessed-ro"
 where = "@cloud-creds"
 action = "@ro"
 policy = "allow"
 
-# the aws cli reads + writes its own creds.
+# The aws CLI reads and writes its own creds.
 [[rule]]
 who = "/usr/bin/aws"
 where = "~/.aws"
 action = ["read", "write"]
 policy = "allow"
 
-# log (but allow) every *other* reader of the cloud-credential dirs — preview who
-# touches them before tightening to a deny.
+# Log, but allow, every other reader of the cloud-credential dirs. This previews who
+# touches them before you tighten the rule to a deny.
 [[rule]]
 who = "*"
 where = "@cloud-creds"
 action = "read"
 policy = "audit"
 
-# copy-down exception: aws may read ~/.aws (above), but never this one stashed token,
-# and silently (deny + no log line). Precedence 1 makes it win over the subtree allow,
-# but only for this file and only for aws.
+# A copy-down exception. aws may read ~/.aws (above), but never this one stashed token,
+# and the denial is silent (no log line). Precedence 1 makes this rule win over the
+# subtree allow, but only for this file and only for aws.
 [[rule]]
 who = "/usr/bin/aws"
 where = "~/.aws/.danger-token"

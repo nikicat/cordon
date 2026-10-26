@@ -1,14 +1,14 @@
-//! Linux BPF-LSM enforcement backend (DESIGN §4, §15).
+//! The Linux BPF-LSM enforcement backend (DESIGN §4, §15).
 //!
 //! The eBPF program (`crates/bpf`) returns every verdict in-kernel from the rule table in
-//! BPF maps; this Rust code never sees an individual open. This module is the control
-//! plane: it compiles the text policy (`cordon_core::policy`), loads, attaches and
-//! self-tests the program, and hands the rest to its submodules: [`seed`] writes the maps,
-//! [`pin`] keeps the boundary up without a daemon, [`events`] drains logged decisions into
-//! the journal, and [`bless`] owns the live blessings.
+//! BPF maps, so this Rust code never sees an individual open. This module is the control
+//! plane. It compiles the text policy (`cordon_core::policy`) and loads, attaches and
+//! self-tests the program. Its submodules own the rest: [`seed`] writes the maps, [`pin`]
+//! keeps the boundary up without a daemon, [`events`] drains logged decisions into the
+//! journal, and [`bless`] owns the live blessings.
 //!
-//! `BpfLsmBackend::run` is the lifecycle: load → attach → self-test → seed → pin → drain.
-//! The kernel and privilege requirements are listed in the README.
+//! A run (`BpfLsmBackend::run`) loads, attaches, self-tests, seeds, pins and drains, in
+//! that order. The kernel and privilege requirements are listed in the README.
 
 mod bless;
 mod events;
@@ -38,14 +38,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// The LSM hooks we attach to. Each name does double duty: aya keys programs by their
-/// **function symbol**, and the same string is the **kernel hook name** resolved from BTF
-/// as `bpf_lsm_<hook>` — the eBPF side keeps them equal by naming each `#[lsm(hook = …)]`
-/// fn after its hook.
+/// The LSM hooks the program attaches to. Each name does double duty. aya keys programs
+/// by their function symbol, and the same string is the kernel hook name that BTF resolves
+/// as `bpf_lsm_<hook>`. The eBPF side keeps the two equal by naming each
+/// `#[lsm(hook = …)]` fn after its hook.
 ///
-/// `file_open` decides reads/writes/creates; the four mutation hooks make a *directory*
-/// object sound, since a directory protects its children only by ancestry and a second
-/// name (hardlink or rename) is an ancestry that avoids it (DESIGN §15.5).
+/// `file_open` decides reads, writes and creates. The mutation hooks make a directory
+/// object sound, because a directory protects its children only by ancestry, and a second
+/// name (a hardlink or a rename) is an ancestry that avoids it (DESIGN §15.5).
 const HOOKS: &[&str] = &[
     "file_open",
     "inode_link",
@@ -56,16 +56,18 @@ const HOOKS: &[&str] = &[
     "bprm_check_security",
 ];
 
-/// Test-only env var: forces deliberately wrong field offsets so the self-test's
-/// failure path can be exercised end-to-end.
+/// The test-only environment variable that forces deliberately wrong field offsets, so
+/// that the self-test's failure path can be exercised end to end.
 const POISON_OFFSETS_ENV: &str = "CORDON_SELFTEST_POISON_OFFSETS";
 
 pub struct BpfLsmBackend {
-    /// The compiled eBPF object (`just build-ebpf` output / packaged install).
+    /// The path of the compiled eBPF object, which `just build-ebpf` or the package puts
+    /// there.
     object: PathBuf,
-    /// bpffs directory the LSM links are pinned under, one subdirectory per run ([`pin`]).
+    /// The bpffs directory that the LSM links are pinned under, with one subdirectory per
+    /// run ([`pin`]).
     pin_dir: PinDir,
-    /// The root-owned text policy compiled + seeded at startup.
+    /// The root-owned text policy that is compiled and seeded at startup.
     policy: PathBuf,
 }
 
@@ -81,13 +83,13 @@ impl BpfLsmBackend {
 
 impl Backend for BpfLsmBackend {
     fn run(self: Box<Self>, control: PolicyControl, shutdown: Arc<Shutdown>) -> Result<()> {
-        // Compile the policy *before* loading anything — a bad startup policy fails
-        // fast, without touching the kernel.
+        // Compile the policy before loading anything, so a bad startup policy fails fast
+        // without touching the kernel.
         let compiled = self.compile_policy()?;
 
-        // Kernel BTF resolves the hook's BTF id for attach (and sanitizes the program's
-        // own BTF). The object carries no struct layout, so resolve the running kernel's
-        // field offsets and inject them (see `Offsets`).
+        // Kernel BTF resolves each hook's BTF id for attach, and it sanitizes the
+        // program's own BTF. The object carries no struct layout, so resolve the running
+        // kernel's field offsets and inject them (see `Offsets`).
         let btf = Btf::from_sys_fs().context("bpf-lsm: kernel BTF")?;
         let mut offsets = KernelBtf::from_running_kernel()?.offsets()?;
         maybe_poison_offsets(&mut offsets);
@@ -104,12 +106,12 @@ impl Backend for BpfLsmBackend {
                 ))
             })?;
 
-        // Attach (the maps are still empty, so this allows everything until the seed),
-        // then prove the hooks enforce before trusting them (see `self_test`).
+        // Attach while the maps are still empty, so the hooks allow everything until the
+        // seed. Then prove that the hooks enforce before trusting them (see `self_test`).
         //
-        // Keep the `LsmLinkId`s: they are the handle `PinDir::pin_links` takes. A link
-        // left inside its `Program` detaches when `ebpf` drops, ending enforcement with
-        // the daemon.
+        // Keep the `LsmLinkId`s, because they are the handle `PinDir::pin_links` takes. A
+        // link left inside its `Program` detaches when `ebpf` drops, and enforcement would
+        // end with the daemon.
         let mut links = Vec::with_capacity(HOOKS.len());
         for &hook in HOOKS {
             let program: &mut Lsm = ebpf
@@ -135,11 +137,11 @@ impl Backend for BpfLsmBackend {
         Maps(&mut ebpf).seed(&compiled)?;
         *control.current.lock().unwrap() = Some(build_view(&compiled));
 
-        // Pinned last, and `_pinned` held for the run: see `PinDir::pin_links` for both.
+        // Pinned last, with `_pinned` held for the run. `PinDir::pin_links` says why.
         let _pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
 
-        // A fixed phrase that marks readiness, so it can be grepped for; context goes in
-        // fields, which tracing renders after the message.
+        // The message is a fixed phrase that marks readiness, so it can be grepped for.
+        // Context goes in fields, which tracing renders after the message.
         info!(
             event = "ready",
             objects = compiled.objects.len(),
@@ -149,24 +151,26 @@ impl Backend for BpfLsmBackend {
             "bpf-lsm active on the file_open hook (self-test passed)",
         );
 
-        // The per-run state beside the Ebpf handle (journal naming maps, class
-        // registry, blessings table), then adopt the carrier cgroups a previous daemon
-        // run left behind (see `Blessings::reconcile`).
+        // Build the per-run state that sits beside the `Ebpf` handle, and adopt the
+        // carrier cgroups that a previous daemon run left behind (see
+        // `Blessings::reconcile`).
         let mut runtime = events::Runtime::new(&compiled);
         runtime
             .blessings
             .reconcile(&mut Maps(&mut ebpf), &runtime.classes);
 
-        // Drain the ring buffer + honor control requests (applies, bless ops) until
-        // shutdown; the apply path refreshes the runtime's maps on each re-seed.
+        // Drain the ring buffer and serve control requests until shutdown. The apply path
+        // refreshes the runtime's maps on each re-seed.
         events::serve(&mut ebpf, &control, &shutdown, runtime)
     }
 }
 
 impl BpfLsmBackend {
-    /// Startup: read + compile the policy source (a file, or a conf.d directory of
-    /// fragments). Returns an error (refusing to seed) if it has any error-severity
-    /// finding — a bad startup policy must not silently run.
+    /// Returns the startup policy, compiled from its file or its conf.d directory of
+    /// fragments.
+    ///
+    /// Errors when the policy cannot be read or has any error-severity finding, because a
+    /// bad startup policy must not silently run.
     fn compile_policy(&self) -> Result<CompiledPolicy> {
         let sources = policy::load_policy(&self.policy)?;
         let compiled = compile_sources(&sources);
@@ -180,10 +184,10 @@ impl BpfLsmBackend {
     }
 }
 
-/// Compiles a set of policy fragments with [`policy::compile_fragments`], falling back to
-/// [`policy_home`] for `~`, and logs every diagnostic. Always returns a `CompiledPolicy`,
-/// so `policy apply` reports a bad fragment instead of the daemon crashing; the caller
-/// decides whether to seed via [`CompiledPolicy::has_errors`].
+/// Compiles the policy fragments `sources` and logs every diagnostic. A `~` in a fragment
+/// with no `user =` header expands against [`policy_home`]. The result comes back even
+/// when it has errors, and the caller decides by [`CompiledPolicy::has_errors`] whether to
+/// seed it.
 pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
     let compiled = policy::compile_fragments(sources, &policy_home(), proc::file_id);
     for d in &compiled.diagnostics {
@@ -195,7 +199,7 @@ pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
     compiled
 }
 
-/// A human-facing view of a compiled policy for `cordon policy show`.
+/// Returns the human-facing summary of `c` that `cordon policy show` prints.
 pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
     PolicyView {
         objects: c
@@ -210,41 +214,41 @@ pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
     }
 }
 
-/// Returns the protected objects' `inode → path` map, which names objects in the journal:
-/// a `DecisionEvent` carries only the object's [`FileId`], the reverse of the path→inode
-/// resolution done at seed time. Rebuilt on every apply, since the set of protected
-/// objects changes.
+/// Returns the path of each protected object by its inode, which names objects in the
+/// journal. A `DecisionEvent` carries only the object's [`FileId`], so this map reverses
+/// the path-to-inode resolution done at seed time.
 pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
     c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
 }
 
-/// Returns the home `~` expands against in a fragment with no `user =` header: the
-/// daemon's `$HOME`, else `/root`. A user-session dev daemon thus resolves its own home.
+/// Returns the home that `~` expands against in a fragment with no `user =` header. It is
+/// the daemon's `$HOME`, or `/root` when that is unset, so a user-session dev daemon
+/// resolves its own home.
 fn policy_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
-/// Test hook for the self-test's *failure* path: throw away the BTF-resolved offsets
-/// and inject [`Offsets::POISON`] for the fields read out of kernel memory, so the dentry
-/// walk reads garbage, matches nothing, and would silently allow — exactly the
-/// kernel-mismatch no-op the self-test must catch.
+/// Replaces the offsets of the fields read out of kernel memory with [`Offsets::POISON`]
+/// when [`POISON_OFFSETS_ENV`] is set. The dentry walk then reads garbage, matches nothing
+/// and would silently allow, which is exactly the kernel-mismatch no-op that the self-test
+/// must catch.
 fn maybe_poison_offsets(offsets: &mut Offsets) {
     if std::env::var_os(POISON_OFFSETS_ENV).is_some() {
         warn!(
             "{POISON_OFFSETS_ENV} set — injecting poison offsets; the self-test MUST now \
              abort (test-only failure-path hook)"
         );
-        // Keep real every offset applied to a **trusted ctx pointer**: the verifier
+        // Keep every offset that is applied to a trusted ctx pointer real. The verifier
         // bounds-checks that math against `.rodata` and rejects an out-of-range value at
-        // *load*, which is a different (also loud) guard — but one that would abort before
-        // the self-test could run, turning this failure-path test into a load failure.
-        // The trusted arg is `file` at `file_open`, a *dentry* at the mutation hooks, and
-        // the `linux_binprm` at `bprm_check_security`, so `dentry_d_*` and `binprm_file`
-        // are trusted-pointer math too and must stay real.
+        // load. That is a different guard, and a loud one too, but it would abort before
+        // the self-test could run and turn this failure-path test into a load failure. The
+        // trusted arg is `file` at `file_open`, a dentry at the mutation hooks, and the
+        // `linux_binprm` at `bprm_check_security`. So `dentry_d_*` and `binprm_file` are
+        // trusted-pointer math too, and they must stay real.
         //
-        // Poisoning `sb_s_dev`/`inode_i_*` alone still yields a complete silent no-op:
+        // Poisoning only `sb_s_dev` and `inode_i_*` still yields a complete silent no-op.
         // `find_object`'s very first read is `dentry.super_block()?.dev()?`, so every walk
         // faults out and matches nothing.
         *offsets = Offsets {
@@ -262,14 +266,15 @@ fn maybe_poison_offsets(offsets: &mut Offsets) {
     }
 }
 
-/// Prove the boundary actually enforces before trusting it. Protect a throwaway probe
-/// directory with a single deny-all rule, make ourselves not-fast-allowed, and confirm
-/// that **every** attached hook refuses. A wrong-offset attach — or a hook reading the
-/// wrong context argument — matches nothing, the operation is *allowed*, and we abort
-/// instead of pretending to protect.
+/// Checks that every attached hook refuses an operation on a protected probe directory,
+/// so the boundary is proven to enforce before it is trusted. Writes the probe's rules
+/// into bank 0 of the maps, which the real seed then replaces.
 ///
-/// Each hook is exercised separately because "loaded and attached" is not "mediating":
-/// the argument index a mutation hook reads is not type-checked, and getting it wrong
+/// Errors when any hook allows its operation, which is what a wrong-offset attach or a
+/// hook that reads the wrong context argument does, or when the probe cannot be set up.
+///
+/// Each hook is exercised separately because "loaded and attached" is not "mediating".
+/// The argument index a mutation hook reads is not type-checked, and getting it wrong
 /// fails open in complete silence. This is the only thing that catches that.
 fn self_test(ebpf: &mut Ebpf) -> Result<()> {
     let probe = make_probe(Path::new(PROBE_DIR))?;
@@ -278,26 +283,31 @@ fn self_test(ebpf: &mut Ebpf) -> Result<()> {
     outcome
 }
 
-/// Root-only scratch for the self-test probe. Deliberately **not** `TMPDIR`: the daemon is
-/// uid 0 and this runs *before* `Maps::seed`, so cordon is not yet enforcing on itself. In a
-/// world-writable directory a local user pre-creates `cordon-selftest.<pid>/` (pids are
-/// sequential, so guessing is cheap) holding `src -> /etc/cordon/policy.toml`, and root
-/// truncates the policy on the next start — after which the daemon fails to compile and the
-/// boundary is off entirely. `create_dir_all` accepts a pre-existing directory of any owner
-/// and `fs::write` is `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW`, and
-/// `fs.protected_symlinks` does not help: it keys on the symlink's *immediate parent* being
-/// sticky and world-writable, which the attacker's own plain directory is not.
+/// The root-only scratch directory for the self-test probe. It is deliberately not
+/// `TMPDIR`, because the daemon is uid 0 and the self-test runs before `Maps::seed`, so
+/// cordon is not yet enforcing on itself. In a world-writable directory a local user could
+/// pre-create `cordon-selftest.<pid>/` holding `src -> /etc/cordon/policy.toml`, and pids
+/// are sequential, so guessing is cheap. Root would then truncate the policy on the next
+/// start, the daemon would fail to compile it, and the boundary would be off entirely.
+/// `create_dir_all` accepts a pre-existing directory of any owner, and `fs::write` is
+/// `O_WRONLY|O_CREAT|O_TRUNC` with no `O_NOFOLLOW`. `fs.protected_symlinks` does not help
+/// either. It keys on the symlink's immediate parent being sticky and world-writable, and
+/// the attacker's own plain directory is not.
 ///
 /// `/run` is root-owned `0755`, so nothing unprivileged can plant any component of this path.
 /// That removes the shared namespace outright rather than hardening each open against it.
 const PROBE_DIR: &str = "/run/cordon";
 
-/// Create the probe directory and seed it. `base` is [`PROBE_DIR`] outside tests.
+/// Creates a fresh probe directory under `base` with its seed files, and returns its
+/// path. `base` is [`PROBE_DIR`] outside tests.
 ///
-/// Never reuses a directory it finds: the probe is removed and recreated with `create_dir`,
-/// so anything already sitting on the path — and any symlink inside it — is gone before the
-/// seed writes, which have no `O_NOFOLLOW`. Under [`PROBE_DIR`] nothing unprivileged could
-/// have put it there in the first place; this is the second line, not the first.
+/// Errors when the directory or a seed file cannot be created.
+///
+/// It never reuses a directory it finds. The probe is removed and recreated with
+/// `create_dir`, so anything already on the path, and any symlink inside it, is gone before
+/// the seed writes, which have no `O_NOFOLLOW`. Under [`PROBE_DIR`] nothing unprivileged
+/// could have put it there in the first place, so this is the second line of defence, not
+/// the first.
 fn make_probe(base: &Path) -> Result<PathBuf> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -308,9 +318,9 @@ fn make_probe(base: &Path) -> Result<PathBuf> {
     // A previous run that died before its cleanup leaves this behind, and pids are reused.
     let _ = std::fs::remove_dir_all(&probe);
     std::fs::create_dir(&probe).context("bpf-lsm self-test: mkdir probe")?;
-    // Seeded *before* the object goes live, or creating them would be denied by our own
-    // rule. `over` is the rename-over target: a *positive* destination dentry, which is the
-    // one shape `link` can never produce.
+    // Seed the files before the probe's rules go live, or the daemon's own rule would deny
+    // creating them. `over` is the rename-over target. It is a positive destination dentry,
+    // which is the one shape `link` can never produce.
     for name in ["src", "over", "exe"] {
         std::fs::write(probe.join(name), b"x")
             .with_context(|| format!("bpf-lsm self-test: seed probe {name}"))?;
@@ -322,7 +332,9 @@ fn make_probe(base: &Path) -> Result<PathBuf> {
     Ok(probe)
 }
 
-/// One hook's expectation: the operation must have been refused with `EPERM`.
+/// Checks that the probe operation `what` was refused as permission denied.
+///
+/// Errors when the operation was allowed or failed for another reason.
 fn expect_denied(what: &str, result: std::io::Result<()>) -> Result<()> {
     match result {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
@@ -341,14 +353,15 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     let id = proc::file_id(probe)
         .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve probe FileId"))?;
     let obj = ObjId(0);
-    // Seed bank 0 and point `active_bank` at it (the zero-initialized default), so the
-    // probe is live; the real `Maps::seed` then fills bank 1 and flips away from this.
+    // Seed bank 0, which `active_bank` points at as its zero-initialized default, so the
+    // probe is live. The real `Maps::seed` then fills bank 1 and flips away from this one.
     let bank = Bank::ZERO;
-    // A *silent* deny-all rule (any subject, any action) on the probe object; u32::MAX pid
-    // and a zero exe id so we are *not* fast-allowed. No real inode is `dev=0 ino=0`, so
-    // the exe half can never match either — the identity is unsatisfiable on both fields.
-    // SILENCE (deny + no log) not DENY: the self-test only needs the open *blocked*, and a
-    // logged probe-deny would spam a spurious record on every startup.
+    // A silent deny-all rule (any subject, any action) on the probe object. The
+    // fast-allowed identity is pid u32::MAX with a zero exe id, so this process is not
+    // fast-allowed. No real inode is `dev=0 ino=0`, so the exe half can never match
+    // either, and the identity is unsatisfiable on both fields. The rule is SILENCE (deny
+    // with no log) rather than DENY, because the self-test only needs the open blocked,
+    // and a logged probe deny would add a spurious record on every startup.
     maps.set_settings(Pid(u32::MAX), FileId::new(Dev(0), Ino(0)), bank)?;
     maps.protected_insert(bank, id, obj)?;
     maps.rules_set(
@@ -358,10 +371,10 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     maps.rule_count_insert(bank, obj, 1)?;
 
     // A second object, for `execute` alone. It cannot be proven under the deny-all rule
-    // above: an exec *opens* the file first, so `file_open` would refuse it and the verdict
-    // would never reach `bprm_check_security` — the probe would pass with the hook detached.
-    // So this object allows the read and denies the rest; the only thing that can then
-    // refuse the exec is the bprm hook itself. It nests inside the probe directory, and
+    // above, because an exec opens the file first. `file_open` would refuse it, the
+    // verdict would never reach `bprm_check_security`, and the probe would pass with that
+    // hook detached. So this object allows the read and denies the rest, and only the
+    // bprm hook itself can then refuse the exec. It nests inside the probe directory, and
     // `find_object` takes the deepest match, so this file's own rules win.
     let exec_obj = ObjId(1);
     let exec_path = probe.join("exe");
@@ -378,29 +391,29 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     )?;
     maps.rule_count_insert(bank, exec_obj, 2)?;
 
-    // One operation per attached hook. `outside` is in the same directory as the probe so
-    // link/rename really reach the LSM hook instead of failing `EXDEV` at the VFS layer.
-    // Ordered so each still has something to act on: link is non-destructive, rename would
-    // consume `src`, unlink would remove it.
+    // One operation per attached hook. `outside` is in the same directory as the probe, so
+    // link and rename really reach the LSM hook instead of failing with `EXDEV` at the VFS
+    // layer. The order leaves each operation something to act on. A link is
+    // non-destructive, a rename would consume `src`, and an unlink would remove it.
     let src = probe.join("src");
     let outside = Path::new(PROBE_DIR).join(format!("selftest-out.{}", std::process::id()));
     let opened = std::fs::File::open(probe).map(drop);
     let linked = std::fs::hard_link(&src, &outside);
     let renamed = std::fs::rename(&src, &outside);
     let unlinked = std::fs::remove_file(&src);
-    // Rename *over* an existing name, both sides inside the object. The pair-of-directories
-    // classification calls this an internal shuffle and allows it, so only the destination
-    // dentry's own lookup refuses — which is the whole point of the case. Last, because if
-    // it is wrongly allowed it consumes `src`.
+    // Rename over an existing name, with both sides inside the object. The
+    // pair-of-directories classification calls this an internal shuffle and allows it, so
+    // only the destination dentry's own lookup refuses, which is the whole point of the
+    // case. It comes last, because if it is wrongly allowed it consumes `src`.
     let clobbered = std::fs::rename(&src, probe.join("over"));
-    // A *negative* dentry inside the object: `inode_mkdir` classifies off the parent, which
-    // no other probe here exercises (every other one starts from a positive dentry).
+    // A negative dentry inside the object. `inode_mkdir` classifies by the parent, which no
+    // other probe here exercises, because every other one starts from a positive dentry.
     let made = std::fs::create_dir(probe.join("sub"));
     // The exec probe: its object allows `read`, so reaching a refusal here means the verdict
     // came from `bprm_check_security` and not from the open.
     let executed = std::process::Command::new(&exec_path).status().map(drop);
 
-    // Clean up the probe entries (the real seed also clears, but don't rely on it).
+    // Clean up the probe entries. The real seed also clears them, but don't rely on it.
     let _ = maps.protected_remove(bank, id);
     let _ = maps.rule_count_remove(bank, obj);
     // Only exists if a hook let us through, i.e. if we are about to abort anyway.
@@ -423,12 +436,12 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Guards the planted-directory attack described at [`PROBE_DIR`]: `make_probe` must
-    /// recreate the probe directory, never reuse one it finds, or the seed writes follow a
-    /// planted symlink.
+    /// Guards against the planted-directory attack described at [`PROBE_DIR`].
+    /// `make_probe` must recreate the probe directory and never reuse one it finds, or the
+    /// seed writes follow a planted symlink.
     ///
-    /// Driven through a writable `base` because the test is unprivileged. That is the
-    /// *second* line of defence; the first, the root-only location, is pinned below.
+    /// It drives a writable `base` because the test is unprivileged. That is the second
+    /// line of defence. The first, the root-only location, is pinned below.
     #[test]
     fn the_probe_never_reuses_a_directory_it_found() {
         let tmp = tempfile::tempdir().unwrap();
@@ -460,9 +473,9 @@ mod tests {
         );
     }
 
-    /// Pins [`PROBE_DIR`] under the root-only `/run`. Checked as a constant because an
-    /// unprivileged test cannot write `/run`; moving the probe under `TMPDIR` would reopen
-    /// the hole with every other line intact.
+    /// Pins [`PROBE_DIR`] under the root-only `/run`. It checks the constant because an
+    /// unprivileged test cannot write `/run`, and moving the probe under `TMPDIR` would
+    /// reopen the hole with every other line intact.
     #[test]
     fn the_probe_lives_where_only_root_can_write() {
         assert!(

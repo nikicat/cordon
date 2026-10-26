@@ -11,25 +11,25 @@
 //! allow   /usr/bin/backup     read              "~/My Secrets/tokens"
 //! ```
 //!
-//! - **Fields** are split on unquoted whitespace (so columns can be aligned freely);
-//!   **list items** within a field are split on unquoted commas.
-//! - `"…"` quotes a token: spaces are allowed inside, and `*` / `@` are taken
-//!   **literally** (the one way to name a path that starts with those sigils). An
-//!   unquoted token is classified like a `[[rule]]` field — `*` → wildcard, `@x` →
-//!   group, else a leaf path/name.
-//! - `#` starts an end-of-line comment (outside quotes); blank lines are skipped.
+//! - Fields are split on unquoted whitespace, so columns can be aligned freely. List
+//!   items within a field are split on unquoted commas.
+//! - `"…"` quotes a token. Spaces are allowed inside, and `*` and `@` are taken
+//!   literally, which is the one way to name a path that starts with those sigils. An
+//!   unquoted token is classified like a `[[rule]]` field, so `*` is the wildcard, `@x`
+//!   is a group, and anything else is a leaf path or name.
+//! - `#` outside quotes starts an end-of-line comment, and blank lines are skipped.
 //!
-//! This module is *only* surface syntax: each field becomes the same [`Token`] list a
-//! `[[rule]]` field produces, so [`super::resolve`] and everything downstream are
-//! unchanged.
+//! This module is only surface syntax. Each field becomes the same [`Token`] list that a
+//! `[[rule]]` field produces, so [`super::resolve`] and every later stage stay unchanged.
 
 use super::parse::{ParsedRule, Token};
 use super::{LineIndex, PolicyName};
 use crate::{Error, Result};
 
-/// Parse a `rules = '''…'''` block into rules. `content` is the literal block text;
-/// `content_start` is its absolute byte offset in the source file, so a diagnostic
-/// reports the real file `line:col` via `lines`.
+/// Parses the text of a `rules = '''…'''` block into rules. `content_start` is the
+/// block's byte offset in the source file, so that each diagnostic reports the real
+/// `line:col` in the file. Errors when a line has other than four fields, an unknown
+/// policy keyword, or a malformed or unterminated quote.
 pub(crate) fn parse_block(
     content: &str,
     content_start: usize,
@@ -41,7 +41,6 @@ pub(crate) fn parse_block(
         let base = content_start + line_off;
         line_off += raw.len();
 
-        // Strip the trailing newline (and a CR) and any `#` comment, then the fields.
         let mut line = raw.strip_suffix('\n').unwrap_or(raw);
         line = line.strip_suffix('\r').unwrap_or(line);
         let body = strip_comment(line);
@@ -86,9 +85,10 @@ pub(crate) fn parse_block(
     Ok(out)
 }
 
-/// Split one field into comma-separated items, each classified to a [`Token`]: a
-/// quoted item is always a literal [`Token::Leaf`] (sigils inert); an unquoted item is
-/// [`Token::classify`]d. `field_base` is the field's absolute source offset.
+/// Returns the tokens of one field's comma-separated items. A quoted item is always a
+/// literal [`Token::Leaf`], and [`Token::classify`] classifies an unquoted one.
+/// `field_base` is the field's absolute source offset. Errors when an item's quote is
+/// malformed or unterminated.
 fn field_tokens(field: &str, field_base: usize, lines: &LineIndex) -> Result<Vec<Token>> {
     let items = split_quoted(field, Sep::Comma).map_err(|(c, m)| at(lines, field_base + c, m))?;
     let mut toks = Vec::with_capacity(items.len());
@@ -99,7 +99,7 @@ fn field_tokens(field: &str, field_base: usize, lines: &LineIndex) -> Result<Vec
     Ok(toks)
 }
 
-/// Truncate `line` at the first `#` that is not inside double quotes.
+/// Returns `line` cut at the first `#` that is not inside double quotes.
 fn strip_comment(line: &str) -> &str {
     let mut in_quote = false;
     for (i, c) in line.char_indices() {
@@ -112,12 +112,13 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// What separates segments in [`split_quoted`]: the two nesting levels of the DSL.
+/// The separator for [`split_quoted`], one for each of the two nesting levels of the DSL.
 #[derive(Clone, Copy)]
 enum Sep {
-    /// Top level: fields, split on runs of whitespace (free column alignment).
+    /// Splits a line into fields on runs of whitespace, so that columns can be aligned
+    /// freely.
     Whitespace,
-    /// Within a field: list items, split on commas.
+    /// Splits a field into list items on commas.
     Comma,
 }
 
@@ -130,10 +131,9 @@ impl Sep {
     }
 }
 
-/// Split `s` into segments separated by `sep`, with `"…"` spans never split. Returns
-/// each segment's byte offset within `s` and its raw text (quotes retained —
-/// [`Item::parse`] strips them). `Err((col, msg))` on an unterminated quote, positioned
-/// at the opening quote.
+/// Returns the segments of `s` between `sep` boundaries, each with its byte offset in `s`.
+/// A `"…"` span is never split, and a segment keeps its quotes for [`Item::parse`] to
+/// strip. Errors with the offset of the opening quote when a quote is unterminated.
 fn split_quoted(s: &str, sep: Sep) -> std::result::Result<Vec<(usize, &str)>, (usize, String)> {
     let mut segs = Vec::new();
     let mut in_quote = false;
@@ -151,9 +151,9 @@ fn split_quoted(s: &str, sep: Sep) -> std::result::Result<Vec<(usize, &str)>, (u
             quote_at = i;
             start.get_or_insert(i);
         } else if sep.is_boundary(c) {
-            // Close the current segment. An empty run (consecutive separators, or a
-            // leading/trailing one) leaves `start` unset, so nothing is emitted —
-            // whitespace collapses and a stray `,,`/trailing comma is dropped.
+            // An empty run, such as consecutive separators or a leading or trailing one,
+            // leaves `start` unset, so nothing is emitted. That collapses whitespace and
+            // drops a stray `,,` or a trailing comma.
             if let Some(st) = start.take() {
                 segs.push((st, &s[st..i]));
             }
@@ -173,22 +173,21 @@ fn split_quoted(s: &str, sep: Sep) -> std::result::Result<Vec<(usize, &str)>, (u
     Ok(segs)
 }
 
-/// One comma-separated field item, after splitting but before classification: the raw
-/// text with its optional `"…"` quotes resolved into `content` + a `quoted` flag.
-/// Quoting forces a literal [`Token::Leaf`] (so `*`/`@` can name a real path); an
-/// unquoted item is [`Token::classify`]d.
+/// One comma-separated field item, after splitting and before classification. Quoting
+/// forces a literal [`Token::Leaf`], so that `*` or `@` can name a real path, and
+/// [`Token::classify`] classifies an unquoted item.
 struct Item {
     content: String,
     quoted: bool,
 }
 
 impl Item {
-    /// Strip an optional surrounding `"…"`. A token that opens with `"` must close
-    /// with `"` and nothing after it.
+    /// Parses one raw item, stripping an optional pair of surrounding quotes. Errors when
+    /// an item that opens with `"` does not end with a closing `"`.
     fn parse(raw: &str) -> std::result::Result<Item, String> {
         match raw.strip_prefix('"') {
             Some(rest) => match rest.strip_suffix('"') {
-                // `rest.is_empty()` ⇒ the item was a lone `"`; no closing quote.
+                // An empty `rest` means the item was a lone `"` with no closing quote.
                 Some(inner) if !rest.is_empty() => Ok(Item {
                     content: inner.to_string(),
                     quoted: true,
@@ -202,8 +201,8 @@ impl Item {
         }
     }
 
-    /// The classified [`Token`], or `None` for an empty item (e.g. a stray trailing
-    /// comma) the caller skips.
+    /// Returns the classified [`Token`], or `None` for an empty item, such as the one
+    /// after a stray trailing comma.
     fn into_token(self) -> Option<Token> {
         if self.content.is_empty() {
             None
@@ -224,8 +223,9 @@ fn at(lines: &LineIndex, abs: usize, msg: impl Into<String>) -> Error {
 mod tests {
     use super::*;
 
-    /// Parse a block in isolation (offset 0). Real callers pass the block's source
-    /// offset; here positions are block-relative, which is all these tests check.
+    /// Parses a block in isolation, at offset 0. Real callers pass the block's source
+    /// offset, but here positions are relative to the block, which is all these tests
+    /// check.
     fn block(content: &str) -> Result<Vec<ParsedRule>> {
         let lines = LineIndex::new(content);
         parse_block(content, 0, &lines)
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn quoting_suppresses_sigils() {
-        // A dir literally named `@weird` or `*odd` — unrepresentable unquoted.
+        // A directory literally named `@weird` or `*odd` cannot be written unquoted.
         let r = block("allow /usr/bin/x read \"@weird\",\"*odd\"\n").unwrap();
         assert_eq!(
             r[0].where_,
@@ -325,8 +325,9 @@ mod tests {
         assert!(err.contains("unterminated quote"), "got: {err}");
     }
 
-    /// A field-level error lands on the right line *and* column when the block sits
-    /// deeper in a file — exercising the `content_start` + intra-block offset math.
+    /// A field-level error lands on the right line and column when the block sits deeper
+    /// in a file. This exercises the offset math of `content_start` plus the offset
+    /// within the block.
     #[test]
     fn diagnostic_position_is_file_absolute() {
         // Simulate a block whose content starts at file line 5, col 1.

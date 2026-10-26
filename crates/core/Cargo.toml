@@ -7,32 +7,33 @@ repository.workspace = true
 rust-version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# `socket` + `uio` provide the `sendmsg`/`recvmsg` behind proto's SCM_RIGHTS hand-off of
-# a `CarrierProcs` (DESIGN §16.6). Both ends of the wire need it, hence core rather
-# than a copy in each of daemon and cli. (`uio` is what gates the scatter-
-# gather msghdr calls; `socket` alone stops at getsockopt/setsockopt.)
+# `socket` and `uio` provide the `sendmsg` and `recvmsg` behind proto's SCM_RIGHTS
+# hand-off of a `CarrierProcs` (DESIGN §16.6). Both ends of the wire need them, so they
+# live in core rather than in a copy in each of daemon and cli. `uio` gates the
+# scatter-gather msghdr calls, and `socket` alone stops at getsockopt and setsockopt.
 nix = { version = "0.31.3", features = ["socket", "uio"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-# `fs` adds `fcntl`, used only to assert the received descriptor is close-on-exec — a
-# security property that would otherwise fail silently. Test-only, so the shipped binary
-# pulls in no more than it needs.
+# `fs` adds `fcntl`, which is used only to assert that the received descriptor is
+# close-on-exec. That security property would otherwise fail silently. The feature is
+# test-only, so the shipped binary pulls in no more than it needs.
 nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
 
 [dependencies]
 serde = { workspace = true }
-# The blessing nonce (DESIGN §16.5) — the tree's only randomness, and it must be
-# unguessable. A thin wrapper over `getrandom(2)`: no descriptor to open, so it can't be
-# defeated by exhausted fds or a missing /dev, and it blocks correctly on an unseeded pool
-# rather than handing back weak bytes. `libc` is its only dependency here, already present.
+# For the blessing nonce (DESIGN §16.5), which is the tree's only randomness and must be
+# unguessable. It is a thin wrapper over `getrandom(2)`. With no descriptor to open, it
+# cannot be defeated by exhausted fds or a missing /dev, and it blocks correctly on an
+# unseeded pool rather than handing back weak bytes. Its only dependency here is `libc`,
+# which is already present.
 getrandom = "0.4.3"
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
-# The flat rule-model POD types (the compiler's output contract). Default features
-# only — NO `user`, so the stock build pulls in no aya/eBPF deps; the daemon enables
-# `user` for the loader.
+# The POD types of the flat rule model, which are the compiler's output contract. Only
+# the default features, without `user`, so the stock build pulls in no aya or eBPF deps.
+# The daemon enables `user` for the loader.
 cordon-bpf-common = { path = "../bpf-common" }

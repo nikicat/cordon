@@ -1,8 +1,8 @@
-//! The few privileged operations `policy edit` and `bless` need, isolated here. Every
-//! one is a safe `nix` wrapper except the two inherently-unsafe `Command::pre_exec`
-//! registrations — so the whole crate's `unsafe` surface is those two *calls*, one line
-//! each. The hooks they register are ordinary safe code, hoisted into `let` bindings so
-//! the `unsafe` block covers only the operation that is actually unsound to get wrong.
+//! The process-identity and file-ownership operations that `policy edit` and `bless`
+//! need, kept in one place so that the crate's `unsafe` lives here. Every one is a safe
+//! `nix` wrapper except the two `Command::pre_exec` registrations, so the crate's whole
+//! `unsafe` surface is those two one-line calls. The hooks they register are ordinary safe
+//! code, bound with `let` first so that each `unsafe` block covers only the registration.
 
 use cordon_core::policy::UserName;
 use cordon_core::proto::CarrierProcs;
@@ -23,46 +23,45 @@ pub fn user_identity(uid: Uid) -> Option<(UserName, PathBuf)> {
     Some((UserName::new(user.name), user.dir))
 }
 
-/// `chown(2)` a path to `uid:gid`. Used only for the temp directory, a root-created entry
-/// in the sticky tmpdir whose own path can't be swapped out from under us; anything inside
-/// it goes through [`fchown`].
+/// Changes the owner of `path` to `uid:gid`, following symlinks. It is safe only on a path
+/// that nobody else can swap, such as the root-created temp directory in the sticky
+/// tmpdir. Anything inside that directory goes through [`fchown`] instead.
 pub fn chown(path: &Path, uid: Uid, gid: Gid) -> io::Result<()> {
     nix::unistd::chown(path, Some(uid), Some(gid)).map_err(io::Error::from)
 }
 
-/// `fchown(2)` an open fd to `uid:gid`; hands the temp edit copy to the invoking user so
-/// the dropped editor can read and write it. Acting on the open inode is symlink-safe: a
-/// path `chown` follows symlinks, so once the temp dir is the invoking user's, a same-uid
-/// attacker could plant one and redirect the chown to an arbitrary file (a TOCTOU). An fd
-/// has no name to redirect.
+/// Changes the owner of the open file `fd` to `uid:gid`. Acting on the open inode is
+/// symlink-safe, because an fd has no name to redirect. A path-based [`chown`] follows
+/// symlinks, so once a directory belongs to another user, that user could plant a link
+/// and redirect the chown to any file.
 pub fn fchown(fd: impl AsFd, uid: Uid, gid: Gid) -> io::Result<()> {
     nix::unistd::fchown(fd, Some(uid), Some(gid)).map_err(io::Error::from)
 }
 
-/// Arranges for `cmd` to drop to `uid:gid`, shedding all supplementary groups, in the
-/// forked child before exec; the parent keeps its privilege.
+/// Arranges for the child of `cmd` to drop to `uid:gid` with no supplementary groups
+/// before it execs. The calling process keeps its privilege.
 pub fn drop_to_on_exec(cmd: &mut Command, uid: Uid, gid: Gid) {
-    // The order is load-bearing: shed supplementary groups and the gid *before* the uid —
-    // once root is surrendered the earlier two would be refused.
+    // The groups and the gid must go before the uid, because once root is given up the
+    // kernel refuses the other two.
     let hook = move || -> io::Result<()> {
         nix::unistd::setgroups(&[])?;
         nix::unistd::setgid(gid)?;
         nix::unistd::setuid(uid)?;
         Ok(())
     };
-    // SAFETY: `hook` runs post-fork / pre-exec in the child, where only async-signal-safe
-    // operations are sound. setgroups/setgid/setuid are raw syscalls over values captured
-    // before the fork (nix adds errno translation, no allocation), so they qualify.
+    // SAFETY: `hook` runs in the child between fork and exec, where only async-signal-safe
+    // operations are sound. setgroups, setgid and setuid qualify. They are raw syscalls on
+    // values captured before the fork, and nix adds only errno translation, not allocation.
     unsafe { cmd.pre_exec(hook) };
 }
 
-/// Arranges for `cmd`, in the forked child, to join the bless carrier cgroup by writing
-/// its own pid through `procs`, the carrier's `cgroup.procs` descriptor the root daemon
-/// opened and handed over.
+/// Arranges for the child of `cmd` to join the bless carrier cgroup before it execs, so
+/// the target runs no instruction outside the blessing. The child writes its own pid
+/// through `procs`, which is the carrier's `cgroup.procs` descriptor as the root daemon
+/// opened it.
 ///
-/// Joining before `exec` means the target runs zero instructions unblessed. The caller
-/// needs no privilege: the kernel checks the descriptor's opener, not the writer (see
-/// [`CarrierProcs`]).
+/// The caller needs no privilege, because the kernel checks who opened the descriptor,
+/// not who writes to it (see [`CarrierProcs`]).
 pub fn join_cgroup_on_exec(cmd: &mut Command, procs: CarrierProcs) {
     let hook = move || -> io::Result<()> {
         let mut buf = [0u8; U32_DECIMAL_MAX];
@@ -72,18 +71,18 @@ pub fn join_cgroup_on_exec(cmd: &mut Command, procs: CarrierProcs) {
         }
         Ok(())
     };
-    // SAFETY: `hook` runs post-fork / pre-exec in the child, where only async-signal-safe
-    // operations are sound. getpid(2) and write(2) are raw syscalls and the pid is
-    // formatted into a stack buffer — no allocation, which could otherwise deadlock on an
-    // allocator lock another thread held at fork time.
+    // SAFETY: `hook` runs in the child between fork and exec, where only async-signal-safe
+    // operations are sound. getpid(2) and write(2) are raw syscalls, and the pid is
+    // formatted into a stack buffer. Nothing allocates, which matters because an
+    // allocation could deadlock on an allocator lock that another thread held at fork.
     unsafe { cmd.pre_exec(hook) };
 }
 
-/// Decimal digits of `u32::MAX` — the buffer a [`format_u32`] caller provides.
+/// The number of decimal digits in `u32::MAX`, which sizes the buffer for [`format_u32`].
 pub(crate) const U32_DECIMAL_MAX: usize = 10;
 
-/// Format `n` in decimal into the tail of `buf`, returning the used slice. No
-/// allocation, no `core::fmt` machinery — async-signal-safe for the `pre_exec` join.
+/// Writes `n` in decimal into the tail of `buf` and returns the written slice. It neither
+/// allocates nor uses `core::fmt`, so it is async-signal-safe for the `pre_exec` join.
 pub(crate) fn format_u32(mut n: u32, buf: &mut [u8; U32_DECIMAL_MAX]) -> &[u8] {
     let mut i = buf.len();
     loop {
@@ -101,8 +100,8 @@ pub(crate) fn format_u32(mut n: u32, buf: &mut [u8; U32_DECIMAL_MAX]) -> &[u8] {
 mod tests {
     use super::*;
 
-    /// The passwd lookup resolves the test runner's own uid (no root needed) — the path the
-    /// editor's `$HOME`/`$USER` ride on.
+    /// Checks that the passwd lookup resolves the test runner's own uid, which needs no
+    /// root. The editor's `$HOME` and `$USER` come from this lookup.
     #[test]
     fn user_identity_resolves_current_user() {
         let (name, home) = user_identity(Uid::current()).expect("current uid is in passwd");
@@ -110,8 +109,8 @@ mod tests {
         assert!(home.is_absolute(), "home should be absolute, got {home:?}");
     }
 
-    /// The no-alloc formatter behind the async-signal-safe cgroup join: exact digits,
-    /// no leading zeros, both extremes.
+    /// Checks that the formatter writes exact digits with no leading zeros, at both
+    /// extremes too.
     #[test]
     fn format_u32_renders_decimal() {
         let mut buf = [0u8; U32_DECIMAL_MAX];
@@ -121,14 +120,13 @@ mod tests {
         assert_eq!(format_u32(u32::MAX, &mut buf), b"4294967295");
     }
 
-    /// Exercises the fd-based [`fchown`] end to end; a no-op self-chown needs no root.
+    /// Exercises the real [`fchown`] path end to end without root.
     #[test]
     fn fchown_by_fd_chowns_an_owned_file() {
         use std::os::unix::fs::MetadataExt;
         let f = tempfile::tempfile().expect("create temp file");
         let meta = f.metadata().expect("stat");
-        // Re-assert the file's own uid:gid — allowed without CAP_CHOWN (owner unchanged),
-        // so the test runs unprivileged while still exercising the real `fchown` path.
+        // Setting the owner the file already has needs no CAP_CHOWN.
         fchown(&f, Uid::from_raw(meta.uid()), Gid::from_raw(meta.gid())).expect("fchown by fd");
     }
 }

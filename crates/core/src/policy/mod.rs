@@ -1,24 +1,26 @@
-//! The flat **rule model** (DESIGN §15): a root-owned text policy compiled in
-//! userspace into the flat per-object decision table the kernel evaluates.
+//! The flat rule model (DESIGN §15). It compiles a root-owned text policy, in userspace,
+//! into the flat per-object decision table that the kernel evaluates.
 //!
-//! Three pure, unit-testable stages:
-//!   1. [`parse`] — TOML text → [`ParsedPolicy`] (serde; structural validation, with
-//!      source spans retained via [`toml::Spanned`]).
-//!   2. [`resolve`] — expand `@group` refs on all three axes (subject/object/action),
-//!      cycle-check, validate action/policy names, expand `~`, lexically normalize →
-//!      a [`ResolvedPolicy`] that is group-free but still **path-based**.
-//!   3. [`compile`] — cross-product `who × where × action`, resolve object/exe paths
-//!      to inode identity, build each object's **copy-down** bucket → a
-//!      [`CompiledPolicy`] of per-object [`cordon_bpf_common::CompiledRule`] buckets.
+//! Compilation runs in three pure stages, each testable on its own:
+//!   1. [`parse`] turns TOML text into a [`ParsedPolicy`]. Serde does the structural
+//!      validation, and [`toml::Spanned`] keeps the source spans.
+//!   2. [`resolve`] expands `@group` references on all three axes (subject, object and
+//!      action), rejects cycles and unknown action or policy names, expands `~`, and
+//!      normalizes paths lexically. The result is a [`ResolvedPolicy`] with no groups
+//!      left, which still names objects by path.
+//!   3. [`compile`] takes the cross product of subject, object and action, resolves
+//!      object and exe paths to inodes, and builds each object's copy-down bucket. The
+//!      result is a [`CompiledPolicy`] of per-object
+//!      [`cordon_bpf_common::CompiledRule`] buckets.
 //!
-//! All group expansion, nesting, and object precedence resolve *here*, so the kernel
+//! All group expansion, nesting and object precedence are settled here, so the kernel
 //! stays flat (DESIGN §15.3).
 //!
-//! Diagnostics carry a source [`Pos`] (rule-/group-level) so `cordon policy check`
-//! can report `config.toml:LINE: …`. We reuse the `toml` crate's spans rather than
-//! tracking positions by hand, and lean on serde + `deny_unknown_fields` + typed
-//! enums for structural validation — only the domain-specific checks (cycles, refs,
-//! paths, precedence) are hand-written.
+//! Diagnostics carry the source [`Pos`] of their rule or group, so that
+//! `cordon policy check` can report `config.toml:LINE: …`. Positions come from the `toml`
+//! crate's spans instead of being tracked by hand. Serde, `deny_unknown_fields` and typed
+//! enums do the structural validation, so only the domain checks (cycles, references,
+//! paths, precedence) are written by hand.
 
 mod compile;
 mod parse;
@@ -35,8 +37,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// A 1-based line/column into the policy source. Column is a byte offset within the
-/// line (fine for the ASCII paths/names a policy holds; not grapheme-aware).
+/// A 1-based line and column in the policy source. The column counts bytes within the
+/// line, which suits the ASCII paths and names a policy holds but is not grapheme-aware.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pos {
     pub line: u32,
@@ -49,8 +51,9 @@ impl fmt::Display for Pos {
     }
 }
 
-/// Where in the policy a diagnostic points. A merged policy has several fragments, so a
-/// position needs the fragment's name to mean anything; either part may be unknown.
+/// The place in the policy that a diagnostic points to. A merged policy has several
+/// fragments, so a position needs the fragment's name to mean anything. Either part may
+/// be unknown.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Loc {
     /// The fragment's name, as [`PolicySource::name`] gives it.
@@ -76,11 +79,11 @@ impl fmt::Display for Loc {
     }
 }
 
-/// Maps a byte offset in the source to a [`Pos`]. Built once from the text so resolve
-/// can turn a [`toml::Spanned`] span into a position when emitting a diagnostic.
+/// Maps a byte offset in the source to a [`Pos`]. It is built once from the text, so
+/// that resolve can turn any [`toml::Spanned`] span into a position for a diagnostic.
 #[derive(Clone, Debug)]
 pub(crate) struct LineIndex {
-    /// Byte offset at which each line starts (`line_starts[0] == 0`).
+    /// The byte offset at which each line starts. The first entry is always 0.
     line_starts: Vec<usize>,
 }
 
@@ -95,9 +98,9 @@ impl LineIndex {
         LineIndex { line_starts }
     }
 
-    /// The [`Pos`] of a byte offset. `partition_point` finds the last line start at or
-    /// before `byte`; the column is the 1-based byte offset within that line.
+    /// Returns the position of `byte`, with the column counted in bytes from 1.
     pub(crate) fn pos(&self, byte: usize) -> Pos {
+        // The line is the one whose start is the last at or before `byte`.
         let line = self.line_starts.partition_point(|&s| s <= byte).max(1);
         let col = byte - self.line_starts[line - 1] + 1;
         Pos {
@@ -107,9 +110,9 @@ impl LineIndex {
     }
 }
 
-/// A finding from parse/resolve/compile, surfaced by `cordon policy check`. An
-/// `Error` means the policy must not be applied; `Warning` means it applies but
-/// something is off (a rule won't be enforced, a path is missing, …).
+/// A finding from parse, resolve or compile, which `cordon policy check` reports. An
+/// error means that the policy must not be applied. A warning means that it applies but
+/// something is off, such as a rule that will not be enforced or a missing path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
@@ -169,9 +172,9 @@ impl fmt::Display for Diagnostic {
     }
 }
 
-/// An authoring-layer action name (DESIGN §15.5). A real enum (vs the kernel's
-/// [`bpf::Action`] bitset) so the token set is closed and the lowering match is
-/// exhaustive — adding an action forces updating [`ActionName::bit`].
+/// An action name as a policy author writes it (DESIGN §15.5). It is an enum rather than
+/// the kernel's [`bpf::Action`] bitset, so that the set of tokens is closed. Adding an
+/// action then forces an update to [`ActionName::bit`], because its match is exhaustive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionName {
     Read,
@@ -187,8 +190,8 @@ pub enum ActionName {
 }
 
 impl ActionName {
-    /// Parse one action token (lower-case, as authored). `None` if unknown — the
-    /// caller turns that into a resolve error naming the offending token.
+    /// Parses one lower-case action token as authored. Returns `None` for an unknown
+    /// token.
     pub fn parse(token: &str) -> Option<ActionName> {
         Some(match token {
             "read" => ActionName::Read,
@@ -205,7 +208,7 @@ impl ActionName {
         })
     }
 
-    /// The single-bit [`bpf::Action`] this name maps to.
+    /// Returns the single-bit [`bpf::Action`] for this name.
     pub fn bit(self) -> bpf::Action {
         use bpf::Action;
         match self {
@@ -223,8 +226,9 @@ impl ActionName {
     }
 }
 
-/// An authoring-layer policy name. Deserialized directly from a rule's `policy` field
-/// (serde validates it's one of the four), then lowered to [`bpf::Policy`].
+/// A policy name as a policy author writes it. A rule's `policy` field deserializes
+/// straight into it, so serde rejects anything but the four names. [`PolicyName::lower`]
+/// turns it into the kernel's [`bpf::Policy`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyName {
@@ -235,10 +239,10 @@ pub enum PolicyName {
 }
 
 impl PolicyName {
-    /// Parse one policy keyword (the leading field of a DSL rule line). `None` if
-    /// unknown — the caller turns that into a diagnostic naming the offending token.
-    /// The names match the `#[serde(rename_all = "snake_case")]` the `[[rule]]` form
-    /// deserializes, so both authoring surfaces accept exactly the same four words.
+    /// Parses one policy keyword, the leading field of a DSL rule line. Returns `None`
+    /// for an unknown keyword. The names match the `#[serde(rename_all = "snake_case")]`
+    /// names that the `[[rule]]` form deserializes, so both authoring forms accept
+    /// exactly the same four words.
     pub fn parse(token: &str) -> Option<PolicyName> {
         Some(match token {
             "allow" => PolicyName::Allow,
@@ -249,7 +253,7 @@ impl PolicyName {
         })
     }
 
-    /// Lower to the kernel's POD [`bpf::Policy`].
+    /// Returns the kernel's POD [`bpf::Policy`] for this name.
     pub fn lower(self) -> bpf::Policy {
         use bpf::Policy;
         match self {
@@ -261,17 +265,16 @@ impl PolicyName {
     }
 }
 
-/// The account named by a policy's `user =` header (see [`home_for`]). A newtype over
-/// the raw login name so it can't be mixed up with the other strings in the policy layer
-/// (paths, group/action names, tokens); (de)serialized transparently from/to the
-/// TOML/JSON string.
+/// The login name of the account that a policy's `user =` header names (see
+/// [`home_for`]). It is a newtype so that it cannot be mixed up with the other strings of
+/// the policy layer, such as paths, group names and tokens. It serializes as a plain
+/// string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserName(String);
 
 impl UserName {
-    /// Wrap a raw login name. Besides the `user =` header (via serde), this is built from a
-    /// passwd lookup — e.g. the CLI naming the invoking user for `policy edit`.
+    /// Wraps a raw login name without checking that the account exists.
     pub fn new(name: impl Into<String>) -> UserName {
         UserName(name.into())
     }
@@ -283,8 +286,8 @@ impl UserName {
 
 impl std::str::FromStr for UserName {
     type Err = std::convert::Infallible;
-    /// Any non-empty string is a candidate login name; existence is checked later against
-    /// `/etc/passwd` (via [`home_for`]). Lets `--user` parse straight into this newtype.
+    /// Accepts any string as a candidate login name. Whether the account exists is
+    /// checked later against `/etc/passwd`, through [`home_for`].
     fn from_str(s: &str) -> std::result::Result<UserName, Self::Err> {
         Ok(UserName::new(s))
     }
@@ -296,11 +299,10 @@ impl fmt::Display for UserName {
     }
 }
 
-/// The name of a `[group.{subject,object,action}.NAME]` group — the key into a group
-/// namespace, referenced by `@NAME` (DESIGN §15.7). A newtype so a group identifier can't
-/// be confused with the policy layer's other strings (paths, leaves, class names); used as
-/// the `Groups` map key, in [`super::resolve`]'s cycle stack, and as a `Token::Group`
-/// payload. (De)serialized transparently from/to a TOML table key / string.
+/// The name of a `[group.{subject,object,action}.NAME]` group, which a rule references
+/// as `@NAME` (DESIGN §15.7). It is a newtype so that a group name cannot be confused with
+/// the other strings of the policy layer, such as paths, leaves and class names. It
+/// serializes as a plain string or TOML table key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GroupName(String);
@@ -333,11 +335,10 @@ impl fmt::Display for GroupName {
     }
 }
 
-/// The name of a **blessing class** (DESIGN §16.3) as authored in policy — the string in a
-/// `[group.subject.*] blessing = "<name>"` predicate and in `cordon bless --class <name>`. A
-/// newtype (like [`UserName`]) so it can't be mixed up with the policy layer's other strings
-/// (group names, paths, tokens); the compiler assigns each distinct one a dense
-/// [`cordon_bpf_common::ClassId`]. (De)serialized transparently from/to a TOML/JSON string.
+/// The name of a blessing class (DESIGN §16.3), as a subject group's
+/// `blessing = "<name>"` predicate spells it. It is a newtype so that it cannot be mixed
+/// up with the other strings of the policy layer, such as group names, paths and tokens.
+/// The compiler assigns each distinct name a dense [`cordon_bpf_common::ClassId`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ClassName(String);
@@ -354,8 +355,8 @@ impl ClassName {
 
 impl std::str::FromStr for ClassName {
     type Err = std::convert::Infallible;
-    /// Any string is a candidate class name; whether the policy actually declares it is
-    /// checked against the compiled registry. Lets `--class` parse straight into this newtype.
+    /// Accepts any string as a candidate class name. Whether the policy declares it is
+    /// checked later against the compiled registry.
     fn from_str(s: &str) -> std::result::Result<ClassName, Self::Err> {
         Ok(ClassName::new(s))
     }
@@ -367,11 +368,10 @@ impl fmt::Display for ClassName {
     }
 }
 
-/// Resolve which home directory `~` expands against for a policy: the home of its
-/// `user =` header (looked up in `/etc/passwd`), or `fallback` (the daemon's or CLI's
-/// `$HOME`, so `/root` for a root daemon) when the policy names no user. Errors if the
-/// named account has no `/etc/passwd` entry — a root-owned policy naming a missing user is
-/// a misconfiguration, not a silent fall-through to the wrong home.
+/// Returns the home directory that `~` expands to in a policy. That is the home of the
+/// account that `user` names, looked up in `/etc/passwd`, or `fallback` when the policy
+/// names no user. Errors when the named account has no `/etc/passwd` entry, so that a
+/// missing user does not silently fall through to the wrong home.
 pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     let Some(user) = user else {
         return Ok(fallback.to_path_buf());
@@ -384,24 +384,26 @@ pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     })
 }
 
-/// Which tier a [`PolicySource`] belongs to (DESIGN §15.8). Determines how `~` expands
-/// and whether the rules are home-scoped; the tiers merge flat, with no precedence
-/// between them.
+/// The tier that a [`PolicySource`] belongs to (DESIGN §15.8). The tier decides how `~`
+/// expands and whether the rules are confined to a home. The tiers merge flat, with no
+/// precedence between them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceOrigin {
-    /// Root-authored, full authority: the system policy and its conf.d fragments.
+    /// The system policy and its conf.d fragments, which root authors and which have
+    /// full authority.
     #[default]
     System,
-    /// Pulled in by a system fragment's `[[include]]` — a user-tier policy, scoped to
-    /// `user`'s home (see `check_scope`).
+    /// A user-tier policy that a system fragment pulls in with `[[include]]`. Its rules
+    /// are confined to the home of `user` (see `check_scope`).
     User { user: UserName },
 }
 
-/// One named policy fragment: a source name (a file path, for diagnostics), its text, and
-/// its [`SourceOrigin`] (tier). The unit of the **conf.d split** + the **system/user tier**
-/// model (DESIGN §15.8), compiled by [`compile_fragments`]. Sent over IPC on `apply`.
+/// One named policy fragment, the unit of both the conf.d split and the system and user
+/// tiers (DESIGN §15.8). A set of them travels over IPC on `apply`, and
+/// [`compile_fragments`] compiles them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicySource {
+    /// The fragment's file path, which its diagnostics name.
     pub name: String,
     pub text: String,
     #[serde(default)]
@@ -409,7 +411,7 @@ pub struct PolicySource {
 }
 
 impl PolicySource {
-    /// A system-tier fragment (the common case — `read_sources` and a single-file policy).
+    /// Creates a system-tier fragment.
     pub fn system(name: impl Into<String>, text: impl Into<String>) -> PolicySource {
         PolicySource {
             name: name.into(),
@@ -419,10 +421,11 @@ impl PolicySource {
     }
 }
 
-/// Read a policy path into [`PolicySource`]s: a single file → one fragment; a directory
-/// → every `*.toml` inside it, **sorted by name** for deterministic load order (the
-/// conf.d split, DESIGN §15.8). Errors on I/O or an empty directory — a policy that
-/// resolves to no fragments is a misconfiguration, not an empty allow-all.
+/// Returns the system fragments at `path`. A file yields one fragment, and a conf.d
+/// directory yields every `*.toml` inside it, sorted by name so that the load order is
+/// deterministic (DESIGN §15.8). Errors when a file cannot be read, or when the directory
+/// holds no fragments, because a policy without fragments is a misconfiguration rather
+/// than an empty allow-all.
 pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
     let meta = std::fs::metadata(path).with_context(|| format!("policy {}", path.display()))?;
     if !meta.is_dir() {
@@ -459,8 +462,8 @@ pub fn fragment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// The configured policy path: one file, or a conf.d directory of `*.toml` fragments
-/// (DESIGN §15.8).
+/// The configured policy path, classified as one file or as a conf.d directory of
+/// `*.toml` fragments (DESIGN §15.8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyRoot {
     /// A single policy file, which may not exist yet.
@@ -469,8 +472,8 @@ pub enum PolicyRoot {
 }
 
 impl PolicyRoot {
-    /// Classifies `path`; a path that doesn't exist is a [`File`](Self::File). Errors when
-    /// `path` can't be inspected.
+    /// Classifies `path`, treating a path that does not exist as a [`File`](Self::File).
+    /// Errors when `path` cannot be inspected.
     pub fn at(path: &Path) -> Result<PolicyRoot> {
         match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => Ok(PolicyRoot::ConfD(path.to_path_buf())),
@@ -488,8 +491,9 @@ impl PolicyRoot {
         }
     }
 
-    /// Returns the system fragment files that exist: the file itself, or the directory's
-    /// `*.toml` fragments sorted by name.
+    /// Returns the system fragment files that exist, which are the file itself or the
+    /// directory's `*.toml` fragments sorted by name. Errors when the path cannot be
+    /// inspected or the directory cannot be read.
     pub fn fragments(&self) -> Result<Vec<PathBuf>> {
         match self {
             PolicyRoot::File(p) if p.try_exists()? => Ok(vec![p.clone()]),
@@ -499,19 +503,18 @@ impl PolicyRoot {
     }
 }
 
-/// Read the full policy: the system fragments at `path` ([`read_sources`]) **plus** every
-/// user-tier file a system fragment pulls in via `[[include]]` (DESIGN §15.8). Each
-/// include names the owning `user` (whose home scopes its rules) and a `path`; the file is
-/// read and tagged [`SourceOrigin::User`]. A missing included file is treated as empty (the
-/// user simply hasn't authored their policy yet) — it still occupies a slot, so
-/// `cordon policy edit --user` can create it. This is what the CLI ships on `apply` and the
-/// daemon reads at startup; the pure [`compile_fragments`] then merges every tier.
+/// Returns the full policy, which is the system fragments at `path` ([`read_sources`])
+/// plus every user-tier file that a system fragment pulls in with `[[include]]`
+/// (DESIGN §15.8). Each include names the owning `user` and a `path`, and its file comes
+/// back tagged [`SourceOrigin::User`]. A missing included file reads as empty and still
+/// takes its slot, so that `cordon policy edit` can create it later. Errors when a system
+/// fragment or an existing included file cannot be read.
 pub fn load_policy(path: &Path) -> Result<Vec<PolicySource>> {
     let mut sources = read_sources(path)?;
     let mut included = Vec::new();
     for src in &sources {
-        // Best-effort: a system fragment that doesn't parse still surfaces its error in
-        // `compile_fragments`; we just can't read its includes, so skip it here.
+        // A system fragment that does not parse still reports its error in
+        // `compile_fragments`. Its includes cannot be read, so it is skipped here.
         let Ok(parsed) = parse(&src.text) else {
             continue;
         };
@@ -539,9 +542,9 @@ pub fn load_policy(path: &Path) -> Result<Vec<PolicySource>> {
     Ok(sources)
 }
 
-/// The file a system `[[include]]` binds to `user`, if any — what `cordon policy edit
-/// --user <user>` opens. Reads the system fragments at `policy_root` and returns the first
-/// matching include's `path`. `Ok(None)` if no system fragment includes `user`.
+/// Returns the file that the first system `[[include]]` for `user` names, from the system
+/// fragments at `policy_root`. Returns `None` when no system fragment includes `user`.
+/// Errors when the system fragments cannot be read.
 pub fn user_include_path(policy_root: &Path, user: &str) -> Result<Option<PathBuf>> {
     for src in &read_sources(policy_root)? {
         let Ok(parsed) = parse(&src.text) else {
@@ -556,14 +559,15 @@ pub fn user_include_path(policy_root: &Path, user: &str) -> Result<Option<PathBu
     Ok(None)
 }
 
-/// Parse → resolve → **merge** → compile a set of fragments into one decision table.
-/// Each fragment resolves independently — its `@`-groups are file-local and its `~`
-/// expands against its own `user =` header (else `fallback_home`) — then the resolved
-/// rules are concatenated in the order given (name order, from [`read_sources`]) and
-/// compiled together, so precedence ([`compile()`]) applies across the whole set. A
-/// fragment's parse/resolve failure becomes an error diagnostic naming it, so one
-/// bad fragment fails the apply via [`CompiledPolicy::has_errors`] rather than silently
-/// dropping its rules.
+/// Compiles a set of fragments into one decision table. Each fragment resolves on its
+/// own, so its `@`-groups are local to it, and its `~` expands against its own `user =`
+/// header, or against `fallback_home` without one. The resolved rules compile together in
+/// the order given, so precedence ([`compile()`]) applies across the whole set.
+///
+/// A fragment that fails to parse or resolve becomes an error diagnostic that names it,
+/// so one bad fragment fails the apply through [`CompiledPolicy::has_errors`] instead of
+/// silently losing its rules. A user-tier fragment also fails when it contains
+/// `[[include]]` or names an object outside its owner's home.
 pub fn compile_fragments<R>(
     sources: &[PolicySource],
     fallback_home: &Path,
@@ -579,13 +583,13 @@ where
     let mut errors = Vec::new();
     for src in sources {
         let resolved = parse(&src.text).and_then(|parsed| match &src.origin {
-            // System tier: `~` uses the fragment's own `user =` header (else the fallback);
-            // full authority, no scope restriction.
+            // The system tier has full authority and no scope restriction. Its `~` uses
+            // the fragment's own `user =` header, or the fallback without one.
             SourceOrigin::System => {
                 let home = home_for(parsed.user(), fallback_home)?;
                 resolve(&parsed, &home)
             }
-            // User tier: the owning user is fixed by the include; see `check_scope`.
+            // In the user tier, the include fixes the owning user (see `check_scope`).
             SourceOrigin::User { user } => {
                 if !parsed.includes().is_empty() {
                     return Err(crate::Error::msg(
@@ -614,17 +618,16 @@ where
         blessing_classes,
     };
     let mut compiled = compile(&resolved, resolve_fileid);
-    // Surface per-fragment parse/resolve errors ahead of the compile diagnostics.
+    // Per-fragment parse and resolve errors go ahead of the compile diagnostics.
     compiled.diagnostics.splice(0..0, errors);
     compiled
 }
 
-/// Enforce the user-tier scope (DESIGN §15.8): every object a user policy names must
-/// resolve under the owning user's `home`, whose `~` it expands against. Rejects the first
-/// out-of-scope object with a `line:col`-prefixed error — a rule reaching into `/etc` or
-/// another user's home is a hard error, not a silent drop. The rest of the user-tier
-/// scope sits in [`compile_fragments`]: a user tier may not `[[include]]`, so the
-/// user↔file binding only ever lives in a system fragment.
+/// Checks that every object a user-tier policy names lies under the owning user's
+/// `home` (DESIGN §15.8). Errors at the first rule with an object outside it, so that a
+/// rule reaching into `/etc` or another user's home fails instead of being dropped.
+/// [`compile_fragments`] enforces the rest of the user-tier scope by refusing
+/// `[[include]]` in a user tier, so only a system fragment binds a user to a file.
 fn check_scope(resolved: &ResolvedPolicy, home: &Path) -> Result<()> {
     for rule in &resolved.rules {
         for obj in &rule.objects {
@@ -644,9 +647,9 @@ fn check_scope(resolved: &ResolvedPolicy, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Expand a leading `~` to `home`, then lexically normalize. Errors if the result is
-/// neither absolute nor `~`-relative — policy paths must be unambiguous (no
-/// cwd-relative surprises in a reviewable, root-owned file; DESIGN §15.8).
+/// Returns `raw` with a leading `~` expanded to `home`, normalized lexically. Errors when
+/// `raw` is neither absolute nor `~`-relative, because a path in a reviewable, root-owned
+/// policy must not depend on the working directory (DESIGN §15.8).
 pub(crate) fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     use crate::paths::normalize;
 
@@ -734,8 +737,8 @@ mod tests {
     #[test]
     fn compile_fragments_merges_and_names_bad_fragment() {
         use cordon_bpf_common::{Dev, FileId, Ino};
-        // Deterministic stub resolver: a distinct fake inode per path (so /a ≠ /b),
-        // no filesystem dependency.
+        // A deterministic stub resolver gives each path a distinct fake inode (so that
+        // /a ≠ /b) without touching the filesystem.
         let resolver = |p: &Path| {
             let ino: u64 = p.to_string_lossy().bytes().map(u64::from).sum();
             Some(FileId::new(Dev(1), Ino(ino)))
@@ -854,10 +857,10 @@ mod tests {
         assert_eq!(bpf::Action::RENAME.to_string(), "rename");
     }
 
-    /// The shipped example policy must always parse + resolve (group refs, action
-    /// names, paths) — guards `packaging/cordon.example.policy.toml` against drift.
-    /// Inode resolution (compile) is left out: the example's exes/dirs need not exist
-    /// on the test box.
+    /// The shipped example policy must always parse and resolve, with its group
+    /// references, action names and paths. This guards
+    /// `packaging/cordon.example.policy.toml` against drift. Compile is left out, because
+    /// the example's exes and directories need not exist on the test box.
     #[test]
     fn shipped_example_policy_resolves() {
         let text = include_str!("../../../../packaging/cordon.example.policy.toml");
@@ -867,9 +870,9 @@ mod tests {
         assert!(!resolved.rules.is_empty());
     }
 
-    /// The DSL-form example must parse + resolve too — guards
-    /// `packaging/cordon.example.dsl.policy.toml` (the `rules = '''…'''` surface) against
-    /// drift, the same way the `[[rule]]` example is guarded above.
+    /// The DSL-form example must parse and resolve too. This guards
+    /// `packaging/cordon.example.dsl.policy.toml`, the `rules = '''…'''` form, against
+    /// drift in the same way as the `[[rule]]` example above.
     #[test]
     fn shipped_dsl_example_policy_resolves() {
         let text = include_str!("../../../../packaging/cordon.example.dsl.policy.toml");

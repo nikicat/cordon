@@ -1,4 +1,4 @@
-//! Path → inode identity for the bpf-lsm backend (see `file_id`).
+//! Resolves a path to the inode identity that the bpf-lsm program sees (see `file_id`).
 
 #[cfg(feature = "bpf-lsm")]
 pub use fsid::file_id;
@@ -9,33 +9,35 @@ mod fsid {
     use std::os::linux::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    /// Returns a path's [`FileId`] as the eBPF program sees it, or `None` if the path
-    /// can't be resolved. The device must equal `inode->i_sb->s_dev`, the mount's
-    /// super_block device, which is not `stat(2)`'s `st_dev` on overlayfs (containers) or
-    /// btrfs (per-subvolume device); so it comes from `/proc/self/mountinfo`. The inode
-    /// number comes from `stat`, which does match the kernel's `i_ino`.
+    /// Returns the [`FileId`] that the eBPF program sees for `path`, or `None` when the
+    /// path cannot be resolved.
     pub fn file_id(path: &Path) -> Option<FileId> {
         let canonical = std::fs::canonicalize(path).ok()?;
+        // The device must equal `inode->i_sb->s_dev`, which is the device of the mount's
+        // super_block. That is not `stat(2)`'s `st_dev` on overlayfs (containers) or btrfs
+        // (a device per subvolume), so it comes from `/proc/self/mountinfo`. The inode
+        // number comes from `stat`, which does match the kernel's `i_ino`.
         let dev = mount_dev(&canonical)?;
         let ino = Ino(std::fs::metadata(&canonical).ok()?.st_ino());
         Some(FileId::new(dev, ino))
     }
 
-    /// The device of the longest mount-point prefixing `canonical`, from
-    /// `/proc/self/mountinfo`.
+    /// Returns the device of the deepest mount point that contains `canonical`, or `None`
+    /// when `/proc/self/mountinfo` cannot be read or parsed.
     fn mount_dev(canonical: &Path) -> Option<Dev> {
         let contents = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
         dev_from_mountinfo(&contents, canonical)
     }
 
-    /// Parse `/proc/self/mountinfo` for the device of the longest mount-point that
-    /// prefixes `path`. Field 3 (`major:minor`) is `MAJOR(s_dev):MINOR(s_dev)` of the
-    /// mount's super_block — exactly the value `inode->i_sb->s_dev` holds. Split out
-    /// (pure) for testing.
+    /// Returns the device of the deepest mount point in `contents` that contains `path`,
+    /// or `None` when no mount point does or a line does not parse. `contents` is the text
+    /// of `/proc/self/mountinfo`.
     fn dev_from_mountinfo(contents: &str, path: &Path) -> Option<Dev> {
         let mut best: Option<(usize, Dev)> = None;
         for line in contents.lines() {
-            // mountinfo: id parent MAJ:MIN root mount_point options... — fields 2 and 4.
+            // A line reads `id parent MAJ:MIN root mount_point options...`, and only
+            // fields 2 and 4 matter. `MAJ:MIN` is `MAJOR(s_dev):MINOR(s_dev)` of the
+            // mount's super_block, which is exactly the value `inode->i_sb->s_dev` holds.
             let mut fields = line.split(' ');
             let majmin = fields.nth(2)?;
             let mount_point = PathBuf::from(unescape_mountinfo(fields.nth(1)?));
@@ -51,13 +53,14 @@ mod fsid {
         best.map(|(_, dev)| dev)
     }
 
-    /// Pack a major/minor into the kernel's `dev_t` (`MKDEV`, `MINORBITS = 20`).
+    /// Returns the kernel's `dev_t` for `major` and `minor`, packed as `MKDEV` packs it
+    /// (`MINORBITS = 20`).
     fn mkdev(major: u64, minor: u64) -> Dev {
         Dev((major << 20) | (minor & 0x000f_ffff))
     }
 
-    /// Decode `mountinfo`'s octal escapes (`\040` space, `\011` tab, `\012` newline,
-    /// `\134` backslash) in a mount-point field.
+    /// Returns the mount-point field `s` with `mountinfo`'s octal escapes decoded (`\040`
+    /// space, `\011` tab, `\012` newline, `\134` backslash).
     fn unescape_mountinfo(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars();
@@ -88,9 +91,9 @@ mod fsid {
             assert_eq!(mkdev(259, 1234), Dev((259 << 20) | 1234));
         }
 
-        /// Guards the premise `seed::daemon_exe`'s memoization rests on: this lookup is
-        /// path-based, so its answer changes, or disappears, when a package upgrade renames
-        /// a new binary over the running one.
+        /// Guards the premise that `seed::daemon_exe`'s memoization rests on. This lookup
+        /// is path-based, so its answer changes, or disappears, when a package upgrade
+        /// renames a new binary over the running one.
         #[test]
         fn file_id_follows_the_name_not_the_inode() {
             let tmp = tempfile::tempdir().unwrap();
@@ -112,7 +115,7 @@ mod fsid {
                  binary, which the running process never exec'd"
             );
 
-            // …and once the name is gone there is no id to be had by path at all: the
+            // …and once the name is gone, no id can be had by path at all. This is the
             // `(deleted)` case, where re-resolving would refuse `policy apply` after an
             // upgrade.
             std::fs::remove_file(&path).unwrap();

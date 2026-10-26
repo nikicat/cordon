@@ -1,427 +1,458 @@
 # Implementation plan — the rule model
 
-Concrete, reviewable plan for the architecture in [`DESIGN.md` §15](DESIGN.md). Replaces
-the v1 owner model (`owners` / `owner_identities` / `subtrees` + the unenforced `rules`
-table) with one flat rule model, compiled in userspace and enforced in-kernel.
+This is the concrete, reviewable plan for the architecture in
+[`DESIGN.md` §15](DESIGN.md). It replaces the v1 owner model with one flat rule model,
+compiled in userspace and enforced in the kernel. The v1 model consisted of `owners`,
+`owner_identities` and `subtrees`, plus the `rules` table, which was never enforced.
 
-> **M1 (rule core) is done and VM-validated**, along with the refinements that followed it —
-> no global mode, subject specificity, leaf-path reconstruction — and the authoring
-> ergonomics (compact DSL, `user =` header, conf.d fragments, `policy edit`, system/user
-> tiers). What exists today is summarized in [`STATUS.md`](../STATUS.md) and specified in
-> DESIGN §15; the M1 task breakdown has been retired now that it is code. What follows is
-> what is left.
+> M1 (the rule core) is done and VM-validated. So are the refinements that followed it (no
+> global mode, subject specificity, and leaf-path reconstruction) and the authoring
+> ergonomics (the compact DSL, the `user =` header, conf.d fragments, `policy edit`, and the
+> system and user tiers). [`STATUS.md`](../STATUS.md) summarizes what exists today, and
+> DESIGN §15 specifies it. The M1 task breakdown was retired once it became code. What
+> follows is what is left.
 
-Guiding constraints (from §15):
-- **Compile in userspace, flat in kernel.** Groups/nesting/precedence resolve at compile
-  time; the eBPF program evaluates a pre-resolved per-object rule table.
-- **Explicit apply, no autoreload.** Policy takes effect only on `cordon policy apply`.
-- **Identity stays inode-based** across hooks (no `bpf_d_path`); subjects gain predicates
+These guiding constraints come from §15:
+- **Compile in userspace, keep the kernel flat.** Groups, nesting and precedence resolve at
+  compile time. The eBPF program evaluates a pre-resolved rule table for each object.
+- **Explicit apply, no autoreload.** A policy takes effect only on `cordon policy apply`.
+- **Identity stays inode-based** across hooks, with no `bpf_d_path`. Subjects gain predicates
   over time, not a new matching mechanism.
 
-The milestones are sequenced so each is shippable and VM-validated on its own.
+The milestones are sequenced so that each one is shippable and VM-validated on its own.
 
 ## Order of work (set 2026-07-28)
 
-Numbering is identity, not schedule. The queue:
+The numbers identify milestones and do not set the schedule. This is the queue:
 
-1. ~~**Known bugs**~~ — **done.** The self-test probe ran in a world-writable `TMPDIR` and
-   reused any directory it found, so a planted symlink got root to truncate the policy and
-   switch the boundary off. It lives in root-only `/run/cordon` now.
-2. **Docs** — keep DESIGN/STATUS/plan in step with what ships, since these files are the
-   resume point.
-3. ~~**Finish M3**~~ — **done.** `inode_mkdir`, `bprm_check_security`, and `RENAME_EXCHANGE`
-   verified. Every hook in the action↔hook map now fires except `listdir`, which has no hook
-   by design.
-4. ~~**M5**~~ — **done.** The links are bpffs-pinned, so enforcement no longer fails open when
-   the daemon dies, and a singleton `flock` guards the socket and the pins.
-5. **M6** ← **here** — the largest known hole and the longest job. Start with its
-   userspace-only tasks (attestation first; see *Task order*).
+1. ~~**Known bugs**~~: done. The self-test probe ran in a world-writable `TMPDIR` and reused
+   any directory it found. So a planted symlink let root be tricked into truncating the
+   policy and switching the boundary off. The probe now lives in the root-only `/run/cordon`.
+2. **Docs**: keep DESIGN, STATUS and the plans in step with what ships, because these files
+   are the resume point.
+3. ~~**Finish M3**~~: done. `inode_mkdir`, `bprm_check_security` and `RENAME_EXCHANGE` are
+   verified. Every hook in the map from actions to hooks now fires, except `listdir`, which
+   has no hook by design.
+4. ~~**M5**~~: done. The links are pinned to bpffs, so enforcement no longer fails open when
+   the daemon dies. A singleton `flock` guards the socket and the pins.
+5. **M6** ← **here**. It closes the largest known hole and is the longest job. Start with its
+   userspace-only tasks, attestation first (see *Task order*).
 
-**M2 and M4 are not scheduled on their own.** M6 pulls in the parts it needs — M2's
-`unsandboxed` predicate *is* M6 enforcement point (3), and M4's learning machinery is how code
-sets get built (M6 task 6) — so those land as M6 tasks. The rest of M2/M4 is opportunistic.
-Blessing's B3/B4 are deferred behind all of this; see [`PLAN-bless.md`](PLAN-bless.md).
+**M2 and M4 are not scheduled on their own.** M6 pulls in the parts it needs, so those parts
+land as M6 tasks. M2's `unsandboxed` predicate is M6's enforcement point (3), and M4's
+learning machinery is how code sets get built (M6 task 6). The rest of M2 and M4 is
+opportunistic. Blessing's B3 and B4 are deferred behind all of this (see
+[`PLAN-bless.md`](PLAN-bless.md)).
 
-*Why this order:* soundness before ergonomics. M5 and M6 were the two ways the boundary was
-unsound — it stopped enforcing when the daemon died, and a grant can be hijacked by
-`LD_PRELOAD`. M5 is closed; **M6 is the one that remains**, and no ergonomic win is worth
-having on top of it.
+*Why this order:* soundness comes before ergonomics. M5 and M6 were the two ways the boundary
+was unsound. It stopped enforcing when the daemon died, and `LD_PRELOAD` can hijack a grant.
+M5 is closed and M6 is the one that remains. No ergonomic win is worth having on top of that
+hole.
 
 ---
 
 ## Milestone 2 — Subject predicates beyond exe ← **not scheduled; M6 takes what it needs**
-- Add `uid`/`gid`, `cgroup` matching to `SubjectMatch` + kernel checks (cheap helpers).
-- **IMA/fsverity** content identity: match via `bpf_ima_inode_hash`/`bpf_ima_file_hash`
-  (needs `CONFIG_IMA`/policy); userspace records expected hashes. Survives upgrades, resists
-  binary swap. **It does not resist code injection** — under `LD_PRELOAD` the exe is
-  genuinely unmodified, so its hash is correct and the predicate passes. That is M6's
-  problem, not this one; do not read this bullet as covering it.
-- `argv0` (read `mm->arg_start..arg_end`, bounded) and `ancestor-exe` (`task->real_parent`
-  chain, bounded) — the interpreter fix; document forgeability (double-fork, argv rewrite).
-- **`unsandboxed`** — enforcement point (3) of M6's invariant, and the answer for browsers.
-  A privilege-separated app splits itself into a trusted process that touches the profile and
-  untrusted ones that run web JS; the grant must attach only to the first. argv
-  (`--type=renderer`, `-contentproc`) names the split but is **forgeable** — a compromised
-  renderer rewrites `mm->arg_start..arg_end` with a memcpy — so match on the sandbox state
-  itself, which is **one-way kernel state the task cannot shed**: `task->seccomp.mode != 0`
-  and `cred->user_ns != &init_user_ns` (Chrome's layer-1 namespace sandbox). Two derefs,
-  BTF-resolved like the existing `file → inode → sb` chain, one more `SubjectFlags` bit —
-  §15.4 notes a fifth predicate bit extends matching and specificity for free. Strictly
-  fail-safe against an *attacker*: it only ever narrows an `exe` grant, so someone who
-  declines to sandbox themselves still fails the `exe` check.
+- Add `uid`, `gid` and `cgroup` matching to `SubjectMatch`, with kernel checks. The kernel
+  helpers for these are cheap.
+- **IMA or fsverity content identity.** It would match through `bpf_ima_inode_hash` or
+  `bpf_ima_file_hash`, which needs `CONFIG_IMA` and an IMA policy. Userspace records the
+  expected hashes. Content identity survives upgrades and resists a binary swap. It does not
+  resist code injection. Under `LD_PRELOAD` the exe is genuinely unmodified, so its hash is
+  correct and the predicate passes. That is M6's problem, not this one, so do not read this
+  bullet as covering it.
+- `argv0` (a bounded read of `mm->arg_start..arg_end`) and `ancestor-exe` (a bounded walk of
+  the `task->real_parent` chain). Together they are the interpreter fix. Document how they
+  can be forged, with a double fork or an argv rewrite.
+- **`unsandboxed`.** This is enforcement point (3) of M6's invariant, and it is the answer
+  for browsers. A privilege-separated app splits itself into a trusted process that touches
+  the profile, and untrusted processes that run web JS. The grant must attach only to the
+  trusted one. argv (`--type=renderer`, `-contentproc`) names the split, but it is forgeable.
+  A compromised renderer can rewrite `mm->arg_start..arg_end` with a memcpy. So the predicate
+  matches on the sandbox state itself, which is one-way kernel state that the task cannot
+  shed. The tests are `task->seccomp.mode != 0` and `cred->user_ns != &init_user_ns`, the
+  latter being Chrome's layer-1 namespace sandbox. That costs two dereferences, resolved
+  through BTF like the existing chain from `file` to `inode` to `sb`, and one more
+  `SubjectFlags` bit. §15.4 notes that a fifth predicate bit extends matching and
+  specificity for free. The predicate is strictly fail-safe against an attacker, because it
+  only ever narrows an `exe` grant. Someone who declines to sandbox themselves still fails
+  the `exe` check.
 
-  **Measured 2026-07-27** (7.1.5-zen1-1-zen, Firefox 153.0, Chrome 150.0.7871.46, Chrome
-  headless), by holding the profile's DBs and reading `/proc/PID/{status,ns/user}`:
+  This was measured on 2026-07-27 (7.1.5-zen1-1-zen, Firefox 153.0, and Chrome
+  150.0.7871.46 headless). The method was to find the processes holding the profile's
+  databases and read `/proc/PID/{status,ns/user}` for each:
 
   | | holds the secrets | `Seccomp` | `ns/user` |
   |---|---|---|---|
   | firefox parent | `cookies.sqlite`, `key4.db`, `formhistory`, `places` | 0 | init |
   | firefox fork server (`-contentproc`) | — | 0 | init |
-  | firefox content ×18 | — | 2 | **one namespace each** |
+  | firefox content ×18 | — | 2 | one namespace each |
   | chrome browser | `Login Data`, `Web Data` | 0 | init |
-  | chrome `network.mojom.NetworkService` | **`Cookies`** | 0 | init |
+  | chrome `network.mojom.NetworkService` | `Cookies` | 0 | init |
   | chrome `storage.mojom.StorageService` | — | 2 | sandboxed |
   | chrome renderers ×4 | — | 2 | sandboxed (shared) |
   | chrome gpu-process, zygote (`--no-zygote-sandbox`) | — | 0 | init |
   | chrome renderer zygotes | — | 0 | sandboxed |
 
-  Four conclusions, and only the first is the security property:
+  There are four conclusions, and only the first is the security property:
 
-  1. **Every process that runs web JS is excluded, in both browsers, by both signals
-     independently.** That is what the predicate is for and it holds.
-  2. **It is a superset, not an identification.** Chrome's GPU process and outer zygote are
-     also unsandboxed. They run no web content so this is not a failure, but do not write
-     "the predicate identifies the process holding the grant" — it doesn't.
+  1. **Every process that runs web JS is excluded, in both browsers, by each signal on its
+     own.** That is what the predicate is for, and it holds.
+  2. **The predicate selects a superset, not one process.** Chrome's GPU process and outer
+     zygote are also unsandboxed. They run no web content, so this is not a failure. But do
+     not write that the predicate identifies the process holding the grant, because it
+     doesn't.
   3. **Require the conjunction, `Seccomp == 0 && ns/user == init`.** The signals are not
-     redundant: Chrome's renderer zygotes are `Seccomp 0` in the *sandboxed* namespace, and
+     redundant. Chrome's renderer zygotes are `Seccomp 0` in the sandboxed namespace, and
      only the AND excludes them.
-  4. **Chrome's cookies work by luck.** They are held by the network service, which on Linux
-     runs `--service-sandbox-type=none`; Chrome already sandboxes it on Windows and macOS.
-     If `NetworkServiceSandbox` lands on Linux this predicate stops Chrome reading its own
-     cookies — a false positive that **breaks the browser**, which is a worse failure mode
-     than the taint's (a password prompt). Needs a version check and a documented fallback
-     before this ships enforcing. Re-measure headful too; the GPU row may differ.
-- Compiler + TOML extended to author predicate conjunctions (Appendix A shows the object form).
+  4. **Chrome's cookies work by luck.** The network service holds them, and on Linux that
+     service runs with `--service-sandbox-type=none`. Chrome already sandboxes it on Windows
+     and macOS. If `NetworkServiceSandbox` lands on Linux, this predicate stops Chrome from
+     reading its own cookies. That false positive breaks the browser, which is a worse
+     failure than the taint's, where the cost is a password prompt. The predicate needs a
+     version check and a documented fallback before it ships enforcing. Re-measure a headful
+     browser too, because the GPU row may differ.
+- Extend the compiler and the TOML to author conjunctions of predicates (Appendix A shows the
+  object form).
 
-> *Audit signal:* this is **targeted, not universal**. In the first run almost every opener
-> was a compiled binary (helm, kubectl, gpg, gh, ssh, gopass) — fine at plain `exe`
-> granularity. Only shared runtimes needed it: `node`/`deno` on `~/.npmrc` (and `python` on
-> `~/.aws` once exercised). So argv0/ancestor matters per-interpreter-fronted-dir, not for
-> the policy as a whole — keep `exe`-only the default and opt into argv/ancestor where a
-> dir's opener is an interpreter.
+> *Audit signal:* the need for this milestone is targeted, not universal. In the first run,
+> almost every opener was a compiled binary (helm, kubectl, gpg, gh, ssh, gopass), which is
+> fine at plain `exe` granularity. Only shared runtimes needed more. They were `node` and
+> `deno` on `~/.npmrc`, and `python` on `~/.aws` once that was exercised. So argv0 and
+> ancestor matching matter for each directory that an interpreter fronts, not for the policy
+> as a whole. Keep `exe`-only matching as the default, and opt into argv or ancestor matching
+> where a directory's opener is an interpreter.
 
 ## Milestone 3 — Mutation + exec hooks ← **done**
-- **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir` — the
-  second-name escape, clobber, and destroy. Design + rationale in DESIGN §15.5.
-- **Done (2026-07-28): `inode_mkdir`.** `rmdir` was gated and `mkdir` was not, so a subject
+- **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink` and `inode_rmdir`. They
+  cover the second-name escape, clobber and destroy. The design and its rationale are in
+  DESIGN §15.5.
+- **Done (2026-07-28): `inode_mkdir`.** `rmdir` was gated and `mkdir` was not. So a subject
   that could not remove a directory inside an object could still add one. The new dentry is
-  **negative**, so `find_object` on it misses on the first step and the verdict comes from the
-  *parent* — the same shape as the clobber arm of `decide_reparent`. It is an ordinary
-  create/write on the parent object, so `audit` still observes rather than blocks. This is not
-  the `rm -rf ~/.ssh && mkdir ~/.ssh` case: that one is closed by `inode_rmdir` refusing the
-  removal, since once the object's own directory is gone there is no protected ancestor left
-  for this hook to find.
-- **Done (2026-07-28): `bprm_check_security`** — the `execute` action, and the first hook to
-  need a new BTF offset (`linux_binprm -> file`); every other hook is handed a dentry the
-  existing offsets already cover. Since that offset is applied to the hook's **trusted**
-  context pointer, it must stay *real* under `maybe_poison_offsets` — the verifier
-  range-checks trusted-pointer math against `.rodata` at load, so poisoning it would turn the
-  failure-path test into a load failure.
+  negative, so `find_object` on it misses on the first step, and the verdict comes from the
+  parent directory. That is the same shape as the clobber arm of `decide_reparent`. It is an
+  ordinary create or write on the parent object, so `audit` still observes rather than
+  blocks. This hook is not what closes `rm -rf ~/.ssh && mkdir ~/.ssh`. `inode_rmdir` closes
+  that case by refusing the removal, because once the object's own directory is gone, there
+  is no protected ancestor left for this hook to find.
+- **Done (2026-07-28): `bprm_check_security`.** It implements the `execute` action. It is the
+  first hook that needs a new BTF offset (`linux_binprm -> file`), because every other hook
+  is handed a dentry that the existing offsets already cover. That offset is applied to the
+  hook's trusted context pointer, so it must stay real under `maybe_poison_offsets`. The
+  verifier range-checks trusted-pointer arithmetic against `.rodata` at load time, so
+  poisoning the offset would turn the failure-path test into a load failure.
   - **`execute` is not implied by `read`.** The exec open is an ordinary `file_open`
-    (`FMODE_EXEC | FMODE_READ`), so an object denying reads already refuses to run its
-    contents; this hook adds the converse — readable but not runnable.
-  - Expressing that needs an explicit `deny`, not a narrower `allow`: copy-down puts the
-    parent's rules in the child's bucket too, so a child rule that does not *match the
-    action* falls through to them. The smoke scenario is built that way.
-  - The self-test needs a **second object** for it. Under the deny-all probe rule the exec
-    *open* is refused by `file_open` and the verdict never reaches this hook, so the probe
-    would pass with the hook detached; the exec probe therefore gets its own object that
-    allows `read` and denies the rest. Its file also needs the x bit, or `may_open(MAY_EXEC)`
-    fails with `EACCES` first.
-- **Done (2026-07-28): the `listdir` limitation is documented** (DESIGN §15.5) — and it is
-  sharper than "coarse". There is no per-`getdents` hook, so listing *is* `file_open` on the
-  directory, and `requested_action` derives only `read`/`write`/`create`: **nothing ever
-  requests `listdir`**, so a rule naming it alone matches no request and the open falls to
-  default-deny. `allow @tools listdir @secrets` therefore *denies* the listing it appears to
-  grant. It fails closed, so this is a usability trap rather than a hole, and the shipped
-  example policies now carry the caution. Making it fire means tagging the request when the
-  opened inode is a directory (`i_mode & S_IFMT`) — one more BTF offset, deliberately not
-  taken, since `read` covers the case correctly today.
-  - Worth considering next: a `cordon policy check` warning on a rule whose action set names
-    `listdir` without `read`. Cheap, userspace-only, and it turns a silent surprise into a
-    lint. Not done here — it is a CLI behaviour change rather than an M3 hook.
+    (`FMODE_EXEC | FMODE_READ`). So an object that denies reads already refuses to run its
+    contents. This hook adds the converse, a file that is readable but not runnable.
+  - Expressing that needs an explicit `deny`, not a narrower `allow`. Copy-down also puts the
+    parent's rules into the child's bucket. So a child rule that does not match the action
+    falls through to the parent's rules. The smoke scenario is built that way.
+  - The self-test needs a second object for this hook. Under the deny-all probe rule,
+    `file_open` refuses the exec open, and the verdict never reaches this hook. The probe
+    would then pass with the hook detached. So the exec probe gets its own object, which
+    allows `read` and denies everything else. Its file also needs the x bit, or
+    `may_open(MAY_EXEC)` fails with `EACCES` first.
+- **Done (2026-07-28): the `listdir` limitation is documented** (DESIGN §15.5), and it is
+  sharper than "coarse". There is no hook for each `getdents`, so listing a directory is a
+  `file_open` on it. `requested_action` derives only `read`, `write` and `create`. So nothing
+  ever requests `listdir`. A rule that names `listdir` alone matches no request, and the open
+  falls to default-deny. `allow @tools listdir @secrets` therefore denies the listing it
+  appears to grant. It fails closed, so it is a usability trap rather than a hole, and the
+  shipped example policies now carry a caution about it. Making `listdir` fire means tagging
+  the request when the opened inode is a directory (`i_mode & S_IFMT`). That needs one more
+  BTF offset, and it was deliberately not taken, because `read` covers the case correctly
+  today.
+  - Worth considering next is a `cordon policy check` warning on a rule whose action set
+    names `listdir` without `read`. It is cheap and userspace-only, and it turns a silent
+    surprise into a lint. It is not done here, because it is a change to CLI behaviour rather
+    than an M3 hook.
 
-**M3 is complete**: every hook in the action↔hook map now fires except `listdir`, which is
-specified above as having no hook by design.
-- `listdir` ≈ "open dir for read" (coarse) — note the limitation; finer (`file_permission`)
-  stays opt-in for cost.
-- **Done:** gate a positive `new_dentry`. `decide_reparent` classified the source and
-  `new_dentry.parent()` but never `new_dentry` itself, so rename-over destroyed a protected
-  inode with no verdict and dangled its `PROTECTED` entry — `mv anything secret` did what
-  `rm secret` is refused. `find_object` now runs on the destination dentry first and takes
-  that object's `write` verdict; the daemon self-test and a `bpf-lsm-smoke.sh` scenario both
-  cover it, the latter also pinning that atomic-save still works. DESIGN §15.5.
-- **Done (2026-07-28): `renameat2(RENAME_EXCHANGE)` verified.** An exchange re-parents both
-  inodes and destroys neither, so the destroy check's `write` floor does not cover it; the
-  protected side leaving needs the unconditional escape refusal, which requires the kernel to
-  ask about *that* side. It does: `security_inode_rename` calls the hook a second time with
-  the pair swapped when `RENAME_EXCHANGE` is set. Now measured rather than believed, by the
-  `rename_exchange` smoke scenario. The load-bearing case is an object that **allows write**
-  and the unprotected name passed *first* — then the first call sees only an ordinary
-  permitted clobber, and the swapped call is the sole thing standing between the secret and a
-  name outside its object. The scenario preflights the syscall against two unprotected files,
-  because an unavailable `renameat2` would otherwise read as a deny and pass for the wrong
-  reason. An exchange wholly inside one object stays allowed (internal shuffle).
+**M3 is complete.** Every hook in the map from actions to hooks now fires, except `listdir`,
+which is specified above as having no hook by design.
+- `listdir` is roughly "open a directory for read", which is coarse. The limitation is noted.
+  Finer mediation through `file_permission` stays opt-in, because of its cost.
+- **Done: gate a positive `new_dentry`.** `decide_reparent` classified the source and
+  `new_dentry.parent()`, but never `new_dentry` itself. So a rename over a protected inode
+  destroyed it with no verdict, and left its `PROTECTED` entry dangling. `mv anything secret`
+  did what `rm secret` is refused. `find_object` now runs on the destination dentry first and
+  takes that object's `write` verdict. The daemon self-test and a `bpf-lsm-smoke.sh` scenario
+  both cover it, and the smoke scenario also pins that atomic save still works. See DESIGN
+  §15.5.
+- **Done (2026-07-28): `renameat2(RENAME_EXCHANGE)` is verified.** An exchange re-parents both
+  inodes and destroys neither, so the `write` floor of the destroy check does not cover it.
+  When the protected side leaves its object, the unconditional escape refusal must catch it,
+  and that requires the kernel to ask about that side. It does. `security_inode_rename` calls
+  the hook a second time, with the pair swapped, when `RENAME_EXCHANGE` is set. The
+  `rename_exchange` smoke scenario now measures this rather than assuming it. The case that
+  matters is an object that allows write, with the unprotected name passed first. The first
+  call then sees only an ordinary permitted clobber, and the swapped call is the only thing
+  that keeps the secret from getting a name outside its object. The scenario first runs the
+  syscall against two unprotected files, because an unavailable `renameat2` would otherwise
+  read as a deny and pass for the wrong reason. An exchange wholly inside one object stays
+  allowed, because it is an internal shuffle.
 
 ## Milestone 4 — Autolearn (the zones layer) ← **not scheduled; its machinery lands as M6 task 6**
-- Separate `learned.db` (SQLite); `zones` config = where learning may propose rules.
-- `cordon learn [--for ZONE] [--ttl T]` (bounded window) → ring events become candidate
-  rules; **generalize** (per-file → subtree), **confidence** (seen N), **dedup**; record the
-  rich subject (argv0/ancestor/hash).
-- `cordon learn review` → diff of proposals → `promote` writes them into the text policy.
-- Learned rules are **lower precedence** and never override a hand-written deny.
+- A separate `learned.db` (SQLite). The `zones` config says where learning may propose rules.
+- `cordon learn [--for ZONE] [--ttl T]` opens a bounded window in which ring events become
+  candidate rules. The candidates are generalized (from single files to subtrees), given a
+  confidence (seen N times), and deduplicated. Each one records the rich subject (argv0,
+  ancestor and hash).
+- `cordon learn review` shows a diff of the proposals, and `promote` writes them into the text
+  policy.
+- Learned rules have lower precedence and never override a hand-written deny.
 
 ## Milestone 5 — Fail-safe pinning ← **done (2026-07-28), VM-validated**
 
-Enforcement was fail-**open**: `attach()`'s `LsmLinkId` was discarded, so the links lived
-inside `ebpf` — a local in `Backend::run` — and every hook detached when the daemon exited.
-That made every other guarantee in this document conditional on a process staying alive.
+Enforcement used to fail open. `attach()`'s `LsmLinkId` was discarded, so the links lived
+inside `ebpf`, a local variable in `Backend::run`, and every hook detached when the daemon
+exited. That made every other guarantee in this document depend on a process staying alive.
 
-**Shipped: pin the links, and only the links.** A pinned link holds its program and a program
-holds its maps, so seven pinned links keep the programs *and* the seeded policy enforcing with
-no holding process. The startup sequence is attach → self-test → seed → **pin** →
-sweep older generations: the previous generation keeps enforcing until the new one is
-*proven*, so there is no instant with nothing attached and an abort on a bad policy leaves the
-boundary up. Pins live in a per-run generation subdirectory of `bpf_pin_dir`, because
-`BPF_OBJ_PIN` fails `EEXIST` on a taken path and one shared directory would force a
-detach-then-attach gap; the code that owns the layout and the order is `PinDir::pin_links`
-in `crates/daemon/src/backend/bpf_lsm/pin.rs`.
+**What shipped: pin the links, and only the links.** A pinned link holds its program, and a
+program holds its maps. So seven pinned links keep the programs and the seeded policy
+enforcing with no process holding them. At startup the daemon attaches, runs the self-test,
+seeds, pins, and then sweeps older generations. The previous generation keeps enforcing
+until the new one is proven. So there is no instant with nothing attached, and an abort on a
+bad policy leaves the boundary up. Each run pins into its own generation subdirectory of
+`bpf_pin_dir`. `BPF_OBJ_PIN` fails with `EEXIST` on a path that is taken, so one shared
+directory would force a gap between detaching and attaching. `PinDir::pin_links` in
+`crates/daemon/src/backend/bpf_lsm/pin.rs` owns the layout and the order.
 
-- **Adopt-existing-pins was specified here and deliberately dropped.** It buys nothing the
-  link pins don't already give, and costs a mandatory cross-process writer lock, an
-  ABI/build-id check to avoid an upgraded daemon driving the old kernel program, and a clash
-  with the self-test (which writes bank 0 + `SETTINGS` before `Maps::seed` and would
-  transiently clobber a live adopted policy). A restarting daemon loads its own object with
-  its own private maps, so the single-writer invariant in `seed.rs` is untouched.
-- The old note "pin the policy maps only — a pinned `BLESSED` means grants that never expire"
-  was **backwards** and is retired: under a pinned program an unpinned `BLESSED` is still
-  alive and its stale grants persist anyway, just unreachably. Pinning no maps at all leaves
-  `BLESSED` fail-closed on restart exactly as DESIGN §16 step 9 specifies.
-- **Singleton guard — shipped**, as an exclusive `flock` on `<socket>.lock` taken before the
-  kernel or the socket is touched. Keyed on the socket rather than the pin dir so it also
-  covers user-mode dev daemons, and it fixes a standing bug: `serve` unlinks any socket inode
-  it finds without probing whether anyone is listening, so a second daemon used to steal the
-  first one's live socket and leave it running unreachable.
-- **The fast-allow had to be narrowed in the same milestone.** `live_bank` returns `None` — a
-  total, unlogged bypass of every object — for `settings.daemon_pid`. Pinning makes that
-  record outlive the process that wrote it, so a recycled pid would inherit the bypass;
-  `Settings` gained `daemon_exe` and the kernel now requires both. No new BTF offset:
-  `caller_exe()` is argument-free, so `live_bank`'s signature and the five-register ceiling
-  are unchanged, and `&&` short-circuits on the pid so the hot path is unaffected.
-- **Teardown is explicit and asynchronous.** `systemctl stop` deliberately leaves the pins, so
-  stop/restart/crash are all gapless and a killed log-drainer never disarms the box;
-  `cordond --teardown` removes them and refuses while a daemon holds the lock. Unlinking a pin
-  only drops the link's last reference — the kernel detaches from a workqueue — so anything
-  needing to observe the boundary down must poll.
-- Covered by two smoke scenarios: `pinned_survives_daemon_death` (SIGKILL, assert the deny
-  *and* the allow still stand, then teardown and assert the read succeeds) and
-  `singleton_refuses_a_second_daemon`.
+- **Adopting existing pins was specified here and deliberately dropped.** It buys nothing that
+  the link pins don't already give. It costs three things. One is a mandatory cross-process
+  writer lock. Another is an ABI or build-id check, so that an upgraded daemon doesn't drive
+  the old kernel program. The third is a clash with the self-test, which writes bank 0 and
+  `SETTINGS` before `Maps::seed` and so would briefly clobber a live adopted policy. A
+  restarting daemon loads its own object with its own private maps, so the single-writer
+  invariant in `seed.rs` is untouched.
+- The old note "pin the policy maps only, because a pinned `BLESSED` means grants that never
+  expire" was backwards, and it is retired. Under a pinned program, an unpinned `BLESSED` is
+  still alive, and its stale grants persist anyway, only unreachably. Pinning no maps at all
+  leaves `BLESSED` failing closed on restart, exactly as DESIGN §16 step 9 specifies.
+- **The singleton guard shipped.** It is an exclusive `flock` on `<socket>.lock`, taken before
+  the daemon touches the kernel or the socket. It is keyed on the socket rather than on the
+  pin directory, so it also covers dev daemons in user mode. It also fixes a standing bug.
+  `serve` unlinks any socket inode it finds without checking whether anyone is listening. So
+  a second daemon used to steal the first one's live socket and leave the first one running
+  but unreachable.
+- **The fast-allow had to be narrowed in the same milestone.** For `settings.daemon_pid`,
+  `live_bank` returns `None`, which is a total bypass of every object with no log line.
+  Pinning makes that record outlive the process that wrote it, so a recycled pid would
+  inherit the bypass. `Settings` gained `daemon_exe`, and the kernel now requires both. It
+  needed no new BTF offset. `caller_exe()` takes no arguments, so `live_bank`'s signature and
+  the five-register ceiling are unchanged. And `&&` short-circuits on the pid, so the hot path
+  is unaffected.
+- **Teardown is explicit and asynchronous.** `systemctl stop` deliberately leaves the pins.
+  So a stop, a restart and a crash are all gapless, and killing the log drainer never disarms
+  the box. `cordond --teardown` removes the pins, and it refuses while a daemon holds the
+  lock. Unlinking a pin only drops the link's last reference, and the kernel detaches from a
+  workqueue. So anything that needs to observe the boundary going down must poll.
+- Two smoke scenarios cover this milestone. `pinned_survives_daemon_death` kills the daemon
+  with SIGKILL and asserts that both the deny and the allow still stand. It then tears down
+  and asserts that the read succeeds. The other is `singleton_refuses_a_second_daemon`.
 
 ---
 
 ## Milestone 6 — Fixed code as the precondition for a grant ← **the remaining must-have**
 
 > **The invariant.** A grant attaches only to a process that runs *the code it shipped with*.
-> A process that executes foreign code **in its own address space** — a JIT, an interpreter
-> running a script, a preloaded library — forfeits it. Not "is denied by a rule": has no
-> subject identity worth granting to in the first place.
+> A process that executes foreign code in its own address space forfeits the grant. That
+> covers a JIT, an interpreter running a script, and a preloaded library. Such a process is
+> not denied by a rule. It has no subject identity worth granting to in the first place.
 
-This is one rule with three enforcement points, and it is stated as an invariant rather than
-a mechanism because the mechanism alone (the taint below) catches only one of the three.
+This is one rule with three enforcement points. It is stated as an invariant rather than as a
+mechanism, because the mechanism alone (the taint below) catches only one of the three.
 
 ### Why "in its own address space" is load-bearing
 
-Taken as a property of a *program* the invariant is unsatisfiable, and browsers are the proof:
-Chrome runs attacker JavaScript all day and must read its own cookie DB or it is not a
-browser. Taken as a property of a *process* it is satisfiable, because well-built tools have
-already done the separation:
+Taken as a property of a program, the invariant can't be satisfied, and browsers are the
+proof. Chrome runs attacker JavaScript all day, and it must read its own cookie DB or it is
+not a browser. Taken as a property of a process, the invariant can be satisfied, because
+well-built tools have already done the separation:
 
 | tool | runs foreign code | where | grant survives? |
 |---|---|---|---|
-| Chrome / Firefox | web JS, JIT | renderer / content process, sandboxed | **yes** — the browser/parent process holds the grant and runs no web JS |
-| `ssh` | `ProxyCommand`, `LocalCommand` | `exec` → new process, new `exe` | **yes** — exec resets identity, the child holds no grant |
-| `git` | hooks, credential helpers, pager | `exec` | **yes**, same reason |
-| `python3 script.py` | the script | **same process** | **no** — no boundary exists, ever |
-| `gdb`, `vim +python`, lua-linked daemons | embedded interpreter | **same process** | **no** — and no hook fires, see *Attestation* |
+| Chrome / Firefox | web JS, JIT | a sandboxed renderer or content process | yes, because the browser or parent process holds the grant and runs no web JS |
+| `ssh` | `ProxyCommand`, `LocalCommand` | `exec` into a new process with a new `exe` | yes, because exec resets identity and the child holds no grant |
+| `git` | hooks, credential helpers, pager | `exec` | yes, for the same reason |
+| `python3 script.py` | the script | the same process | no, because no boundary ever exists |
+| `gdb`, `vim +python`, lua-linked daemons | an embedded interpreter | the same process | no, and no hook fires (see *Attestation*) |
 
 So `exec` and the process boundary are what make the invariant reachable. Anything that mixes
 untrusted code into the granted process's own address space is out, permanently and by
-construction — not a tuning problem, not a learning problem.
+construction. That is not a tuning problem, and it is not a learning problem.
 
 ### The three enforcement points
 
 | | catches | where | mechanism |
 |---|---|---|---|
-| **1. Attestation** | a program whose *purpose* is executing arbitrary code — `python`, `node`, `bash`, `deno` | `cordon policy check` | policy lint, no kernel code |
-| **2. Taint** (this milestone's bulk) | a fixed-code program that *acquires* code at runtime — `LD_PRELOAD`, `dlopen`, anon RWX | `mmap_file` / `file_mprotect` / `ptrace_access_check` | sticky per-`mm` bit → `SubjectFlags` |
-| **3. Sandbox state** | the untrusted half of a privilege-separated app — a Chrome renderer | `file_open` | `SubjectFlags` bit off one-way task state (M2) |
+| **1. Attestation** | a program whose purpose is executing arbitrary code, such as `python`, `node`, `bash` or `deno` | `cordon policy check` | a policy lint, with no kernel code |
+| **2. Taint** (the bulk of this milestone) | a fixed-code program that acquires code at runtime, through `LD_PRELOAD`, `dlopen` or anonymous RWX memory | `mmap_file` / `file_mprotect` / `ptrace_access_check` | a sticky bit for each `mm`, read as a `SubjectFlags` bit |
+| **3. Sandbox state** | the untrusted half of a privilege-separated app, such as a Chrome renderer | `file_open` | a `SubjectFlags` bit taken from one-way task state (M2) |
 
-Only (2) needs new in-kernel machinery. (1) is a lint over the compiled policy. (3) is a
-subject predicate that belongs to M2's axis, specified there and referenced here.
+Only (2) needs new machinery in the kernel. (1) is a lint over the compiled policy. (3) is a
+subject predicate that belongs to M2's axis. M2 specifies it, and this section refers to it.
 
 ### The gap that (2) closes
 
-`exe` is `mm->exe_file`: set once at `execve`, never updated. That is a statement about *the
-file that was exec'd*, not *the code that ends up running*, and any dynamic loading breaks
-the equivalence. `LD_PRELOAD=evil.so ssh -V` runs attacker code with
-`mm->exe_file == /usr/bin/ssh` and inherits every grant `ssh` has. **Every static `allow` is
-therefore a confused-deputy grant.**
+`exe` is `mm->exe_file`. It is set once at `execve` and never updated. So it describes the
+file that was exec'd, not the code that ends up running, and any dynamic loading breaks the
+equivalence. `LD_PRELOAD=evil.so ssh -V` runs attacker code with
+`mm->exe_file == /usr/bin/ssh` and inherits every grant that `ssh` has. Every static `allow`
+is therefore a confused-deputy grant.
 
-Preconditions are ordinary: `/usr/bin/ssh` is `0755`, not setuid, no file capabilities, so
-`ld.so` is not in secure-execution mode and honours `LD_PRELOAD`. A one-shot scraper running
-as the user can set an environment variable.
+The preconditions are ordinary. `/usr/bin/ssh` is `0755`, not setuid, and has no file
+capabilities. So `ld.so` is not in secure-execution mode, and it honours `LD_PRELOAD`. A
+one-shot scraper running as the user can set an environment variable.
 
-None of M2's predicates close it. `uid`/`gid`/`cgroup` are unchanged; `argv0` is still
-`ssh`; `ancestor-exe` is still the shell. **IMA/fsverity exe-hash does not help either** —
-the exe genuinely *is* ssh, unmodified, so its hash is correct. The injected code lives in a
-file that is never the subject of any check. This is the trap: M2 lists exe-hash as
-"resists binary swap", which is true and irrelevant, because nothing is swapped.
+None of M2's predicates close the gap. `uid`, `gid` and `cgroup` are unchanged. `argv0` is
+still `ssh`, and `ancestor-exe` is still the shell. An IMA or fsverity hash of the exe does
+not help either. The exe genuinely is ssh, unmodified, so its hash is correct. The injected
+code lives in a file that is never the subject of any check. This is the trap. M2 lists the
+exe hash as resisting a binary swap, which is true and irrelevant, because nothing is
+swapped.
 
 ### Attestation — enforcement point (1)
 
 The taint structurally cannot catch an interpreter. `python3 evil.py` maps nothing
-executable: the script is read as **data** and executed by the interpreter's own loop, so no
-hook fires and the process is genuinely untainted. `exe` is `/usr/bin/python3`, unmodified,
-and the code it runs is arbitrary. There is no runtime signal to find — the exclusion has to
-be static.
+executable. The interpreter reads the script as data and executes it in its own loop, so no
+hook fires, and the process is genuinely untainted. `exe` is `/usr/bin/python3`, unmodified,
+and the code it runs is arbitrary. There is no runtime signal to find, so the exclusion has
+to be static.
 
-It must be an **allowlist, not a blocklist.** Enumerating interpreters is unbounded and
-§3 rejects exactly that shape (*unprofiled = unconfined*); the dangerous cases are not the
-obvious ones but fixed ELF binaries with *embedded* interpreters — `gdb`, `vim +python`,
-anything linking lua — which look like ordinary compiled tools and fire no hook. So invert
-it: a subject appearing in an `allow` rule must **positively attest** fixed code, via the
-same `code =` token the policy surface below already introduces. No attestation ⇒
-`cordon policy check` warns that the rule is a confused-deputy grant. This scopes the vetting
-to the handful of exes that actually hold grants — the same argument the code-set enumeration
-makes — rather than to the system.
+It must be an allowlist, not a blocklist. Enumerating interpreters is an unbounded task, and
+§3 rejects exactly that shape (*unprofiled means unconfined*). The dangerous cases are not
+the obvious ones. They are fixed ELF binaries with embedded interpreters, such as `gdb`,
+`vim +python` and anything that links lua. These look like ordinary compiled tools and fire
+no hook. So the check is inverted. A subject that appears in an `allow` rule must positively
+attest that it runs fixed code. It does so with the same `code =` token that the policy
+surface below introduces. Without an attestation, `cordon policy check` warns that the rule
+is a confused-deputy grant. This limits the vetting to the handful of exes that actually hold
+grants, rather than the whole system. The code-set enumeration makes the same argument.
 
-**Recorded consequence: the shipped example policy loses `allow /usr/bin/aws`.** The aws CLI
-is Python, and M2's own audit signal records `~/.aws` being opened by `python3`, not `aws`.
-Under this invariant that rule cannot be made honest, and the example policy should say so
-rather than model a grant that grants nothing. Expect the same verdict for most npm- and
-Electron-distributed tooling. **Static `allow` rules get rare**, and the residue routes
-through `bless` — which is the lever this plan already names, arrived at deliberately instead
-of by attrition.
+**A recorded consequence is that the shipped example policy loses `allow /usr/bin/aws`.** The
+aws CLI is Python, and M2's own audit signal records `python3`, not `aws`, opening `~/.aws`.
+Under this invariant that rule cannot be made honest. The example policy should say so,
+rather than model a grant that grants nothing. Expect the same verdict for most tooling
+distributed through npm or Electron. Static `allow` rules become rare, and the rest of the
+access goes through `bless`. That is the lever this plan already names, now reached
+deliberately instead of by attrition.
 
 **`bless` does not satisfy the invariant, and is not meant to.** A blessed `python` session
-reads secrets. Blessing proves *human presence*, not code identity (DESIGN §16), so it is the
-deliberate escape hatch from this rule. Naming it as such keeps the invariant honest instead
-of quietly violated in the one place it is most often reached for.
+reads secrets. Blessing proves human presence, not code identity (DESIGN §16), so it is the
+deliberate escape hatch from this rule. Naming it as an escape hatch keeps the invariant
+honest. Otherwise it would be quietly violated in the one place where people reach for it
+most.
 
 ### Why it must be caught at load time, not decision time
 
-At `file_open` you are inspecting state the attacker controls and has had time to launder:
+At `file_open`, you are inspecting state that the attacker controls and has had time to
+launder:
 
-- a constructor can patch what it wants and then `munmap`/`dlclose` itself
-- `environ` lives in the process's own writable memory and can be scrubbed
-- injection need not touch a file at all — `ptrace` of a forked child is permitted under
-  Yama `scope=1`, and anonymous `PROT_EXEC` needs no file
+- A constructor can patch whatever it wants and then `munmap` or `dlclose` itself.
+- `environ` lives in the process's own writable memory, and it can be scrubbed.
+- Injection need not touch a file at all. `ptrace` of a forked child is permitted under Yama
+  `scope=1`, and anonymous `PROT_EXEC` memory needs no file.
 
-There is no durable artifact to find. Walking the VMAs is also impractical (a maple tree on
-modern kernels) and would still need a per-tool expectation set to interpret. So detection at
-decision time is **structurally unsound**, not merely difficult.
+There is no durable artifact to find. Walking the VMAs is also impractical, because they are
+a maple tree on modern kernels, and the result would still need an expected set for each tool
+to interpret it. So detection at decision time is structurally unsound, and not merely
+difficult.
 
 ### The mechanism
 
-A sticky taint, recorded when code is acquired, read as one more predicate:
+The mechanism is a sticky taint, recorded when code is acquired and read as one more
+predicate:
 
-- **Set** at `mmap_file` (`PROT_EXEC` of a file outside the subject's code set — **and of a
-  NULL file**, since `security_mmap_file` is called with `file == NULL` for anonymous
-  mappings and Linux does not enforce W^X, so a direct `mmap(PROT_EXEC|PROT_WRITE,
-  MAP_ANONYMOUS)` never reaches `mprotect`), `file_mprotect` (existing memory turned
-  executable), and `ptrace_access_check` (taints the *target*; `process_vm_writev` routes
-  through `ptrace_may_access`, so it is covered by the same hook).
-- **Sticky** for the life of the `mm`, so unloading launders nothing. Cleared by `execve`
-  only — a genuinely new program image. (The attacker gains nothing by re-execing: that
-  discards the injection too.)
-- **Store** — open, and the one question that changes the mechanism rather than its notes.
-  Stickiness above is stated per-`mm`; `BPF_MAP_TYPE_TASK_STORAGE` is per-*task*, and task-local
-  storage is believed **not** to be copied on `clone` (which is why `security_task_alloc`
-  exists) — **verify before relying on it**, the answer picks the map. If it does not
-  inherit, two laundering paths open: a tainted process forks and the child starts clean, and
-  — worse, because no hook closes it — thread A `dlopen`s the payload while thread B, created
-  earlier, keeps its own untainted storage and does the read. `mm` is shared; task storage is
-  not. Hooking `task_alloc` to copy the parent's bit closes fork and covers threads created
-  *after* the taint, and nothing closes threads that already exist. Keying an LRU hash on
-  `task->mm` implements the stated invariant directly, at the cost of no free-time hook to
+- **Set.** The taint is set at three hooks. The first is `mmap_file`, on a `PROT_EXEC`
+  mapping of a file outside the subject's code set. It is also set on a mapping with a NULL
+  file. `security_mmap_file` is called with `file == NULL` for anonymous mappings, and Linux
+  does not enforce W^X. So a direct `mmap(PROT_EXEC|PROT_WRITE, MAP_ANONYMOUS)` never reaches
+  `mprotect`. The second is `file_mprotect`, when existing memory is made executable. The
+  third is `ptrace_access_check`, which taints the target. `process_vm_writev` goes through
+  `ptrace_may_access`, so the same hook covers it.
+- **Sticky.** The taint lasts for the life of the `mm`, so unloading the code launders
+  nothing. Only `execve` clears it, because that loads a genuinely new program image. The
+  attacker gains nothing by re-execing, because that discards the injection too.
+- **Store.** This is still open, and it is the one question that changes the mechanism rather
+  than its notes. Stickiness above is stated per `mm`, but `BPF_MAP_TYPE_TASK_STORAGE` is per
+  task. Task-local storage is believed not to be copied on `clone`, which is why
+  `security_task_alloc` exists. Verify that before relying on it, because the answer picks
+  the map. If the taint does not inherit, two laundering paths open. In the first, a tainted
+  process forks and the child starts clean. The second is worse, because no hook closes it.
+  Thread A `dlopen`s the payload, while thread B, created earlier, keeps its own untainted
+  storage and does the read. The `mm` is shared, and task storage is not. Hooking
+  `task_alloc` to copy the parent's bit closes the fork path and covers threads created after
+  the taint. Nothing closes threads that already exist. An LRU hash keyed on `task->mm`
+  implements the stated invariant directly. Its cost is that there is no hook at free time to
   clean up on.
-- **Read** at `file_open` as a `SubjectFlags` bit, so a tainted process stops matching
-  exe-based rules and falls through to the object's catch-all. Fail-safe by construction, no
-  special-case code path, and it composes with copy-down and precedence unchanged. Note the
-  floor is the **catch-all, not denial**: on an object whose catch-all is `audit *` a tainted
-  process still reads it and is merely logged. That is the intended composition — the
-  catch-all is the floor for everyone — but "tainted ⇒ denied" holds only where the catch-all
-  denies, so it is a policy-authoring trap to call out in the docs.
+- **Read.** `file_open` reads the taint as a `SubjectFlags` bit, so a tainted process stops
+  matching exe-based rules and falls through to the object's catch-all. That is fail-safe by
+  construction. It needs no special-case code path, and it composes with copy-down and
+  precedence unchanged. Note that the floor is the catch-all, not denial. On an object whose
+  catch-all is `audit *`, a tainted process still reads the object and is merely logged. That
+  is the intended composition, because the catch-all is the floor for everyone. But "tainted
+  means denied" holds only where the catch-all denies, so it is a trap for policy authors that
+  the docs must call out.
 
-The subject was never `exe`. It is **`exe AND untainted`**.
+The subject was never `exe`. It is `exe AND untainted`.
 
-Ordering is what makes this work: `ld.so` must *map* a preloaded library before its
-constructor can run, so the taint lands before any attacker code executes.
+The order of events is what makes this work. `ld.so` must map a preloaded library before the
+library's constructor can run, so the taint lands before any attacker code executes.
 
 ### Why this is not a per-tool profile
 
-It looks like AppArmor's `m` permission and is not. §3 rejects per-tool profiles because
-*unprofiled = unconfined*. Here a code set is a **precondition for a grant**, not a
-confinement mechanism: an exe with no code set gets no grant and falls to the catch-all
-deny. **Unprofiled = denied.** The failure mode that makes MAC profiles fragile cannot
-arise, and sets are written only for the handful of exes that appear in `allow` rules — not
-for the system.
+It looks like AppArmor's `m` permission, but it is not. §3 rejects per-tool profiles because
+an unprofiled program is unconfined. Here a code set is a precondition for a grant, not a
+confinement mechanism. An exe with no code set gets no grant and falls to the catch-all deny.
+An unprofiled program is denied. So the failure that makes MAC profiles fragile cannot arise,
+and code sets are written only for the handful of exes that appear in `allow` rules, not for
+the whole system.
 
 ### The code set is enumerated, not inferred
 
-An earlier sketch used *provenance* — "taint if the mapped file was writable by the
-adversary" (root-owned and not group/other-writable ⇒ trusted). It is cheap and it is too
-weak: a **legitimate root-owned library** preloaded into `ssh` satisfies provenance and is
-still an injection. Provenance answers "who wrote this file"; the grant needs "is this the
-code that constitutes ssh". Different questions, and only the second one is what
-`allow ssh read ~/.ssh` means.
+An earlier sketch used provenance. It would taint a process if the mapped file was writable by
+the adversary, and trust a file that is root-owned and not writable by group or other. That
+rule is cheap, and it is too weak. A legitimate root-owned library preloaded into `ssh`
+satisfies provenance and is still an injection. Provenance answers "who wrote this file", but
+the grant needs to know "is this the code that makes up ssh". Those are different questions,
+and only the second one is what `allow ssh read ~/.ssh` means.
 
-So the set is enumerated per subject. Root-ownership still earns its keep, but only in a
-narrow way: because the adversary cannot modify files under `/usr/lib`, **path identity is
-sufficient and no hashes or signatures are needed**.
+So the set is enumerated for each subject. Root ownership still earns its keep, but only in a
+narrow way. The adversary cannot modify files under `/usr/lib`, so path identity is enough,
+and no hashes or signatures are needed.
 
-**Static derivation is off the table** — verified, not assumed (2026-07-27):
+**Static derivation is off the table.** This was verified on 2026-07-27, not assumed:
 
 - `ldd /usr/bin/ssh` lists 17 libraries.
-- At runtime ssh also loads `libnss_*.so` (dlopened by libc on every hostname lookup),
-  krb5 plugins from `/usr/lib/krb5/plugins/{kdb,preauth,tls}/`, and OpenSSL providers from
-  `/usr/lib/ossl-modules/`.
-- **Which `libnss_*` is decided by `/etc/nsswitch.conf`** — runtime *configuration*, not the
-  binary. This host's `hosts:` line alone pulls `mymachines`, `mdns4_minimal`, `resolve`,
-  `files`, `myhostname`, `dns`, `wins`.
+- At runtime ssh also loads `libnss_*.so` modules, which libc dlopens on every hostname
+  lookup. It loads krb5 plugins from `/usr/lib/krb5/plugins/{kdb,preauth,tls}/` and OpenSSL
+  providers from `/usr/lib/ossl-modules/` too.
+- **`/etc/nsswitch.conf` decides which `libnss_*` modules load.** That is runtime
+  configuration, not the binary. On this host, the `hosts:` line alone pulls in
+  `mymachines`, `mdns4_minimal`, `resolve`, `files`, `myhostname`, `dns` and `wins`.
 
-So the set is a property of the binary *plus machine configuration*, and cannot be read out
-of the ELF. A hook that ran `ldd` would emit a set that breaks ssh the first time it resolves
-a hostname, and break differently on different machines. **Learn it, don't derive it** —
-which is M4's machinery and §15.10's audit→admit→enforce, applied to a second axis.
+So the set is a property of the binary plus the machine's configuration, and it cannot be read
+out of the ELF. A hook that ran `ldd` would emit a set that breaks ssh the first time ssh
+resolves a hostname, and that breaks differently on different machines. The set must be
+learned, not derived. That is M4's machinery and §15.10's audit, admit, enforce flow, applied
+to a second axis.
 
 ### Policy surface
 
-The set is a property of the *subject*, not of a rule, so it hangs off the subject group —
-the shape `blessing` already established. One token is hand-authored:
+The code set is a property of the subject, not of a rule, so it hangs off the subject group.
+That is the shape `blessing` already established. One token is written by hand:
 
 ```toml
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/ssh-add", "/usr/lib/gcr-ssh-agent"]
-code = "learn"        # observe + journal, enforce nothing
+code = "learn"        # observe and journal, enforce nothing
 # code = "strict"     # taint on any mapping outside the set
-# code = "arbitrary"  # attested arbitrary-code executor — never eligible for a grant
+# code = "arbitrary"  # attested arbitrary-code executor, never eligible for a grant
 #                     # (browsers, interpreters); `policy check` errors on an `allow`
 ```
 
-The entries themselves are **not policy** — they are facts about the machine, the same
-category as the `(dev,ino)` resolutions cordon already performs invisibly at apply time.
-They live in a generated, root-owned sidecar:
+The entries themselves are not policy. They are facts about the machine, in the same category
+as the `(dev,ino)` resolutions that cordon already performs silently at apply time. They live
+in a generated, root-owned sidecar file:
 
 ```
 # /etc/cordon/code.d/ssh-tools.list
@@ -434,28 +465,28 @@ They live in a generated, root-owned sidecar:
 …
 ```
 
-Groups keep it small. §15.7 makes groups symmetric across axes; code is simply a fourth one,
-and nearly all bulk is shared (libc, libcrypto, libz appear under every subject), so a
-`[group.code.base]` absorbs it. Per-subject content drops to the genuinely distinctive
-handful: krb5 and NSS for ssh, gpgme for gopass. Expect ~40 lines of `@base` plus 5–10 per
-subject — around 150 authored lines, against a compiled map of ~600 `(exe, lib)` pairs.
-Compiled forms are not read by humans.
+Groups keep the set small. §15.7 makes groups symmetric across the axes, and code is simply a
+fourth axis. Nearly all of the bulk is shared, because libc, libcrypto and libz appear under
+every subject. So a `[group.code.base]` absorbs it. What is left for each subject is the
+genuinely distinctive handful, such as krb5 and NSS for ssh, and gpgme for gopass. Expect
+about 40 lines of `@base` plus 5 to 10 for each subject. That is around 150 authored lines,
+against a compiled map of about 600 `(exe, lib)` pairs. Humans do not read the compiled forms.
 
-Verbs, matching the existing `policy`/`bless` surface: `cordon code show <subject>`,
-`cordon code promote <subject>`, `cordon code check`.
+The verbs match the existing `policy` and `bless` surface. They are
+`cordon code show <subject>`, `cordon code promote <subject>` and `cordon code check`.
 
 ### Flows
 
-**Initial setup.** The code axis reuses the object axis's rhythm, so there is nothing new to
-learn:
+**Initial setup.** The code axis reuses the rhythm of the object axis, so there is nothing new
+to learn:
 
 ```sh
-# objects first — today's flow, unchanged
+# objects first: today's flow, unchanged
 sudo cordon policy edit          # @secrets at `audit`
 … use the machine a week …
 journalctl -u cordond            # see who actually touches what
 sudo cordon policy edit          # admit the owners you saw
-sudo cordon policy edit          # flip audit → deny
+sudo cordon policy edit          # flip audit to deny
 
 # ssh now holds a grant worth hijacking, so tighten the subject
 sudo cordon policy edit          # [group.subject.ssh-tools]  code = "learn"
@@ -473,10 +504,10 @@ sudo cordon code promote @ssh-tools
 sudo cordon policy edit          # code = "learn" → "strict"
 ```
 
-No library path is ever typed by hand. `learn` is safe to leave on indefinitely — it
-observes and journals only — so there is no pressure to rush to `strict`.
+Nobody ever types a library path by hand. `learn` only observes and journals, so it is safe
+to leave on indefinitely, and there is no pressure to rush to `strict`.
 
-**System upgrade.** Usually nothing:
+**System upgrade.** Usually an upgrade needs nothing:
 
 ```sh
 sudo pacman -Syu
@@ -484,12 +515,14 @@ sudo pacman -Syu
 #   (cordon) policy applied
 ```
 
-Paths are stable across an upgrade; only inodes change, and the pacman hook's
-`cordon policy apply` re-resolves them. Empty diff, no review, no action.
+Paths are stable across an upgrade, and only inodes change. The pacman hook runs
+`cordon policy apply`, which re-resolves them. The diff is empty, so there is nothing to
+review and nothing to do.
 
-When a package gains a dependency, the hook catches the common case *before* it bites by
-comparing the new binary's `DT_NEEDED` against the recorded set. That check is incomplete (it
-cannot see `dlopen`) but it is a strict subset, so anything it flags is real:
+When a package gains a dependency, the hook catches the common case before it bites. It
+compares the new binary's `DT_NEEDED` entries against the recorded set. That check is
+incomplete, because it cannot see `dlopen`. But it checks a strict subset of what loads, so
+anything it flags is real:
 
 ```
 (cordon) WARNING @ssh-tools: /usr/bin/ssh gained a dependency that is not in its
@@ -497,8 +530,8 @@ cannot see `dlopen`) but it is a strict subset, so anything it flags is real:
          ssh will lose its grants until:  sudo cordon code promote @ssh-tools
 ```
 
-When something slips past it — a newly `dlopen`ed module, exactly what static analysis
-cannot predict — the failure is soft and self-diagnosing:
+Something can still slip past the check, such as a newly `dlopen`ed module, which is exactly
+what static analysis cannot predict. Then the failure is soft and diagnoses itself:
 
 ```
 WARN  taint pid=8812 exe=/usr/bin/ssh lib=/usr/lib/libfido2.so.1 \
@@ -507,10 +540,10 @@ INFO  deny  pid=8812 user=nb exe=/usr/bin/ssh object=~/.ssh \
             path=~/.ssh/id_ed25519 action=read policy=default-deny tainted=1
 ```
 
-**Taint revokes the grant; it does not break the program.** ssh still runs, and falls back to
-a password. The journal names the exact library and recovery is one `promote`. That asymmetry
-is what makes the design deployable: a false positive costs a password prompt, not a broken
-tool.
+**Taint revokes the grant, and it does not break the program.** ssh still runs, and falls back
+to a password. The journal names the exact library, and recovery takes one `promote`. That
+asymmetry is what makes the design deployable. A false positive costs a password prompt, not
+a broken tool.
 
 **An attacker failing.**
 
@@ -529,136 +562,142 @@ file_open(~/.ssh/id_ed25519)
 
 | attempt | why it fails |
 |---|---|
-| `LD_PRELOAD=/usr/lib/libfoo.so` (**root-owned**) | passes provenance, but is not in *ssh's* set — the case that makes enumeration necessary |
-| `dlclose` to hide the evidence | taint is sticky for the life of the `mm` |
+| `LD_PRELOAD=/usr/lib/libfoo.so` (root-owned) | it passes provenance, but it is not in ssh's set, and this is the case that makes enumeration necessary |
+| `dlclose` to hide the evidence | the taint is sticky for the life of the `mm` |
 | `ptrace` a forked ssh | `ptrace_access_check` taints the target |
-| re-exec to clear the taint | `execve` clears it, but discards the injection too |
-| `LD_AUDIT` instead of `LD_PRELOAD` | same `mmap_file` path; the mechanism does not care how the load was requested |
-| fork after tainting, read from the child | **only if the taint propagates** — task storage may not copy on `clone`; see *Store* |
-| taint one thread, read from a sibling | **not closed by any hook** if the taint is per-task; the `mm` is shared and the storage is not |
+| re-exec to clear the taint | `execve` clears it, but it discards the injection too |
+| `LD_AUDIT` instead of `LD_PRELOAD` | it takes the same `mmap_file` path, and the mechanism does not care how the load was requested |
+| fork after tainting, read from the child | it fails only if the taint propagates, and task storage may not be copied on `clone` (see *Store*) |
+| taint one thread, read from a sibling | no hook closes this if the taint is per task, because the `mm` is shared and the storage is not |
 
 ### Rejected alternatives
 
-- **Glob the trust set** (`/usr/lib/*`) — three lines instead of 600, and exactly the
-  provenance rule this milestone exists to replace. `LD_PRELOAD` of any system library passes.
-- **Package granularity** (`code = ["openssh", "glibc", "krb5"]`, expanded via `pacman -Qlq`)
-  — upgrade-stable and human-scale, but glibc ships ~50 libraries where ssh uses ~8, so all
-  50 become loadable; and it couples cordon to a package manager.
-- **`ldd`/`DT_NEEDED`** — static, blind to `dlopen`, and per-exe. See the nsswitch finding.
-- **Detect `LD_PRELOAD` in the environment** at `bprm_check_security` — a bounded walk over
-  the new stack, and defeated by `LD_AUDIT`, `/etc/ld.so.preload`, or `ptrace`, none of which
-  touch the environment. Whack-a-mole that reads like a mitigation.
-- **Force `AT_SECURE`** on gated binaries (`ld.so` ignores `LD_PRELOAD` for setuid/file-caps
-  executables) — genuinely works, but means granting `/usr/bin/ssh` a capability it does not
-  need, system-wide, for every user, to obtain a side effect.
+- **Glob the trust set** (`/usr/lib/*`). It takes three lines instead of 600, and it is
+  exactly the provenance rule this milestone exists to replace. `LD_PRELOAD` of any system
+  library passes it.
+- **Package granularity** (`code = ["openssh", "glibc", "krb5"]`, expanded with
+  `pacman -Qlq`). It is stable across upgrades and has a human scale. But glibc ships about
+  50 libraries where ssh uses about 8, so all 50 become loadable. It also couples cordon to a
+  package manager.
+- **`ldd` or `DT_NEEDED`.** These are static, blind to `dlopen`, and only cover one exe. See
+  the nsswitch finding.
+- **Detect `LD_PRELOAD` in the environment** at `bprm_check_security`. That is a bounded walk
+  over the new stack. `LD_AUDIT`, `/etc/ld.so.preload` and `ptrace` all defeat it, and none of
+  them touch the environment. It is whack-a-mole that only reads like a mitigation.
+- **Force `AT_SECURE`** on gated binaries, since `ld.so` ignores `LD_PRELOAD` for setuid and
+  file-capability executables. It genuinely works. But it means granting `/usr/bin/ssh` a
+  capability it does not need, system-wide and for every user, just to obtain a side effect.
 
 ### Honest limits
 
-- **A JIT self-taints, which is correct and is not the reason interpreters are excluded.**
-  V8 turns anonymous memory executable on startup, so `node`/`deno`/JVM/Chrome trip
-  `file_mprotect` on their own first JIT page, immediately, with no attacker present.
-  `code = "strict"` is therefore structurally unusable for them — but they were already
-  excluded by attestation for the prior and more basic reason that they execute arbitrary
-  code with no injection at all. `python evil.py` involves no JIT and is equally
-  disqualifying. Do not read the JIT taint as *the* interpreter answer; it is a correct
-  second signal on a subject that never should have held a grant.
-- **Browsers are where the JIT taint genuinely bites**, because unlike an interpreter a
-  browser has a stable identity and a legitimate need for its own profile directory (the
-  cookie DB is the single highest-value scraper target on a desktop). Enforcement point (3)
-  is the answer: the grant attaches to the unsandboxed side, and the JIT-running renderers
-  are excluded by one-way sandbox state they cannot shed. **Measured, not assumed** — the
-  table under M2's `unsandboxed` bullet has the numbers. The guess this replaces was that
-  Chrome's cookie DB had moved to a *sandboxed* network service and would land on the wrong
-  side of the predicate; it has indeed moved there, but on Linux that service runs
-  unsandboxed, so it lands on the right side by luck rather than by design. That is the
-  fragile part of the whole enforcement point, and it is Chrome-specific: Firefox's split is
-  clean, with the parent holding every secret DB and all 18 content processes seccomped into
-  their own namespaces.
-- **ROP** maps nothing and loads nothing — it chains fragments of already-mapped, already
-  legitimate code — so no hook fires and the process stays untainted. The defences are
-  compiler- and CPU-level (CFI, shadow stacks / Intel CET), not LSM-level.
-- **A gadget already inside the subject's own code set** still works. 31 libraries is a far
-  smaller search space than all of `/usr/lib`, but it is not zero. This is where IMA
+- **A JIT taints itself, which is correct, and it is not the reason interpreters are
+  excluded.** V8 makes anonymous memory executable on startup. So `node`, `deno`, the JVM and
+  Chrome trip `file_mprotect` on their own first JIT page, immediately, with no attacker
+  present. `code = "strict"` is therefore structurally unusable for them. But attestation
+  already excluded them, for a prior and more basic reason. They execute arbitrary code with
+  no injection at all. `python evil.py` involves no JIT and is just as disqualifying. Do not
+  read the JIT taint as the answer for interpreters. It is a correct second signal on a
+  subject that should never have held a grant.
+- **Browsers are where the JIT taint genuinely bites.** Unlike an interpreter, a browser has a
+  stable identity and a legitimate need for its own profile directory. The cookie DB is the
+  single most valuable scraper target on a desktop. Enforcement point (3) is the answer. The
+  grant attaches to the unsandboxed side, and one-way sandbox state that the JIT-running
+  renderers cannot shed excludes them. This was measured, not assumed, and the table under
+  M2's `unsandboxed` bullet has the numbers. The guess it replaces was that Chrome's cookie DB
+  had moved to a sandboxed network service, and would land on the wrong side of the
+  predicate. It has indeed moved there. But on Linux that service runs unsandboxed, so it
+  lands on the right side by luck rather than by design. That is the fragile part of the whole
+  enforcement point, and it is specific to Chrome. Firefox's split is clean. Its parent holds
+  every secret DB, and all 18 content processes run under seccomp in their own namespaces.
+- **ROP** maps nothing and loads nothing. It chains fragments of code that is already mapped
+  and already legitimate. So no hook fires, and the process stays untainted. The defences are
+  at the compiler and CPU level (CFI, shadow stacks, Intel CET), not at the LSM level.
+- **A gadget already inside the subject's own code set still works.** 31 libraries are a far
+  smaller search space than all of `/usr/lib`, but the space is not empty. This is where IMA
   appraisal would compose usefully, rather than pretending to be a fix on its own.
-- **Preloading a library already in the set** reorders symbol resolution, so interposition
-  *between expected libraries* remains possible. Much narrower than arbitrary preload;
-  accepted.
-- The trust set needs tuning where tools legitimately load code from `$HOME` — nvim's
-  compiled treesitter parsers under `~/.local/share/nvim` are the obvious first case.
+- **Preloading a library that is already in the set** reorders symbol resolution. So
+  interposition between expected libraries remains possible. That is much narrower than
+  arbitrary preloading, and it is accepted.
+- The trust set needs tuning where tools legitimately load code from `$HOME`. nvim's compiled
+  treesitter parsers under `~/.local/share/nvim` are the obvious first case.
 
 ### Implementation notes
 
-- Hooks: `mmap_file`, `file_mprotect`, `ptrace_access_check`. All three are ordinary BPF LSM
-  attach points; the same `clamped()` return discipline applies.
-- Maps: `CODE_SETS: HashMap<FileId exe, mode>` probed **first**, then
-  `ALLOWED_CODE: HashMap<(FileId exe, FileId lib), ()>` — ~600 entries for a 15-subject
-  policy. The composite key alone cannot tell "this exe has no code set" from "this lib is
-  not in it", so without the `CODE_SETS` probe the first library every process on the box maps
-  is a miss and *every* process taints and pays the lookup. `CODE_SETS` also carries
-  `learn` vs `strict`.
-- Taint: one bit, cleared on `execve`. Map choice and fork/thread propagation are the open
-  question in *The mechanism* above — settle that before writing the hooks, since it decides
-  whether `task_alloc` is a fourth attach point.
-- `SubjectFlags` gains an `UNTAINTED` bit — §15.4 notes a fifth predicate bit extends
+- Hooks: `mmap_file`, `file_mprotect` and `ptrace_access_check`. All three are ordinary BPF
+  LSM attach points, and the same `clamped()` return discipline applies.
+- Maps: `CODE_SETS: HashMap<FileId exe, mode>` is probed first, and then
+  `ALLOWED_CODE: HashMap<(FileId exe, FileId lib), ()>`. The second map holds about 600
+  entries for a policy with 15 subjects. The composite key alone cannot tell "this exe has no
+  code set" from "this library is not in the set". So without the `CODE_SETS` probe, the
+  first library that any process on the box maps would miss, and every process would taint
+  and pay for the lookup. `CODE_SETS` also says whether the mode is `learn` or `strict`.
+- Taint: one bit, cleared on `execve`. The choice of map and the propagation across fork and
+  threads are the open question in *The mechanism* above. Settle that before writing the
+  hooks, because it decides whether `task_alloc` is a fourth attach point.
+- `SubjectFlags` gains an `UNTAINTED` bit. §15.4 notes that a fifth predicate bit extends
   matching and specificity for free.
-- No new BTF offsets: the hooks hand over a `struct file *`, and the existing `file_f_inode`
-  → `inode_i_ino`/`inode_i_sb` → `sb_s_dev` chain already yields a `FileId`.
-- **Meanwhile, the deployment answer is `bless`:** a per-invocation cgroup grant has no
+- No new BTF offsets are needed. The hooks hand over a `struct file *`, and the existing chain
+  from `file_f_inode` through `inode_i_ino` and `inode_i_sb` to `sb_s_dev` already yields a
+  `FileId`.
+- **In the meantime, the deployment answer is `bless`.** A per-invocation cgroup grant has no
   standing exe rule to inject into, so preloading gains nothing. The lever is the ratio of
   static `allow` rules to blessings.
 
 ### Task order
 
-Attestation first — it is the cheapest of the three, needs no kernel code, and it is what
-tells you which subjects the rest of the milestone is even for.
+Attestation comes first. It is the cheapest of the three and needs no kernel code. It is also
+what tells you which subjects the rest of the milestone is for.
 
-1. **`code =` on subject groups** — parse/resolve `arbitrary | learn | strict`, plus the
-   absent case. Pure userspace.
-2. **`cordon policy check` attestation lint** — error on an `allow` whose subject attests
-   `arbitrary`; warn on one with no attestation at all. Ships independently of everything
-   below and immediately makes the confused-deputy grants visible in an existing policy.
-3. **Retire `allow /usr/bin/aws` from the example policies** and record why in-line, so the
-   shipped examples stop modelling a grant that cannot be honest.
-4. **Settle the taint's storage** (per-task + `task_alloc`, or an `mm`-keyed LRU) — verify
-   `clone` semantics first; it decides the map and whether there is a fourth hook.
-5. **`CODE_SETS` + `ALLOWED_CODE` seeding**, then the three taint hooks, then the
+1. **`code =` on subject groups.** Parse and resolve `arbitrary`, `learn` and `strict`, plus
+   the case where the token is absent. This is pure userspace.
+2. **The attestation lint in `cordon policy check`.** It errors on an `allow` whose subject
+   attests `arbitrary`, and warns on one with no attestation at all. It ships independently of
+   everything below, and it immediately makes the confused-deputy grants in an existing policy
+   visible.
+3. **Retire `allow /usr/bin/aws` from the example policies**, and record the reason inline,
+   so the shipped examples stop modelling a grant that cannot be honest.
+4. **Settle where the taint is stored**, either per task with a `task_alloc` hook or in an LRU
+   keyed by `mm`. Verify the `clone` semantics first, because they decide the map and whether
+   there is a fourth hook.
+5. **Seed `CODE_SETS` and `ALLOWED_CODE`**, then add the three taint hooks, then the
    `UNTAINTED` bit in `SubjectFlags`.
-6. **Learning + `cordon code show|promote|check`** (M4 machinery on a second axis).
+6. **Learning, and `cordon code show|promote|check`.** This is M4's machinery on a second axis.
 
-Enforcement point (3), the `unsandboxed` predicate, is sequenced under M2 and gated on the
-cookie-DB measurement, not on any of the above.
+Enforcement point (3), the `unsandboxed` predicate, is sequenced under M2. It is gated on the
+cookie-DB measurement, not on any of the tasks above.
 
 ## Carried-over notes (still live)
-Loose ends left by shipped work, none of them a milestone of their own:
-- **`MAX_RULES_PER_OBJ = 32`** — raise toward 64 if a verifier log demands it; `cordon policy
-  check` errors when a compiled bucket exceeds it.
-- **Per-object default deferred.** A protected object with no matching rule falls to the
-  global default-deny (§15.6.3); a per-object default was considered and parked.
-- **Group expansion is a lever, not a law.** Subject groups expand at compile time, so
-  subject-group size × object-nesting depth multiplies bucket entries. If that ever binds,
-  keep groups as a `(GroupId, exe)` membership map instead of expanding.
-- **conf.d diagnostics don't carry the fragment name.** Parse/resolve errors name their
-  fragment; compile-stage ones (e.g. pending-path warnings) carry only `line:col`. A source
-  id on `Pos` would close it.
-- **Tier precedence is flat.** *System is a floor* (a user tier may tighten, never loosen)
-  isn't expressible in one first-match bucket, and only bites once user files are
-  user-owned — so it lands with the home-migration below.
-- **Home-migration.** User-tier files are root-owned under `/etc` today. The roadmap is
-  `~user/.config/cordon/`, with cordon *cordoning* its own user-policy file — a protected
-  object only an authorized editor may write. That self-protection is the future
-  "edit without sudo".
-  - **M5 adds a precondition to it.** `compile_policy()` runs *before* the new generation
-    loads, so it is mediated by the **previous** generation, which does not fast-allow the
-    new daemon (the fast-allow is pid + exe, and the pid is new). A policy file that cordons
-    itself must therefore carry an explicit rule letting cordond's exe read it, or the next
-    daemon cannot compile its own policy and the box stays on the old one until
-    `cordond --teardown`. Not a live problem — the shipped examples protect no policy file —
-    but do not discover it the hard way.
+These are loose ends left by shipped work, and none of them is a milestone of its own:
+- **`MAX_RULES_PER_OBJ = 32`.** Raise it toward 64 if a verifier log demands it.
+  `cordon policy check` errors when a compiled bucket exceeds it.
+- **A per-object default is deferred.** A protected object with no matching rule falls to the
+  global default-deny (§15.6.3). A per-object default was considered and parked.
+- **Group expansion is a lever, not a law.** Subject groups expand at compile time, so the
+  number of bucket entries grows with the size of a subject group times the object nesting
+  depth. If that ever binds, keep groups as a `(GroupId, exe)` membership map instead of
+  expanding them.
+- **conf.d diagnostics don't carry the fragment name.** Parse and resolve errors name their
+  fragment. Compile-stage diagnostics, such as pending-path warnings, carry only `line:col`.
+  A source id on `Pos` would close the gap.
+- **Tier precedence is flat.** The rule that the system tier is a floor (a user tier may
+  tighten it but never loosen it) can't be expressed in one first-match bucket. It only bites
+  once user files are owned by their users, so it lands with the home migration below.
+- **Home migration.** User-tier files are root-owned under `/etc` today. The roadmap moves
+  them to `~user/.config/cordon/`, with cordon cordoning its own user-policy file. That file
+  would be a protected object that only an authorized editor may write. That self-protection
+  is the future "edit without sudo".
+  - **M5 adds a precondition to it.** `compile_policy()` runs before the new generation loads.
+    So the previous generation mediates it, and that generation does not fast-allow the new
+    daemon, because the fast-allow checks pid and exe and the pid is new. A policy file that
+    cordons itself must therefore carry an explicit rule that lets cordond's exe read it.
+    Otherwise the next daemon cannot compile its own policy, and the box stays on the old
+    policy until `cordond --teardown`. This is not a live problem, because the shipped
+    examples protect no policy file. But do not discover it the hard way.
 
 ## The policy surface
-Authored TOML is specified in DESIGN §15.8 and shown by two regression-tested examples:
-[`packaging/cordon.example.policy.toml`](../packaging/cordon.example.policy.toml) (verbose
-`[[rule]]` tables) and
-[`packaging/cordon.example.dsl.policy.toml`](../packaging/cordon.example.dsl.policy.toml)
-(the compact one-rule-per-line DSL). The compiled shapes are
+DESIGN §15.8 specifies the authored TOML, and two regression-tested examples show it.
+[`packaging/cordon.example.policy.toml`](../packaging/cordon.example.policy.toml) uses
+verbose `[[rule]]` tables, and
+[`packaging/cordon.example.dsl.policy.toml`](../packaging/cordon.example.dsl.policy.toml) uses
+the compact one-rule-per-line DSL. The compiled shapes are in
 `crates/bpf-common/src/policy_maps.rs`.

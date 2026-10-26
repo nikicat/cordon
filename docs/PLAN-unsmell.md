@@ -6,8 +6,8 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 5 are committed. Step 6.1 (one owner per fact) is in the
-> working tree, unstaged.
+> **Status:** steps 0 through 6.1 are committed. Step 6.2 (house style) is in the working
+> tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -146,7 +146,7 @@ described, and its numbering, stale since four scenarios were added unnumbered, 
 ## 6. Doc pass
 
 Two commits:
-1. **One owner per fact** (done, unstaged). A survey of the current tree found 92 facts
+1. **One owner per fact** (done). A survey of the current tree found 92 facts
    restated at about 560 sites and 110 history or milestone notes in code. Each fact is
    now stated on the item that decides it, and the other sites point there or are gone;
    regression notes stay as present-tense statements of what they guard. The pass also
@@ -154,12 +154,32 @@ Two commits:
    stopped daemon", a `BlessMint` verb and two `policy check` lints that don't exist, the
    pinning of maps, `/dev/urandom` for the nonce, and others). It adds no rustdoc
    error: the `--document-private-items` run has 30, all pre-existing.
-2. **House style.** Every flagged doc is rewritten as plain, verb-first Google-style
-   reference text, with "Errors when…" for the error contract. Entity docs state the item's
-   place in the system instead of listing its fields.
+2. **House style** (done, unstaged). Every doc and comment, in the crates, the smoke suite,
+   the example configs and the markdown docs, is rewritten as plain, verb-first reference
+   text, with "Errors when…" for the error contract. Entity docs state the item's place in
+   the system instead of listing its fields, tautologies are deleted, and mechanism moved
+   into `//` comments beside the code. About 10 more docs that contradicted the code were
+   fixed on the way. Refactor candidates the rewrite surfaced (functions whose docs cannot
+   be short because they do several things) are listed below, not done.
+
+## Refactor candidates from the doc pass
+
+Left as code; each makes its doc long or awkward:
+- `Ctx::serve_bless_request` issues the nonce, waits for approval, mints and sends the
+  descriptor in one function.
+- `events::apply`, `Resolver::expand` and `Compiler`'s steps return results through a
+  parameter or side channel (`reply`, the `leaf` callback, `self.diagnostics`).
+- `Maps::seed` also rewrites the daemon's fast-allow identity on every flip.
+- `Session::open` (edit) does four jobs; `editor_identity` and `invoker_uid` both parse
+  `SUDO_UID` with the same message.
+- `decide_reparent` (eBPF) answers three questions, within the verifier's limits.
+- `OneOrMany::classified` is `tokens().to_vec()` under a misleading name.
+- `UserName::from_str` accepts the empty string; the doc now says so.
+- Smoke suite: `cgroup2_ready` has three unrelated effects; `edit_env_setup` returns its
+  results through five globals.
 
 ## Out of scope
 
-- Rustdoc's `-D warnings` run has 30 pre-existing errors (private and unresolved intra-doc
+- Rustdoc's `-D warnings` run has 24 pre-existing errors (private and unresolved intra-doc
   links). CI does not run rustdoc. The doc pass will not add any; fixing them is a separate
   decision.
