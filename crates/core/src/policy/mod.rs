@@ -51,6 +51,33 @@ impl fmt::Display for Pos {
     }
 }
 
+/// Where in the policy a diagnostic points. A merged policy has several fragments, so a
+/// position needs the fragment's name to mean anything; either part may be unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Loc {
+    /// The fragment's name, as [`PolicySource::name`] gives it.
+    pub source: Option<String>,
+    pub pos: Option<Pos>,
+}
+
+impl Loc {
+    fn is_empty(&self) -> bool {
+        self.source.is_none() && self.pos.is_none()
+    }
+}
+
+/// Renders `source:line:col`, dropping whichever part is unknown.
+impl fmt::Display for Loc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.source, self.pos) {
+            (Some(s), Some(p)) => write!(f, "{s}:{p}"),
+            (Some(s), None) => f.write_str(s),
+            (None, Some(p)) => write!(f, "{p}"),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
 /// Maps a byte offset in the source to a [`Pos`]. Built once from the text so resolve
 /// can turn a [`toml::Spanned`] span into a position when emitting a diagnostic.
 #[derive(Clone, Debug)]
@@ -84,13 +111,13 @@ impl LineIndex {
 
 /// A finding from parse/resolve/compile, surfaced by `cordon policy check`. An
 /// `Error` means the policy must not be applied; `Warning` means it applies but
-/// something is off (a rule won't be enforced, a path is missing, …). `pos` points at
-/// the offending rule/group when the source location is known.
+/// something is off (a rule won't be enforced, a path is missing, …).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
-    pub pos: Option<Pos>,
+    /// The offending rule or group, as far as it is known.
+    pub loc: Loc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,19 +128,32 @@ pub enum Severity {
 }
 
 impl Diagnostic {
-    pub(crate) fn warn(pos: Option<Pos>, msg: impl Into<String>) -> Diagnostic {
+    pub(crate) fn warn(loc: Loc, msg: impl Into<String>) -> Diagnostic {
         Diagnostic {
             severity: Severity::Warning,
             message: msg.into(),
-            pos,
+            loc,
         }
     }
-    pub(crate) fn error(pos: Option<Pos>, msg: impl Into<String>) -> Diagnostic {
+    pub(crate) fn error(loc: Loc, msg: impl Into<String>) -> Diagnostic {
         Diagnostic {
             severity: Severity::Error,
             message: msg.into(),
-            pos,
+            loc,
         }
+    }
+
+    /// Returns the error diagnostic for fragment `source` failing with `err`.
+    fn of_fragment(source: &str, err: crate::Error) -> Diagnostic {
+        let (pos, message) = match err {
+            crate::Error::Located(pos, msg) => (Some(pos), msg),
+            other => (None, other.to_string()),
+        };
+        let loc = Loc {
+            source: Some(source.to_string()),
+            pos,
+        };
+        Diagnostic::error(loc, message)
     }
 }
 
@@ -123,9 +163,10 @@ impl fmt::Display for Diagnostic {
             Severity::Warning => "warning",
             Severity::Error => "error",
         };
-        match self.pos {
-            Some(p) => write!(f, "{p}: {kind}: {}", self.message),
-            None => write!(f, "{kind}: {}", self.message),
+        if self.loc.is_empty() {
+            write!(f, "{kind}: {}", self.message)
+        } else {
+            write!(f, "{}: {kind}: {}", self.loc, self.message)
         }
     }
 }
@@ -527,10 +568,13 @@ where
         });
         match resolved {
             Ok(r) => {
-                rules.extend(r.rules);
+                rules.extend(r.rules.into_iter().map(|mut rule| {
+                    rule.source = Some(src.name.clone());
+                    rule
+                }));
                 blessing_classes.extend(r.blessing_classes);
             }
-            Err(e) => errors.push(Diagnostic::error(None, format!("{}: {e}", src.name))),
+            Err(e) => errors.push(Diagnostic::of_fragment(&src.name, e)),
         }
     }
     let resolved = ResolvedPolicy {
@@ -551,13 +595,15 @@ fn check_scope(resolved: &ResolvedPolicy, home: &Path) -> Result<()> {
     for rule in &resolved.rules {
         for obj in &rule.objects {
             if !crate::paths::is_within(obj, home) {
-                let loc = rule.pos.map(|p| format!("{p}: ")).unwrap_or_default();
-                return Err(crate::Error::msg(format!(
-                    "{loc}object {} is outside the owner's home {} — a user policy may only \
-                     govern paths under it",
-                    obj.display(),
-                    home.display(),
-                )));
+                return Err(crate::Error::at(
+                    rule.pos,
+                    format!(
+                        "object {} is outside the owner's home {} — a user policy may only \
+                         govern paths under it",
+                        obj.display(),
+                        home.display(),
+                    ),
+                ));
             }
         }
     }
@@ -653,10 +699,27 @@ mod tests {
         assert!(
             c.diagnostics
                 .iter()
-                .any(|d| d.message.contains("bad.toml") && d.message.contains("4 fields")),
+                .any(|d| d.loc.source.as_deref() == Some("bad.toml")
+                    && d.loc.pos.is_some()
+                    && d.message.contains("4 fields")),
             "expected a bad.toml arity error, got: {:?}",
             c.diagnostics
         );
+    }
+
+    /// A compile diagnostic about a rule names the fragment the rule came from, and renders
+    /// as `source:line:col: severity: message`.
+    #[test]
+    fn compile_diagnostic_names_the_rules_fragment() {
+        let frags = [PolicySource::system(
+            "b.toml",
+            "\nrules = '''\nallow /usr/bin/ssh read /gone\n'''\n",
+        )];
+        let c = compile_fragments(&frags, Path::new("/home/u"), |_: &Path| None);
+        let d = &c.diagnostics[0];
+        assert_eq!(d.loc.source.as_deref(), Some("b.toml"));
+        assert!(d.to_string().starts_with("b.toml:3:"), "{d}");
+        assert!(d.to_string().contains(": warning: "), "{d}");
     }
 
     #[test]

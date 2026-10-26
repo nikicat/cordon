@@ -9,7 +9,7 @@
 //! [`super::compile`].
 
 use super::parse::{GroupDef, Groups, ParsedPolicy, Token};
-use super::{ActionName, ClassName, GroupName, Pos, expand_path};
+use super::{ActionName, ClassName, GroupName, Loc, Pos, expand_path};
 use crate::{Error, Result};
 use cordon_bpf_common as bpf;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,8 +38,21 @@ pub struct ResolvedRule {
     pub objects: Vec<PathBuf>,
     pub actions: bpf::Action,
     pub policy: bpf::Policy,
-    /// Source position of the originating `[[rule]]`, for diagnostics.
-    pub pos: Option<Pos>,
+    /// The fragment the rule came from. Resolve leaves it unset; the merge in
+    /// [`super::compile_fragments`] names it.
+    pub source: Option<String>,
+    /// The originating `[[rule]]`'s position in its fragment.
+    pub pos: Pos,
+}
+
+impl ResolvedRule {
+    /// Returns where the rule was written, for a diagnostic about it.
+    pub fn loc(&self) -> Loc {
+        Loc {
+            source: self.source.clone(),
+            pos: Some(self.pos),
+        }
+    }
 }
 
 /// A fully group-expanded, name-validated policy. Still path-based; [`super::compile`]
@@ -69,13 +82,13 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
         let actions = resolve_actions(&rule.action, parsed, pos)?;
 
         if subjects.is_empty() {
-            return Err(at(pos, "rule `who` resolves to nothing"));
+            return Err(Error::at(pos, "rule `who` resolves to nothing"));
         }
         if objects.is_empty() {
-            return Err(at(pos, "rule `where` resolves to nothing"));
+            return Err(Error::at(pos, "rule `where` resolves to nothing"));
         }
         if actions.is_empty() {
-            return Err(at(pos, "rule `action` resolves to no actions"));
+            return Err(Error::at(pos, "rule `action` resolves to no actions"));
         }
 
         rules.push(ResolvedRule {
@@ -83,7 +96,8 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
             objects,
             actions,
             policy: rule.policy.lower(),
-            pos: Some(pos),
+            source: None,
+            pos,
         });
     }
     Ok(ResolvedPolicy {
@@ -171,7 +185,7 @@ fn resolve_objects(
         &mut stack,
         &mut |tok, p| -> Result<()> {
             match tok {
-                Token::Wildcard => Err(at(
+                Token::Wildcard => Err(Error::at(
                     p,
                     "`where` cannot be `*` — the filesystem can't be default-denied wholesale",
                 )),
@@ -179,7 +193,7 @@ fn resolve_objects(
                     push_unique(&mut out, expand_path(s, home)?);
                     Ok(())
                 }
-                Token::Blessing(_) => Err(at(
+                Token::Blessing(_) => Err(Error::at(
                     p,
                     "a blessing group is a subject predicate; it can't appear in `where`",
                 )),
@@ -205,11 +219,11 @@ fn resolve_actions(tokens: &[Token], parsed: &ParsedPolicy, pos: Pos) -> Result<
                 Token::Wildcard => mask |= bpf::Action::all(),
                 Token::Leaf(s) => {
                     let name = ActionName::parse(s)
-                        .ok_or_else(|| at(p, format!("unknown action: {s:?}")))?;
+                        .ok_or_else(|| Error::at(p, format!("unknown action: {s:?}")))?;
                     mask |= name.bit();
                 }
                 Token::Blessing(_) => {
-                    return Err(at(
+                    return Err(Error::at(
                         p,
                         "a blessing group is a subject predicate; it can't appear in `action`",
                     ));
@@ -252,11 +266,14 @@ where
                         .get(name)
                         .map(|g| parsed.lines.pos(g.span().start))
                         .unwrap_or(enclosing);
-                    return Err(at(gpos, format!("{axis} group cycle: @{chain} -> @{name}")));
+                    return Err(Error::at(
+                        gpos,
+                        format!("{axis} group cycle: @{chain} -> @{name}"),
+                    ));
                 }
-                let g = groups
-                    .get(name)
-                    .ok_or_else(|| at(enclosing, format!("unknown {axis} group: @{name}")))?;
+                let g = groups.get(name).ok_or_else(|| {
+                    Error::at(enclosing, format!("unknown {axis} group: @{name}"))
+                })?;
                 let gpos = parsed.lines.pos(g.span().start);
                 // A blessing-class group is a subject predicate, not a member list: emit a
                 // synthesized `Blessing` leaf and don't recurse (it has no members).
@@ -286,11 +303,6 @@ fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {
     if !v.contains(&item) {
         v.push(item);
     }
-}
-
-/// An error with a `line:col` prefix.
-fn at(pos: Pos, msg: impl AsRef<str>) -> Error {
-    Error::msg(format!("{pos}: {}", msg.as_ref()))
 }
 
 #[cfg(test)]

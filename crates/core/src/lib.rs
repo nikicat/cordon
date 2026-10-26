@@ -32,11 +32,19 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Msg(String),
+    /// An error at a known position in one policy source.
+    #[error("{0}: {1}")]
+    Located(policy::Pos, String),
 }
 
 impl Error {
     pub fn msg(s: impl Into<String>) -> Self {
         Error::Msg(s.into())
+    }
+
+    /// Returns an error at `pos` in a policy source.
+    pub fn at(pos: policy::Pos, msg: impl Into<String>) -> Self {
+        Error::Located(pos, msg.into())
     }
 }
 

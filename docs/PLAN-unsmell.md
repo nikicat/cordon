@@ -6,7 +6,7 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0, 1 and 2.1 are committed. Step 2.2 is in the working tree, unstaged.
+> **Status:** steps 0 through 2.2 are committed. Step 2.3 is in the working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
 
@@ -55,13 +55,15 @@ One commit each, in this order:
    with `id(&ClassName)`, `name(ClassId)` and the "first assignable id is `UNBLESSED + 1`"
    rule. It replaces the `Vec<(ClassName, ClassId)>` on `CompiledPolicy` and the four
    `BTreeMap<ClassName, ClassId>` signatures in the daemon.
-2. **One passwd reader** (done, unstaged): `crate::passwd` parses each line once into an
+2. **One passwd reader** (done): `crate::passwd` parses each line once into an
    `Entry` and gains `home_of`, which `policy::home_for` calls in place of its own parser.
    The CLI's `sys::user_identity` stays separate on purpose: it asks NSS (`getpwuid`), so
    `policy edit` also works for an LDAP or other non-file account.
-3. **Located errors**: one `Pos`-owned constructor builds the `line:col: msg` text that is
-   formatted four ways today, and a fragment's error keeps its position in
-   `Diagnostic.pos` instead of only in the message.
+3. **Located errors** (done, unstaged): `Error::at(pos, msg)` builds every positioned
+   error as an `Error::Located`, and `Diagnostic` carries a `Loc` (fragment name and
+   position) in place of a bare `pos`. Output changes: a fragment's error renders as
+   `file:line:col: error: msg` instead of `error: file: line:col: msg`, and a compile
+   warning about a rule now names the rule's fragment.
 4. **`Error::context`**: one helper replaces about 30 hand-written
    `.map_err(|e| Error::msg(format!("<verb> {path}: {e}")))` sites, and
    `Response::into_result` plus `read_reply` replace the three ways the CLI turns a daemon

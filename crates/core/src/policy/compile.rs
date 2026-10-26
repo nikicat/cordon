@@ -19,7 +19,7 @@
 //! unit-testable. A path that doesn't resolve yet is **pending** (re-tried on a later
 //! apply); an exe that doesn't resolve drops that one rule with a warning.
 
-use super::{ClassName, Diagnostic, ResolvedPolicy, Severity, SubjectSpec};
+use super::{ClassName, Diagnostic, Loc, ResolvedPolicy, Severity, SubjectSpec};
 use crate::paths;
 use cordon_bpf_common::{
     ClassId, CompiledRule, FileId, MAX_RULES_PER_OBJ, ObjId, SubjectFlags, SubjectMatch,
@@ -186,7 +186,7 @@ where
             &rule.subjects,
             &mut resolve_fileid,
             &classes,
-            rule.pos,
+            &rule.loc(),
             &mut diagnostics,
         );
         for obj_path in &rule.objects {
@@ -201,7 +201,7 @@ where
                     }
                 }
                 None => diagnostics.push(Diagnostic::warn(
-                    rule.pos,
+                    rule.loc(),
                     format!(
                         "path {} does not exist yet; this rule is not enforced until it is created and you re-apply",
                         obj_path.display()
@@ -226,7 +226,7 @@ where
 
         if bucket.len() > MAX_RULES_PER_OBJ {
             diagnostics.push(Diagnostic::error(
-                None,
+                Loc::default(),
                 format!(
                     "object {} compiles to {} rules, over the per-object limit of {} \
                      (split the policy or raise MAX_RULES_PER_OBJ)",
@@ -259,7 +259,7 @@ fn lower_subjects<R>(
     subjects: &[SubjectSpec],
     resolve_fileid: &mut R,
     classes: &ClassRegistry,
-    pos: Option<super::Pos>,
+    loc: &Loc,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<SubjectMatch>
 where
@@ -272,7 +272,7 @@ where
             SubjectSpec::Exe(path) => match resolve_fileid(path) {
                 Some(file) => out.push(SubjectMatch::exe(file)),
                 None => diagnostics.push(Diagnostic::warn(
-                    pos,
+                    loc.clone(),
                     format!(
                         "exe {} does not exist; this rule is not enforced for it",
                         path.display()
@@ -284,7 +284,7 @@ where
             SubjectSpec::Blessed(name) => match classes.id(name) {
                 Some(id) => out.push(SubjectMatch::blessed(id)),
                 None => diagnostics.push(Diagnostic::error(
-                    pos,
+                    loc.clone(),
                     format!("internal: blessing class {name:?} is not in the registry"),
                 )),
             },

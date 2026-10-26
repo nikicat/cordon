@@ -216,10 +216,9 @@ impl Item {
     }
 }
 
-/// A `line:col`-prefixed error at absolute source byte `abs` (same shape as
-/// [`super::resolve`]'s diagnostics, so `cordon policy check` renders them uniformly).
+/// Returns the error at absolute source byte `abs`.
 fn at(lines: &LineIndex, abs: usize, msg: impl Into<String>) -> Error {
-    Error::msg(format!("{}: {}", lines.pos(abs), msg.into()))
+    Error::at(lines.pos(abs), msg)
 }
 
 #[cfg(test)]
