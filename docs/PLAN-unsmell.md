@@ -169,8 +169,12 @@ Left as code; each makes its doc long or awkward:
   descriptor in one function.
 - `events::apply`, `Resolver::expand` and `Compiler`'s steps return results through a
   parameter or side channel (`reply`, the `leaf` callback, `self.diagnostics`).
-- `Maps::seed` also rewrites the daemon's fast-allow identity on every flip.
-- `Session::open` (edit) does four jobs.
+- `Maps::seed` also rewrites the daemon's fast-allow identity on every flip. Kept. The
+  bank and the identity share one `SETTINGS` element, which the kernel reads as one
+  snapshot, so the flip must write both. The value never changes after the first seed,
+  which is where it replaces the self-test's placeholder.
+- `Session::open` (edit) did four jobs. Done. `EditTarget::locate` finds the file, and the
+  banner prints at the start of `edit_loop`.
 - `editor_identity` and `invoker_uid` both parsed `SUDO_UID`. Done, `SudoInvoker` owns it.
 - `decide_reparent` (eBPF) answers three questions, within the verifier's limits.
 - `OneOrMany::classified` was `tokens().to_vec()` under a misleading name. Done, it is

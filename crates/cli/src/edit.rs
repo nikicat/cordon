@@ -164,6 +164,50 @@ pub(crate) enum EditTarget {
     User(UserName),
 }
 
+impl EditTarget {
+    /// Returns the file this target names under `policy_root`. Errors when it can't be
+    /// resolved or is a directory.
+    fn locate(self, policy_root: &PolicyRoot) -> Result<EditFile> {
+        let file = match self {
+            EditTarget::System(file) => EditFile {
+                path: resolve_target(file.as_deref(), policy_root)?,
+                origin: SourceOrigin::System,
+                scaffold: None,
+            },
+            // A user target is the file that a system `[[include]]` binds. With no include
+            // yet, it is the convention path, and the include is registered on first save.
+            EditTarget::User(user) => {
+                let (path, scaffold) = resolve_user_target(policy_root, user.clone())?;
+                EditFile {
+                    path,
+                    origin: SourceOrigin::User { user },
+                    scaffold,
+                }
+            }
+        };
+        if file.path.is_dir() {
+            return Err(Error::msg(format!(
+                "{} is a directory, not a policy file",
+                file.path.display()
+            )));
+        }
+        Ok(file)
+    }
+}
+
+/// The policy file that an edit session opens, and where it sits in the policy.
+struct EditFile {
+    /// For a one-file policy it is that file, and otherwise it is one conf.d fragment or
+    /// user-tier file.
+    path: PathBuf,
+    /// The tier that the file belongs to. It lets the candidate validate the file with the
+    /// right scope even before any `[[include]]` for it exists on disk.
+    origin: SourceOrigin,
+    /// The `[[include]]` that saving must register. It is `Some` only on a first
+    /// user-tier edit, when no binding exists yet (see [`Session::save`]).
+    scaffold: Option<Scaffold>,
+}
+
 /// The mutually exclusive ways to name the policy to edit, which clap enforces. Naming
 /// nothing edits your own tier.
 #[derive(clap::Args, Clone, Debug)]
@@ -281,15 +325,8 @@ struct Session {
     /// The configured policy that the daemon reads on its next restart. The candidate is
     /// validated as part of this whole set.
     policy_root: PolicyRoot,
-    /// The file opened in the editor. For a one-file policy it is that file, and
-    /// otherwise it is one conf.d fragment or user-tier file.
-    target: PathBuf,
-    /// The tier that the edited file belongs to. It lets the candidate validate `target`
-    /// with the right scope even before any `[[include]]` for it exists on disk.
-    target_origin: SourceOrigin,
-    /// The `[[include]]` that saving must register. It is `Some` only on a first
-    /// user-tier edit, when no binding exists yet (see [`Session::save`]).
-    scaffold: Option<Scaffold>,
+    /// The file opened in the editor.
+    file: EditFile,
     /// The home that `~` expands to in the local validation compile.
     home: PathBuf,
     socket: PathBuf,
@@ -300,50 +337,28 @@ struct Session {
 }
 
 impl Session {
-    /// Opens a session on `target`, creates the temp copy that the editor will work on,
-    /// and prints a banner naming the file and the editor. Errors when the target can't be
-    /// resolved or is a directory, when [`editor_identity`] refuses, or when the config,
+    /// Opens a session on `target` and creates the temp copy that the editor will work on.
+    /// Errors as [`EditTarget::locate`] and [`editor_identity`] do, and when the config,
     /// the current file or the temp copy can't be read or created.
     fn open(target: EditTarget, root_editor: RootEditor, client: &Client) -> Result<Session> {
         let policy_root = PolicyRoot::at(&client.policy_path(None)?)?;
-        let (target, target_origin, scaffold) = match target {
-            EditTarget::System(file) => (
-                resolve_target(file.as_deref(), &policy_root)?,
-                SourceOrigin::System,
-                None,
-            ),
-            // A user target is the file that a system `[[include]]` binds. With no include
-            // yet, it is the convention path, and the include is registered on first save.
-            EditTarget::User(user) => {
-                let (path, scaffold) = resolve_user_target(&policy_root, user.clone())?;
-                (path, SourceOrigin::User { user }, scaffold)
-            }
-        };
-        if target.is_dir() {
-            return Err(Error::msg(format!(
-                "{} is a directory, not a policy file",
-                target.display()
-            )));
-        }
+        let file = target.locate(&policy_root)?;
         let editor_as = editor_identity(root_editor)?;
-        let seed = read_seed(&target)?;
-        let tmp = TempEdit::create(&target, seed.text(), &editor_as)?;
-        let session = Session {
+        let seed = read_seed(&file.path)?;
+        let tmp = TempEdit::create(&file.path, seed.text(), &editor_as)?;
+        Ok(Session {
             policy_root,
-            target,
-            target_origin,
-            scaffold,
+            file,
             home: crate::home(),
             socket: client.socket()?,
             editor: EditorCommand::lookup(),
             editor_as,
             seed,
             tmp,
-        };
-        session.announce();
-        Ok(session)
+        })
     }
 
+    /// Prints a banner naming the file and the editor, and any include the save will owe.
     fn announce(&self) {
         let new = matches!(self.seed, Seed::New(_));
         let who = match &self.editor_as {
@@ -353,11 +368,11 @@ impl Session {
         };
         eprintln!(
             "cordon: editing {}{} with {:?}{who}",
-            self.target.display(),
+            self.file.path.display(),
             if new { " (new)" } else { "" },
             self.editor.as_str(),
         );
-        if let Some(s) = &self.scaffold {
+        if let Some(s) = &self.file.scaffold {
             eprintln!(
                 "cordon: user {:?} has no `[[include]]` yet — one will be registered in {} \
                  once you save a valid policy.",
@@ -372,12 +387,13 @@ impl Session {
     /// returns failure. Errors as [`Session::run_editor`], [`read_edited`],
     /// [`Session::assess`] and [`Session::save`] do.
     fn edit_loop(self) -> Result<ExitCode> {
+        self.announce();
         loop {
             self.run_editor()?;
             let edited = read_edited(&self.tmp.file)?;
             // An unchanged buffer is a no-op, unless an include registration is still owed.
             // Then even an untouched valid file is registered and applied.
-            if edited == self.seed.text() && self.scaffold.is_none() {
+            if edited == self.seed.text() && self.file.scaffold.is_none() {
                 println!("cordon: no changes — policy left unchanged");
                 return Ok(ExitCode::SUCCESS);
             }
@@ -386,14 +402,14 @@ impl Session {
             // conf.d fragment or a user file is validated against the rest, not alone.
             let candidate = candidate_sources(
                 &self.policy_root,
-                &self.target,
+                &self.file.path,
                 &edited,
-                &self.target_origin,
+                &self.file.origin,
             )?;
             match self.assess(candidate)? {
                 Verdict::Apply => {
                     self.save(&edited)?;
-                    println!("cordon: applied and saved {}", self.target.display());
+                    println!("cordon: applied and saved {}", self.file.path.display());
                     return Ok(ExitCode::SUCCESS);
                 }
                 Verdict::SaveOnly => {
@@ -401,7 +417,7 @@ impl Session {
                     println!(
                         "cordon: saved {} — NOT applied (daemon unreachable on {}). \
                          Run `cordon policy apply` to enforce.",
-                        self.target.display(),
+                        self.file.path.display(),
                         self.socket.display(),
                     );
                     return Ok(ExitCode::SUCCESS);
@@ -418,8 +434,8 @@ impl Session {
     /// include is registered only after the file is saved, so a cancelled or rejected edit
     /// never leaves a stale binding. Errors when either write fails.
     fn save(&self, edited: &str) -> Result<()> {
-        self.tmp.commit(&self.target, edited)?;
-        if let Some(s) = &self.scaffold {
+        self.tmp.commit(&self.file.path, edited)?;
+        if let Some(s) = &self.file.scaffold {
             s.register()?;
             eprintln!(
                 "cordon: registered `[[include]]` for user {:?} in {}",
