@@ -164,7 +164,7 @@ Two commits:
 
 ## Refactor candidates from the doc pass
 
-Left as code; each makes its doc long or awkward:
+Each made its doc long or awkward. Every one is now done or kept, with the reason:
 - `Ctx::serve_bless_request` issued the nonce, waited for approval, minted and sent the
   descriptor in one function. Done, `Ctx::await_approval` owns the rendezvous.
 - `events::apply`, `Resolver::expand` and `Compiler`'s steps returned results through a
@@ -178,7 +178,10 @@ Left as code; each makes its doc long or awkward:
 - `Session::open` (edit) did four jobs. Done. `EditTarget::locate` finds the file, and the
   banner prints at the start of `edit_loop`.
 - `editor_identity` and `invoker_uid` both parsed `SUDO_UID`. Done, `SudoInvoker` owns it.
-- `decide_reparent` (eBPF) answers three questions, within the verifier's limits.
+- `decide_reparent` (eBPF) answers three questions, within the verifier's limits. Kept.
+  The body is the three questions in order, and the long doc is the security reasoning
+  for each. Splitting them would pass dentry-backed `Option`s across calls that the
+  verifier must then check, for no gain in reading.
 - `OneOrMany::classified` was `tokens().to_vec()` under a misleading name. Done, it is
   now `From<OneOrMany> for Vec<Token>`.
 - `UserName::from_str` accepted the empty string and `/`. Done, it now refuses both.
