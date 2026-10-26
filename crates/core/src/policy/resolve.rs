@@ -8,7 +8,7 @@
 //! get `~`-expanded and lexically normalized here; inode resolution is deferred to
 //! [`super::compile`].
 
-use super::parse::{GroupDef, Groups, ParsedPolicy, Token};
+use super::parse::{GroupDef, Groups, ParsedPolicy, ParsedRule, Token};
 use super::{ActionName, ClassName, GroupName, Loc, Pos, expand_path};
 use crate::{Error, Result};
 use cordon_bpf_common as bpf;
@@ -72,34 +72,12 @@ pub struct ResolvedPolicy {
 /// `blessing` group — the policy is structurally unusable until fixed.
 pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
     let blessing_classes = declared_classes(&parsed.groups)?;
-
-    let mut rules = Vec::with_capacity(parsed.rules.len());
-    for rule in &parsed.rules {
-        let pos = rule.pos;
-
-        let subjects = resolve_subjects(&rule.who, parsed, home, pos)?;
-        let objects = resolve_objects(&rule.where_, parsed, home, pos)?;
-        let actions = resolve_actions(&rule.action, parsed, pos)?;
-
-        if subjects.is_empty() {
-            return Err(Error::at(pos, "rule `who` resolves to nothing"));
-        }
-        if objects.is_empty() {
-            return Err(Error::at(pos, "rule `where` resolves to nothing"));
-        }
-        if actions.is_empty() {
-            return Err(Error::at(pos, "rule `action` resolves to no actions"));
-        }
-
-        rules.push(ResolvedRule {
-            subjects,
-            objects,
-            actions,
-            policy: rule.policy.lower(),
-            source: None,
-            pos,
-        });
-    }
+    let resolver = Resolver { parsed, home };
+    let rules = parsed
+        .rules
+        .iter()
+        .map(|rule| resolver.rule(rule))
+        .collect::<Result<_>>()?;
     Ok(ResolvedPolicy {
         rules,
         blessing_classes,
@@ -111,8 +89,9 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
 /// `members`. Returns the distinct class names.
 fn declared_classes(groups: &Groups) -> Result<BTreeSet<ClassName>> {
     // `blessing` is a subject predicate — reject it in the object/action namespaces.
-    for (axis, ns) in [("object", &groups.object), ("action", &groups.action)] {
-        if let Some(name) = ns
+    for axis in [Axis::Object, Axis::Action] {
+        if let Some(name) = axis
+            .groups(groups)
             .iter()
             .find(|(_, g)| g.get_ref().blessing.is_some())
             .map(|(name, _)| name)
@@ -138,83 +117,108 @@ fn declared_classes(groups: &Groups) -> Result<BTreeSet<ClassName>> {
     Ok(classes)
 }
 
-fn resolve_subjects(
-    tokens: &[Token],
-    parsed: &ParsedPolicy,
-    home: &Path,
-    pos: Pos,
-) -> Result<Vec<SubjectSpec>> {
-    let mut out = Vec::new();
-    let mut stack = Vec::new();
-    expand_axis(
-        tokens,
-        &parsed.groups.subject,
-        "subject",
-        parsed,
-        pos,
-        &mut stack,
-        &mut |tok, _p| -> Result<()> {
+/// One of a rule's three axes, each with its own group namespace.
+#[derive(Clone, Copy, Debug)]
+enum Axis {
+    Subject,
+    Object,
+    Action,
+}
+
+impl Axis {
+    /// Returns this axis's group namespace.
+    fn groups(self, groups: &Groups) -> &BTreeMap<GroupName, Spanned<GroupDef>> {
+        match self {
+            Axis::Subject => &groups.subject,
+            Axis::Object => &groups.object,
+            Axis::Action => &groups.action,
+        }
+    }
+}
+
+impl std::fmt::Display for Axis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Axis::Subject => "subject",
+            Axis::Object => "object",
+            Axis::Action => "action",
+        })
+    }
+}
+
+/// Resolves the rules of one parsed policy, expanding `~` against `home`.
+struct Resolver<'a> {
+    parsed: &'a ParsedPolicy,
+    home: &'a Path,
+}
+
+impl Resolver<'_> {
+    fn rule(&self, rule: &ParsedRule) -> Result<ResolvedRule> {
+        let pos = rule.pos;
+        let subjects = self.subjects(&rule.who, pos)?;
+        let objects = self.objects(&rule.where_, pos)?;
+        let actions = self.actions(&rule.action, pos)?;
+
+        if subjects.is_empty() {
+            return Err(Error::at(pos, "rule `who` resolves to nothing"));
+        }
+        if objects.is_empty() {
+            return Err(Error::at(pos, "rule `where` resolves to nothing"));
+        }
+        if actions.is_empty() {
+            return Err(Error::at(pos, "rule `action` resolves to no actions"));
+        }
+        Ok(ResolvedRule {
+            subjects,
+            objects,
+            actions,
+            policy: rule.policy.lower(),
+            source: None,
+            pos,
+        })
+    }
+
+    fn subjects(&self, tokens: &[Token], pos: Pos) -> Result<Vec<SubjectSpec>> {
+        let mut out = Vec::new();
+        self.expand(Axis::Subject, tokens, pos, &mut |tok, _p| {
             match tok {
                 Token::Wildcard => push_unique(&mut out, SubjectSpec::Any),
-                Token::Leaf(s) => push_unique(&mut out, SubjectSpec::Exe(expand_path(s, home)?)),
+                Token::Leaf(s) => {
+                    push_unique(&mut out, SubjectSpec::Exe(expand_path(s, self.home)?))
+                }
                 Token::Blessing(class) => {
                     push_unique(&mut out, SubjectSpec::Blessed(class.clone()))
                 }
-                Token::Group(_) => unreachable!("group tokens are consumed by expand_axis"),
+                Token::Group(_) => unreachable!("group tokens are consumed by expand"),
             }
             Ok(())
-        },
-    )?;
-    Ok(out)
-}
+        })?;
+        Ok(out)
+    }
 
-fn resolve_objects(
-    tokens: &[Token],
-    parsed: &ParsedPolicy,
-    home: &Path,
-    pos: Pos,
-) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut stack = Vec::new();
-    expand_axis(
-        tokens,
-        &parsed.groups.object,
-        "object",
-        parsed,
-        pos,
-        &mut stack,
-        &mut |tok, p| -> Result<()> {
-            match tok {
-                Token::Wildcard => Err(Error::at(
-                    p,
-                    "`where` cannot be `*` — the filesystem can't be default-denied wholesale",
-                )),
-                Token::Leaf(s) => {
-                    push_unique(&mut out, expand_path(s, home)?);
-                    Ok(())
-                }
-                Token::Blessing(_) => Err(Error::at(
-                    p,
-                    "a blessing group is a subject predicate; it can't appear in `where`",
-                )),
-                Token::Group(_) => unreachable!("group tokens are consumed by expand_axis"),
+    fn objects(&self, tokens: &[Token], pos: Pos) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        self.expand(Axis::Object, tokens, pos, &mut |tok, p| match tok {
+            Token::Wildcard => Err(Error::at(
+                p,
+                "`where` cannot be `*` — the filesystem can't be default-denied wholesale",
+            )),
+            Token::Leaf(s) => {
+                push_unique(&mut out, expand_path(s, self.home)?);
+                Ok(())
             }
-        },
-    )?;
-    Ok(out)
-}
+            Token::Blessing(_) => Err(Error::at(
+                p,
+                "a blessing group is a subject predicate; it can't appear in `where`",
+            )),
+            Token::Group(_) => unreachable!("group tokens are consumed by expand"),
+        })?;
+        Ok(out)
+    }
 
-fn resolve_actions(tokens: &[Token], parsed: &ParsedPolicy, pos: Pos) -> Result<bpf::Action> {
-    let mut mask = bpf::Action::empty();
-    let mut stack = Vec::new();
-    expand_axis(
-        tokens,
-        &parsed.groups.action,
-        "action",
-        parsed,
-        pos,
-        &mut stack,
-        &mut |tok, p| -> Result<()> {
+    fn actions(&self, tokens: &[Token], pos: Pos) -> Result<bpf::Action> {
+        let mut mask = bpf::Action::empty();
+        self.expand(Axis::Action, tokens, pos, &mut |tok, p| {
             match tok {
                 Token::Wildcard => mask |= bpf::Action::all(),
                 Token::Leaf(s) => {
@@ -228,75 +232,73 @@ fn resolve_actions(tokens: &[Token], parsed: &ParsedPolicy, pos: Pos) -> Result<
                         "a blessing group is a subject predicate; it can't appear in `action`",
                     ));
                 }
-                Token::Group(_) => unreachable!("group tokens are consumed by expand_axis"),
+                Token::Group(_) => unreachable!("group tokens are consumed by expand"),
             }
             Ok(())
-        },
-    )?;
-    Ok(mask)
-}
-
-/// Recursively expand a token list for one axis. `@group` refs recurse (cycle-checked
-/// against `stack` of group names); every non-group token is handed to `leaf` with the
-/// position of its enclosing rule/group, for axis-specific interpretation. A `@ref` to a
-/// `blessing = "…"` group (DESIGN §16.3) is a leaf, not a member list: it synthesizes a
-/// [`Token::Blessing`] handed to `leaf` (which the subject axis accepts, others reject).
-fn expand_axis<F>(
-    tokens: &[Token],
-    groups: &BTreeMap<GroupName, Spanned<GroupDef>>,
-    axis: &str,
-    parsed: &ParsedPolicy,
-    enclosing: Pos,
-    stack: &mut Vec<GroupName>,
-    leaf: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&Token, Pos) -> Result<()>,
-{
-    for tok in tokens {
-        match tok {
-            Token::Group(name) => {
-                if stack.iter().any(|s| s == name) {
-                    let chain = stack
-                        .iter()
-                        .map(GroupName::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" -> @");
-                    let gpos = groups
-                        .get(name)
-                        .map(|g| parsed.lines.pos(g.span().start))
-                        .unwrap_or(enclosing);
-                    return Err(Error::at(
-                        gpos,
-                        format!("{axis} group cycle: @{chain} -> @{name}"),
-                    ));
-                }
-                let g = groups.get(name).ok_or_else(|| {
-                    Error::at(enclosing, format!("unknown {axis} group: @{name}"))
-                })?;
-                let gpos = parsed.lines.pos(g.span().start);
-                // A blessing-class group is a subject predicate, not a member list: emit a
-                // synthesized `Blessing` leaf and don't recurse (it has no members).
-                if let Some(class) = &g.get_ref().blessing {
-                    leaf(&Token::Blessing(class.clone()), gpos)?;
-                    continue;
-                }
-                stack.push(name.clone());
-                expand_axis(
-                    &g.get_ref().members,
-                    groups,
-                    axis,
-                    parsed,
-                    gpos,
-                    stack,
-                    leaf,
-                )?;
-                stack.pop();
-            }
-            other => leaf(other, enclosing)?,
-        }
+        })?;
+        Ok(mask)
     }
-    Ok(())
+
+    /// Expands `@group` refs in `tokens` and hands every other token to `leaf`, with the
+    /// position of its enclosing rule or group. A `@ref` to a `blessing = "…"` group
+    /// (DESIGN §16.3) is a leaf, not a member list: `leaf` gets a [`Token::Blessing`],
+    /// which the subject axis accepts and the others reject. Errors on a cycle or an
+    /// unknown group.
+    fn expand(
+        &self,
+        axis: Axis,
+        tokens: &[Token],
+        enclosing: Pos,
+        leaf: &mut dyn FnMut(&Token, Pos) -> Result<()>,
+    ) -> Result<()> {
+        self.expand_within(axis, tokens, enclosing, &mut Vec::new(), leaf)
+    }
+
+    /// [`expand`](Self::expand) inside the groups on `stack`, which a ref back into is a
+    /// cycle.
+    fn expand_within(
+        &self,
+        axis: Axis,
+        tokens: &[Token],
+        enclosing: Pos,
+        stack: &mut Vec<GroupName>,
+        leaf: &mut dyn FnMut(&Token, Pos) -> Result<()>,
+    ) -> Result<()> {
+        let groups = axis.groups(&self.parsed.groups);
+        for tok in tokens {
+            let Token::Group(name) = tok else {
+                leaf(tok, enclosing)?;
+                continue;
+            };
+            let group_pos = |g: &Spanned<GroupDef>| self.parsed.lines.pos(g.span().start);
+            if stack.contains(name) {
+                let chain = stack
+                    .iter()
+                    .map(GroupName::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" -> @");
+                let gpos = groups.get(name).map(group_pos).unwrap_or(enclosing);
+                return Err(Error::at(
+                    gpos,
+                    format!("{axis} group cycle: @{chain} -> @{name}"),
+                ));
+            }
+            let g = groups
+                .get(name)
+                .ok_or_else(|| Error::at(enclosing, format!("unknown {axis} group: @{name}")))?;
+            let gpos = group_pos(g);
+            // A blessing-class group is a subject predicate, not a member list: emit a
+            // synthesized `Blessing` leaf and don't recurse (it has no members).
+            if let Some(class) = &g.get_ref().blessing {
+                leaf(&Token::Blessing(class.clone()), gpos)?;
+                continue;
+            }
+            stack.push(name.clone());
+            self.expand_within(axis, &g.get_ref().members, gpos, stack, leaf)?;
+            stack.pop();
+        }
+        Ok(())
+    }
 }
 
 fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {

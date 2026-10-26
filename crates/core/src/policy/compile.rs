@@ -142,155 +142,162 @@ struct ProvRule {
 
 /// Compile `resolved` to the flat table. `resolve_fileid` maps an absolute path to its
 /// inode identity (`None` ⇒ doesn't exist / unreadable).
-pub fn compile<R>(resolved: &ResolvedPolicy, mut resolve_fileid: R) -> CompiledPolicy
+pub fn compile<R>(resolved: &ResolvedPolicy, resolve_fileid: R) -> CompiledPolicy
 where
     R: FnMut(&Path) -> Option<FileId>,
 {
-    let mut diagnostics = Vec::new();
+    let mut compiler = Compiler {
+        resolve_fileid,
+        classes: ClassRegistry::new(resolved.blessing_classes.iter().cloned()),
+        diagnostics: Vec::new(),
+    };
+    let (objects, pending) = compiler.objects(resolved);
+    let own = compiler.own_rules(resolved, &objects);
+    let objects = compiler.buckets(&objects, &own);
+    CompiledPolicy {
+        objects,
+        pending,
+        diagnostics: compiler.diagnostics,
+        classes: compiler.classes,
+    }
+}
 
-    // 0. The blessing class registry (DESIGN §16.3).
-    let classes = ClassRegistry::new(resolved.blessing_classes.iter().cloned());
+/// One compile's state: the path resolver, the class ids it hands out, and the
+/// diagnostics every step adds to.
+struct Compiler<R> {
+    resolve_fileid: R,
+    classes: ClassRegistry,
+    diagnostics: Vec<Diagnostic>,
+}
 
-    // 1. Resolve the distinct object paths → objects (sorted for stable ObjIds) +
-    //    pending. A `BTreeSet` gives a deterministic order so ObjIds don't churn
-    //    across compiles of the same policy.
-    let distinct_objs: BTreeSet<&Path> = resolved
-        .rules
-        .iter()
-        .flat_map(|r| r.objects.iter().map(PathBuf::as_path))
-        .collect();
+impl<R> Compiler<R>
+where
+    R: FnMut(&Path) -> Option<FileId>,
+{
+    /// Resolves the distinct object paths. Returns the objects, numbered in path order so
+    /// ObjIds don't churn across compiles of the same policy, and the paths that don't
+    /// resolve yet.
+    fn objects(&mut self, resolved: &ResolvedPolicy) -> (Vec<Object>, Vec<PathBuf>) {
+        let distinct: BTreeSet<&Path> = resolved
+            .rules
+            .iter()
+            .flat_map(|r| r.objects.iter().map(PathBuf::as_path))
+            .collect();
 
-    let mut objects: Vec<Object> = Vec::new();
-    let mut pending: Vec<PathBuf> = Vec::new();
-    for path in distinct_objs {
-        match resolve_fileid(path) {
-            Some(file) => {
-                objects.push(Object {
+        let mut objects: Vec<Object> = Vec::new();
+        let mut pending: Vec<PathBuf> = Vec::new();
+        for path in distinct {
+            match (self.resolve_fileid)(path) {
+                Some(file) => objects.push(Object {
                     id: ObjId(objects.len() as u32),
                     file,
                     path: path.to_path_buf(),
                     depth: paths::depth(path),
-                });
+                }),
+                None => pending.push(path.to_path_buf()),
             }
-            None => pending.push(path.to_path_buf()),
         }
+        (objects, pending)
     }
-    let index_of = |p: &Path| objects.iter().position(|o| o.path == p);
 
-    // 2. Per-object "own" rules: cross-product subjects × this object, lowering each
-    //    subject to a `SubjectMatch` (resolving exe paths). Unknown exe ⇒ drop that one
-    //    rule with a warning; a pending object ⇒ warn + skip (recorded above).
-    let mut own: Vec<Vec<ProvRule>> = (0..objects.len()).map(|_| Vec::new()).collect();
-    for rule in &resolved.rules {
-        let subjects = lower_subjects(
-            &rule.subjects,
-            &mut resolve_fileid,
-            &classes,
-            &rule.loc(),
-            &mut diagnostics,
-        );
-        for obj_path in &rule.objects {
-            match index_of(obj_path) {
-                Some(idx) => {
-                    let depth = objects[idx].depth;
-                    for &subject in &subjects {
-                        own[idx].push(ProvRule {
+    /// Returns each object's own rules, indexed like `objects`: the cross product of every
+    /// rule's subjects with that object. Warns about a rule on a pending object.
+    fn own_rules(&mut self, resolved: &ResolvedPolicy, objects: &[Object]) -> Vec<Vec<ProvRule>> {
+        let mut own: Vec<Vec<ProvRule>> = (0..objects.len()).map(|_| Vec::new()).collect();
+        for rule in &resolved.rules {
+            let subjects = self.lower_subjects(&rule.subjects, &rule.loc());
+            for obj_path in &rule.objects {
+                match objects.iter().position(|o| &o.path == obj_path) {
+                    Some(idx) => {
+                        let depth = objects[idx].depth;
+                        own[idx].extend(subjects.iter().map(|&subject| ProvRule {
                             rule: CompiledRule::new(subject, rule.actions, rule.policy),
                             depth,
-                        });
+                        }));
                     }
+                    None => self.diagnostics.push(Diagnostic::warn(
+                        rule.loc(),
+                        format!(
+                            "path {} does not exist yet; this rule is not enforced until it is created and you re-apply",
+                            obj_path.display()
+                        ),
+                    )),
                 }
-                None => diagnostics.push(Diagnostic::warn(
-                    rule.loc(),
-                    format!(
-                        "path {} does not exist yet; this rule is not enforced until it is created and you re-apply",
-                        obj_path.display()
-                    ),
-                )),
             }
         }
+        own
     }
 
-    // 3. Copy-down: each object's bucket = its own rules + every protected ancestor's
-    //    own rules; sort (specificity desc, deny before allow); dedup; cap-check.
-    let mut compiled = Vec::with_capacity(objects.len());
-    for i in 0..objects.len() {
-        let mut bucket: Vec<ProvRule> = own[i].clone();
-        for j in 0..objects.len() {
-            if j != i && paths::is_within(&objects[i].path, &objects[j].path) {
-                bucket.extend(own[j].iter().cloned());
+    /// Lowers a rule's subjects to `SubjectMatch`es: resolves exe paths to inodes, and maps
+    /// a blessing class name to its [`ClassId`]. Drops an exe that doesn't resolve, with a
+    /// warning.
+    fn lower_subjects(&mut self, subjects: &[SubjectSpec], loc: &Loc) -> Vec<SubjectMatch> {
+        let mut out = Vec::new();
+        for s in subjects {
+            match s {
+                SubjectSpec::Any => out.push(SubjectMatch::ANY),
+                SubjectSpec::Exe(path) => match (self.resolve_fileid)(path) {
+                    Some(file) => out.push(SubjectMatch::exe(file)),
+                    None => self.diagnostics.push(Diagnostic::warn(
+                        loc.clone(),
+                        format!(
+                            "exe {} does not exist; this rule is not enforced for it",
+                            path.display()
+                        ),
+                    )),
+                },
+                // `resolve` only emits a `Blessed` for a *declared* class, so the lookup
+                // always hits; guard it as an internal error rather than panicking in the
+                // daemon.
+                SubjectSpec::Blessed(name) => match self.classes.id(name) {
+                    Some(id) => out.push(SubjectMatch::blessed(id)),
+                    None => self.diagnostics.push(Diagnostic::error(
+                        loc.clone(),
+                        format!("internal: blessing class {name:?} is not in the registry"),
+                    )),
+                },
             }
         }
-        sort_bucket(&mut bucket);
-        dedup_bucket(&mut bucket);
-
-        if bucket.len() > MAX_RULES_PER_OBJ {
-            diagnostics.push(Diagnostic::error(
-                Loc::default(),
-                format!(
-                    "object {} compiles to {} rules, over the per-object limit of {} \
-                     (split the policy or raise MAX_RULES_PER_OBJ)",
-                    objects[i].path.display(),
-                    bucket.len(),
-                    MAX_RULES_PER_OBJ
-                ),
-            ));
-        }
-
-        compiled.push(CompiledObject {
-            id: objects[i].id,
-            file: objects[i].file,
-            path: objects[i].path.clone(),
-            rules: bucket.into_iter().map(|pr| pr.rule).collect(),
-        });
+        out
     }
 
-    CompiledPolicy {
-        objects: compiled,
-        pending,
-        diagnostics,
-        classes,
-    }
-}
+    /// Builds each object's bucket by copy-down: its own rules plus every protected
+    /// ancestor's, sorted into first-match order and deduped. Reports a bucket over
+    /// `MAX_RULES_PER_OBJ` as an error.
+    fn buckets(&mut self, objects: &[Object], own: &[Vec<ProvRule>]) -> Vec<CompiledObject> {
+        let mut compiled = Vec::with_capacity(objects.len());
+        for (obj, own_rules) in objects.iter().zip(own) {
+            let mut bucket: Vec<ProvRule> = own_rules.clone();
+            for (anc, anc_rules) in objects.iter().zip(own) {
+                if anc.id != obj.id && paths::is_within(&obj.path, &anc.path) {
+                    bucket.extend(anc_rules.iter().cloned());
+                }
+            }
+            sort_bucket(&mut bucket);
+            dedup_bucket(&mut bucket);
 
-/// Lower a rule's subjects to `SubjectMatch`es: resolve exe paths to inodes, and map a
-/// blessing class name to its dense [`ClassId`] via `classes` (DESIGN §16.3).
-fn lower_subjects<R>(
-    subjects: &[SubjectSpec],
-    resolve_fileid: &mut R,
-    classes: &ClassRegistry,
-    loc: &Loc,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<SubjectMatch>
-where
-    R: FnMut(&Path) -> Option<FileId>,
-{
-    let mut out = Vec::new();
-    for s in subjects {
-        match s {
-            SubjectSpec::Any => out.push(SubjectMatch::ANY),
-            SubjectSpec::Exe(path) => match resolve_fileid(path) {
-                Some(file) => out.push(SubjectMatch::exe(file)),
-                None => diagnostics.push(Diagnostic::warn(
-                    loc.clone(),
+            if bucket.len() > MAX_RULES_PER_OBJ {
+                self.diagnostics.push(Diagnostic::error(
+                    Loc::default(),
                     format!(
-                        "exe {} does not exist; this rule is not enforced for it",
-                        path.display()
+                        "object {} compiles to {} rules, over the per-object limit of {} \
+                         (split the policy or raise MAX_RULES_PER_OBJ)",
+                        obj.path.display(),
+                        bucket.len(),
+                        MAX_RULES_PER_OBJ
                     ),
-                )),
-            },
-            // `resolve` only emits a `Blessed` for a *declared* class, so the lookup always
-            // hits; guard it as an internal error rather than panicking in the daemon.
-            SubjectSpec::Blessed(name) => match classes.id(name) {
-                Some(id) => out.push(SubjectMatch::blessed(id)),
-                None => diagnostics.push(Diagnostic::error(
-                    loc.clone(),
-                    format!("internal: blessing class {name:?} is not in the registry"),
-                )),
-            },
+                ));
+            }
+
+            compiled.push(CompiledObject {
+                id: obj.id,
+                file: obj.file,
+                path: obj.path.clone(),
+                rules: bucket.into_iter().map(|pr| pr.rule).collect(),
+            });
         }
+        compiled
     }
-    out
 }
 
 /// Sort a bucket into kernel first-match order: most-specific object first, then
