@@ -6,7 +6,7 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 4.3 are committed. Step 4.4 (smoke outcomes) is in the
+> **Status:** steps 0 through 4 are committed. Step 5 (smoke-suite helpers) is in the
 > working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
@@ -112,7 +112,7 @@ parameter into a struct the caller builds once:
    `ExecStart=` and `Environment=`, so the dev unit regains `RequiresMountsFor=`,
    `DefaultDependencies=no` and `Before=basic.target`. Every privileged step runs under
    one `sudo` (it was three).
-4. **Machine-checkable outcomes for the smoke suite** (done, unstaged): the suite matched
+4. **Machine-checkable outcomes for the smoke suite** (done): the suite matched
    27 distinct strings the Rust code writes. Now:
    - `bless list`, `bless revoke` and `policy show` are read through `--json`, which also
      removes the pid-collision hazard of matching ids in the rendered list.
@@ -127,13 +127,21 @@ parameter into a struct the caller builds once:
      error kind on the wire and distinct CLI exit codes. That is a protocol change, not
      taken here.
 
-## 5. Smoke-suite helpers
+## 5. Smoke-suite helpers (done, unstaged)
 
-`bpf-lsm-smoke.sh` gets a `rule` emitter for the ~45 hand-written `[[rule]]` heredocs, a
-`run_scenario` driver for the shared setup and teardown, `wait_until` for the eleven
-sleep loops, a cleanup stack that an early return cannot skip (it fixes the `$TMP` leak in
-the rename-exchange scenario), and `expect_log` beside `expect_allow`/`expect_deny`. The
-156-line stale scenario catalog in the header is cut to a short file header.
+`bpf-lsm-smoke.sh` gains:
+- `rule WHO WHERE ACTION POLICY`, which renders a `[[rule]]` table (space-separated values
+  become a TOML array) and replaces all 47 hand-written rule blocks;
+- `run_scenario`, which drives every scenario and always stops its daemon afterwards, so
+  the 51 per-exit `daemon_stop` calls are gone and an early return can no longer leak
+  `$TMP` or a pinned boundary;
+- `on_cleanup`, a stack of commands a scenario queues as it sets things up (the synthetic
+  passwd users, the fake sudo, the placement and reconcile cgroup trees, the `/root`
+  vault). They used to be repeated, or skipped, at each exit;
+- `wait_until TRIES CMD…` for the poll loops, and `expect_log` for the positive log checks.
+
+The 156-line scenario catalog in the header moved onto the scenario functions it
+described, and its numbering, stale since four scenarios were added unnumbered, is gone.
 
 ## 6. Doc pass
 
