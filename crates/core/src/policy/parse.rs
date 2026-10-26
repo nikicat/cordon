@@ -163,18 +163,12 @@ pub(crate) enum OneOrMany {
     Many(Vec<Token>),
 }
 
-impl OneOrMany {
-    /// Returns the tokens as a slice, with a bare value as a one-element slice.
-    pub(crate) fn tokens(&self) -> &[Token] {
-        match self {
-            OneOrMany::One(t) => std::slice::from_ref(t),
+impl From<OneOrMany> for Vec<Token> {
+    fn from(field: OneOrMany) -> Vec<Token> {
+        match field {
+            OneOrMany::One(t) => vec![t],
             OneOrMany::Many(v) => v,
         }
-    }
-
-    /// Returns the tokens as an owned list.
-    pub(crate) fn classified(&self) -> Vec<Token> {
-        self.tokens().to_vec()
     }
 }
 
@@ -246,14 +240,15 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
 
     let mut rules = Vec::with_capacity(raw.blocks.len());
     // A `[[rule]]` table's position is its header.
-    for spanned in &raw.blocks {
-        let rd = spanned.get_ref();
+    for spanned in raw.blocks {
+        let pos = lines.pos(spanned.span().start);
+        let rd = spanned.into_inner();
         rules.push(ParsedRule {
-            who: rd.who.classified(),
-            where_: rd.where_.classified(),
-            action: rd.action.classified(),
+            who: rd.who.into(),
+            where_: rd.where_.into(),
+            action: rd.action.into(),
             policy: rd.policy,
-            pos: lines.pos(spanned.span().start),
+            pos,
         });
     }
     // The DSL block's content starts at `content_start`, so byte offsets inside it map

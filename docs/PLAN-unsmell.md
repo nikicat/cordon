@@ -173,7 +173,8 @@ Left as code; each makes its doc long or awkward:
 - `Session::open` (edit) does four jobs.
 - `editor_identity` and `invoker_uid` both parsed `SUDO_UID`. Done, `SudoInvoker` owns it.
 - `decide_reparent` (eBPF) answers three questions, within the verifier's limits.
-- `OneOrMany::classified` is `tokens().to_vec()` under a misleading name.
+- `OneOrMany::classified` was `tokens().to_vec()` under a misleading name. Done, it is
+  now `From<OneOrMany> for Vec<Token>`.
 - `UserName::from_str` accepted the empty string and `/`. Done, it now refuses both.
 - Smoke suite: `cgroup2_ready` has three unrelated effects; `edit_env_setup` returns its
   results through five globals.
