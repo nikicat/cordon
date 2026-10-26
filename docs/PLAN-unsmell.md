@@ -6,7 +6,7 @@ numbered step is one commit. Every step leaves `just test` and the VM smoke
 unless it says otherwise. Steps are ordered so that later ones build on the types earlier
 ones introduce, and so that the doc pass runs last, over code that has stopped moving.
 
-> **Status:** steps 0 through 4.2 are committed. Step 4.3 (the dev drop-in) is in the
+> **Status:** steps 0 through 4.3 are committed. Step 4.4 (smoke outcomes) is in the
 > working tree, unstaged.
 
 ## 0. Bug fixes and false doc claims (done)
@@ -107,15 +107,25 @@ parameter into a struct the caller builds once:
    hand-rolled atomic write, which gains the missing fsync of the parent directory after
    the rename. The 16 test temp dirs and files move to it too, so a panicking test cleans
    up. The daemon also drops nix's `socket` feature, unused since `Conn` moved to core.
-3. **Dev unit as a drop-in** (done, unstaged): `just install-service` installs the
+3. **Dev unit as a drop-in** (done; only dry-run, see STATUS.md): `just install-service` installs the
    packaged `cordond.service` plus a `cordond.service.d/dev.conf` that overrides only
    `ExecStart=` and `Environment=`, so the dev unit regains `RequiresMountsFor=`,
    `DefaultDependencies=no` and `Before=basic.target`. Every privileged step runs under
    one `sudo` (it was three).
-4. **Machine-checkable outcomes for the smoke suite**: the suite matches about fifteen
-   message strings that the Rust code writes. Each matched string is either replaced by a
-   distinct exit code or `--json` field, or marked at its Rust site as matched by the
-   suite. The step starts with the inventory and a per-string choice.
+4. **Machine-checkable outcomes for the smoke suite** (done, unstaged): the suite matched
+   27 distinct strings the Rust code writes. Now:
+   - `bless list`, `bless revoke` and `policy show` are read through `--json`, which also
+     removes the pid-collision hazard of matching ids in the rendered list.
+   - `cordond --log-format json` writes one JSON object per line. The suite starts the
+     daemon with it and checks the decision records by field (`.user`, `.path`,
+     `.policy`, …) through jq, instead of regexes over the rendered line.
+   - The records a tool waits for carry an `event` field: `ready`, `backend_failed`,
+     `self_test_failed`, `carrier_not_adopted`, `already_running` and `teardown` (with
+     `generations`, 0 when nothing was pinned). Teardown keeps exit 0 either way, so it
+     stays safe to run blind.
+   - Left as text: the three refusal reasons (`requires root`, `not root`), which need an
+     error kind on the wire and distinct CLI exit codes. That is a protocol change, not
+     taken here.
 
 ## 5. Smoke-suite helpers
 

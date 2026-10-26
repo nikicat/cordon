@@ -55,7 +55,7 @@ jobs:
       - name: Install qemu + virtme-ng
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get install -y qemu-system-x86 jq
           pipx install virtme-ng
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install bpf-linker

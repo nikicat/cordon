@@ -186,6 +186,7 @@ OBJ="$ROOT_DIR/target/bpf/cordon.bpf.o"
 [ -x "$CORDOND" ] || { echo "missing $CORDOND — cargo build -p cordon-daemon" >&2; exit 1; }
 [ -x "$CORDON" ]  || { echo "missing $CORDON — cargo build -p cordon-cli" >&2; exit 1; }
 [ -e "$OBJ" ]     || { echo "missing $OBJ — just build-ebpf" >&2; exit 1; }
+command -v jq >/dev/null || { echo "missing jq — the daemon log is checked as JSON" >&2; exit 1; }
 
 # --- shared per-scenario state + helpers -----------------------------------
 TMP="" VAULT="" SECRET="" OWNER="" OWNER_B="" SCRAPER="" SOCK="" LOG="" DPID=""
@@ -256,9 +257,9 @@ daemon_start() {
     if [ -n "$DCGROUP" ]; then
         mkdir -p "$DCGROUP"
         RUST_LOG="${RUST_LOG:-info}" env "$@" \
-            sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$DCGROUP" "$CORDOND" >"$LOG" 2>&1 &
+            sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$DCGROUP" "$CORDOND" --log-format json >"$LOG" 2>&1 &
     else
-        RUST_LOG="${RUST_LOG:-info}" env "$@" "$CORDOND" >"$LOG" 2>&1 &
+        RUST_LOG="${RUST_LOG:-info}" env "$@" "$CORDOND" --log-format json >"$LOG" 2>&1 &
     fi
     DPID=$!
     for _ in $(seq 1 50); do
@@ -294,25 +295,29 @@ daemon_stop() {
     fi
 }
 
-# 0 once the program is attached, self-tested, AND the policy is seeded ("active …",
-# which the daemon logs only after seeding); 1 on a fatal backend error / timeout.
+# 0 once the program is attached, self-tested, AND the policy is seeded (the `ready`
+# event, which the daemon logs only after seeding); 1 on a fatal backend error / timeout.
 wait_active() {
     for _ in $(seq 1 80); do
-        grep -q "active on the file_open hook" "$LOG" && return 0
-        grep -qiE "backend exited with error|self-test FAILED|has errors" "$LOG" && return 1
+        log_has '.event == "ready"' && return 0
+        log_has '.event == "backend_failed"' && return 1
         kill -0 "$DPID" 2>/dev/null || return 1
         sleep 0.1
     done
     return 1
 }
 
-# grep the daemon log with ANSI styling stripped (tracing colorizes key=value).
-log_has() { sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -qE "$1"; }
-# count matching daemon-log lines (ANSI stripped) — for the coalescing assertion.
-log_count() { sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -cE "$1"; }
+# The records of a `--log-format json` log (one object per line, fields as top-level keys)
+# that satisfy the jq condition $2; extra args (e.g. `--arg v "$X"`) go to jq. Lines that
+# aren't JSON, such as a panic message, are skipped.
+records() { local file="$1" cond="$2"; shift 2; jq -cR "$@" "fromjson? | select($cond)" "$file"; }
+# Whether the daemon log has a record matching the jq condition $1 (extra args to jq).
+log_has() { [ -n "$(records "$LOG" "$@")" ]; }
+# How many daemon-log records match — for the coalescing assertion.
+log_count() { records "$LOG" "$@" | grep -c .; }
 
 # Poll for a log line that the async ring drain produces (e.g. a deny record).
-wait_log() { for _ in $(seq 1 30); do log_has "$1" && return 0; sleep 0.1; done; return 1; }
+wait_log() { for _ in $(seq 1 30); do log_has "$@" && return 0; sleep 0.1; done; return 1; }
 
 expect_allow() { local l="$1"; shift; if "$@" >/dev/null 2>&1; then echo "  OK: $l (allowed)"; else echo "  FAIL: $l — denied, expected ALLOW"; return 1; fi; }
 # Like expect_allow, but tolerant of the teardown lag: the kernel drops a link when its
@@ -350,7 +355,9 @@ EOF
     # root runs the readers, so the caller resolves to user=root (uid 0 → passwd), proving
     # the kernel-captured uid reaches the journal; root is not a regular user, so paths stay
     # absolute (no `~` collapse — that's exercised by the daemon's unit tests).
-    if wait_log 'deny pid=[0-9]+ user=root exe=.* object=.*vault path=.*/vault/secret action=read policy=default-deny'; then
+    if wait_log '.message == "deny" and (.pid | type == "number") and .user == "root" and has("exe")
+            and (.object | endswith("vault")) and (.path | endswith("/vault/secret"))
+            and .action == "read" and .policy == "default-deny"'; then
         echo "  OK: denial reported on the ring buffer (user + object + opened path + action, default-deny)"
     else
         echo "  FAIL: no deny record with the user, object, opened path, and action"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -373,7 +380,7 @@ EOF
     local fail=0
     if wait_active; then
         echo "  FAIL: daemon went 'active' with poisoned offsets — self-test missed the no-op"; fail=1
-    elif grep -q "self-test FAILED" "$LOG"; then
+    elif log_has '.event == "self_test_failed"'; then
         echo "  OK: daemon aborted (self-test caught the no-op: a protected open was allowed)"
     else
         echo "  FAIL: backend stopped, but not via the self-test guard:"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -536,7 +543,7 @@ EOF
     daemon_start; started || return 1
     local fail=0
     expect_allow "scraper reads under audit (observe, not enforce)" read_as "$SCRAPER" "$SECRET" || fail=1
-    if wait_log 'audit pid=[0-9]+ user=root exe=.* object=.* action=read'; then
+    if wait_log '.message == "audit" and .user == "root" and has("exe") and has("object") and .action == "read"'; then
         echo "  OK: the audit catch-all logged the read (allowed)"
     else
         echo "  FAIL: no audit record for the observed read"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -558,8 +565,9 @@ EOF
     fi
     expect_deny "scraper denied after the flip to deny" read_as "$SCRAPER" "$SECRET" || fail=1
     # Drive reads to cross the in-kernel suppressor's 1s window, then assert a deny record.
-    for _ in $(seq 1 40); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; log_has 'deny pid=[0-9]+ user=root exe=.* action=read' && break; sleep 0.1; done
-    if log_has 'deny pid=[0-9]+ user=root exe=.* object=.* action=read'; then
+    local deny_read='.message == "deny" and .user == "root" and has("exe") and has("object") and .action == "read"'
+    for _ in $(seq 1 40); do read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1; log_has "$deny_read" && break; sleep 0.1; done
+    if log_has "$deny_read"; then
         echo "  OK: the same access now logs as deny (enforced)"
     else
         echo "  FAIL: no deny record after the flip to deny"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -583,7 +591,7 @@ EOF
     expect_deny "scraper denied under silence" read_as "$SCRAPER" "$SECRET" || fail=1
     # Give the (would-be) ring drain a moment, then assert nothing was logged.
     sleep 0.5
-    if log_has 'deny pid=[0-9]+'; then
+    if log_has '.message == "deny"'; then
         echo "  FAIL: silence produced a log record (should be silent)"; sed 's/^/  daemon| /' "$LOG"; fail=1
     else
         echo "  OK: no log record for a silenced denial"
@@ -628,7 +636,7 @@ EOF
     expect_allow "owner reads after apply" read_as "$OWNER" "$SECRET" || fail=1
     expect_deny "scraper denied after apply" read_as "$SCRAPER" "$SECRET" || fail=1
     # `show` reflects the applied policy.
-    if "$CORDON" policy show 2>/dev/null | grep -qF "$VAULT"; then
+    if "$CORDON" --json policy show 2>/dev/null | json_field path | grep -qxF "$VAULT"; then
         echo "  OK: policy show lists the applied object"
     else
         echo "  FAIL: policy show did not list the applied object"
@@ -661,7 +669,7 @@ EOF
     read_as "$SCRAPER" "$SECRET" >/dev/null 2>&1
     sleep 0.8   # > one poll interval, so the final drain lands before we count
 
-    local recs; recs=$(log_count 'deny pid=[0-9]+ .*action=read')
+    local recs; recs=$(log_count '.message == "deny" and .action == "read"')
     if [ "$recs" -ge 1 ] && [ "$recs" -le 15 ]; then
         echo "  OK: $((n + 1)) denied opens collapsed to $recs ring record(s)"
     else
@@ -669,7 +677,7 @@ EOF
         sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
     # At least one record must carry a nonzero suppressed count (volume stays visible).
-    if log_has 'deny .*suppressed=[1-9][0-9]*'; then
+    if log_has '.message == "deny" and (.suppressed | tonumber) > 0'; then
         echo "  OK: a suppressed>0 count was carried into a record"
     else
         echo "  FAIL: no record reported a folded suppressed count"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -699,17 +707,17 @@ EOF
     read_as "$OWNER" "$VAULT/sub/nested" >/dev/null 2>&1   # $VAULT/sub/nested  (depth 2, nested)
     # Each distinct leaf surfaces its own audit record carrying the ACTUAL opened path —
     # not just the matched root ($VAULT). Proves the d_name walk + leaf-keyed suppressor.
-    if wait_log "audit pid=[0-9]+ .*path=$VAULT/secret action=read"; then
+    if wait_log '.message == "audit" and .path == $p and .action == "read"' --arg p "$VAULT/secret"; then
         echo "  OK: leaf path reported ($VAULT/secret)"
     else
         echo "  FAIL: no audit record with path=$VAULT/secret"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
-    if log_has "audit .*path=$VAULT/other action=read"; then
+    if log_has '.message == "audit" and .path == $p and .action == "read"' --arg p "$VAULT/other"; then
         echo "  OK: sibling surfaces separately ($VAULT/other)"
     else
         echo "  FAIL: no audit record with path=$VAULT/other (siblings coalesced away?)"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
-    if log_has "audit .*path=$VAULT/sub/nested action=read"; then
+    if log_has '.message == "audit" and .path == $p and .action == "read"' --arg p "$VAULT/sub/nested"; then
         echo "  OK: depth-2 nested path reconstructed ($VAULT/sub/nested)"
     else
         echo "  FAIL: no audit record with path=$VAULT/sub/nested"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -807,7 +815,8 @@ EOF
     # The audit line names the user and collapses ~ on BOTH object= (the rule's dir) and
     # path= (the opened file): object=~/.creds, path=~/.creds/key — copy-pasteable into the
     # user's policy verbatim.
-    if wait_log "audit pid=[0-9]+ user=$tuser exe=.* object=~/\.creds path=~/\.creds/key action=read"; then
+    if wait_log '.message == "audit" and .user == $u and has("exe") and .object == "~/.creds"
+            and .path == "~/.creds/key" and .action == "read"' --arg u "$tuser"; then
         echo "  OK: audit line shows user=$tuser with ~-collapsed object and path"
     else
         echo "  FAIL: no audit line with user=$tuser and ~-collapsed paths"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -973,8 +982,13 @@ bless_root() {
 }
 # The live carrier dirs (cordon-bless-<id>.<class>), if any.
 bless_dirs() { ls -d "$(bless_root)"/cordon-bless-* 2>/dev/null; }
-# The first live blessing's id from `bless list` ("" when none).
-bless_first_id() { "$CORDON" bless list 2>/dev/null | awk '/class=/{print $1; exit}'; }
+# The values of every `"KEY": VALUE` field in `cordon --json` output, which pretty-prints
+# one field per line, unquoted, one per line. Matches the reply's schema, not its rendering.
+json_field() { sed -n 's/^ *"'"$1"'": "\{0,1\}\([^",]*\)"\{0,1\},\{0,1\}$/\1/p'; }
+# The live blessing ids, one per line.
+bless_ids() { "$CORDON" --json bless list 2>/dev/null | json_field id; }
+# The first live blessing's id ("" when none).
+bless_first_id() { bless_ids | head -n1; }
 
 # The first carrier that actually has members; echoes its dir. NB: `cgroup.procs` is a
 # kernfs file — its st_size is 0 even when populated, so `[ -s ]` would always be false
@@ -996,7 +1010,7 @@ bless_read_as() { "$CORDON" bless --class "$1" -- "$2" -c 'exec 3<"$1"' bash "$3
 # Poll until the daemon has reaped every blessing: list drained AND carrier dirs gone.
 bless_drained() {
     for _ in $(seq 1 40); do
-        [ -z "$(bless_dirs)" ] && "$CORDON" bless list 2>/dev/null | grep -q "no live blessings" && return 0
+        [ -z "$(bless_dirs)" ] && [ -z "$(bless_ids)" ] && return 0
         sleep 0.2
     done
     return 1
@@ -1076,7 +1090,7 @@ EOF
     else
         echo "  FAIL: no populated carrier appeared"; sed 's/^/  daemon| /' "$LOG"; fail=1
     fi
-    if "$CORDON" bless list 2>/dev/null | grep -q "class=ro"; then
+    if "$CORDON" --json bless list 2>/dev/null | json_field class | grep -qx ro; then
         echo "  OK: bless list shows the live entry"
     else
         echo "  FAIL: bless list does not show the entry"; "$CORDON" bless list 2>&1 | sed 's/^/  cli| /'; fail=1
@@ -1163,7 +1177,7 @@ EOF
     local id=""
     bless_wait_populated >/dev/null && id="$(bless_first_id)"
     [ -n "$id" ] || { echo "  FAIL: no populated blessing appeared"; sed 's/^/  daemon| /' "$LOG"; kill "$clipid" 2>/dev/null; daemon_stop; return 1; }
-    if "$CORDON" bless revoke "$id" 2>/dev/null | grep -q "revoked: $id"; then
+    if "$CORDON" --json bless revoke "$id" 2>/dev/null | json_field id | grep -qx "$id"; then
         echo "  OK: revoke accepted (id $id)"
     else
         echo "  FAIL: revoke errored"; "$CORDON" bless revoke "$id" 2>&1 | sed 's/^/  cli| /'; fail=1
@@ -1204,7 +1218,7 @@ EOF
     local fail=0
     expect_allow "blessed read under the audit rule" bless_read_as ro "$OWNER" "$SECRET" || fail=1
     # The class is journaled by NAME, appended after the standard fields.
-    if wait_log 'audit .*blessing=ro'; then
+    if wait_log '.message == "audit" and .blessing == "ro"'; then
         echo "  OK: audit line carries blessing=ro"
     else
         echo "  FAIL: no audit line with blessing=ro"; sed 's/^/  daemon| /' "$LOG"; fail=1
@@ -1604,28 +1618,25 @@ EOF
     daemon_start
     if ! started; then reconcile_cleanup; return 1; fi
     local fail=0
-    local listing; listing="$("$CORDON" bless list 2>&1)"
-    if printf '%s' "$listing" | grep -q '^70 \|^  70 '; then
+    local listing; listing="$(bless_ids)"
+    if printf '%s\n' "$listing" | grep -qx 70; then
         echo "  OK: the root-owned leftover was adopted"
     else
         echo "  FAIL: the root-owned leftover was not adopted: $listing"; fail=1
     fi
-    # Anchor on the id column. `bless list` prints "  <id> class=… pids=[…] cgroup=…", so a
-    # bare `grep 71` also matches any *pid* containing 71 — which in a VM (3-digit pids) trips
-    # roughly whenever the allocator lands there, failing this scenario at random.
-    if printf '%s' "$listing" | grep -q '^71 \|^  71 '; then
+    if printf '%s\n' "$listing" | grep -qx 71; then
         echo "  FAIL: a NON-ROOT-OWNED carrier was adopted — self-bless primitive"; fail=1
     else
         echo "  OK: the planted (user-owned) carrier was ignored"
     fi
-    if printf '%s' "$listing" | grep -q '^72 \|^  72 '; then
+    if printf '%s\n' "$listing" | grep -qx 72; then
         echo "  OK: a leftover in the user slice (the desktop placement) was adopted"
     else
         echo "  FAIL: the user-slice leftover was not adopted — reconcile does not scan"
         echo "        where placement puts desktop carriers; it would leak and then block"
         echo "        every later mint on EEXIST. listing: $listing"; fail=1
     fi
-    if log_has 'not root-owned; ignored'; then
+    if log_has '.event == "carrier_not_adopted"'; then
         echo "  OK: the refusal is journaled"
     else
         echo "  FAIL: no journal line for the ignored carrier"; fail=1
@@ -1862,7 +1873,7 @@ EOF
     # …and teardown is what lifts it. Without this step the two asserts above would also
     # pass if the reads were failing for some reason unrelated to the pins.
     local t1="$TMP/teardown1.log" t2="$TMP/teardown2.log"
-    if "$CORDOND" --teardown >"$t1" 2>&1; then
+    if "$CORDOND" --log-format json --teardown >"$t1" 2>&1; then
         echo "  OK: --teardown removed the pins with no daemon running"
     else
         echo "  FAIL: --teardown errored"; sed 's/^/  daemon| /' "$t1"; fail=1
@@ -1872,13 +1883,13 @@ EOF
     # count made both runs print "enforcement torn down — the boundary is OFF", which on an
     # already-unenforced box is a false statement about a security boundary. Both halves are
     # asserted: checking only the second would pass if BOTH said "already off".
-    "$CORDOND" --teardown >"$t2" 2>&1
-    if sed 's/\x1b\[[0-9;]*m//g' "$t1" | grep -q "torn down"; then
+    "$CORDOND" --log-format json --teardown >"$t2" 2>&1
+    if [ -n "$(records "$t1" '.event == "teardown" and .generations > 0')" ]; then
         echo "  OK: the teardown that removed pins reports a disarm"
     else
         echo "  FAIL: the real teardown did not report a disarm:"; sed 's/^/  daemon| /' "$t1"; fail=1
     fi
-    if sed 's/\x1b\[[0-9;]*m//g' "$t2" | grep -q "already off"; then
+    if [ -n "$(records "$t2" '.event == "teardown" and .generations == 0')" ]; then
         echo "  OK: a second teardown says the box was already off, not that it disarmed one"
     else
         echo "  FAIL: a no-op teardown misreports the posture:"; sed 's/^/  daemon| /' "$t2"; fail=1
@@ -1969,14 +1980,14 @@ EOF
     daemon_start; started || return 1
     local fail=0 out rc2
 
-    out="$("$CORDOND" 2>&1)"
+    out="$("$CORDOND" --log-format json 2>&1)"
     rc2=$?
     if [ "$rc2" -eq 0 ]; then
         echo "  FAIL: a second cordond started successfully"; fail=1
     else
         echo "  OK: the second cordond refused to start (exit $rc2)"
     fi
-    if printf '%s' "$out" | grep -q "already running"; then
+    if printf '%s\n' "$out" | jq -eR 'fromjson? | select(.event == "already_running")' >/dev/null; then
         echo "  OK: it named the conflict instead of failing obscurely"
     else
         echo "  FAIL: no 'already running' diagnostic:"; printf '%s\n' "$out" | sed 's/^/  second| /'; fail=1

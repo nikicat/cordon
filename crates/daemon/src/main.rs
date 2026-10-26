@@ -67,11 +67,22 @@ struct Args {
     /// reference and the kernel detaches the hooks on a workqueue.
     #[arg(long)]
     teardown: bool,
+    /// Log line format. `json` writes one object per line, with each record's fields as
+    /// top-level keys and an `event` key on the records a tool would wait for.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 fn main() -> ExitCode {
-    init_tracing();
-    match run(Args::parse()) {
+    let args = Args::parse();
+    init_tracing(args.log_format);
+    match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error = %e, "fatal");
@@ -81,9 +92,10 @@ fn main() -> ExitCode {
 }
 
 /// Logs to stderr; level via `RUST_LOG` (default `info`). Drops the module-path target
-/// (`cordond::backend::…` — noise in an audit line, not signal). On a terminal keep ANSI
-/// + timestamps; under systemd/journald drop both (journald colours and timestamps).
-fn init_tracing() {
+/// (`cordond::backend::…` — noise in an audit line, not signal). As text, on a terminal
+/// keep ANSI + timestamps; under systemd/journald drop both (journald colours and
+/// timestamps).
+fn init_tracing(format: LogFormat) {
     use std::io::IsTerminal;
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -93,7 +105,9 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_target(false)
         .with_ansi(terminal);
-    if terminal {
+    if let LogFormat::Json = format {
+        builder.json().flatten_event(true).init();
+    } else if terminal {
         builder.init();
     } else {
         builder.without_time().init();
@@ -142,10 +156,13 @@ fn teardown_enforcement(cfg: &Config) -> cordon_core::Result<()> {
         // Not the same event, and saying "torn down" here would misreport the posture:
         // nothing was holding the boundary up in the first place.
         Swept::Nothing => info!(
+            event = "teardown",
+            generations = 0,
             pin_dir = %cfg.bpf_pin_dir.display(),
             "nothing was pinned — enforcement was already off, no change",
         ),
         Swept::Generations(n) => info!(
+            event = "teardown",
             generations = n.get(),
             pin_dir = %cfg.bpf_pin_dir.display(),
             "enforcement torn down — the boundary is OFF until cordond starts again",
@@ -174,7 +191,7 @@ fn serve_daemon(cfg: Config) -> cordon_core::Result<()> {
     let backend_thread = std::thread::spawn(move || {
         let result = backend.run(policy_control, backend_shutdown);
         if let Err(e) = &result {
-            error!(error = %e, "backend exited with error");
+            error!(event = "backend_failed", error = %e, "backend exited with error");
         }
         result
     });
@@ -230,10 +247,13 @@ fn acquire_singleton(socket: &Path) -> cordon_core::Result<File> {
         .open(&path)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(Error::msg(format!(
-            "another cordond is already running on {}; stop it first",
-            socket.display()
-        ))),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            error!(event = "already_running", socket = %socket.display(), "another cordond holds the lock");
+            Err(Error::msg(format!(
+                "another cordond is already running on {}; stop it first",
+                socket.display()
+            )))
+        }
         Err(std::fs::TryLockError::Error(e)) => {
             Err(Error::msg(format!("cordond: lock {}: {e}", path.display())))
         }

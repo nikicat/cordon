@@ -146,7 +146,9 @@ impl Backend for BpfLsmBackend {
                 .with_context(|| format!("bpf-lsm: attach {hook}"))?;
             links.push((hook, id));
         }
-        self_test(&mut ebpf)?;
+        self_test(&mut ebpf).inspect_err(|e| {
+            error!(event = "self_test_failed", error = %e, "bpf-lsm self-test failed");
+        })?;
 
         // Seed the real, compiled policy and publish it for `cordon policy show`.
         Maps(&mut ebpf).seed(&compiled)?;
@@ -158,10 +160,10 @@ impl Backend for BpfLsmBackend {
         // `_pinned` is held for the run: see `PinDir::pin_links`.
         let _pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
 
-        // The message text is load-bearing beyond readability: the VM smoke's readiness
-        // gate greps "active on the file_open hook", and every scenario waits on it. Extra
-        // context goes in *fields*, which tracing renders after the message.
+        // A fixed phrase that marks readiness, so it can be grepped for; context goes in
+        // fields, which tracing renders after the message.
         info!(
+            event = "ready",
             objects = compiled.objects.len(),
             hooks = HOOKS.len(),
             policy = %self.policy.display(),

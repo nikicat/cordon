@@ -327,6 +327,7 @@ impl Blessings {
             let owner = Uid(std::os::unix::fs::MetadataExt::uid(&meta));
             if !adoptable(owner) {
                 warn!(
+                    event = "carrier_not_adopted",
                     dir = %found.dir.display(), %owner,
                     "bless: leftover carrier is not root-owned; ignored (not ours to adopt)"
                 );

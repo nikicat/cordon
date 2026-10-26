@@ -24,7 +24,7 @@ bpf-lsm = ["dep:aya", "dep:cordon-bpf-common"]
 cordon-core = { workspace = true }
 clap = { workspace = true }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # nix `poll` drives the bpf-lsm ring-buffer reader: a safe wrapper over hand-rolled `unsafe`.
