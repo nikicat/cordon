@@ -1,27 +1,26 @@
-//! The map names and POD records shared between the eBPF program and the loader
-//! that are **not** part of the per-object rule table (that lives in
-//! [`crate::policy_maps`]): the `(dev,inode)` [`FileId`] used everywhere as inode
-//! identity, the one-element [`Settings`] control record, and the [`DecisionEvent`]
-//! pushed on the ring buffer.
+//! The map names and POD records that the eBPF program and the loader share outside the
+//! per-object rule table, which lives in [`crate::policy_maps`]. They carry the control
+//! record that the daemon writes, the decisions that the program reports, and the
+//! suppressor's state.
 
 use crate::ids::{Bank, Dev, Ino, Nanos, Pid, Suppressed, Uid};
 use crate::policy_maps::{Action, ClassId};
 
 // ---- map names ------------------------------------------------------------
-// The program defines these maps; the loader resolves them by name. (The rule-table
-// maps `PROTECTED`/`RULES`/`RULE_COUNT` are named in `policy_maps`.)
+// The program defines these maps, and the loader resolves them by name. The rule-table
+// maps `PROTECTED`, `RULES` and `RULE_COUNT` are named in `policy_maps`.
 
-/// `Array<Settings>` (one element, index 0); see [`Settings`].
+/// The name of the one-element `Array<Settings>`, read at index 0.
 pub const MAP_SETTINGS: &str = "SETTINGS";
-/// `RingBuf` of [`DecisionEvent`]s, drained by the daemon into the journal.
+/// The name of the `RingBuf` of [`DecisionEvent`]s that the daemon drains into the journal.
 pub const MAP_EVENTS: &str = "EVENTS";
 
-/// A file or directory identified by its filesystem device + inode — the identity of both
-/// protected objects and callers' executables. Never a path: the eBPF program cannot
-/// resolve paths at its hooks (`bpf_d_path` is not allowed at `file_open`), so the daemon
-/// resolves each policy path to a `FileId` at seed time (its `proc::file_id`). Inode
-/// identity is also what the in-kernel dentry walk can cheaply compare, and it survives a
-/// rename of the object itself.
+/// A file or directory, identified by its filesystem device and inode. It is the identity
+/// of both protected objects and callers' executables. It is never a path, because the eBPF
+/// program cannot resolve paths at its hooks (`bpf_d_path` is not allowed at `file_open`).
+/// So the daemon resolves each policy path to a `FileId` at seed time (its
+/// `proc::file_id`). The in-kernel dentry walk can compare inode identity cheaply, and the
+/// identity survives a rename of the object itself.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FileId {
@@ -35,8 +34,8 @@ impl FileId {
     }
 }
 
-/// The compact canonical human form (`dev=N ino=N`) — used in the daemon's journal where
-/// no path is available. `no_std`: `core::fmt`.
+/// Writes the compact form `dev=N ino=N`, which the daemon's journal shows when it has no
+/// path.
 impl core::fmt::Display for FileId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "dev={} ino={}", self.dev.0, self.ino.0)
@@ -44,10 +43,10 @@ impl core::fmt::Display for FileId {
 }
 
 padded_pod! {
-    /// The one-element control record in `SETTINGS`: the daemon's identity, which the
-    /// kernel fast-allows (pid *and* exe, never the pid alone — see the program's
-    /// `live_bank`), and the live double-buffer [`Bank`] (see there for the flip). The
-    /// kernel reads all of it from one `Array::get(0)` snapshot.
+    /// The one-element control record in `SETTINGS`, which the kernel reads as one
+    /// `Array::get(0)` snapshot. It names the daemon, which the kernel fast-allows by pid
+    /// and exe together, never by pid alone (see the program's `live_bank`). It also holds
+    /// the live double-buffer [`Bank`] (its doc describes the flip).
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct Settings {
@@ -68,28 +67,31 @@ impl Settings {
     }
 }
 
-/// Max path components the kernel reconstructs (leaf → matched object). Deeper paths set
-/// [`DecisionEvent::trunc`]. Bounds the dentry walk (verifier-friendly) and the record.
+/// The most path components that the kernel reconstructs between the leaf and the matched
+/// object. A deeper path sets [`DecisionEvent::trunc`]. The cap bounds both the dentry
+/// walk, for the verifier, and the size of the record.
 pub const PATH_MAX_DEPTH: usize = 8;
-/// Max bytes per path component (incl. the NUL `bpf_probe_read_kernel_str` writes). A
-/// longer name is truncated into the slot and sets [`DecisionEvent::trunc`].
+/// The most bytes in one path component, including the NUL that
+/// `bpf_probe_read_kernel_str` writes. A longer name is truncated into the slot and sets
+/// [`DecisionEvent::trunc`].
 pub const PATH_NAME_MAX: usize = 32;
 
-/// One reconstructed path component in a [`DecisionEvent`]: a NUL-terminated (NUL-padded)
-/// name, at most `PATH_NAME_MAX` bytes including the terminator. The kernel fills it with
-/// `bpf_probe_read_kernel_str` (which always NUL-terminates within the slot); the daemon
-/// reads the name back with [`name`](PathComp::name). A `repr(transparent)` byte array, so
-/// it embeds in the POD record with no layout cost.
+/// One reconstructed path component in a [`DecisionEvent`]. It holds a name that is
+/// NUL-terminated and NUL-padded to `PATH_NAME_MAX` bytes. The kernel fills it with
+/// `bpf_probe_read_kernel_str`, which always NUL-terminates within the slot, and the daemon
+/// reads the name back with [`name`](PathComp::name). It is a `repr(transparent)` byte
+/// array, so it embeds in the POD record at no layout cost.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct PathComp(pub [u8; PATH_NAME_MAX]);
 
 impl PathComp {
-    /// The zero (all-NUL) component — the fill value for unused slots.
+    /// The all-NUL component that fills unused slots.
     pub const EMPTY: PathComp = PathComp([0; PATH_NAME_MAX]);
 
-    /// The component name: the bytes up to the first NUL (the whole slot if somehow
-    /// unterminated). `no_std`/no-alloc, so it serves both the kernel and the daemon.
+    /// Returns the component name, which is the bytes before the first NUL, or the whole
+    /// slot if it has no NUL. It needs no allocation, so the kernel can call it as well as
+    /// the daemon.
     pub fn name(&self) -> &[u8] {
         let end = match self.0.iter().position(|&b| b == 0) {
             Some(i) => i,
@@ -100,58 +102,61 @@ impl PathComp {
 }
 
 padded_pod! {
-    /// One decision whose policy [`logs`](crate::policy_maps::Policy::logs), pushed to the
-    /// ring buffer for the daemon to journal. Carries [`FileId`]s and the leaf path's
-    /// components; the daemon reverse-resolves them and reads `/proc/<pid>/exe` for a
-    /// friendly line.
+    /// One decision whose policy [`logs`](crate::policy_maps::Policy::logs), which the
+    /// program pushes to the ring buffer for the daemon to journal. It carries [`FileId`]s
+    /// and the components of the leaf path. The daemon turns them back into paths and reads
+    /// `/proc/<pid>/exe` to write a readable line.
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct DecisionEvent {
-        /// The caller's executable identity (the subject that hit the rule).
+        /// The identity of the caller's executable, which is the subject that hit the rule.
         pub exe: FileId,
-        /// The matched protected object's inode identity (the rule's `where`).
+        /// The inode identity of the matched protected object, which is the rule's `where`.
         pub object: FileId,
-        /// The **opened file's own** inode identity (the suppressor keys on it, see
-        /// [`SuppressKey`]). Equals `object` when the rule targets the file directly.
+        /// The opened file's own inode identity, which [`SuppressKey`] keys on. It equals
+        /// `object` when the rule targets the file directly.
         pub leaf: FileId,
-        /// The requested action(s) at this access (`read`/`write`/`create`).
+        /// The action or actions requested at this access, such as `read`, `write` or
+        /// `create`.
         pub action: Action,
-        /// Thread-group id (userspace pid) of the caller.
+        /// The caller's thread-group id, which is its userspace pid.
         pub pid: Pid,
-        /// The caller's **real** uid, which the daemon names on the audit line.
+        /// The caller's real uid, which the daemon names on the audit line.
         pub uid: Uid,
-        /// Repeats the in-kernel suppressor folded into this record (see [`Suppressed`]).
+        /// The repeats that the in-kernel suppressor folded into this record (see
+        /// [`Suppressed`]).
         pub suppressed: Suppressed,
-        /// The caller's resolved **blessing class** (DESIGN §16.3), or [`ClassId::UNBLESSED`]
-        /// when the caller is in no blessed cgroup; the daemon prints it by class name.
-        /// Placed among the `u32` scalars (before the `u8` `policy`/`depth`/`trunc`) to
-        /// keep the record interior-padding-free.
+        /// The caller's resolved blessing class (DESIGN §16.3), or [`ClassId::UNBLESSED`]
+        /// when the caller is in no blessed cgroup. The daemon prints it by class name. It
+        /// sits among the `u32` fields, before the `u8` fields `policy`, `depth` and
+        /// `trunc`, so that the record has no interior padding.
         pub blessing: ClassId,
-        /// The matched policy, which says both how the access was handled
-        /// ([`denies`](crate::policy_maps::Policy::denies)) and why: an authored
-        /// `audit`/`deny`, or a synthetic `DEFAULT_DENY`/`ESCAPE_DENY`.
+        /// The matched policy. It says how the access was handled
+        /// ([`denies`](crate::policy_maps::Policy::denies)), and it says why, as one of
+        /// these: an authored `audit` or `deny`, or a synthetic `DEFAULT_DENY` or
+        /// `ESCAPE_DENY`.
         pub policy: crate::policy_maps::Policy,
-        /// Number of valid entries in [`comps`](Self::comps) (`0` ⇒ the object *is* the
-        /// opened file, or reconstruction read nothing).
+        /// The number of valid entries in [`comps`](Self::comps). It is `0` when the object
+        /// is the opened file itself, or when reconstruction read nothing.
         pub depth: u8,
-        /// `1` if the path was truncated (deeper than [`PATH_MAX_DEPTH`] or a name longer than
-        /// [`PATH_NAME_MAX`]) — the daemon renders a leading `…/` so it never reads as exact.
+        /// `1` when the path was cut short, because it was deeper than [`PATH_MAX_DEPTH`],
+        /// a name was longer than [`PATH_NAME_MAX`], or a component was unreadable. The
+        /// daemon then renders a leading `…/`, so the path never reads as exact.
         pub trunc: u8,
-        /// The opened file's path relative to the matched object, as [`PathComp`]s
-        /// **leaf-first**: `comps[0]` is the file's own name, `comps[1]` its parent's,
-        /// and so on up to but excluding the object; [`depth`](Self::depth) of them are
-        /// valid and [`trunc`](Self::trunc) marks an overflow. The kernel fills them by
-        /// walking `d_name` up the dentry chain, since it has no path (see [`FileId`]); the
-        /// daemon reverses and joins them onto the object's known path (DESIGN §15.10
-        /// flow B).
+        /// The opened file's path relative to the matched object, as [`PathComp`]s in
+        /// leaf-first order. `comps[0]` is the file's own name and `comps[1]` is its
+        /// parent's, up to but not including the object. The kernel fills them by walking
+        /// `d_name` up the dentry chain, since it has no path (see [`FileId`]). The daemon
+        /// reverses them and joins them onto the object's known path (DESIGN §15.10 flow
+        /// B).
         pub comps: [PathComp; PATH_MAX_DEPTH],
     }
 }
 
 impl DecisionEvent {
-    /// Build a record with **no path** (`depth = 0`): for daemon-side tests and any
-    /// caller that doesn't reconstruct the leaf path. The kernel fills `depth`/`comps`
-    /// directly in the ring slot instead of going through this.
+    /// Creates a record with no path, so `depth` is 0 and every component is empty. The
+    /// kernel does not use it, because it writes the path straight into its per-CPU scratch
+    /// record.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pid: Pid,
@@ -183,20 +188,20 @@ impl DecisionEvent {
 }
 
 padded_pod! {
-    /// The in-kernel suppressor key (the kernel's `SUPPRESS` map): one decision identity,
-    /// `(exe, leaf, action)`. Keyed on the **opened file** (`leaf`), not the protected
-    /// object, so distinct files under one audited object each get their own throttle
-    /// window and surface separately in the journal (DESIGN §15.10 flow B). The
-    /// `padded_pod!` `_pad` (16 + 16 + 4, padded to 40, align 8) keeps the hashed key
-    /// zeroed; see the `layout` module docs.
+    /// The key of the kernel's suppressor map `SUPPRESS`, which identifies one kind of
+    /// decision by `(exe, leaf, action)`. It keys on the opened file (`leaf`) rather than
+    /// the protected object, so distinct files under one audited object each get their own
+    /// throttle window and surface separately in the journal (DESIGN §15.10 flow B). Its
+    /// `padded_pod!` `_pad` pads the 16 + 16 + 4 bytes to 40 at 8-byte alignment, which
+    /// keeps the hashed key zeroed (see the `layout` module docs).
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct SuppressKey {
-        /// The caller's executable identity.
+        /// The identity of the caller's executable.
         pub exe: FileId,
         /// The opened file's inode identity.
         pub leaf: FileId,
-        /// The requested action(s) for this open.
+        /// The action or actions that this open requests.
         pub action: Action,
     }
 }
@@ -213,14 +218,15 @@ impl SuppressKey {
 }
 
 padded_pod! {
-    /// The in-kernel suppressor value (the kernel's `SUPPRESS` map): when this key last emitted, and
-    /// how many identical decisions have been suppressed since (folded into the next emit).
+    /// The value of the kernel's suppressor map `SUPPRESS`. It records when its key last
+    /// emitted a ring record, and how many identical decisions were suppressed since then.
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct SuppressVal {
-        /// `bpf_ktime_get_ns()` at the last *emitted* decision for this key.
+        /// The `bpf_ktime_get_ns()` reading at the last emitted decision for this key.
         pub last_ns: Nanos,
-        /// Decisions suppressed since `last_ns` (carried into the next [`DecisionEvent`]).
+        /// The decisions suppressed since `last_ns`, which the next [`DecisionEvent`]
+        /// carries.
         pub suppressed: Suppressed,
     }
 }
@@ -235,15 +241,15 @@ impl SuppressVal {
     }
 }
 
-// ---- userspace-only: mark the POD types usable as aya map keys/values -----
+// ---- userspace only, so the POD types can be aya map keys and values -------
 
 #[cfg(feature = "user")]
 mod user {
     use super::*;
 
-    // SAFETY: every field is a POD newtype/aggregate over integers, so any bit
-    // pattern is a valid value and the types are `Copy` with a fixed `repr(C)` layout
-    // — exactly aya's contract for `Pod`.
+    // SAFETY: every field is a POD newtype or aggregate over integers, so any bit pattern
+    // is a valid value. The types are `Copy` with a fixed `repr(C)` layout, which is
+    // aya's contract for `Pod`.
     unsafe impl aya::Pod for FileId {}
     unsafe impl aya::Pod for Settings {}
     unsafe impl aya::Pod for DecisionEvent {}

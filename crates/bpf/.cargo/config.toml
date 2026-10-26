@@ -1,6 +1,6 @@
-# Build for the BPF target and bring our own `core` (no prebuilt std for BPF), so a
-# plain `cargo build` inside this directory produces the eBPF object. Requires the
-# nightly pinned in rust-toolchain.toml.
+# Builds for the BPF target and brings its own `core`, since BPF has no prebuilt std, so a
+# plain `cargo build` inside this directory produces the eBPF object. It needs the nightly
+# pinned in rust-toolchain.toml.
 [build]
 target = "bpfel-unknown-none"
 

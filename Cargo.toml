@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/daemon", "crates/cli", "crates/bpf-common"]
-# crates/bpf is the eBPF program: it builds only for the `bpfel-unknown-none`
-# target with a pinned nightly (see crates/bpf/rust-toolchain.toml) and is driven
-# by `just build-ebpf`, so it must NOT be a host-target workspace member.
+# crates/bpf is the eBPF program. It builds only for the `bpfel-unknown-none` target
+# with a pinned nightly (see crates/bpf/rust-toolchain.toml), driven by
+# `just build-ebpf`, so it must not be a host-target workspace member.
 exclude = ["crates/bpf"]
 
 [workspace.package]

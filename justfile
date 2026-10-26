@@ -1,34 +1,32 @@
-# cordon task runner — https://just.systems  (install: `cargo install just`)
+# The cordon task runner (https://just.systems). Install just with `cargo install just`.
 #
-# Recipes are gated to the OS they apply to. The eBPF build is Linux-only because
-# eBPF is a Linux-kernel facility; the planned macOS Endpoint Security backend is a
-# separate build path and will get its own `[macos]` recipes here.
+# Recipes are gated to the OS they apply to. The eBPF build is Linux-only because eBPF
+# is a Linux-kernel facility. The planned macOS Endpoint Security backend is a separate
+# build path and will get its own `[macos]` recipes here.
 
 # List available recipes.
 default:
     @just --list
 
-# Build everything the boundary needs: the userspace workspace (core, daemon, cli,
-# bpf-common) on stable, plus the eBPF object. The eBPF crate lives outside the workspace
-# (pinned nightly + bpf-linker), so it takes its own cargo invocation — but the daemon
-# *loads that object at runtime*, so a `build` that skipped it would leave you restarting
-# the daemon onto a stale boundary with nothing to say so.
+# Build the userspace workspace on stable and the eBPF object. The eBPF crate lives
+# outside the workspace (it needs the pinned nightly and bpf-linker), so it takes its own
+# cargo invocation. The daemon loads that object at runtime, so a `build` that skipped it
+# would leave you restarting the daemon onto a stale boundary with nothing to say so.
 [linux]
 [doc("Build the userspace workspace + the eBPF object (everything the daemon runs).")]
 build:
     cargo build --workspace
     @{{ just_executable() }} build-ebpf
 
-# Build the userspace workspace on stable. No eBPF object off Linux — eBPF is a
-# Linux-kernel facility (see the header note); the workspace still compiles, just
-# without a functional backend.
+# Build the userspace workspace on stable. Off Linux there is no eBPF object (see the
+# header note), so the workspace compiles without a functional backend.
 [macos]
 [windows]
 [doc("Build the userspace workspace on stable (no eBPF object off Linux).")]
 build:
     cargo build --workspace
 
-# Run the test suite + lints (what CI gates on).
+# Run the test suite and the lints that CI gates on.
 test:
     cargo test --workspace
     cargo clippy --workspace --all-targets -- -D warnings
@@ -39,22 +37,23 @@ test:
 build-ebpf:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Prerequisites (declared, not discovered):
-    #   - pinned nightly + rust-src — crates/bpf/rust-toolchain.toml (auto-fetched)
-    #   - bpf-linker on PATH — `cargo install bpf-linker`
+    # Prerequisites, declared rather than discovered:
+    #   - the pinned nightly and rust-src, from crates/bpf/rust-toolchain.toml (fetched
+    #     automatically)
+    #   - bpf-linker on PATH, from `cargo install bpf-linker`
     cd crates/bpf
     cargo build --release
     mkdir -p ../../target/bpf
     cp target/bpfel-unknown-none/release/cordon ../../target/bpf/cordon.bpf.o
     echo "staged eBPF object → target/bpf/cordon.bpf.o"
 
-# Install + activate the LOCAL dev unit: the packaged packaging/systemd/cordond.service,
-# unchanged, plus a `cordond.service.d/dev.conf` drop-in that swaps in this checkout's
-# debug daemon and a log level. Everything else (ordering, bpffs mount, capabilities,
-# `Delegate=yes` for bless carriers) is the production unit's, so the two can't drift.
+# Install and activate the local dev unit. It is the packaged
+# packaging/systemd/cordond.service, unchanged, plus a `cordond.service.d/dev.conf` drop-in
+# that swaps in this checkout's debug daemon and a log level. Everything else comes from
+# the production unit, so the two cannot drift.
 #
-# One sudo for every privileged step. Restarts the daemon; enforcement does not blip,
-# since the pinned links hold the boundary across the restart.
+# All privileged steps share one sudo. The recipe restarts the daemon, and enforcement does
+# not blip, because the pinned links hold the boundary across the restart.
 [linux]
 [doc("Install + activate cordond.service with a dev drop-in for this checkout (sudo; restarts the daemon).")]
 install-service:

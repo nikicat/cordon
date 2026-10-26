@@ -4,16 +4,16 @@ on:
   push:
   pull_request:
 
-# Third-party actions are pinned to a commit SHA, not a tag: a tag is mutable, so
-# `@v7` is a promise the upstream owner (or anyone who compromises them) can rewrite
-# under us — and these actions run with a token in the repo's own CI. The trailing
-# comment is the human-readable version the SHA belongs to; bump both together.
+# Third-party actions are pinned to a commit SHA, not a tag. A tag is mutable, so the
+# upstream owner, or anyone who compromises them, can change what `@v7` points at, and
+# these actions run with a token in the repo's own CI. The trailing comment names the
+# version the SHA belongs to, so bump both together.
 #
-# `dtolnay/rust-toolchain` selects the toolchain from the *ref* (`@stable`), which a
-# SHA can't express — so the `toolchain:` input says it explicitly instead.
+# `dtolnay/rust-toolchain` selects the toolchain from the ref (`@stable`), which a SHA
+# cannot express. So the `toolchain:` input names it explicitly instead.
 jobs:
-  # Unprivileged: fmt, clippy and the workspace tests — everything except the in-kernel
-  # boundary, which the VM job below covers.
+  # Checks everything that needs no privilege. The in-kernel boundary is left to the VM
+  # job below.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -27,11 +27,11 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  # Privileged boundary: the bpf-lsm backend, in a virtme-ng VM booting a pinned
-  # kernel with `bpf` added to the active LSM list (`lsm=…,bpf`). Adds the eBPF
-  # toolchain — the pinned nightly (crates/bpf/rust-toolchain.toml, fetched on demand)
-  # and bpf-linker — to build the in-kernel object. The Ubuntu mainline kernel build
-  # sets CONFIG_BPF_LSM=y.
+  # Tests the bpf-lsm backend, which is the privileged boundary, in a virtme-ng VM. The VM
+  # boots a pinned kernel with `bpf` added to the active LSM list (`lsm=…,bpf`), and the
+  # Ubuntu mainline kernel build sets CONFIG_BPF_LSM=y. To build the in-kernel object, the
+  # job adds the eBPF toolchain. That is bpf-linker and the pinned nightly from
+  # crates/bpf/rust-toolchain.toml, fetched on demand.
   bpf-lsm-vm:
     runs-on: ubuntu-latest
     needs: test

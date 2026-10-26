@@ -1,12 +1,11 @@
-//! `cordon bless` — run a command under a fresh blessing (DESIGN §16).
+//! `cordon bless`, which runs a command under a fresh blessing (DESIGN §16).
 //!
-//! It runs as you and never holds privilege (see [`build_command`]). [`mint_and_exec`]
-//! is the whole flow: [`request_and_approve`] runs the client half of the mint handshake
-//! and takes delivery of the carrier's `cgroup.procs` descriptor, then
-//! [`sys::join_cgroup_on_exec`] puts the target in the carrier before it runs, and the
-//! target's own exit code becomes ours.
+//! The command runs as you and never holds privilege (see [`build_command`]). The daemon
+//! hands over a carrier cgroup's descriptor, the target joins that carrier before it
+//! runs, and the target's exit code becomes the exit code of `cordon bless` (see
+//! [`mint_and_exec`]).
 //!
-//! There is no CLI-side cleanup: the daemon reaps the carrier once it empties, and its
+//! The CLI has no cleanup to do. The daemon reaps the carrier once it empties, and its
 //! mint grace covers a CLI that dies before the join (see `MINT_GRACE` in cordond).
 
 use crate::Client;
@@ -21,18 +20,19 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// The elevation command `cordon bless` spawns its approval helper under. A command
-/// string, so `CORDON_SUDO="setpriv --reuid 0"` works as well as a bare program.
+/// The environment variable that names the elevation command for the approval helper. It
+/// holds a command string, so `CORDON_SUDO="setpriv --reuid 0"` works as well as a bare
+/// program.
 ///
-/// Safe to expose as a test seam: the security is the daemon's uid check on the approval
-/// (`authorize` in cordond), so a faked elevation only yields a non-root helper whose
-/// approval is refused.
+/// Exposing it as a test seam is safe. The security lies in the daemon's uid check on the
+/// approval (`authorize` in cordond), so a faked elevation only yields a non-root helper
+/// whose approval is refused.
 const ELEVATION_ENV: &str = "CORDON_SUDO";
 const DEFAULT_ELEVATION: &str = "sudo";
 
-/// `cordon bless [--class <name>] [-- <command>…]` | `bless list` | `bless revoke <id>`.
-/// `list`/`revoke` are subcommands; a command literally named `list` runs via
-/// `cordon bless -- list`.
+/// The arguments of `cordon bless`, in one of three forms: `cordon bless [--class <name>]
+/// [-- <command>…]`, `bless list` and `bless revoke <id>`. A command literally named
+/// `list` runs as `cordon bless -- list`.
 #[derive(clap::Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct BlessArgs {
@@ -41,25 +41,26 @@ pub struct BlessArgs {
     /// Blessing class to mint (default: the sole class the policy declares).
     #[arg(long)]
     class: Option<ClassName>,
-    /// Command to run blessed (default: your login shell). Use `--` before a command
-    /// whose name collides with a subcommand (`cordon bless -- list`).
+    /// Program and arguments to run under the blessing (default: `$SHELL`, or `/bin/sh`).
+    /// Put `--` before a program whose name collides with a subcommand
+    /// (`cordon bless -- list`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<OsString>,
 }
 
 #[derive(Subcommand, Debug)]
 enum BlessCmd {
-    /// List the live blessings.
+    /// Print every live blessing.
     List,
-    /// Revoke a live blessing you minted, or any blessing as root. Kills its process tree
-    /// and reaps the carrier.
+    /// Kill a live blessing's process tree and reap its carrier. You may end a blessing
+    /// you minted, or any blessing as root.
     Revoke { id: BlessId },
 }
 
 pub fn run(args: &BlessArgs, client: &Client) -> ExitCode {
     match &args.cmd {
-        // list/revoke are plain round trips, rendered like any other command; the daemon
-        // decides who may revoke (see `may_revoke` in cordond).
+        // `list` and `revoke` are plain round trips, rendered like any other command. The
+        // daemon decides who may revoke (see `may_revoke` in cordond).
         Some(sub) => {
             let req = match sub {
                 BlessCmd::List => Request::BlessList,
@@ -77,7 +78,9 @@ pub fn run(args: &BlessArgs, client: &Client) -> ExitCode {
     }
 }
 
-/// The blessed-exec flow: request → elevate → receive the carrier → fork the target.
+/// Runs the command in `args` under a freshly minted blessing and returns its exit code,
+/// mapped as [`exit_byte`] describes. Errors when the socket can't be resolved, the mint
+/// handshake fails, or the command can't be spawned.
 fn mint_and_exec(args: &BlessArgs, client: &Client) -> Result<ExitCode> {
     let socket = client.socket()?;
     let procs = request_and_approve(&socket, args.class.clone())?;
@@ -87,14 +90,15 @@ fn mint_and_exec(args: &BlessArgs, client: &Client) -> Result<ExitCode> {
     Ok(ExitCode::from(exit_byte(status.code(), status.signal())))
 }
 
-/// Runs the client half of the mint handshake (the daemon half is
-/// `Ctx::serve_bless_request` in cordond) and returns the minted carrier's `cgroup.procs`.
+/// Asks the daemon on `socket` to mint a blessing of `class`, gets the human's approval
+/// through [`elevate`], and returns the minted carrier's `cgroup.procs` descriptor. The
+/// daemon half of this handshake is `Ctx::serve_bless_request` in cordond.
 ///
-/// It vets the daemon, sends `BlessRequest`, runs [`elevate`] on the nonce that comes
-/// back, then takes the descriptor from the second reply on the same connection. That
-/// connection is a dedicated one rather than [`crate::round_trip`], because ancillary
-/// data is lost to any buffered read (see `Conn::recv_with_fd`).
+/// Errors when the daemon is unreachable or not root, when it refuses or replies out of
+/// protocol, when the elevation fails, or when the mint reply carries no descriptor.
 fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<CarrierProcs> {
+    // A dedicated connection rather than `crate::round_trip`, because any buffered read
+    // loses the ancillary data that carries the descriptor (see `Conn::recv_with_fd`).
     let stream = UnixStream::connect(socket).map_err(|e| {
         Error::msg(format!(
             "connect {}: {e} (is cordond running?)",
@@ -126,20 +130,20 @@ fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<Carrie
 
 /// Errors unless the process on the other end of `conn` is root.
 ///
-/// Without this the nonce is a bearer token handed to whoever answers the socket, and the
-/// elevation that follows is a confused deputy: a local user who leaves a listener at the
-/// client's socket path (the per-user default `SocketPath::for_client` tries first, which
-/// lands in world-writable `/tmp` when `XDG_RUNTIME_DIR` is unset) can park its *own*
-/// request on the real daemon, answer us with *that* nonce, and let the human's
-/// authentication mint a carrier for the attacker. The human really did authenticate,
-/// just not for this request.
+/// Without this check the nonce is a bearer token for whoever answers the socket, and the
+/// elevation that follows is a confused deputy. A local user can leave a listener at the
+/// client's socket path. The per-user default that `SocketPath::for_client` tries first
+/// lands in world-writable `/tmp` when `XDG_RUNTIME_DIR` is unset. That user can park its
+/// own request on the real daemon, answer us with that request's nonce, and let the
+/// human's authentication mint a carrier for the attacker. The human really did
+/// authenticate, just not for this request.
 ///
-/// So the check is not "is a daemon there" but "is the thing I am about to have a root
-/// process approve actually the root daemon", and it runs before anything is sent: the
-/// step after `BlessRequest` hands the reply's nonce to a process about to become root.
-/// Blessing against a non-root daemon could never work anyway: the carrier is root-owned
-/// and membership is the boundary (see `Blessings::mint` in cordond), so a user-owned
-/// daemon has nothing to grant.
+/// So the question is not whether a daemon is there. It is whether the process that a
+/// root helper is about to approve for is the root daemon. The check runs before anything
+/// is sent, because the step after `BlessRequest` hands the reply's nonce to a process
+/// about to become root. A non-root daemon could never grant a blessing anyway. The
+/// carrier is root-owned and membership is the boundary (see `Blessings::mint` in
+/// cordond), so a user-owned daemon has nothing to grant.
 fn require_root_daemon(conn: &Conn, socket: &Path) -> Result<()> {
     let uid = conn.peer_uid();
     if uid != Uid::ROOT {
@@ -154,8 +158,9 @@ fn require_root_daemon(conn: &Conn, socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read one reply, turning a daemon-side `Error` and a hang-up into our error type so
-/// callers only ever match the replies they expect.
+/// Returns the next reply on `conn` and any descriptor that came with it. Errors when the
+/// daemon answers with an error or hangs up without replying, so callers match only the
+/// replies they expect.
 fn reply(conn: &Conn) -> Result<(Response, Option<std::os::fd::OwnedFd>)> {
     match conn.recv_with_fd::<Response>()? {
         Some((resp, fd)) => Ok((resp.into_result()?, fd)),
@@ -167,20 +172,10 @@ fn unexpected(resp: Response) -> Error {
     Error::msg(format!("unexpected daemon reply: {resp:?}"))
 }
 
-/// Runs `cordon bless-helper --nonce=…` under `$CORDON_SUDO`, whose authentication takes
-/// the approval to the daemon as root: the human-presence proof (see `authorize` in
-/// cordond). Errors when the elevation can't be spawned or doesn't succeed.
-///
-/// `--nonce=VALUE` is deliberately **one argv token**: elevation wrappers vary in how
-/// they re-split arguments, and a separated flag and value is the sort of thing one of
-/// them will helpfully rearrange.
-///
-/// `socket` is passed explicitly rather than left to the helper to re-derive. Elevation
-/// resets the environment, so a helper that resolved its own path would consult *root's*
-/// config and could end up approving at a different daemon than the one we asked — which
-/// silently breaks `--socket` and a per-user config, and would leave the two halves of the
-/// handshake talking past each other. Naming it keeps them provably on the one daemon
-/// [`require_root_daemon`] just vetted.
+/// Runs `cordon bless-helper --nonce=…` under `$CORDON_SUDO` and waits for it. The helper
+/// approves `nonce` as root at the daemon on `socket`, and that authentication is the
+/// proof of human presence (see `authorize` in cordond). Errors when `$CORDON_SUDO` is
+/// empty, or when the elevation can't be spawned or doesn't succeed.
 fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
     let elevation = std::env::var(ELEVATION_ENV).unwrap_or_else(|_| DEFAULT_ELEVATION.to_string());
     let mut words = elevation.split_whitespace();
@@ -191,9 +186,15 @@ fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
     let status = Command::new(program)
         .args(words)
         .arg(me)
+        // The socket is named rather than re-derived by the helper. Elevation resets the
+        // environment, so the helper would read root's config and could approve at a
+        // different daemon, which silently breaks `--socket` and a per-user config. Naming
+        // it keeps both halves of the handshake on the daemon `require_root_daemon` vetted.
         .arg("--socket")
         .arg(socket)
         .arg("bless-helper")
+        // One argv token, because elevation wrappers differ in how they re-split arguments
+        // and may rearrange a separate flag and value.
         .arg(format!("--nonce={nonce}"))
         .status()
         .with_context(|| format!("spawn {program}"))?;
@@ -205,12 +206,11 @@ fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Builds the target `Command`: the given argv, or with none, your shell (see
-/// [`default_shell`]). Nothing is set on the environment: `cordon bless` is an ordinary
-/// child of your shell that no privilege tool re-parents, and what it gets from the
-/// daemon is a descriptor, not authority. So the target inherits your environment, cwd,
-/// tty, job control and logind session as they are, which keeps `$DISPLAY` and polkit
-/// working.
+/// Returns the command that runs `argv`, or the shell from [`default_shell`] when `argv`
+/// is empty. The command sets nothing in the environment. `cordon bless` is an ordinary
+/// child of your shell that no privilege tool re-parents, and what it gets from the daemon
+/// is a descriptor, not authority. So the target inherits your environment, cwd, tty, job
+/// control and logind session unchanged, which keeps `$DISPLAY` and polkit working.
 fn build_command(argv: &[OsString]) -> Command {
     match argv.split_first() {
         Some((program, rest)) => {
@@ -222,16 +222,15 @@ fn build_command(argv: &[OsString]) -> Command {
     }
 }
 
-/// Returns the no-command shell: `$SHELL` when set and non-empty, else `/bin/sh`.
-/// `$SHELL` is the caller's own (see [`build_command`]).
+/// Returns `env_shell` when it is set and non-empty, and `/bin/sh` otherwise.
 fn default_shell(env_shell: Option<PathBuf>) -> PathBuf {
     env_shell
         .filter(|s| !s.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
-/// The exit byte to propagate: the child's own code, or `128 + signal` for a
-/// signal death (the shell convention), or 1 if the wait status is somehow neither.
+/// Returns the exit byte for a finished child. It is the child's own code, or
+/// `128 + signal` when a signal killed it, as shells do. It is 1 when there is neither.
 fn exit_byte(code: Option<i32>, signal: Option<i32>) -> u8 {
     match (code, signal) {
         (Some(c), _) => c as u8,
@@ -245,9 +244,9 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// The confused-deputy guard. A socketpair's peer is this very process, so the check
-    /// sees our own uid, and the expected verdict follows how the suite is run: the test
-    /// must hold under `sudo cargo test` or a root container too.
+    /// Checks the confused-deputy guard. A socketpair's peer is this very process, so the
+    /// check sees the suite's own uid. The expected verdict follows that uid, so the test
+    /// also holds under `sudo cargo test` or in a root container.
     #[test]
     fn the_daemon_end_must_be_root() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
@@ -266,9 +265,9 @@ mod tests {
         }
     }
 
-    /// …and a non-root daemon receives zero bytes. Only meaningful when the suite is
-    /// unprivileged, since a root peer is legitimately accepted and the flow would then
-    /// block waiting for a real daemon.
+    /// Checks that a non-root daemon receives zero bytes. The test means something only
+    /// when the suite is unprivileged. A root peer is legitimately accepted, and the flow
+    /// would then block waiting for a real daemon.
     #[test]
     fn a_non_root_daemon_learns_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -276,13 +275,13 @@ mod tests {
         let path = dir.join("cordon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         if Conn::connect(&path).unwrap().peer_uid() == Uid::ROOT {
-            return; // running as root: this listener is a legitimate daemon end
+            return; // As root, this listener is a legitimate daemon end.
         }
 
         assert!(request_and_approve(&path, None).is_err());
 
-        // By now the client has hung up, so an empty read is EOF rather than a
-        // would-block — either way what matters is that zero bytes arrived.
+        // The client has hung up by now, so an empty read is EOF rather than a
+        // would-block. Either way, what matters is that zero bytes arrived.
         listener.set_nonblocking(true).unwrap();
         let (peer, _) = listener.accept().expect("the client did connect");
         peer.set_nonblocking(true).unwrap();
@@ -295,8 +294,9 @@ mod tests {
         assert_eq!(sent, 0, "the client sent bytes to a non-root daemon");
     }
 
-    /// Parse through the real `Cli` so the `args_conflicts_with_subcommands` shape is
-    /// tested exactly as shipped.
+    /// Parses `argv` through the real `Cli`, so the tests see the
+    /// `args_conflicts_with_subcommands` shape exactly as shipped. Panics unless `argv`
+    /// parses to `bless`.
     fn parse(argv: &[&str]) -> BlessArgs {
         match crate::Cli::try_parse_from(argv).expect("parse").cmd {
             crate::Cmd::Bless(args) => args,
@@ -319,7 +319,7 @@ mod tests {
         let a = parse(&["cordon", "bless", "--", "list"]);
         assert!(a.cmd.is_none());
         assert_eq!(a.command, vec![OsString::from("list")]);
-        // Flags + a real command line.
+        // Flags and a real command line.
         let a = parse(&["cordon", "bless", "--class", "ro", "--", "aws", "s3", "ls"]);
         assert_eq!(a.class, Some(ClassName::new("ro")));
         assert_eq!(a.command.len(), 3);
@@ -330,7 +330,8 @@ mod tests {
             a.command,
             vec![OsString::from("echo"), OsString::from("hi")]
         );
-        // Bare `bless`: no subcommand, no command → the invoker's shell, sole class.
+        // Bare `bless` has no subcommand and no command, so it runs the invoker's shell
+        // under the sole class.
         let a = parse(&["cordon", "bless"]);
         assert!(a.cmd.is_none() && a.command.is_empty() && a.class.is_none());
     }
@@ -353,7 +354,7 @@ mod tests {
     fn exit_byte_maps_code_signal_and_neither() {
         assert_eq!(exit_byte(Some(0), None), 0);
         assert_eq!(exit_byte(Some(3), None), 3);
-        // SIGKILL(9) → 137, SIGTERM(15) → 143 — the shell convention.
+        // SIGKILL (9) maps to 137 and SIGTERM (15) to 143, as shells do.
         assert_eq!(exit_byte(None, Some(9)), 137);
         assert_eq!(exit_byte(None, Some(15)), 143);
         assert_eq!(exit_byte(None, None), 1);

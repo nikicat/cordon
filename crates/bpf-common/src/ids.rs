@@ -1,36 +1,35 @@
-//! Semantic scalar types for the policy keys.
+//! Domain newtypes for the integers in the policy keys and the ring records.
 //!
-//! `repr(transparent)` newtypes over integers: they compile to byte-identical BPF
-//! (a `Dev` *is* its `u64`), so the kernel verifier and the map's byte-level key
-//! comparison are unaffected — the cost is zero. They just stop a device number, an
-//! inode, a pid, a uid and the rest from being interchangeable bare integers. Because
-//! the layout is unchanged, the map key/value/record structs that embed them stay POD
-//! (`aya::Pod`).
+//! Each is a `repr(transparent)` wrapper over an integer, so it compiles to the same BPF as
+//! the bare integer, and neither the verifier nor the map's byte-level key compare sees a
+//! difference. The newtypes keep a device number, an inode, a pid, a uid and the rest from
+//! being interchangeable. Because the layout is unchanged, the map keys, map values and
+//! records that embed them stay POD (`aya::Pod`).
 
-/// Filesystem device number, in the **kernel's** `s_dev` encoding (see the daemon's
-/// `proc::mkdev`, which re-packs a mount's major and minor numbers to match).
+/// A filesystem device number in the kernel's `s_dev` encoding. The daemon's `proc::mkdev`
+/// re-packs a mount's major and minor numbers into this encoding.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Dev(pub u64);
 
-/// Inode number within a device.
+/// An inode number, unique within one device.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Ino(pub u64);
 
-/// A process id (thread-group id). Wraps `u32` to match the natural width on both
-/// sides — `std::process::id()` and the kernel's `bpf_get_current_pid_tgid() >> 32`
-/// — distinct from core's `Pid(i32)`, which mirrors `/proc`/`nix`.
+/// A process id, meaning the thread-group id, as the kernel side records it. It is a `u32`
+/// because both `std::process::id()` and the kernel's `bpf_get_current_pid_tgid() >> 32`
+/// produce one. It is distinct from `cordon_core`'s control-plane `Pid`.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Pid(pub u32);
 
-/// A **real** user id, read from the kernel and never from a client. Two capture sites,
-/// one type: the eBPF program reads `bpf_get_current_uid_gid()` (low 32 bits) into
-/// [`crate::DecisionEvent`] for the audit line, and the IPC server reads `SO_PEERCRED`
-/// (`cordon_core`'s `Conn::peer_uid`) to authorize a request. `u32` to match the
-/// kernel/passwd width. `Ord` so a uid can be range-checked against the regular-account
-/// window (`cordon_core`'s `REGULAR_UID_RANGE`).
+/// A real user id that the kernel reported, never one that a client claimed. The eBPF
+/// program reads it from `bpf_get_current_uid_gid()` into [`crate::DecisionEvent`] for the
+/// audit line, and the IPC server reads it from `SO_PEERCRED` (`cordon_core`'s
+/// `Conn::peer_uid`) to authorize a request. It is a `u32` to match the kernel and passwd
+/// width, and it is ordered so that it can be checked against `cordon_core`'s
+/// `REGULAR_UID_RANGE`.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Uid(pub u32);
@@ -40,153 +39,149 @@ impl Uid {
     pub const ROOT: Uid = Uid(0);
 }
 
-/// Render the bare number — for the journal's `user=` fallback when passwd has no name for
-/// the uid, and for the `owner=` field on a minted blessing (recorded through `Display` via
-/// the `%` sigil — see [`SuppressedTotal`]'s note on `tracing`'s sealed `Value`). Having it
-/// is what keeps callers from reaching past the newtype with `.0` just to log one.
+/// Writes the bare number. The journal uses it for the `user=` fallback when passwd has no
+/// name for the uid, and for the `owner=` field of a minted blessing. With it, a caller can
+/// log a uid without reaching past the newtype with `.0`.
 impl core::fmt::Display for Uid {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// A cgroup-v2 id, as returned by `bpf_get_current_cgroup_id()` — the kernel-assigned,
-/// per-directory unique handle for a cgroup. It is the key of
-/// [`crate::policy_maps::MAP_BLESSED`], and the type of the reserved `cgroup` subject
-/// predicate ([`crate::SubjectMatch::cgroup`]). `u64` to match the helper's width; a
-/// newtype so it can't be confused with an [`Ino`]/[`Nanos`]/raw count.
+/// A cgroup-v2 id as `bpf_get_current_cgroup_id()` returns it. The kernel assigns each
+/// cgroup directory a unique one. It keys [`crate::policy_maps::MAP_BLESSED`], and it is
+/// the type of the reserved `cgroup` subject predicate ([`crate::SubjectMatch::cgroup`]).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CgroupId(pub u64);
 
-/// How many identical decisions the in-kernel suppressor folded since the last ring record
-/// for one [`crate::SuppressKey`]: `0` on a first occurrence. Carried on the wire in
-/// [`crate::DecisionEvent`] and held in [`crate::SuppressVal`]. `u32` to match the per-key
-/// kernel counter; a sum across a drain batch is a [`SuppressedTotal`].
+/// The number of identical decisions that the in-kernel suppressor folded since the last
+/// ring record for one [`crate::SuppressKey`]. It is `0` on a first occurrence. It travels
+/// in [`crate::DecisionEvent`] and is held in [`crate::SuppressVal`], and a sum of these
+/// across a drain batch is a [`SuppressedTotal`].
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Suppressed(pub u32);
 
-/// The daemon's running total of folded decisions behind one coalesced journal line: the
-/// sum of the wire [`Suppressed`] counts it folds (see the daemon's `coalesce`). A single
-/// per-window count fits `u32`; a sum over a whole batch wants the headroom, so the total
-/// is its own `u64` type — the two are different quantities, not one widened. Userspace
-/// only (never on the wire), but it lives here with [`Suppressed`] so the suppressor's
-/// counters stay documented together.
+/// The daemon's running total of folded decisions behind one coalesced journal line,
+/// summed from the wire [`Suppressed`] counts (see the daemon's `coalesce`). A single
+/// per-window count fits a `u32`, but a sum over a whole batch needs more headroom. So the
+/// total is a different quantity with its own `u64` type, not a widened count. It never
+/// goes on the wire, and it lives here only to keep the suppressor's counters together.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SuppressedTotal(pub u64);
 
-/// Seed a total from a single wire count — a lossless widen, so a typed `From` rather than
-/// an `as` cast.
+/// Starts a total from a single wire count. The widening is lossless, so it is a typed
+/// `From` rather than an `as` cast.
 impl From<Suppressed> for SuppressedTotal {
     fn from(s: Suppressed) -> SuppressedTotal {
         SuppressedTotal(u64::from(s.0))
     }
 }
 
-/// Fold another wire count into the running total.
+/// Adds a wire count to the running total.
 impl core::ops::AddAssign<Suppressed> for SuppressedTotal {
     fn add_assign(&mut self, s: Suppressed) {
         self.0 += u64::from(s.0);
     }
 }
 
-/// The scalar total — for summing into an [`Opens`] count without reaching for `.0`.
+/// Returns the bare total, so that it can be summed into an [`Opens`] count without `.0`.
 impl From<SuppressedTotal> for u64 {
     fn from(t: SuppressedTotal) -> u64 {
         t.0
     }
 }
 
-/// Render the bare number for the journal's `suppressed=` field (`tracing`'s `Value` is
-/// sealed, so a typed field is recorded through `Display` via the `%` sigil).
+/// Writes the bare number for the journal's `suppressed=` field. The `Value` trait of
+/// `tracing` is sealed, so a typed field can only be recorded through `Display`, with the
+/// `%` sigil.
 impl core::fmt::Display for SuppressedTotal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// The total opens a single coalesced journal record stands for: the opens that *surfaced*
-/// as ring records (`events`) plus the [`SuppressedTotal`] the in-kernel suppressor held
-/// back. Its own type because it's a **superset** of the suppressed count, not the same
-/// quantity — calling it a `SuppressedTotal` would claim every open was suppressed.
-/// Userspace only, alongside the other suppressor counters.
+/// The number of opens that one coalesced journal record stands for. It counts the opens
+/// that surfaced as ring records (`events`) plus the [`SuppressedTotal`] that the in-kernel
+/// suppressor held back. It is a superset of the suppressed count, so it has its own type,
+/// because calling it a `SuppressedTotal` would claim that every open was suppressed. Like
+/// the other suppressor counters, it is userspace only.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Opens(pub u64);
 
-/// Render the bare number for the journal's `count=` field (recorded through `Display` via
-/// the `%` sigil — see [`SuppressedTotal`]'s note on `tracing`'s sealed `Value`).
+/// Writes the bare number for the journal's `count=` field.
 impl core::fmt::Display for Opens {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// A monotonic nanosecond reading of the kernel's `bpf_ktime_get_ns()` clock — both an
-/// instant (the suppressor's last-emit time, [`crate::SuppressVal::last_ns`]) and the
-/// elapsed-since it's compared against. `Ord` for the window check; the elapsed gap is
-/// [`wrapping_sub`](Nanos::wrapping_sub) so the math stays defined across the (practically
-/// unreachable) wrap of a since-boot counter.
+/// A reading of the kernel's monotonic `bpf_ktime_get_ns()` clock, in nanoseconds. It holds
+/// either an instant, such as [`crate::SuppressVal::last_ns`], or the time elapsed since
+/// one. The elapsed time comes from [`wrapping_sub`](Nanos::wrapping_sub), so the
+/// arithmetic stays defined across the practically unreachable wrap of the since-boot
+/// counter.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Nanos(pub u64);
 
 impl Nanos {
-    /// Nanoseconds elapsed from `earlier` to `self`, wrapping (so a counter wrap yields a
-    /// defined small gap rather than a panic/UB).
+    /// Returns the time elapsed from `earlier` to `self`. A counter wrap between the two
+    /// yields a small, defined gap instead of a panic.
     pub const fn wrapping_sub(self, earlier: Nanos) -> Nanos {
         Nanos(self.0.wrapping_sub(earlier.0))
     }
 }
 
-/// Which generation of the double-buffered rule table is live (DESIGN §15.8). The
-/// kernel reads [`Settings::active_bank`](crate::Settings::active_bank); a
+/// One generation of the double-buffered rule table (DESIGN §15.8). The kernel reads the
+/// live one from [`Settings::active_bank`](crate::Settings::active_bank). A
 /// `cordon policy apply` fills the other bank and [`flip`](Bank::flip)s to it in one
 /// `SETTINGS` write (the daemon's `Maps::seed`). Only `active_bank` changes in that record
-/// after startup, so the flip's only moving part is these 4 bytes, which can't tear, and
-/// the kernel never sees a half-filled table.
+/// after startup, so a flip moves just these 4 bytes, which cannot tear, and the kernel
+/// never sees a half-filled table.
 ///
-/// Only `0`/`1` are valid. It is a `repr(transparent)` integer rather than an enum because
-/// it is read out of map memory, so every bit pattern must be a sound value; see
-/// [`masked`](Bank::masked) for what a garbage read does.
+/// Only `0` and `1` are valid. It is a `repr(transparent)` integer rather than an enum
+/// because it is read out of map memory, where every bit pattern must be a sound value.
+/// [`masked`](Bank::masked) says what a garbage read does.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Bank(pub u32);
 
 impl Bank {
-    /// Bank `0`: what a zero-initialized `SETTINGS` reads as, so the first apply fills
-    /// bank `1`.
+    /// The bank that a zero-initialized `SETTINGS` reads as, so the first apply fills bank
+    /// `1`.
     pub const ZERO: Bank = Bank(0);
 
-    /// Returns the *other* generation.
+    /// Returns the other generation.
     pub const fn flip(self) -> Bank {
         Bank(self.index() ^ 1)
     }
 
-    /// Returns the bank as an array index, masked to `0`/`1` so a stray value read from
-    /// map memory can't push a [`crate::rule_slot`] index out of range.
+    /// Returns the bank as an array index, masked to `0` or `1`. A stray value read from
+    /// map memory therefore cannot push a [`crate::rule_slot`] index out of range.
     pub const fn index(self) -> u32 {
         self.0 & 1
     }
 
-    /// Returns this value normalized to `0`/`1`. The kernel keys the banked maps with it,
-    /// so a garbage `active_bank` read degrades to an empty bucket (fail-open allow)
-    /// rather than a wild lookup.
+    /// Returns this bank normalized to `0` or `1`. When the kernel keys the banked maps
+    /// with a garbage `active_bank` read, it finds an empty bucket and allows the access,
+    /// instead of making a wild lookup.
     pub const fn masked(self) -> Bank {
         Bank(self.index())
     }
 }
 
-// ---- userspace-only: usable as aya map keys/values ------------------------
+// ---- userspace only, for use as aya map keys and values --------------------
 
 #[cfg(feature = "user")]
 mod user {
     use super::*;
 
-    // SAFETY: each is a `repr(transparent)` wrapper over an integer, so every bit
-    // pattern is valid and the type is `Copy` — aya's `Pod` contract.
+    // SAFETY: each is a `repr(transparent)` wrapper over an integer, so every bit pattern
+    // is valid, and each is `Copy`. That is aya's `Pod` contract.
     unsafe impl aya::Pod for Dev {}
     unsafe impl aya::Pod for Ino {}
     unsafe impl aya::Pod for Pid {}

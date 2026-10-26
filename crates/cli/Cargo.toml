@@ -17,7 +17,8 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 # `policy edit`'s private temp dir and the atomic install of the saved policy.
 tempfile = { workspace = true }
-# `policy edit` drops privileges (setgroups/setgid/setuid) to run the editor as the
-# invoking user, chowns the temp copy to them, and looks up their home — the sudoedit-style
-# safety boundary. `user` = setuid/setgid/setgroups + passwd lookup; `fs` = chown.
+# `policy edit` drops privileges to run the editor as the invoking user, chowns the temp
+# copy to them and looks up their home. That is its sudoedit-style safety boundary. The
+# `user` feature provides setuid, setgid, setgroups and the passwd lookup, and `fs`
+# provides chown.
 nix = { version = "0.31.3", features = ["user", "fs"] }

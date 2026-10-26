@@ -1,17 +1,17 @@
-//! The unsafe boundary: every read of kernel memory lives here, behind safe typed
-//! handles, so the decision flow in `main.rs` is `unsafe`-free.
+//! The unsafe boundary. Every read of kernel memory lives here, behind safe typed handles,
+//! so the decision flow in `main.rs` has no `unsafe` code.
 //!
-//! ## No committed struct layout — offsets come from the running kernel
-//! There is no `vmlinux.rs` here: every field is read at a byte offset taken from
+//! ## Offsets come from the running kernel
+//! There is no `vmlinux.rs` here. Every field is read at a byte offset taken from
 //! [`OFFSETS`], which the daemon fills from the running kernel's BTF (see
-//! `cordon_bpf_common::offsets` for why). The handles below (`File`, `Dentry`, …) are
-//! `Copy` newtypes over a raw base address; each accessor reads one field at its
+//! `cordon_bpf_common::offsets` for why). The handles below, such as `File` and `Dentry`,
+//! are `Copy` newtypes over a raw base address, and each accessor reads one field at its
 //! injected offset.
 //!
-//! [`read_at`] (a `bpf_probe_read_kernel`, the kernel's *fault-safe* reader: a bad
-//! address faults into an `Err` instead of crashing) does all the actually-unsafe
-//! work. Accessors return [`Option`]; `None` means "couldn't read", and the decision flow
-//! fails open on it. Files are identified by inode ([`FileId`]), never by path.
+//! [`read_at`] does all the truly unsafe work through `bpf_probe_read_kernel`, the kernel's
+//! fault-safe reader, which turns a bad address into an `Err` instead of a crash. Accessors
+//! return [`Option`], where `None` means that the read failed, and the decision flow fails
+//! open on it. Files are identified by inode ([`FileId`]), never by path.
 
 use aya_ebpf::helpers::{
     bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task,
@@ -25,52 +25,55 @@ use cordon_bpf_common::{
     PathComp, Pid, Policy, Suppressed, Uid, SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
 };
 
-/// Running-kernel field offsets, injected into `.rodata` by the daemon
-/// (`override_global("OFFSETS", …)`). The initializer is [`Offsets::POISON`]; see there
-/// for what a missing injection does.
+/// The running kernel's field offsets, which the daemon injects into `.rodata` with
+/// `override_global("OFFSETS", …)`. The initializer is [`Offsets::POISON`], and its doc
+/// says what a missing injection does.
 #[unsafe(no_mangle)]
 static OFFSETS: Offsets = Offsets::POISON;
 
-/// Read one field of [`OFFSETS`]. Volatile so the optimizer can't fold in the POISON
-/// initializer — the loader overwrites these bytes before the program is verified.
+/// Reads one field of [`OFFSETS`]. The read is volatile so that the optimizer cannot fold
+/// in the `POISON` initializer, because the loader overwrites these bytes before the
+/// program is verified.
 macro_rules! offset {
     ($field:ident) => {
         // SAFETY: `&raw const OFFSETS.$field` addresses an initialized `u32` in the
-        // `.rodata` global; the volatile read forces the load the loader's value backs.
+        // `.rodata` global, and the volatile read forces a load of the value that the
+        // loader wrote.
         unsafe { core::ptr::read_volatile(&raw const OFFSETS.$field) }
     };
 }
 
-/// Read a `T` from kernel memory at `base + off`, fault-safely. The address is pure
-/// integer arithmetic (`base` is never dereferenced in Rust — only handed to the
-/// probe helper), so a wild offset can't be UB, only an `Err`. `T` is POD here
-/// (a pointer or an integer — every bit pattern is valid).
+/// Returns the `T` at `base + off` in kernel memory, or `None` when the address faults.
+/// `T` is a pointer or an integer here, so every bit pattern is a valid value.
 fn read_at<T>(base: *const u8, off: u32) -> Option<T> {
+    // The address is integer arithmetic only. Rust never dereferences `base`, which only
+    // the probe helper sees, so a wild offset is an `Err`, never UB.
     let src = base.wrapping_add(off as usize) as *const T;
     unsafe { bpf_probe_read_kernel(src).ok() }
 }
 
-/// Read a pointer field (the common case: chasing one `struct foo *` to the next).
+/// Returns the pointer field at `base + off`, which is how a walk follows one
+/// `struct foo *` to the next.
 fn ptr_at(base: *const u8, off: u32) -> Option<*const u8> {
     read_at::<*const u8>(base, off)
 }
 
-/// The thread-group id (userspace pid) of the current task.
+/// Returns the thread-group id, which is the userspace pid, of the current task.
 pub fn current_pid() -> Pid {
     Pid((bpf_get_current_pid_tgid() >> 32) as u32)
 }
 
-/// The real uid of the current task (the low 32 bits of `bpf_get_current_uid_gid`; the
-/// high 32 are the gid). The daemon names the user from it on the audit line.
+/// Returns the real uid of the current task, which is the low 32 bits of
+/// `bpf_get_current_uid_gid`. The high 32 bits are the gid.
 pub fn current_uid() -> Uid {
     Uid(bpf_get_current_uid_gid() as u32)
 }
 
-/// The current task's cgroup-v2 id (`bpf_get_current_cgroup_id`), from which the decision
-/// flow resolves the caller's blessing class via `BLESSED` (DESIGN §16.3). A general
-/// helper; the verifier accepts it at the `file_open` LSM hook on the CI-pinned kernel.
+/// Returns the current task's cgroup-v2 id (`bpf_get_current_cgroup_id`). The verifier
+/// accepts this general helper at the `file_open` LSM hook on the CI-pinned kernel.
 pub fn current_cgroup_id() -> CgroupId {
-    // SAFETY: an argless helper returning a scalar id — no pointers, always callable.
+    // SAFETY: the helper takes no arguments and returns a scalar id, so it touches no
+    // pointers and is always callable.
     CgroupId(unsafe { bpf_get_current_cgroup_id() })
 }
 
@@ -79,66 +82,72 @@ pub fn current_cgroup_id() -> CgroupId {
 pub struct File(*const u8);
 
 impl File {
-    /// The nth pointer argument of the LSM hook (arg 0 of `file_open` is the file).
+    /// Returns the `n`th pointer argument of the LSM hook as a file. Arg 0 of `file_open`
+    /// is the file.
     pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> File {
         File(unsafe { ctx.arg(n) })
     }
-    /// The file's dentry (entry point for the ancestor walk).
+    /// Returns the file's dentry, where the ancestor walk starts.
     pub fn dentry(self) -> Option<Dentry> {
         Some(Dentry(ptr_at(self.0, offset!(file_f_path_dentry))?))
     }
-    /// The file's inode (via the direct `f_inode` field).
+    /// Returns the file's inode, read from its `f_inode` field.
     pub fn inode(self) -> Option<Inode> {
         Some(Inode(ptr_at(self.0, offset!(file_f_inode))?))
     }
-    /// `f_mode` (`fmode_t`): `FMODE_READ`/`FMODE_WRITE` encode read/write intent at open.
+    /// Returns the file's mode (an `fmode_t`). Its `FMODE_READ` and `FMODE_WRITE` bits
+    /// encode the intent to read and write.
     pub fn f_mode(self) -> Option<u32> {
         read_at::<u32>(self.0, offset!(file_f_mode))
     }
-    /// `f_flags`: `O_CREAT` encodes create intent at open.
+    /// Returns the file's open flags. Their `O_CREAT` bit encodes the intent to create.
     pub fn f_flags(self) -> Option<u32> {
         read_at::<u32>(self.0, offset!(file_f_flags))
     }
 }
 
-/// A `struct linux_binprm *` — the exec in progress, at `bprm_check_security`.
+/// A `struct linux_binprm *`, which describes the exec in progress at
+/// `bprm_check_security`.
 #[derive(Clone, Copy)]
 pub struct Binprm(*const u8);
 
 impl Binprm {
-    /// The nth pointer argument (arg 0 of `bprm_check_security` is the binprm).
+    /// Returns the `n`th pointer argument of the LSM hook as a binprm. Arg 0 of
+    /// `bprm_check_security` is the binprm.
     pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Binprm {
         Binprm(unsafe { ctx.arg(n) })
     }
-    /// `bprm->file`: the binary about to be executed, not the caller (see `decide_exec`).
+    /// Returns the binary about to be executed (`bprm->file`). It is not the caller (see
+    /// `decide_exec`).
     pub fn file(self) -> Option<File> {
         Some(File(ptr_at(self.0, offset!(binprm_file))?))
     }
 }
 
-/// A `struct dentry *`. `PartialEq` compares the pointer (a dentry that is its own
-/// parent is the mount root — the walk's stop condition).
+/// A `struct dentry *`. Equality compares the pointers, which is how a walk detects the
+/// mount root, since the mount root is the one dentry that is its own parent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Dentry(*const u8);
 
 impl Dentry {
-    /// The nth pointer argument of the LSM hook, for the hooks whose arguments are
-    /// dentries rather than a `struct file` (`inode_link` arg 0 = `old_dentry`,
-    /// `inode_rename` arg 1 = `old_dentry`, `inode_unlink`/`inode_rmdir` arg 1).
+    /// Returns the `n`th pointer argument of the LSM hook as a dentry, for the hooks whose
+    /// arguments are dentries rather than a `struct file`. For example, `old_dentry` is
+    /// arg 0 of `inode_link` and arg 1 of `inode_rename`, and `inode_unlink` and
+    /// `inode_rmdir` take the dentry as arg 1.
     ///
-    /// The index is the caller's responsibility and is **not** type-checked: reading an
-    /// `inode *` argument as a dentry yields a plausible-but-wrong pointer whose field
-    /// reads fail, which fails *open*, silently. The daemon's `self_test` exercises every
-    /// hook so a wrong index fails loudly at startup.
+    /// The caller owns the index, and nothing type-checks it. Reading an `inode *`
+    /// argument as a dentry yields a plausible but wrong pointer whose field reads fail,
+    /// and that fails open, silently. The daemon's `self_test` exercises every hook, so a
+    /// wrong index fails loudly at startup.
     pub fn from_arg(ctx: &aya_ebpf::programs::LsmContext, n: usize) -> Dentry {
         Dentry(unsafe { ctx.arg(n) })
     }
-    /// The dentry's inode, or `None` when the dentry is **negative** — `d_inode` is NULL,
-    /// i.e. the name does not exist yet.
+    /// Returns the dentry's inode, or `None` when the dentry is negative, meaning that
+    /// `d_inode` is NULL because the name does not exist yet.
     ///
-    /// The distinction decides a verdict (a positive rename destination is about to be
-    /// destroyed; see `decide_reparent`), so it is tested rather than left to the NULL read
-    /// faulting out on its own.
+    /// The distinction decides a verdict, since a positive rename destination is about to
+    /// be destroyed (see `decide_reparent`). So the NULL is tested here rather than left to
+    /// fault on the next read.
     pub fn inode(self) -> Option<Inode> {
         let inode = ptr_at(self.0, offset!(dentry_d_inode))?;
         (!inode.is_null()).then_some(Inode(inode))
@@ -149,15 +158,16 @@ impl Dentry {
     pub fn parent(self) -> Option<Dentry> {
         Some(Dentry(ptr_at(self.0, offset!(dentry_d_parent))?))
     }
-    /// Read this dentry's component name (`d_name.name`, a NUL-terminated string) into
-    /// `slot`, for leaf-path reconstruction. Returns the byte length read (excluding the
-    /// NUL the helper writes), or `None` if the name pointer or string is unreadable. A
-    /// return `>= PATH_NAME_MAX - 1` means the name was truncated into the slot.
+    /// Reads this dentry's component name (`d_name.name`, a NUL-terminated string) into
+    /// `slot` for leaf-path reconstruction. Returns the number of bytes read, not counting
+    /// the NUL that the helper writes, or `None` when the name pointer or the string is
+    /// unreadable. A return of `PATH_NAME_MAX - 1` or more means that the name was
+    /// truncated into the slot.
     pub fn name_into(self, slot: &mut PathComp) -> Option<usize> {
         let name = ptr_at(self.0, offset!(dentry_d_name_name))?;
-        // SAFETY: `name` is a kernel `const char *` to a NUL-terminated string; the
-        // helper is fault-safe (a bad address yields `Err`, never UB) and writes at most
-        // `slot.len()` bytes, always NUL-terminating.
+        // SAFETY: `name` is a kernel `const char *` to a NUL-terminated string. The helper
+        // is fault-safe, so a bad address yields `Err` and never UB, and it writes at most
+        // `slot.len()` bytes, always NUL-terminating them.
         let read = unsafe { bpf_probe_read_kernel_str_bytes(name, &mut slot.0) }.ok()?;
         Some(read.len())
     }
@@ -169,13 +179,13 @@ pub struct Inode(*const u8);
 
 impl Inode {
     pub fn ino(self) -> Option<Ino> {
-        // i_ino is c_ulong == u64.
+        // `i_ino` is a `c_ulong`, which is a u64 on BPF.
         Some(Ino(read_at::<u64>(self.0, offset!(inode_i_ino))?))
     }
     pub fn super_block(self) -> Option<SuperBlock> {
         Some(SuperBlock(ptr_at(self.0, offset!(inode_i_sb))?))
     }
-    /// The inode's `(dev, inode)` identity.
+    /// Returns the inode's `(dev, ino)` identity.
     pub fn file_id(self) -> Option<FileId> {
         Some(FileId::new(self.super_block()?.dev()?, self.ino()?))
     }
@@ -186,84 +196,87 @@ impl Inode {
 pub struct SuperBlock(*const u8);
 
 impl SuperBlock {
-    /// The device number in the kernel's `s_dev` encoding — the device the daemon takes
-    /// from the mount table (its `proc::file_id`), not `stat(2)`'s `st_dev`.
+    /// Returns the device number in the kernel's `s_dev` encoding. It matches the device
+    /// that the daemon's `proc::file_id` takes from the mount table, not `stat(2)`'s
+    /// `st_dev`.
     pub fn dev(self) -> Option<Dev> {
-        // s_dev is dev_t == u32.
+        // `s_dev` is a `dev_t`, which is a u32 in the kernel.
         Some(Dev(read_at::<u32>(self.0, offset!(sb_s_dev))? as u64))
     }
 }
 
-/// The current task's executable identity (`mm->exe_file`'s inode). `None` for a
-/// kernel thread (no `mm`) or an unreadable chain — the caller fails open.
+/// Returns the identity of the current task's executable, which is the inode of
+/// `mm->exe_file`. Returns `None` for a kernel thread, which has no `mm`, or when the chain
+/// is unreadable.
 pub fn caller_exe() -> Option<FileId> {
     current_exe_file()?.inode()?.file_id()
 }
 
-/// Per-CPU scratch for assembling one [`DecisionEvent`] off the stack. The record is too
-/// large (it carries the reconstructed path) to build as a stack local — the BPF 512-byte
-/// stack won't hold it — so we fill this per-CPU slot, then mem-copy it into the ring.
-/// Per-CPU + the program being non-preemptible at this hook means no other invocation
-/// clobbers it between fill and copy.
+/// Per-CPU scratch space for assembling one [`DecisionEvent`] off the stack. The record
+/// carries the reconstructed path and is too large for the BPF 512-byte stack, so [`emit`]
+/// fills this slot and copies it into the ring. The slot is per CPU, and the program
+/// cannot be preempted at this hook, so no other invocation clobbers it between the fill
+/// and the copy.
 #[map]
 static SCRATCH: PerCpuArray<DecisionEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// One logged decision, assembled by the caller and handed to [`emit`] as a unit.
+/// One logged decision, which the caller assembles and hands to [`emit`] as a unit.
 ///
-/// A struct rather than a parameter list for two reasons. BPF passes at most five
+/// It is a struct rather than a parameter list for two reasons. BPF passes at most five
 /// arguments in registers and has no stack for the rest, so a long positional `emit` links
-/// only while LLVM happens to inline it; a second call site turns that into "stack
-/// arguments are not supported". And three of these fields are [`FileId`]s
-/// whose order a positional call site could transpose in complete silence, swapping (say)
-/// the object and the leaf in every journal line. Named fields cost nothing and make both
+/// only while LLVM happens to inline it, and a second call site turns that into "stack
+/// arguments are not supported". Also, three of these fields are [`FileId`]s, which a
+/// positional call site could transpose in complete silence, for example swapping the
+/// object and the leaf in every journal line. Named fields cost nothing and make both
 /// problems structural.
 ///
-/// It never actually materializes: [`emit`] is `#[inline(always)]`, so LLVM promotes
-/// these fields straight to registers and the struct costs nothing at runtime. That is
-/// also required — see the note on `emit`.
+/// It never materializes at runtime. [`emit`] is `#[inline(always)]`, so LLVM promotes
+/// these fields straight to registers. That inlining is also required, as the note on
+/// `emit` explains.
 pub struct Record {
     /// The acting task.
     pub pid: Pid,
-    /// Its real uid; the daemon resolves it to a login name.
+    /// The acting task's real uid, which the daemon resolves to a login name.
     pub uid: Uid,
-    /// The subject: `mm->exe_file`'s inode.
+    /// The subject, identified by the inode of `mm->exe_file`.
     pub exe: FileId,
     /// The matched protected object's identity.
     pub object: FileId,
-    /// The affected file's own identity — equals `object` when the rule names the file.
+    /// The affected file's own identity. It equals `object` when the rule names the file.
     pub leaf: FileId,
-    /// The actions the hook requested, which can be several bits (read, write and create
-    /// for one open).
+    /// The actions that the journal records, which can be several bits, such as read, write
+    /// and create for one open.
     pub action: Action,
     /// How the access was handled and why: an explicit `deny` rule, the `default-deny`
     /// fallthrough, the structural `escape-deny`, or an `audit`.
     pub policy: Policy,
-    /// Repeats the in-kernel throttle folded into this record.
+    /// The repeats that the in-kernel throttle folded into this record.
     pub suppressed: Suppressed,
-    /// The caller's resolved blessing class; [`ClassId::UNBLESSED`] if none.
+    /// The caller's resolved blessing class, or [`ClassId::UNBLESSED`] if it has none.
     pub blessing: ClassId,
-    /// Start of the `d_name` walk.
+    /// The dentry where the `d_name` walk starts.
     pub leaf_dentry: Dentry,
-    /// Stop point of the `d_name` walk (pointer compare).
+    /// The dentry where the `d_name` walk stops, found by a pointer compare.
     pub object_dentry: Dentry,
 }
 
-/// Assemble + push one logged decision to the ring buffer, reconstructing the affected
-/// file's leaf path (relative to the matched protected object) along the way. Best-effort:
-/// a full ring (or a missing scratch slot) drops the *observation*, never the verdict.
+/// Pushes one logged decision to the ring buffer, with the affected file's leaf path
+/// relative to the matched protected object. It is best-effort, so a full ring or a
+/// missing scratch slot drops the observation, never the verdict.
 ///
-/// `#[inline(always)]` is load-bearing, not a hint. Outlined, this becomes a fifth call
-/// frame (hook → decide → consult → emit → memcpy) and the v6.12 verifier gives up
-/// backtracking precision across it: `BPF_PROG_LOAD` fails with `E2BIG` and a `mark_precise:
-/// frame4` storm. Inlined, [`Record`] is scalarized away and the frame disappears with it.
+/// `#[inline(always)]` is load-bearing, not a hint. Outlined, `emit` becomes a fifth call
+/// frame (hook → decide → consult → emit → memcpy), and the v6.12 verifier loses its
+/// backtracking precision across it. `BPF_PROG_LOAD` then fails with `E2BIG` and a storm
+/// of `mark_precise: frame4` lines. Inlined, [`Record`] is scalarized away, and the frame
+/// disappears with it.
 #[inline(always)]
 pub fn emit(rec: &Record) {
     let Some(ev) = SCRATCH.get_ptr_mut(0) else {
         return;
     };
-    // SAFETY: `ev` is our per-CPU scratch `DecisionEvent`; we write every field below
-    // (scalars directly, the path via `fill_comps`) before copying it to the ring. Field
-    // writes go straight into map memory — no large stack temporary.
+    // SAFETY: `ev` is this CPU's scratch `DecisionEvent`. Every field below is written, the
+    // scalars directly and the path through `fill_comps`, before the record is copied to
+    // the ring. The writes go straight into map memory, with no large stack temporary.
     unsafe {
         (*ev).exe = rec.exe;
         (*ev).object = rec.object;
@@ -282,8 +295,9 @@ pub fn emit(rec: &Record) {
     let Some(mut entry) = EVENTS.reserve::<DecisionEvent>(0) else {
         return;
     };
-    // SAFETY: both regions are exactly `size_of::<DecisionEvent>()` and don't overlap
-    // (per-CPU scratch vs ring slot); a map→ring mem-copy avoids any stack-sized temporary.
+    // SAFETY: both regions are exactly `size_of::<DecisionEvent>()` and do not overlap,
+    // since one is the per-CPU scratch and the other a ring slot. Copying from map to ring
+    // avoids any stack-sized temporary.
     unsafe {
         core::ptr::copy_nonoverlapping(
             ev as *const u8,
@@ -294,15 +308,14 @@ pub fn emit(rec: &Record) {
     entry.submit(0);
 }
 
-/// Fill `comps` with the affected file's path components, **leaf-first**, by walking
-/// `d_name` from `leaf_dentry` up to (but not including) `object_dentry` — the matched
-/// protected object. Returns `(depth, truncated)`: `depth` valid components, and whether
-/// the path was cut short (deeper than [`PATH_MAX_DEPTH`], a name longer than
-/// [`PATH_NAME_MAX`], or an unreadable component). `comps.get_mut` keeps each write
-/// in-bounds for the verifier; the same bound caps the walk.
+/// Fills `comps` with the affected file's path components in leaf-first order, from
+/// `leaf_dentry` up to but not including `object_dentry`, which is the matched protected
+/// object's dentry. Returns the number of valid components, and whether the path was cut
+/// short because it was deeper than [`PATH_MAX_DEPTH`], a name was longer than
+/// [`PATH_NAME_MAX`], or a component was unreadable.
 ///
-/// Entry is a dentry, not a file, so the mutation hooks (which never see a `struct
-/// file`) reconstruct paths through the same code as `file_open`.
+/// It takes a dentry rather than a file, so the mutation hooks, which never see a
+/// `struct file`, reconstruct paths through the same code as `file_open`.
 fn fill_comps(
     leaf_dentry: Dentry,
     object_dentry: Dentry,
@@ -312,8 +325,10 @@ fn fill_comps(
     let mut depth = 0usize;
     for _ in 0..PATH_MAX_DEPTH {
         if dentry == object_dentry {
-            return (depth as u8, false); // reached the object → path complete
+            return (depth as u8, false); // the object ends a complete path
         }
+        // `get_mut` keeps each write in bounds for the verifier, and the same bound caps
+        // the walk.
         let Some(slot) = comps.get_mut(depth) else {
             return (depth as u8, true);
         };
@@ -321,42 +336,43 @@ fn fill_comps(
             // A name that fills the slot was probably truncated.
             Some(n) if n >= PATH_NAME_MAX - 1 => return (depth as u8 + 1, true),
             Some(_) => depth += 1,
-            None => return (depth as u8, true), // unreadable component → stop, mark partial
+            None => return (depth as u8, true), // unreadable, so the path is partial
         }
         let Some(parent) = dentry.parent() else {
             return (depth as u8, true);
         };
         if parent == dentry {
-            return (depth as u8, true); // mount root before the object (shouldn't happen)
+            return (depth as u8, true); // the mount root before the object, never expected
         }
         dentry = parent;
     }
-    // Ran the depth cap without reaching the object → more components than slots.
+    // The walk hit the depth cap before the object, so the path has more components than
+    // slots.
     (depth as u8, true)
 }
 
-/// The suppression window: at most one ring record per [`SuppressKey`] per this many
-/// nanoseconds (1s). The audit found tools re-open the same config hundreds of
-/// times per run; a 1s window collapses each such burst to its first occurrence + a
-/// count, keeping the ring (and the learn path) quiet without losing the event.
+/// The suppression window of 1s, within which each [`SuppressKey`] emits at most one ring
+/// record. The audit found that tools re-open the same config hundreds of times per run. A
+/// 1s window collapses each such burst to its first occurrence and a count, which keeps
+/// the ring and the learn path quiet without losing the event.
 const SUPPRESS_WINDOW_NS: Nanos = Nanos(1_000_000_000);
 
-/// The in-kernel event suppressor: the hottest decision keys and when each
-/// last emitted. **LRU** so a full map evicts the coldest key rather than refusing a
-/// new hot one. Kernel-internal — the daemon never touches it.
+/// The in-kernel event suppressor's state, which holds the hottest decision keys and when
+/// each last emitted. It is an LRU map, so a full map evicts the coldest key rather than
+/// refusing a new hot one. It is internal to the kernel, and the daemon never touches it.
 #[map]
 static SUPPRESS: LruHashMap<SuppressKey, SuppressVal> = LruHashMap::with_max_entries(4096, 0);
 
-/// Throttle a logged decision. Returns `Some(suppressed)` when this open should emit a
-/// ring record — `suppressed` being how many identical decisions were folded in since
-/// the previous emit for this key — or `None` when it falls inside the window and is
-/// suppressed (its only effect a bumped counter). Keyed by [`SuppressKey`]. Best-effort:
-/// a failed map write just means a slightly off count, never a missed *first* occurrence.
+/// Decides whether a logged decision for `(exe, leaf, action)` emits a ring record, and
+/// records the decision in `SUPPRESS`. Returns the number of identical decisions folded in
+/// since the key's previous record when it emits, or `None` when the decision falls inside
+/// the suppression window and only bumps the key's count. A failed map write costs a
+/// slightly wrong count, never a missed first occurrence.
 pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed> {
     let now = now_ns();
     let key = SuppressKey::new(exe, leaf, action);
     match suppress_get(&key) {
-        // Seen before, still inside the window → suppress, bump the pending count.
+        // Seen before and still inside the window, so suppress it and bump the count.
         Some(prev) if now.wrapping_sub(prev.last_ns) < SUPPRESS_WINDOW_NS => {
             let _ = SUPPRESS.insert(
                 &key,
@@ -365,12 +381,12 @@ pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed>
             );
             None
         }
-        // Window elapsed → emit, reporting the burst we held back, and reset.
+        // The window has elapsed, so emit with the held-back count and reset it.
         Some(prev) => {
             let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed(0)), 0);
             Some(prev.suppressed)
         }
-        // First occurrence → emit immediately, start tracking.
+        // A first occurrence emits at once and starts the key's window.
         None => {
             let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed(0)), 0);
             Some(Suppressed(0))
@@ -378,18 +394,21 @@ pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed>
     }
 }
 
-/// Copy the suppressor value for `key` out from behind aya's `unsafe` map ref (which
-/// borrows concurrently-mutable map memory) — keeps the decision flow `unsafe`-free.
+/// Returns a copy of the suppressor value for `key`, or `None` when the key is absent.
 fn suppress_get(key: &SuppressKey) -> Option<SuppressVal> {
+    // aya's map reference borrows map memory that can change concurrently, so it is
+    // `unsafe`. Copying the value out keeps the decision flow free of `unsafe`.
     unsafe { SUPPRESS.get(key).copied() }
 }
 
-/// Monotonic nanoseconds since boot (`bpf_ktime_get_ns`), the suppressor's clock.
+/// Returns the monotonic nanoseconds since boot (`bpf_ktime_get_ns`), which is the
+/// suppressor's clock.
 fn now_ns() -> Nanos {
     Nanos(unsafe { bpf_ktime_get_ns() })
 }
 
-/// The current task's `mm->exe_file`, if any (kernel threads have no `mm`).
+/// Returns the current task's `mm->exe_file`, or `None` for a kernel thread, which has no
+/// `mm`, or when a read fails.
 fn current_exe_file() -> Option<File> {
     let task = unsafe { bpf_get_current_task() } as *const u8;
     let mm = ptr_at(task, offset!(task_mm))?;
@@ -400,6 +419,6 @@ fn current_exe_file() -> Option<File> {
     (!exe_file.is_null()).then_some(File(exe_file))
 }
 
-/// The learn-path ring buffer drained by the daemon.
+/// The ring buffer of logged decisions that the daemon drains for the learn path.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);

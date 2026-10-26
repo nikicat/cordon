@@ -1,9 +1,9 @@
-# The eBPF data plane: the in-kernel boundary that returns the LSM hook verdicts.
+# The eBPF data plane, which is the in-kernel boundary that returns the LSM hook verdicts.
 #
-# This crate is INTENTIONALLY a standalone workspace (`[workspace]` below) and is
-# `exclude`d from the root workspace — it compiles only for `bpfel-unknown-none`
-# with the pinned nightly (rust-toolchain.toml) + `bpf-linker`, driven by
-# `just build-ebpf`. It must never be built for the host.
+# This crate is intentionally a standalone workspace (`[workspace]` below), excluded from
+# the root workspace. It compiles only for `bpfel-unknown-none` with the pinned nightly
+# (rust-toolchain.toml) and `bpf-linker`, driven by `just build-ebpf`. It must never be
+# built for the host.
 [package]
 name = "cordon-bpf"
 version = "0.0.0"
@@ -14,20 +14,20 @@ publish = false
 [[bin]]
 name = "cordon"
 path = "src/main.rs"
-# No host unit-test/bench harness: this is a #![no_std]/#![no_main] BPF object that
-# can't link the `test` crate. Disabling these auto-targets also lets rust-analyzer
-# load this crate with its default `--all-targets` without a build error (it shares
-# one window with the host workspace, which keeps `--all-targets` on for its tests).
+# No host test or bench harness, because this #![no_std], #![no_main] BPF object cannot
+# link the `test` crate. Disabling these auto-targets also lets rust-analyzer load this
+# crate with its default `--all-targets` without a build error. rust-analyzer shares one
+# window with the host workspace, which keeps `--all-targets` on for its tests.
 test = false
 bench = false
 
 [dependencies]
 aya-ebpf = "0.1.1"
-# Shared map/record layout (no_std, no `user` feature → no aya).
+# The shared map and record layout, without the `user` feature so that aya stays out.
 cordon-bpf-common = { path = "../bpf-common" }
 
-# eBPF objects must be optimized (the verifier rejects the bloated, high-stack code
-# a debug build emits) and unwinding-free.
+# eBPF objects must be optimized and free of unwinding. The verifier rejects the bloated,
+# high-stack code that a debug build emits.
 [profile.dev]
 opt-level = 3
 debug = false

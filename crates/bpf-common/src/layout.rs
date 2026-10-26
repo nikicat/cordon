@@ -1,39 +1,37 @@
-//! Compile-time struct-layout helpers and the [`padded_pod!`] macro.
+//! Compile-time layout checks for the POD types that BPF maps copy byte for byte, and the
+//! [`padded_pod!`] macro that applies them.
 //!
-//! The POD types shared with the eBPF program are written into BPF maps by a raw byte
-//! copy (aya takes a `&[u8]` byte-view over the value for `bpf_map_update_elem`). Two
-//! things must hold for that to be sound and stable:
-//!  - **Fully initialized** — a byte-view over *uninitialized* padding is UB, so the value
-//!    may have no uninitialized bytes; and for a map **key**, BPF hashes/compares the whole
-//!    byte span, so stray padding bytes split one logical key across buckets.
-//!  - **Deterministic** — the same logical value should produce the same bytes (no stack
-//!    garbage in the gaps), so an in-map image is reproducible.
+//! aya writes a map value by handing a `&[u8]` view of it to `bpf_map_update_elem`. Two
+//! things must hold for that copy to be sound and stable:
+//!  - The value is fully initialized. A byte view over uninitialized padding is UB. For a
+//!    map key, BPF also hashes and compares the whole byte span, so stray padding bytes
+//!    would split one logical key across buckets.
+//!  - The value is deterministic. The same logical value produces the same bytes, with no
+//!    stack garbage in the gaps, so an in-map image is reproducible.
 //!
-//! [`padded_pod!`] gives both: it appends an **auto-sized, always-zeroed trailing `_pad`**
-//! that rounds the struct up to its alignment (so the value is fully initialized), and it
-//! emits a `const` assertion that there is **no interior padding** — the one thing the
-//! trailing pad can't fill. So a field reorder that opens an interior gap fails the *build*,
-//! not a test. Field *order* is still yours to choose (lay fields out large-to-small to stay
-//! gap-free); the macro only sizes the trailing pad and proves the result is byte-for-byte
-//! packed.
+//! [`padded_pod!`] gives both. It appends a trailing `_pad` that is sized automatically and
+//! always zeroed, which rounds the struct up to its alignment. It also asserts at compile
+//! time that the struct has no interior padding, which a trailing pad cannot fill, so a
+//! field reorder that opens an interior gap fails the build rather than a test. Field order
+//! stays the author's choice, and laying fields out from large to small keeps them
+//! gap-free.
 
-/// The `(size, align)` of a field type — fed one-per-field into [`trailing_pad`] by the
-/// [`padded_pod!`] expansion. Const, so it runs at compile time where sizes are known (a
-/// proc-macro, working on tokens, could not see them).
+/// Returns the size and alignment of `T`, as one entry of the list that [`trailing_pad`]
+/// takes. It is a `const fn` because type sizes are known only at compile time, and a
+/// proc-macro working on tokens could not see them.
 pub(crate) const fn field<T>() -> (usize, usize) {
     (core::mem::size_of::<T>(), core::mem::align_of::<T>())
 }
 
-/// Round `n` up to the next multiple of `align` (a power-of-two alignment, always ≥ 1).
+/// Returns `n` rounded up to the next multiple of `align`, which is a power of two.
 const fn round_up(n: usize, align: usize) -> usize {
     n.div_ceil(align) * align
 }
 
-/// The trailing pad bytes a `#[repr(C)]` struct with these `(size, align)` fields needs to
-/// round its total size up to its own alignment — replicating the `repr(C)` layout walk
-/// (place each field at the next multiple of its alignment; the struct's alignment is the
-/// max field alignment). Returns only the **trailing** gap; interior gaps are caught by the
-/// [`padded_pod!`] assertion instead, since this can't fill them.
+/// Returns the number of trailing pad bytes that a `#[repr(C)]` struct with these
+/// `(size, align)` fields needs to round its size up to its own alignment, following the
+/// `repr(C)` layout rules. It counts only the trailing gap, because the [`padded_pod!`]
+/// assertion rejects any interior one.
 pub(crate) const fn trailing_pad(fields: &[(usize, usize)]) -> usize {
     let mut off = 0;
     let mut max_align = 1;
@@ -49,16 +47,14 @@ pub(crate) const fn trailing_pad(fields: &[(usize, usize)]) -> usize {
     round_up(off, max_align) - off
 }
 
-/// Declare a `#[repr(C)]` POD struct with an **auto-sized, zeroed trailing `_pad`** and a
-/// compile-time **no-interior-padding** guarantee (see the module docs for why both matter).
+/// Declares a `#[repr(C)]` POD struct with a zeroed trailing `_pad` of the right size, and
+/// fails the build if the struct has interior padding. The module docs say why both matter.
 ///
-/// The appended `_pad` is `[u8; Self::PAD]`; construct it as `_pad: [0; Self::PAD]` (when
-/// `PAD == 0` that is just `[0; 0]`, an empty array, so the pattern is uniform). The macro
-/// fills only the *trailing* gap — it cannot insert *interior* padding, so it instead
-/// `assert!`s there is none, turning a bad field order into a build error.
-///
-/// Pass attributes (`#[repr(C)]`, `#[derive(…)]`) and per-field doc comments through as
-/// usual; the derives apply to the generated `_pad` too (`[u8; N]` is `Copy`/`Eq`/`Hash`/… ).
+/// The appended field is `_pad: [u8; Self::PAD]`, and a constructor sets it to
+/// `[0; Self::PAD]`. The same pattern works when `PAD` is 0, since `[0; 0]` is an empty
+/// array. Attributes such as `#[repr(C)]` and `#[derive(…)]`, and per-field doc comments,
+/// pass through as usual. The derives apply to `_pad` too, since `[u8; N]` is `Copy`, `Eq`,
+/// `Hash` and so on.
 macro_rules! padded_pod {
     (
         $(#[$meta:meta])*
@@ -75,22 +71,22 @@ macro_rules! padded_pod {
                 $(#[$fmeta])*
                 $fvis $fname: $fty,
             )*
-            /// Auto-sized, always-zeroed trailing pad generated by `padded_pod!` (see the
-            /// `layout` module docs for why). Constructors set it `[0; Self::PAD]`; the
-            /// kernel never reads it.
+            /// Zeroed trailing padding that `padded_pod!` generated (the `layout` module
+            /// docs say why). Constructors set it to `[0; Self::PAD]`, and the kernel never
+            /// reads it.
             $vis _pad: [u8; $name::PAD],
         }
 
         impl $name {
-            /// Length of the generated trailing [`_pad`](Self::_pad), for constructors
-            /// (`_pad: [0; Self::PAD]`). Computed from the field types' sizes/alignments.
+            /// The length of the generated trailing [`_pad`](Self::_pad), computed from the
+            /// sizes and alignments of the field types.
             $vis const PAD: usize =
                 $crate::layout::trailing_pad(&[$( $crate::layout::field::<$fty>() ),*]);
         }
 
-        // The trailing pad rounds size up to alignment; assert there is no *interior* gap
-        // (which it can't fill), so the type is byte-for-byte packed. A reorder that opens a
-        // gap fails the build right here.
+        // The trailing pad rounds the size up to the alignment but cannot fill an interior
+        // gap. This assertion proves there is none, so a reorder that opens one fails the
+        // build here.
         const _: () = assert!(
             ::core::mem::size_of::<$name>()
                 == (0 $( + ::core::mem::size_of::<$fty>() )*) + $name::PAD,

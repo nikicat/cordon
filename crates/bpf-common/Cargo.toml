@@ -1,12 +1,11 @@
-# Types shared verbatim between the eBPF program (crates/bpf, no_std, BPF target)
-# and the userspace loader (crates/daemon, the `bpf-lsm` feature). Keeping the map
-# key/value/record layouts in ONE place is what keeps the two sides from drifting.
+# Types shared verbatim between the eBPF program (crates/bpf, no_std, BPF target) and
+# the userspace loader (crates/daemon, the `bpf-lsm` feature). Keeping the map key, value
+# and record layouts in one place is what keeps the two sides from drifting.
 #
-# Default build is `#![no_std]`: the only dependency is `bitflags` (itself
-# zero-dep + `no_std`, pure `core` codegen), used for the `Action` bitset, so the
-# eBPF crate can pull this in cleanly. The userspace side enables
-# `features = ["user"]`, which adds the `aya::Pod` impls (so these types can be map
-# keys/values) — that's the only thing that needs the userspace `aya` crate.
+# The default build is `#![no_std]` and depends only on `bitflags`, so the eBPF crate can
+# pull it in cleanly. The userspace side enables the `user` feature for the `aya::Pod`
+# impls, which let these types be map keys and values. Nothing else needs the userspace
+# `aya` crate.
 [package]
 name = "cordon-bpf-common"
 version.workspace = true
@@ -20,11 +19,12 @@ name = "cordon_bpf_common"
 path = "src/lib.rs"
 
 [features]
-# Enabled by the userspace loader: pulls `aya` only to mark these POD types `Pod`.
+# Enabled by the userspace loader. It pulls in `aya` only to mark these POD types `Pod`.
 user = ["dep:aya"]
 
 [dependencies]
-# `no_std`, zero transitive deps; compiles for the BPF target. `default-features =
-# false` keeps the `std` feature off so the eBPF build stays `no_std`.
+# For the `Action` bitset. bitflags is `no_std` with no transitive deps and generates
+# plain `core` code, so it compiles for the BPF target. `default-features = false` keeps
+# its `std` feature off, so the eBPF build stays `no_std`.
 bitflags = { version = "2.13", default-features = false }
 aya = { version = "0.14", optional = true, default-features = false }

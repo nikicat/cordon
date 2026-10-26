@@ -1,104 +1,110 @@
-//! The flat **rule model** schema (DESIGN §15) — the compiled, pre-resolved
-//! decision table both sides agree on, byte-for-byte.
+//! The schema of the flat rule model (DESIGN §15), the compiled and pre-resolved decision
+//! table that both sides read byte for byte.
 //!
-//! The userspace compiler (`cordon_core::policy::compile`) lowers an expressive
-//! text policy — groups, nesting, object precedence — into this dumb form: a set of
-//! protected objects, each with a flat, **pre-sorted** list of [`CompiledRule`]s.
-//! Object precedence and inheritance are resolved *there* (copy-down), so the eBPF
-//! program only ever does: most-specific protected object → **first matching** rule
-//! in its one bucket (DESIGN §15.3 — "expressive source, dumb-fast binary form").
+//! The userspace compiler (`cordon_core::policy::compile`) lowers an expressive text
+//! policy, with groups, nesting and object precedence, into this simple form. The form is a
+//! set of protected objects, each with a flat, pre-sorted list of [`CompiledRule`]s. The
+//! compiler resolves object precedence and inheritance by copying rules down, so the eBPF
+//! program only finds the most specific protected object and applies the first matching
+//! rule in its one bucket (DESIGN §15.3, "expressive source, dumb-fast binary form").
 //!
-//! This module is the contract for that binary form. The three rule maps are
-//! double-buffered: each holds [`NUM_BANKS`] generations (see [`Bank`]).
+//! The three rule maps are double-buffered, and each holds [`NUM_BANKS`] generations (see
+//! [`Bank`]).
 
 use crate::ids::{Bank, CgroupId, Dev, Ino, Uid};
 use crate::maps::FileId;
 use bitflags::bitflags;
 
 // ---- map names ------------------------------------------------------------
-// The eBPF program defines these maps; the loader resolves them by name. Constants
-// so a rename can't silently desync the two crates. The three rule maps are keyed or
-// indexed by `Bank`; `Settings.active_bank` selects the one the kernel reads.
+// The eBPF program defines these maps, and the loader resolves them by name. They are
+// constants so that a rename cannot silently desync the two crates. The three rule maps
+// are keyed or indexed by `Bank`, and `Settings.active_bank` selects the one the kernel
+// reads.
 
-/// `HashMap<BankedFile, ObjId>` — every protected object's `(bank, dev, ino)` → its
-/// object id. The deepest match in the dentry ancestor walk (keyed with the active
-/// bank) is the most-specific object.
+/// The name of the `HashMap<BankedFile, ObjId>` that maps each protected object's bank,
+/// device and inode to its object id. The deepest ancestor of a file that it holds under
+/// the active bank is the most specific object covering that file.
 pub const MAP_PROTECTED: &str = "PROTECTED";
-/// The packed per-(bank,object) rule table: bank `b`, object `o`'s rules occupy the
-/// contiguous slot at [`rule_slot`]`(b, o, 0..RULE_COUNT[(b,o)])`. A single base +
-/// index scan (cache-friendly) rather than a per-rule hash lookup.
+/// The name of the packed rule table for every bank and object. The rules of object `o` in
+/// bank `b` fill the contiguous slots at [`rule_slot`]`(b, o, 0..RULE_COUNT[(b,o)])`, so
+/// the kernel scans them from one base index, which suits the cache better than a hash
+/// lookup per rule.
 pub const MAP_RULES: &str = "RULES";
-/// `HashMap<BankedObj, u32>` — how many rules bank `b`, object `o` actually has in
-/// [`MAP_RULES`] (its slot is otherwise zero-padded to `MAX_RULES_PER_OBJ`).
+/// The name of the `HashMap<BankedObj, u32>` that holds how many rules object `o` in bank
+/// `b` has in [`MAP_RULES`]. The rest of that object's slot is zero-filled up to
+/// `MAX_RULES_PER_OBJ`.
 pub const MAP_RULE_COUNT: &str = "RULE_COUNT";
 
-/// `HashMap<CgroupId, ClassId>` — the runtime **blessing** indirection
-/// (DESIGN §16.3): a live blessed cgroup's id → the [`ClassId`] it was minted with. The
-/// kernel resolves the caller's class once per decision (`BLESSED[current_cgroup_id]`,
-/// or [`ClassId::UNBLESSED`] when absent) and a rule's `blessing` predicate matches that.
+/// The name of the `HashMap<CgroupId, ClassId>` that maps each live blessed cgroup to the
+/// [`ClassId`] it was minted with (DESIGN §16.3). The kernel resolves the caller's class as
+/// `BLESSED[current_cgroup_id]`, or as [`ClassId::UNBLESSED`] when the cgroup is absent,
+/// and a rule's `blessing` predicate matches that class.
 ///
-/// **Not banked** (unlike the three rule maps): it is per-`cordon bless` runtime state,
-/// written only by the daemon's backend thread (at mint, cleared at GC), so a bless never
-/// recompiles policy and a `policy apply` never disturbs a live bless.
+/// Unlike the three rule maps, it is not banked. It holds per-`cordon bless` runtime state.
+/// Only the daemon's backend thread writes it, adding an entry at mint and clearing it at
+/// GC. So a bless never recompiles policy, and a `policy apply` never disturbs a live
+/// bless.
 ///
-/// Not pinned either: the daemon pins only the LSM links (its `PinDir::pin_links`), so a
-/// restarted daemon loads a fresh, empty `BLESSED` and every blessing fails closed until
-/// `Blessings::reconcile` re-registers the carriers whose class is still declared.
+/// It is not pinned either, because the daemon pins only the LSM links (its
+/// `PinDir::pin_links`). A restarted daemon loads a fresh, empty `BLESSED`, and every
+/// blessing fails closed until `Blessings::reconcile` re-registers the carriers whose class
+/// is still declared.
 pub const MAP_BLESSED: &str = "BLESSED";
 
-/// The number of rule-table generations (see [`Bank`]). Sizes the banked [`MAP_RULES`]
+/// The number of rule-table generations (see [`Bank`]). It sizes the banked [`MAP_RULES`]
 /// array and the `bank` dimension of every key.
 pub const NUM_BANKS: usize = 2;
 
-/// Per-object rule-list cap. Bounds the kernel's first-match scan and the verifier
-/// loop, and fixes the [`MAP_RULES`] slot stride. Copy-down can lengthen a bucket
-/// (a deep object inherits every ancestor's rules), so this is the ceiling the
-/// compiler enforces — `cordon policy check` errors if a compiled bucket exceeds it.
-/// Can rise toward 64 if policies need it and the verifier still accepts the scan.
+/// The most rules that one object's bucket may hold. It bounds the kernel's first-match
+/// scan and its verifier loop, and it fixes the [`MAP_RULES`] slot stride. Copying rules
+/// down can lengthen a bucket, since a deep object inherits every ancestor's rules, so the
+/// compiler enforces this ceiling, and `cordon policy check` errors on a bucket that
+/// exceeds it. It can rise toward 64 if policies need more and the verifier still accepts
+/// the scan.
 pub const MAX_RULES_PER_OBJ: usize = 32;
 
-/// Maximum number of protected objects (distinct `where` targets). Sizes the packed
-/// [`MAP_RULES`] array (`MAX_OBJECTS * MAX_RULES_PER_OBJ` slots) and bounds the dense
-/// [`ObjId`] space. The compiler reports more objects than this as an error, and the
-/// daemon's `Maps::seed` refuses such a policy again before touching the slot arithmetic.
+/// The most protected objects, meaning distinct `where` targets, that a policy may have. It
+/// sizes the packed [`MAP_RULES`] array (`MAX_OBJECTS * MAX_RULES_PER_OBJ` slots) and
+/// bounds the dense [`ObjId`] space. The compiler reports more objects than this as an
+/// error, and the daemon's `Maps::seed` refuses such a policy again before it does any slot
+/// arithmetic.
 pub const MAX_OBJECTS: usize = 1024;
 
-/// Maximum number of live blessings ([`MAP_BLESSED`] entries) at once — one per active
-/// `cordon bless` invocation. On a personal box concurrent blessings are few; the daemon
-/// refuses a new mint past this. (Distinct from the policy-class *count*: many invocations
-/// can share one [`ClassId`].)
+/// The most live blessings, meaning [`MAP_BLESSED`] entries, at once. Each active
+/// `cordon bless` invocation holds one, and on a personal machine few run at the same
+/// time. The daemon refuses a new mint past this. It does not limit the number of policy
+/// classes, since many invocations can share one [`ClassId`].
 pub const MAX_BLESSED: usize = 1024;
 
-/// A protected object's id — a dense `u32` index assigned by the compiler, used to
-/// address the object's slot in [`MAP_RULES`]/[`MAP_RULE_COUNT`]. Distinct from
-/// [`FileId`]: the `(dev,ino)` is the *kernel's* key into [`MAP_PROTECTED`], the
-/// `ObjId` is the *compiler's* dense handle for the rule table.
+/// A protected object's dense id, which the compiler assigns to address the object's slot
+/// in [`MAP_RULES`] and [`MAP_RULE_COUNT`]. It differs from the object's [`FileId`], which
+/// is the kernel's key into [`MAP_PROTECTED`].
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ObjId(pub u32);
 
-/// A **blessing class** id — a dense `u32` the compiler assigns to each named blessing
-/// class declared in policy (`[group.subject.*] blessing = "<name>"`, DESIGN §16.3), and
-/// the value stored in [`MAP_BLESSED`] for a live blessed cgroup. A rule's
-/// [`SubjectMatch::blessing`] names the class it requires; the kernel matches it against
-/// the caller's resolved class.
+/// A blessing class id. The compiler assigns a dense id to each named blessing class that
+/// policy declares (`[group.subject.*] blessing = "<name>"`, DESIGN §16.3), and
+/// [`MAP_BLESSED`] stores it for a live blessed cgroup. A rule's
+/// [`SubjectMatch::blessing`] names the class it requires, and the kernel matches it
+/// against the caller's resolved class.
 ///
-/// [`UNBLESSED`](ClassId::UNBLESSED) (`0`) is the sentinel a process in *no* blessed
+/// [`UNBLESSED`](ClassId::UNBLESSED) (`0`) is the sentinel that a process in no blessed
 /// cgroup resolves to. The compiler never assigns it to a named class, so no concrete
-/// `blessing` predicate ever equals it — an unblessed caller matches only blessing-wildcard
-/// rules ([`SubjectFlags::BLESSING_ANY`]).
+/// `blessing` predicate equals it. An unblessed caller therefore matches only the rules
+/// that wildcard the blessing ([`SubjectFlags::BLESSING_ANY`]).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ClassId(pub u32);
 
 impl ClassId {
-    /// The "not in any blessed cgroup" sentinel (`0`): what a cgroup with no `BLESSED`
-    /// entry resolves to. See [`ClassId`].
+    /// The sentinel `0` that a cgroup with no `BLESSED` entry resolves to (see
+    /// [`ClassId`]).
     pub const UNBLESSED: ClassId = ClassId(0);
 }
 
-/// The raw class id, for the journal's `blessing=` field. The daemon resolves it back to
-/// the class name. `no_std`.
+/// Writes the raw class id for the journal's `blessing=` field. The daemon resolves it back
+/// to the class name.
 impl core::fmt::Display for ClassId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
@@ -106,11 +112,11 @@ impl core::fmt::Display for ClassId {
 }
 
 padded_pod! {
-    /// A [`MAP_PROTECTED`] key: a protected object's inode identity within one bank. The
-    /// trailing `_pad` is **load-bearing**: `FileId` is 8-aligned, so [`Bank`] (a `u32`)
-    /// at offset 16 would leave 4 trailing *implicit* padding bytes in a hashed key (see
-    /// the `layout` module docs). `padded_pod!` makes the gap an explicit, always-zeroed
-    /// field, keeping the 24-byte key padding-free.
+    /// A [`MAP_PROTECTED`] key, which is a protected object's inode identity within one
+    /// bank. Its trailing `_pad` is load-bearing. `FileId` is 8-aligned, so a [`Bank`] (a
+    /// `u32`) at offset 16 would leave 4 bytes of implicit trailing padding in a hashed key
+    /// (see the `layout` module docs). `padded_pod!` turns that gap into an explicit field
+    /// that is always zeroed, so the 24-byte key has no padding.
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct BankedFile {
@@ -129,8 +135,8 @@ impl BankedFile {
     }
 }
 
-/// A [`MAP_RULE_COUNT`] key: an object id within one bank. `ObjId` + [`Bank`]
-/// (`u32 + u32`) is naturally padding-free.
+/// A [`MAP_RULE_COUNT`] key, which is an object id within one bank. `ObjId` and [`Bank`]
+/// are both `u32`, so the key has no padding.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BankedObj {
@@ -144,13 +150,14 @@ impl BankedObj {
     }
 }
 
-/// The flat index of bank `bank`, object `obj`'s rule `i` in the banked [`MAP_RULES`]
-/// array (sized `NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ`). The **one** definition
-/// both sides use — the kernel to scan, the loader to fill — so the stride can't
-/// desync. [`Bank::index`] masks the bank to `0`/`1` and `wrapping_*` keeps the math
-/// total, so valid inputs (`obj < MAX_OBJECTS`, `i < MAX_RULES_PER_OBJ`) stay in range
-/// (and `Array::get` bounds-checks regardless).
+/// Returns the flat index of rule `i` of object `obj` in bank `bank`, within the banked
+/// [`MAP_RULES`] array of `NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ` slots. The kernel
+/// scans with it and the loader fills with it, so the stride has one definition. Any bank
+/// value is masked to `0` or `1`, and valid inputs (`obj < MAX_OBJECTS`,
+/// `i < MAX_RULES_PER_OBJ`) stay in range.
 pub const fn rule_slot(bank: Bank, obj: ObjId, i: u32) -> u32 {
+    // `Bank::index` masks the bank, and wrapping arithmetic keeps the result defined for
+    // any input. `Array::get` bounds-checks the index regardless.
     (bank.index().wrapping_mul(MAX_OBJECTS as u32))
         .wrapping_add(obj.0)
         .wrapping_mul(MAX_RULES_PER_OBJ as u32)
@@ -158,19 +165,19 @@ pub const fn rule_slot(bank: Bank, obj: ObjId, i: u32) -> u32 {
 }
 
 bitflags! {
-    /// The set of actions a rule covers, as a bitset — one bit per LSM-mediated
-    /// operation (DESIGN §15.5). A rule carries a *mask* (not one action) so e.g.
-    /// `action = ["read","write"]` is a single [`CompiledRule`]; the kernel matches
-    /// when the requested action's bit is set (`intersects`). `READ`/`WRITE`/`CREATE`
-    /// are requested at `file_open`, `LINK`/`RENAME`/`UNLINK`/`RMDIR`/`MKDIR` at the
-    /// mutation hooks and `EXECUTE` at `bprm_check_security` (§15.5).
+    /// The set of actions that a rule covers, with one bit per LSM-mediated operation
+    /// (DESIGN §15.5). A rule carries a mask rather than one action, so
+    /// `action = ["read","write"]` compiles to a single [`CompiledRule`], and the kernel
+    /// matches when the mask intersects the requested actions. `file_open` requests
+    /// `READ`, `WRITE` and `CREATE`, the mutation hooks request `LINK`, `RENAME`, `UNLINK`,
+    /// `RMDIR` and `MKDIR`, and `bprm_check_security` requests `EXECUTE` (§15.5).
     ///
-    /// `#[repr(transparent)]` is load-bearing: it's read byte-for-byte out of the
-    /// `RULES` map inside [`CompiledRule`] (`repr(C)`), so the ABI must be exactly the
-    /// inner `u32`. bitflags' public type is `repr(Rust)` by default — this attribute
-    /// makes it transparent over the (also-transparent) internal `u32`, and bitflags
-    /// 2.x permits unknown bits, so every bit pattern is valid → the `aya::Pod` impl
-    /// below is sound.
+    /// `#[repr(transparent)]` is load-bearing. The type is read byte for byte out of the
+    /// `RULES` map inside [`CompiledRule`], which is `repr(C)`, so its ABI must be exactly
+    /// the inner `u32`. bitflags makes its public type `repr(Rust)` by default, and this
+    /// attribute makes it transparent over the internal `u32`, which is transparent too.
+    /// bitflags 2.x also permits unknown bits, so every bit pattern is valid and the
+    /// `aya::Pod` impl below is sound.
     #[repr(transparent)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct Action: u32 {
@@ -178,8 +185,9 @@ bitflags! {
         const WRITE   = 1 << 1;
         const CREATE  = 1 << 2;
         const EXECUTE = 1 << 3;
-        /// Compiles, but no hook requests it: a directory open requests `READ`, so a
-        /// `listdir`-only rule never matches and the read falls to default-deny.
+        /// An action that compiles but that no hook requests. A directory open requests
+        /// `READ`, so a rule that grants only `listdir` never matches, and the read falls
+        /// to default-deny.
         const LISTDIR = 1 << 4;
         const UNLINK  = 1 << 5;
         const MKDIR   = 1 << 6;
@@ -189,8 +197,8 @@ bitflags! {
     }
 }
 
-/// The canonical human form: `read|write|create|…` (or `none`). The lower-case names
-/// match the policy authoring vocabulary. `no_std`: `core::fmt`, no allocation.
+/// Writes the actions as `read|write|create|…`, or `none` for the empty set. The lower-case
+/// names match the policy authoring vocabulary.
 impl core::fmt::Display for Action {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         const NAMED: [(Action, &str); 10] = [
@@ -222,50 +230,51 @@ impl core::fmt::Display for Action {
     }
 }
 
-/// A rule's effect = `{allow, deny} × {log, silent}` (DESIGN §15.2). This per-rule
-/// policy is the *only* enforcement level — there is no global mode (§15.6): the kernel
-/// blocks iff [`denies`](Policy::denies), so `audit` observes an object and `deny`
-/// enforces it, per object.
+/// A rule's effect, one of `{allow, deny} × {log, silent}` (DESIGN §15.2). This per-rule
+/// policy is the only enforcement level, and there is no global mode (§15.6). The kernel
+/// blocks exactly when the policy [`denies`](Policy::denies), so `audit` observes an object
+/// and `deny` enforces it, per object.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Policy(pub u8);
 
 impl Policy {
-    /// Allow, don't log.
+    /// The effect that allows the access without logging it.
     pub const ALLOW: Policy = Policy(0);
-    /// Allow, but log the access (preview a would-be rule's reach).
+    /// The effect that allows the access and logs it, to preview a would-be rule's reach.
     pub const AUDIT: Policy = Policy(1);
-    /// Deny, and log it.
+    /// The effect that denies the access and logs it.
     pub const DENY: Policy = Policy(2);
-    /// Deny, silently (no learn record).
+    /// The effect that denies the access silently, with no learn record.
     pub const SILENCE: Policy = Policy(3);
-    /// Synthetic effect the kernel applies when **no rule matched** on a protected object
-    /// (the default-deny, DESIGN §15.6.3). Only a protected object can reach it: a path
-    /// under no object is allowed, and `where = "*"` is rejected at resolve, so the
-    /// filesystem as a whole is never default-denied. Never authored or stored in a
-    /// [`CompiledRule`] — it exists only as the *cause* carried on a
-    /// [`crate::DecisionEvent`], so the journal can tell a default-deny ("you have no rule
-    /// for this") apart from an explicit `deny` rule ("you chose to block this"). Blocks +
-    /// logs exactly like [`DENY`](Policy::DENY).
+    /// The synthetic effect that the kernel applies when no rule matched on a protected
+    /// object (the default-deny, DESIGN §15.6.3). Only a protected object can reach it. A
+    /// path under no object is allowed, and `where = "*"` is rejected at resolve, so the
+    /// filesystem as a whole is never default-denied. It is never authored or stored in a
+    /// [`CompiledRule`]. It exists only as the cause carried on a [`crate::DecisionEvent`],
+    /// so the journal can tell a default-deny ("you have no rule for this") apart from an
+    /// explicit `deny` rule ("you chose to block this"). It blocks and logs exactly like
+    /// [`DENY`](Policy::DENY).
     pub const DEFAULT_DENY: Policy = Policy(4);
-    /// Synthetic effect the kernel applies when a protected inode would acquire a name
-    /// **outside its object** — a hardlink or rename out (DESIGN §15.5). Like
-    /// [`DEFAULT_DENY`](Policy::DEFAULT_DENY) it is never authored or stored in a
-    /// [`CompiledRule`]; unlike every other cause it comes from no rule *at all*, because
-    /// the escape is refused unconditionally (see the program's `decide_reparent`). A
-    /// distinct cause so the journal reads "this was structurally refused", not "a rule of
-    /// yours blocked it" — the two want very different fixes.
+    /// The synthetic effect that the kernel applies when a protected inode would acquire a
+    /// name outside its object, through a hardlink or a rename out (DESIGN §15.5). Like
+    /// [`DEFAULT_DENY`](Policy::DEFAULT_DENY), it is never authored or stored in a
+    /// [`CompiledRule`]. Unlike every other cause, it comes from no rule at all, because
+    /// the escape is refused unconditionally (see the program's `decide_reparent`). It is a
+    /// distinct cause so that the journal reads "this was structurally refused" rather than
+    /// "a rule of yours blocked it", since the two need very different fixes.
     pub const ESCAPE_DENY: Policy = Policy(5);
 
-    /// Whether this policy blocks the access (the `deny` half of `{allow,deny}×{log,silent}`).
+    /// Checks whether this policy blocks the access, which is the `deny` half of
+    /// `{allow,deny}×{log,silent}`.
     pub const fn denies(self) -> bool {
         matches!(
             self,
             Policy::DENY | Policy::SILENCE | Policy::DEFAULT_DENY | Policy::ESCAPE_DENY
         )
     }
-    /// Whether a decision under this policy emits a record (the `log` half) rather than
-    /// staying silent.
+    /// Checks whether a decision under this policy emits a record, which is the `log` half,
+    /// rather than staying silent.
     pub const fn logs(self) -> bool {
         matches!(
             self,
@@ -274,9 +283,9 @@ impl Policy {
     }
 }
 
-/// The canonical human form (`allow`/`audit`/`deny`/`silence`/`default-deny`/
-/// `escape-deny`): the policy authoring vocabulary plus the two synthetic deny causes.
-/// `no_std`: `core::fmt`.
+/// Writes the policy's name. The names are `allow`, `audit`, `deny` and `silence` from the
+/// authoring vocabulary, `default-deny` and `escape-deny` for the two synthetic causes, and
+/// `unknown` for any other value.
 impl core::fmt::Display for Policy {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match *self {
@@ -292,57 +301,61 @@ impl core::fmt::Display for Policy {
 }
 
 bitflags! {
-    /// Which subject predicates are **wildcards** — a set bit means "match any, skip the
-    /// compare." `who = "*"` sets all of them; a concrete predicate *clears* its bit. The
-    /// kernel ANDs only the non-wildcard predicates (DESIGN §15.4 + the §16.3 `blessing`),
-    /// and the compiler counts the *cleared* bits as the rule's subject specificity
-    /// (`subject_specificity`, §15.6), so a 5th predicate bit extends both for free.
+    /// The subject predicates that are wildcards. A set bit means "match any caller and
+    /// skip the compare". `who = "*"` sets every bit, and a concrete predicate clears its
+    /// own bit. The kernel ANDs only the predicates that are not wildcards (DESIGN §15.4
+    /// and the §16.3 `blessing`). The compiler counts the cleared bits as the rule's
+    /// subject specificity (`subject_specificity`, §15.6), so a fifth predicate bit extends
+    /// both for free.
     ///
-    /// `#[repr(transparent)]` over `u32` (same rationale as [`Action`]): it's read
-    /// byte-for-byte out of `RULES` inside [`CompiledRule`], and bitflags 2.x admits unknown
-    /// bits so every pattern is valid → the `aya::Pod` impl below is sound.
+    /// It is `#[repr(transparent)]` over `u32` for the same reason as [`Action`]. It is
+    /// read byte for byte out of `RULES` inside [`CompiledRule`], and bitflags 2.x admits
+    /// unknown bits, so every pattern is valid and the `aya::Pod` impl below is sound.
     #[repr(transparent)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct SubjectFlags: u32 {
         /// `exe` is a wildcard.
         const EXE_ANY      = 1 << 0;
-        /// `uid` is a wildcard (always set: the predicate is reserved).
+        /// `uid` is a wildcard. It is always set, because the predicate is reserved.
         const UID_ANY      = 1 << 1;
-        /// `cgroup` is a wildcard (always set: the predicate is reserved).
+        /// `cgroup` is a wildcard. It is always set, because the predicate is reserved.
         const CGROUP_ANY   = 1 << 2;
-        /// `blessing` is a wildcard (cleared only by a rule naming a blessing class).
+        /// `blessing` is a wildcard. Only a rule that names a blessing class clears it.
         const BLESSING_ANY = 1 << 3;
     }
 }
 
 padded_pod! {
-    /// A subject predicate: a conjunction of cheap-to-check fields the kernel ANDs
-    /// against the caller (DESIGN §15.4 + the §16.3 `blessing` predicate).
-    /// [`flags`](Self::flags) ([`SubjectFlags`]) marks which fields are wildcards. The
-    /// compiler fills `exe` and `blessing`; `uid` and `cgroup` are reserved and always
-    /// wildcard. It is a map *value* (it rides inside [`CompiledRule`]), so its `_pad` is
-    /// for initialization soundness, not key hashing — see the `layout` module docs.
+    /// A subject predicate, which is a conjunction of cheap checks that the kernel ANDs
+    /// against the caller (DESIGN §15.4 and the §16.3 `blessing` predicate). The compiler
+    /// fills `exe` and `blessing`, while `uid` and `cgroup` are reserved and always
+    /// wildcard. It rides inside [`CompiledRule`] as part of a map value, so its `_pad` is
+    /// there for initialization soundness rather than key hashing (see the `layout` module
+    /// docs).
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct SubjectMatch {
-        /// The caller's executable identity `(dev,ino)`. Compared unless [`SubjectFlags::EXE_ANY`].
+        /// The identity `(dev,ino)` of the caller's executable. It is compared unless
+        /// [`SubjectFlags::EXE_ANY`] is set.
         pub exe: FileId,
-        /// The caller's cgroup id. Reserved: [`SubjectFlags::CGROUP_ANY`] is always set.
+        /// The caller's cgroup id. It is reserved, and [`SubjectFlags::CGROUP_ANY`] is
+        /// always set.
         pub cgroup: CgroupId,
-        /// The caller's uid. Reserved: [`SubjectFlags::UID_ANY`] is always set.
+        /// The caller's uid. It is reserved, and [`SubjectFlags::UID_ANY`] is always set.
         pub uid: Uid,
-        /// The blessing class this rule requires (DESIGN §16.3). Compared against the caller's
-        /// resolved class (`BLESSED[cgroup]`, or [`ClassId::UNBLESSED`]) unless
-        /// [`SubjectFlags::BLESSING_ANY`].
+        /// The blessing class that this rule requires (DESIGN §16.3). It is compared
+        /// against the caller's resolved class, `BLESSED[cgroup]` or
+        /// [`ClassId::UNBLESSED`], unless [`SubjectFlags::BLESSING_ANY`] is set.
         pub blessing: ClassId,
-        /// Which predicates are wildcards (skip the compare).
+        /// The predicates that the kernel does not compare, because they are wildcards.
         pub flags: SubjectFlags,
     }
 }
 
 impl SubjectMatch {
-    /// Matches any caller (`who = "*"`): every predicate is a wildcard — including
-    /// `blessing`, so a `*` catch-all matches blessed and unblessed callers alike.
+    /// The subject that matches any caller (`who = "*"`). Every predicate is a wildcard,
+    /// including `blessing`, so a `*` catch-all matches blessed and unblessed callers
+    /// alike.
     pub const ANY: SubjectMatch = SubjectMatch {
         exe: FileId::new(Dev(0), Ino(0)),
         cgroup: CgroupId(0),
@@ -352,29 +365,30 @@ impl SubjectMatch {
         _pad: [0; Self::PAD],
     };
 
-    /// A subject that matches exactly one executable (by `(dev,ino)`), any uid/cgroup/blessing.
+    /// Returns a subject that matches exactly one executable, by `(dev,ino)`, with any uid,
+    /// cgroup or blessing.
     pub const fn exe(exe: FileId) -> SubjectMatch {
         SubjectMatch {
             exe,
             cgroup: CgroupId(0),
             uid: Uid(0),
             blessing: ClassId::UNBLESSED,
-            // Everything wildcard except the concrete `exe`.
+            // Every predicate is a wildcard except the concrete `exe`.
             flags: SubjectFlags::all().difference(SubjectFlags::EXE_ANY),
             _pad: [0; Self::PAD],
         }
     }
 
-    /// A subject that matches any caller in blessing class `class` (DESIGN §16.3) — the
-    /// `@blessed-*` predicate: exe/uid/cgroup wildcard, `blessing` concrete. Composes with
-    /// [`exe`](Self::exe) under conjunction in the compiler.
+    /// Returns a subject that matches any caller in blessing class `class` (DESIGN §16.3),
+    /// which is the `@blessed-*` predicate. The exe, uid and cgroup are wildcards. The
+    /// compiler combines it with [`exe`](Self::exe) by conjunction.
     pub const fn blessed(class: ClassId) -> SubjectMatch {
         SubjectMatch {
             exe: FileId::new(Dev(0), Ino(0)),
             cgroup: CgroupId(0),
             uid: Uid(0),
             blessing: class,
-            // Everything wildcard except the concrete `blessing`.
+            // Every predicate is a wildcard except the concrete `blessing`.
             flags: SubjectFlags::all().difference(SubjectFlags::BLESSING_ANY),
             _pad: [0; Self::PAD],
         }
@@ -382,12 +396,10 @@ impl SubjectMatch {
 }
 
 padded_pod! {
-    /// One pre-resolved rule in an object's bucket: a subject predicate, the actions it
-    /// covers, and the effect. The compiler sorts each bucket into first-match order
-    /// (`cordon_core`'s `sort_bucket`), so the kernel applies the **first** rule whose
-    /// action and subject match. The `padded_pod!` `_pad` keeps the layout deterministic
-    /// (no uninitialized bytes) when the loader memcpys these into the packed
-    /// [`MAP_RULES`] array.
+    /// One pre-resolved rule in an object's bucket. The compiler sorts each bucket into
+    /// first-match order (`cordon_core`'s `sort_bucket`), so the kernel applies the first
+    /// rule whose action and subject match. Its `padded_pod!` `_pad` leaves no byte
+    /// uninitialized when the loader copies rules into the packed [`MAP_RULES`] array.
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct CompiledRule {
@@ -408,16 +420,16 @@ impl CompiledRule {
     }
 }
 
-// ---- userspace-only: mark the POD types usable as aya map keys/values -----
+// ---- userspace only, so the POD types can be aya map keys and values -------
 
 #[cfg(feature = "user")]
 mod user {
     use super::*;
 
-    // SAFETY: each is `repr(transparent)`/`repr(C)` over POD integer fields, so every
-    // bit pattern is valid and the type is `Copy` with a fixed layout — aya's `Pod`
-    // contract. (`Policy`/`Action` accept out-of-range discriminants in memory; that's a
-    // memory-safety statement, not a claim every value is semantically meaningful.)
+    // SAFETY: each type is `repr(transparent)` or `repr(C)` over POD integer fields, so
+    // every bit pattern is valid, and each is `Copy` with a fixed layout. That is aya's
+    // `Pod` contract. `Policy` and `Action` accept out-of-range values in memory, which is
+    // a statement about memory safety, not a claim that every value means something.
     unsafe impl aya::Pod for ObjId {}
     unsafe impl aya::Pod for ClassId {}
     unsafe impl aya::Pod for BankedFile {}
@@ -473,7 +485,8 @@ mod tests {
         assert_eq!(s.exe, FileId::new(Dev(7), Ino(9)));
         assert_eq!(s.blessing, ClassId::UNBLESSED);
 
-        // A blessing rule clears BLESSING_ANY and names a concrete class, exe stays wildcard.
+        // A blessing rule clears BLESSING_ANY and names a concrete class, exe stays
+        // wildcard.
         let b = SubjectMatch::blessed(ClassId(3));
         assert!(b.flags.contains(SubjectFlags::EXE_ANY));
         assert!(!b.flags.contains(SubjectFlags::BLESSING_ANY));
@@ -486,7 +499,8 @@ mod tests {
         // 4 (pad) = 40, 8-aligned, no implicit padding.
         assert_eq!(core::mem::size_of::<SubjectMatch>(), 40);
         assert_eq!(core::mem::align_of::<SubjectMatch>(), 8);
-        // CompiledRule: 40 (SubjectMatch) + 4 (Action) + 1 (Policy) + 3 (pad) = 48, 8-aligned.
+        // CompiledRule: 40 (SubjectMatch) + 4 (Action) + 1 (Policy) + 3 (pad) = 48,
+        // 8-aligned.
         assert_eq!(core::mem::size_of::<CompiledRule>(), 48);
         assert_eq!(core::mem::align_of::<CompiledRule>(), 8);
     }
