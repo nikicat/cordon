@@ -4,24 +4,13 @@
 //! `unsafe` surface is those two one-line calls. The hooks they register are ordinary safe
 //! code, bound with `let` first so that each `unsafe` block covers only the registration.
 
-use cordon_core::policy::UserName;
 use cordon_core::proto::CarrierProcs;
-use nix::unistd::{Gid, Uid, User};
+use nix::unistd::{Gid, Uid};
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-/// Returns the login name and home directory of `uid` from the passwd database, or `None`
-/// if the uid isn't in passwd or has no home set.
-pub fn user_identity(uid: Uid) -> Option<(UserName, PathBuf)> {
-    let user = User::from_uid(uid).ok().flatten()?;
-    if user.dir.as_os_str().is_empty() {
-        return None;
-    }
-    Some((UserName::new(user.name), user.dir))
-}
 
 /// Changes the owner of `path` to `uid:gid`, following symlinks. It is safe only on a path
 /// that nobody else can swap, such as the root-created temp directory in the sticky
@@ -99,15 +88,6 @@ pub(crate) fn format_u32(mut n: u32, buf: &mut [u8; U32_DECIMAL_MAX]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Checks that the passwd lookup resolves the test runner's own uid, which needs no
-    /// root. The editor's `$HOME` and `$USER` come from this lookup.
-    #[test]
-    fn user_identity_resolves_current_user() {
-        let (name, home) = user_identity(Uid::current()).expect("current uid is in passwd");
-        assert!(!name.as_str().is_empty());
-        assert!(home.is_absolute(), "home should be absolute, got {home:?}");
-    }
 
     /// Checks that the formatter writes exact digits with no leading zeros, at both
     /// extremes too.

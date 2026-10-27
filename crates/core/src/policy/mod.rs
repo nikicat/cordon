@@ -300,10 +300,9 @@ impl From<UserName> for String {
 impl std::str::FromStr for UserName {
     type Err = crate::Error;
     /// Parses a candidate login name. Errors when it is empty or holds `/`, `:`, a newline
-    /// or NUL. The name becomes a file name (`users/<name>.toml`) and is matched against
-    /// passwd fields, so a `/` could escape `users/` and an empty name could match a
-    /// malformed passwd line. Whether the account exists is checked later against
-    /// `/etc/passwd`, through [`home_for`].
+    /// or NUL. The name becomes a file name (`users/<name>.toml`), so a `/` could escape
+    /// `users/`, and `:` or a newline cannot appear in an account name. Whether the
+    /// account exists is checked later, through [`home_for`].
     fn from_str(s: &str) -> Result<UserName> {
         if s.is_empty() || s.contains(['/', ':', '\n', '\0']) {
             return Err(crate::Error::msg(format!("invalid user name {s:?}")));
@@ -422,19 +421,15 @@ pub fn fallback_home() -> PathBuf {
 }
 
 /// Returns the home directory that `~` expands to in a policy. That is the home of the
-/// account that `user` names, looked up in `/etc/passwd`, or `fallback` when the policy
-/// names no user. Errors when the named account has no `/etc/passwd` entry, so that a
-/// missing user does not silently fall through to the wrong home.
+/// account that `user` names, looked up through NSS, or `fallback` when the policy names
+/// no user. Errors when the named account does not exist, so that a missing user does not
+/// silently fall through to the wrong home.
 pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
     let Some(user) = user else {
         return Ok(fallback.to_path_buf());
     };
-    crate::passwd::home_of(user)?.ok_or_else(|| {
-        crate::Error::msg(format!(
-            "policy user {:?} not found in /etc/passwd",
-            user.as_str()
-        ))
-    })
+    crate::passwd::home_of(user)?
+        .ok_or_else(|| crate::Error::msg(format!("policy user {:?} has no account", user.as_str())))
 }
 
 /// The tier that a [`PolicySource`] belongs to (DESIGN §15.8). The tier decides how `~`

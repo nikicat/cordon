@@ -22,6 +22,7 @@
 //! drops privilege. There is no new IPC. The read is a direct file read, validation is the
 //! in-process compiler that `policy check` also runs, and the commit reuses `PolicyApply`.
 
+use cordon_core::passwd::Account;
 use cordon_core::policy::{
     self, Diagnostic, Include, PolicyRoot, PolicySource, SourceOrigin, UserName,
 };
@@ -245,12 +246,16 @@ impl EditTargetArgs {
 }
 
 /// Returns the login name of the account whose tier a bare `cordon policy edit` opens.
-/// Errors as [`invoker_uid`] does, and when that uid has no passwd entry.
+/// Errors as [`invoker_uid`] does, and when that uid has no account.
 fn invoking_user() -> Result<UserName> {
     let uid = invoker_uid(Uid::from_raw(config::euid()), SudoInvoker::from_env)?;
-    let (name, _home) = sys::user_identity(uid)
-        .ok_or_else(|| Error::msg(format!("uid {uid} has no passwd entry")))?;
-    Ok(name)
+    Ok(account_of(uid)?.name)
+}
+
+/// Returns the account of `uid`. Errors when it has none or the lookup fails.
+fn account_of(uid: Uid) -> Result<Account> {
+    Account::by_uid(cordon_core::Uid(uid.as_raw()))?
+        .ok_or_else(|| Error::msg(format!("uid {uid} has no account")))
 }
 
 /// Returns the uid whose tier a bare `cordon policy edit` opens. That is `euid` when it is
@@ -575,8 +580,10 @@ fn editor_identity(root_editor: RootEditor) -> Result<EditorAs> {
             )),
         };
     };
-    let (name, home) = sys::user_identity(uid)
-        .ok_or_else(|| Error::msg(format!("cannot resolve home directory for uid {uid}")))?;
+    let Account { name, home, .. } = account_of(uid)?;
+    if home.as_os_str().is_empty() {
+        return Err(Error::msg(format!("uid {uid} has no home directory")));
+    }
     Ok(EditorAs::User {
         uid,
         gid,

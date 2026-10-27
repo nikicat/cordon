@@ -24,7 +24,7 @@
 # cordon.example.policy.toml.
 #
 # For a root-owned policy that belongs to one user, name the user whose home `~` expands
-# to. The home is looked up in /etc/passwd, so you can write `~/.ssh` instead of
+# to. The home is the account's, as NSS reports it, so you can write `~/.ssh` instead of
 # `/home/<name>/.ssh`:
 #
 #     user = "alice"

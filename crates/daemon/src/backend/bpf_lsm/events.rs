@@ -82,8 +82,8 @@ pub(super) fn serve(
     .with_context(|| format!("bpf-lsm: {MAP_EVENTS}"))?;
     let mut maps = Maps(ebpf);
     let raw = ring.as_raw_fd();
-    // Names callers on the audit line. It reloads at most once per drain, and only when
-    // /etc/passwd has changed.
+    // Names callers on the audit line. NSS is asked once per uid, and the cache empties
+    // when /etc/passwd changes.
     let mut passwd = Passwd::new();
 
     // The ring poll's timeout doubles as the control tick. Every wakeup, by an event or by
@@ -106,11 +106,9 @@ pub(super) fn serve(
                         ),
                     }
                 }
-                // Refresh once per drain, which is cheap unless /etc/passwd changed, and
-                // name each record's caller from the cache.
                 passwd.refresh();
                 for record in coalesce(&batch) {
-                    record.log(&runtime.object_paths, &runtime.classes, &passwd);
+                    record.log(&runtime.object_paths, &runtime.classes, &mut passwd);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -244,7 +242,7 @@ impl Coalesced {
         &self,
         object_paths: &HashMap<FileId, PathBuf>,
         classes: &ClassRegistry,
-        passwd: &Passwd,
+        passwd: &mut Passwd,
     ) {
         // Every field is a typed value with its own `Display`, so `tracing` renders it
         // lazily, with no eager `String`s.
@@ -316,7 +314,7 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
 }
 
 /// The caller as the journal names it. That is the login name for the kernel-captured
-/// uid, or the bare uid when passwd has no entry (a deleted or NSS-only account). A
+/// uid, or the bare uid when it has no account, as for a deleted one. A
 /// regular account also carries the home that [`AuditPath`] collapses to `~`. It borrows
 /// the [`Passwd`] cache, so naming a caller costs no allocation.
 enum CallerUser<'a> {
@@ -328,7 +326,7 @@ enum CallerUser<'a> {
 }
 
 impl<'a> CallerUser<'a> {
-    fn resolve(uid: Uid, passwd: &'a Passwd) -> CallerUser<'a> {
+    fn resolve(uid: Uid, passwd: &'a mut Passwd) -> CallerUser<'a> {
         match passwd.lookup(uid) {
             Some(id) => CallerUser::Named {
                 name: id.name,

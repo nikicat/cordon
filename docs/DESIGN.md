@@ -1060,7 +1060,7 @@ group*. An example in TOML:
   syntax, and the kernel is unaffected. It is the natural form for the decision table that a
   policy actually is.
 - **Per-user `~` (✅ 2026-06-28).** An optional `user = "name"` header expands `~` against that
-  account's home, as `/etc/passwd` gives it. So a root-owned file for one user can write
+  account's home, as NSS reports it. So a root-owned file for one user can write
   `~/.ssh` rather than `/home/<name>/.ssh`. The daemon runs as root, so without the header `~`
   would mean `/root`.
 - **conf.d split (✅ 2026-06-28).** A policy path is either a single file or a directory of

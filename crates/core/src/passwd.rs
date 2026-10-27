@@ -1,7 +1,7 @@
-//! Reads user accounts from `/etc/passwd`, which is the one place cordon reads them. The
-//! journal names a caller by uid through the cached [`Passwd`], and the policy expands a
-//! user's `~` through [`home_of`]. Both go through the same parser, so the `~` that the
-//! journal renders is the same `~` that the user's policy expands to.
+//! Looks up user accounts through NSS, so an LDAP or sssd account resolves like a local
+//! one. The journal names a caller by uid through the cached [`Passwd`], and the policy
+//! expands a user's `~` through [`home_of`]. Both ask NSS, so the `~` that the journal
+//! renders is the same `~` that the user's policy expands to.
 
 use crate::Context;
 use crate::policy::UserName;
@@ -9,8 +9,6 @@ use cordon_bpf_common::Uid;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-const PASSWD: &str = "/etc/passwd";
 
 /// The conventional uid range of human login accounts, which matches the `UID_MIN` and
 /// `UID_MAX` defaults of `useradd` and `login.defs`. System accounts sit below it (`root`
@@ -26,6 +24,42 @@ pub fn is_regular_uid(uid: Uid) -> bool {
     REGULAR_UID_RANGE.contains(&uid)
 }
 
+/// One user account as NSS reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Account {
+    pub name: UserName,
+    pub uid: Uid,
+    pub home: PathBuf,
+}
+
+impl Account {
+    /// Returns the account of `uid`, or `None` when NSS has no such account. Errors when
+    /// the lookup itself fails.
+    pub fn by_uid(uid: Uid) -> crate::Result<Option<Account>> {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid.0))
+            .with_context(|| format!("look up uid {uid}"))?;
+        Ok(user.map(Account::from))
+    }
+
+    /// Returns the account named `name`, or `None` when NSS has no such account. Errors
+    /// when the lookup itself fails.
+    pub fn by_name(name: &UserName) -> crate::Result<Option<Account>> {
+        let user = nix::unistd::User::from_name(name.as_str())
+            .with_context(|| format!("look up user {name}"))?;
+        Ok(user.map(Account::from))
+    }
+}
+
+impl From<nix::unistd::User> for Account {
+    fn from(user: nix::unistd::User) -> Account {
+        Account {
+            name: UserName::new(user.name),
+            uid: Uid(user.uid.as_raw()),
+            home: user.dir,
+        }
+    }
+}
+
 /// A caller resolved for the audit line. It borrows from the [`Passwd`] cache, so naming a
 /// caller costs no allocation.
 pub struct Identity<'a> {
@@ -34,115 +68,106 @@ pub struct Identity<'a> {
     pub home: Option<&'a Path>,
 }
 
-/// A cache of `/etc/passwd` keyed by uid, kept for the daemon's life so that naming a
-/// caller does not reread the file. [`refresh`](Passwd::refresh) keeps it current.
+/// A cache of NSS accounts by uid, kept for the daemon's life so that naming a caller does
+/// not ask NSS on every journal line. A miss is cached too.
+// ponytail: an account changed only in a network directory (LDAP, sssd) is seen after the
+// next /etc/passwd change or a daemon restart. Add a TTL if renames there matter.
 #[derive(Default)]
 pub struct Passwd {
-    by_uid: HashMap<Uid, Entry>,
+    by_uid: HashMap<Uid, Option<Account>>,
     mtime: Option<SystemTime>,
 }
 
 impl Passwd {
-    /// Creates an empty cache. The first [`refresh`](Passwd::refresh) fills it.
+    /// Creates an empty cache. Each uid is looked up on first use.
     pub fn new() -> Passwd {
         Passwd::default()
     }
 
-    /// Reloads the cache from `/etc/passwd` when the cache is empty or the file's mtime
-    /// changed since the last load. A failed read keeps the previous entries, so that a
-    /// transient error heals on the next call instead of emptying the cache.
+    /// Empties the cache when `/etc/passwd` changed since the last call, so a local
+    /// account change shows on the next journal line.
     pub fn refresh(&mut self) {
-        let mtime = std::fs::metadata(PASSWD).and_then(|m| m.modified()).ok();
-        if mtime == self.mtime && !self.by_uid.is_empty() {
-            return;
-        }
-        if let Ok(text) = std::fs::read_to_string(PASSWD) {
-            self.by_uid = entries(&text).map(|e| (e.uid, e)).collect();
+        let mtime = std::fs::metadata("/etc/passwd")
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime != self.mtime {
+            self.by_uid.clear();
             self.mtime = mtime;
         }
     }
 
-    /// Returns the [`Identity`] of `uid` from the entries that
-    /// [`refresh`](Passwd::refresh) last loaded, without any I/O. Returns `None` when `uid`
-    /// has no passwd entry, as for a deleted or NSS-only account.
-    pub fn lookup(&self, uid: Uid) -> Option<Identity<'_>> {
-        let entry = self.by_uid.get(&uid)?;
+    /// Returns the [`Identity`] of `uid`, asking NSS only on the first lookup of that uid
+    /// since the last [`refresh`](Passwd::refresh) that emptied the cache. Returns `None`
+    /// when `uid` has no account or the lookup failed.
+    pub fn lookup(&mut self, uid: Uid) -> Option<Identity<'_>> {
+        let account = self
+            .by_uid
+            .entry(uid)
+            .or_insert_with(|| Account::by_uid(uid).ok().flatten())
+            .as_ref()?;
         Some(Identity {
-            name: &entry.name,
-            home: is_regular_uid(uid).then_some(entry.home.as_path()),
+            name: &account.name,
+            home: is_regular_uid(uid).then_some(account.home.as_path()),
         })
     }
 }
 
-/// Returns the home of the login `user`, or `None` when `/etc/passwd` has no entry for
-/// it. Errors when `/etc/passwd` can't be read.
+/// Returns the home of the login `user`, or `None` when NSS has no such account. Errors
+/// when the lookup fails.
 pub fn home_of(user: &UserName) -> crate::Result<Option<PathBuf>> {
-    let text = std::fs::read_to_string(PASSWD).with_context(|| format!("read {PASSWD}"))?;
-    Ok(home_in(&text, user))
-}
-
-fn home_in(passwd: &str, user: &UserName) -> Option<PathBuf> {
-    entries(passwd).find(|e| e.name == *user).map(|e| e.home)
-}
-
-/// The fields of one passwd line that cordon reads.
-struct Entry {
-    name: UserName,
-    uid: Uid,
-    home: PathBuf,
-}
-
-/// Returns the entries of the passwd text `passwd`, skipping any malformed line.
-fn entries(passwd: &str) -> impl Iterator<Item = Entry> + '_ {
-    passwd.lines().filter_map(|line| {
-        // name(0):passwd(1):uid(2):gid(3):gecos(4):home(5):shell(6).
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        let uid = fields.nth(1)?.parse().ok()?; // skip passwd(1), take uid(2)
-        let home = fields.nth(2)?; // skip gid(3), gecos(4), take home(5)
-        Some(Entry {
-            name: UserName::new(name),
-            uid: Uid(uid),
-            home: PathBuf::from(home),
-        })
-    })
+    Ok(Account::by_name(user)?.map(|a| a.home))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "root:x:0:0:root:/root:/bin/bash\n\
-                          alice:x:1000:1000:Alice,,,:/home/alice:/usr/bin/fish\n";
-
-    /// Returns a cache filled from the passwd text `passwd`, without reading a file.
-    fn db(passwd: &str) -> Passwd {
-        Passwd {
-            by_uid: entries(passwd).map(|e| (e.uid, e)).collect(),
-            mtime: None,
-        }
-    }
-
+    /// Checks both lookups against the account running the tests, which NSS always knows,
+    /// and that they agree with each other.
     #[test]
-    fn home_in_finds_a_login_by_name() {
-        let home = |name| home_in(SAMPLE, &UserName::new(name));
-        assert_eq!(home("alice"), Some("/home/alice".into()));
-        assert_eq!(home("root"), Some("/root".into()));
-        assert_eq!(home("ghost"), None);
+    fn looks_up_the_current_account_both_ways() {
+        let uid = Uid(nix::unistd::getuid().as_raw());
+        let me = Account::by_uid(uid)
+            .unwrap()
+            .expect("the test user has an account");
+        assert_eq!(me.uid, uid);
+        assert_eq!(Account::by_name(&me.name).unwrap(), Some(me.clone()));
+        assert_eq!(home_of(&me.name).unwrap(), Some(me.home));
+        assert_eq!(
+            home_of(&UserName::new("cordon-no-such-user")).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn lookup_names_caller_and_gates_home_on_regular() {
-        let p = db(SAMPLE);
-        // alice is regular → home present for the `~` collapse.
-        let alice = p.lookup(Uid(1000)).unwrap();
-        assert_eq!(alice.name.as_str(), "alice");
-        assert_eq!(alice.home, Some(Path::new("/home/alice")));
-        // root resolves its name but is not regular → no home, so its paths stay absolute.
-        let root = p.lookup(Uid::ROOT).unwrap();
-        assert_eq!(root.name.as_str(), "root");
-        assert_eq!(root.home, None);
-        // A uid with no passwd line → None (the caller shows the bare number).
+        let alice = Account {
+            name: UserName::new("alice"),
+            uid: Uid(1000),
+            home: PathBuf::from("/home/alice"),
+        };
+        let root = Account {
+            name: UserName::new("root"),
+            uid: Uid::ROOT,
+            home: PathBuf::from("/root"),
+        };
+        let mut p = Passwd {
+            by_uid: HashMap::from([
+                (alice.uid, Some(alice)),
+                (root.uid, Some(root)),
+                (Uid(4242), None),
+            ]),
+            mtime: None,
+        };
+        // alice is regular, so her home is present for the `~` collapse.
+        let id = p.lookup(Uid(1000)).unwrap();
+        assert_eq!(id.name.as_str(), "alice");
+        assert_eq!(id.home, Some(Path::new("/home/alice")));
+        // root resolves its name but is not regular, so its paths stay absolute.
+        let id = p.lookup(Uid::ROOT).unwrap();
+        assert_eq!(id.name.as_str(), "root");
+        assert_eq!(id.home, None);
+        // A cached miss stays a miss, and the caller shows the bare number.
         assert!(p.lookup(Uid(4242)).is_none());
     }
 
@@ -153,12 +178,5 @@ mod tests {
         assert!(is_regular_uid(Uid(1000))); // first human account
         assert!(is_regular_uid(Uid(60000))); // login.defs UID_MAX default
         assert!(!is_regular_uid(Uid(65534))); // nobody / overflow
-    }
-
-    #[test]
-    fn malformed_lines_are_dropped() {
-        // A non-numeric uid and a too-short line are skipped, not panicked on.
-        let p = db("garbage\nbob:x:notanumber:1:b:/home/bob:/bin/sh\n");
-        assert!(p.lookup(Uid(1)).is_none());
     }
 }

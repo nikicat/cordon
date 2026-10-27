@@ -11,7 +11,8 @@ rust-version.workspace = true
 # hand-off of a `CarrierProcs` (DESIGN §16.6). Both ends of the wire need them, so they
 # live in core rather than in a copy in each of daemon and cli. `uio` gates the
 # scatter-gather msghdr calls, and `socket` alone stops at getsockopt and setsockopt.
-nix = { version = "0.31.3", features = ["socket", "uio"] }
+# `user` is the NSS account lookup behind `passwd`.
+nix = { version = "0.31.3", features = ["socket", "uio", "user"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -20,7 +21,7 @@ tempfile = { workspace = true }
 # `fs` adds `fcntl`, which is used only to assert that the received descriptor is
 # close-on-exec. That security property would otherwise fail silently. The feature is
 # test-only, so the shipped binary pulls in no more than it needs.
-nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
+nix = { version = "0.31.3", features = ["socket", "uio", "user", "fs"] }
 
 [dependencies]
 serde = { workspace = true }
