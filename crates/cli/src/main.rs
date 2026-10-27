@@ -49,7 +49,7 @@ enum Cmd {
     /// that it spawns.
     Bless(bless::BlessArgs),
     /// Approve a pending blessing. Only `cordon bless` runs this, through its elevation
-    /// (see `bless::elevate`).
+    /// (see `bless::Elevation::approve`).
     #[command(hide = true)]
     BlessHelper {
         #[arg(long)]
@@ -125,7 +125,7 @@ fn main() -> ExitCode {
         return bless::run(args, &client);
     }
 
-    // `bless-helper` is the approval half of the bless handshake (see `bless::elevate`).
+    // `bless-helper` is the approval half of the bless handshake (see `bless::Elevation::approve`).
     if let Cmd::BlessHelper { nonce } = &cli.cmd {
         return client.run_request(&Request::BlessApprove {
             nonce: nonce.clone(),
@@ -297,7 +297,8 @@ fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let compiled = policy::compile_fragments(&sources, &home(), policy::stat_resolver);
+    let compiled =
+        policy::compile_fragments(&sources, &policy::fallback_home(), policy::stat_resolver);
     for d in &compiled.diagnostics {
         eprintln!("{}:{d}", path.display());
     }
@@ -342,7 +343,7 @@ fn render(resp: &Response) {
                 if *applied {
                     "applied"
                 } else {
-                    "not applied (policy has errors; live policy unchanged)"
+                    "not applied (see the errors above; live policy unchanged)"
                 }
             );
         }
@@ -401,13 +402,6 @@ fn exit_for(resp: &Response) -> ExitCode {
         | Response::BlessMinted(_) => ExitCode::FAILURE,
         _ => ExitCode::SUCCESS,
     }
-}
-
-/// Returns `$HOME`, or `/` when it is unset, for expanding `~` in a policy.
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn round_trip(socket: &Path, req: &Request) -> Result<Response> {

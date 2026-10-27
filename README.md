@@ -171,7 +171,7 @@ mistaken for "not enforcing".
 |---|---|
 | Kernel | `CONFIG_BPF_LSM=y`, and `bpf` in the active LSM list (`lsm=…,bpf` on the kernel command line). Kernel 5.7 or later should work in principle, but CI pins v6.12, and that is the version actually tested. |
 | Privileges | root with `CAP_BPF` and `CAP_MAC_ADMIN` (the packaged unit runs as root) |
-| Build | stable Rust for the workspace, a pinned nightly and [`bpf-linker`](https://github.com/aya-rs/bpf-linker) for the eBPF object, and [`just`](https://just.systems) |
+| Build | stable Rust for the workspace, a pinned nightly and [`bpf-linker`](https://github.com/aya-rs/bpf-linker) for the eBPF object (the justfile fetches the pinned release), and [`just`](https://just.systems) |
 | VM tests | `/dev/kvm`, `qemu` and [`virtme-ng`](https://github.com/arighi/virtme-ng). No host root is needed. |
 
 ```sh
@@ -193,7 +193,7 @@ precedence, audit to deny, silence, blessing and runtime `policy apply`. It uses
 userspace read-only and needs no host root:
 
 ```sh
-cargo install bpf-linker just
+cargo install just   # `just build-ebpf` fetches the pinned bpf-linker into target/tools
 packaging/test/run-bpf-lsm-vm.sh                          # pinned kernel v6.12, the same as CI
 CORDON_VM_KERNEL=host packaging/test/run-bpf-lsm-vm.sh    # host kernel, for fast iteration
 ```

@@ -189,7 +189,7 @@ impl BpfLsmBackend {
 /// when it has errors, and the caller decides by [`CompiledPolicy::has_errors`] whether to
 /// seed it.
 pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
-    let compiled = policy::compile_fragments(sources, &policy_home(), proc::file_id);
+    let compiled = policy::compile_fragments(sources, &policy::fallback_home(), proc::file_id);
     for d in &compiled.diagnostics {
         match d.severity {
             Severity::Error => error!("policy: {d}"),
@@ -219,15 +219,6 @@ pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
 /// the path-to-inode resolution done at seed time.
 pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
     c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
-}
-
-/// Returns the home that `~` expands against in a fragment with no `user =` header. It is
-/// the daemon's `$HOME`, or `/root` when that is unset, so a user-session dev daemon
-/// resolves its own home.
-fn policy_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
 /// Replaces the offsets of the fields read out of kernel memory with [`Offsets::POISON`]
@@ -413,9 +404,12 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     // came from `bprm_check_security` and not from the open.
     let executed = std::process::Command::new(&exec_path).status().map(drop);
 
-    // Clean up the probe entries. The real seed also clears them, but don't rely on it.
+    // Remove the probe entries. The first real seed fills bank 1 and leaves bank 0 alone, so
+    // nothing else clears them until a later seed flips back here.
     let _ = maps.protected_remove(bank, id);
     let _ = maps.rule_count_remove(bank, obj);
+    let _ = maps.protected_remove(bank, exec_id);
+    let _ = maps.rule_count_remove(bank, exec_obj);
     // Only exists if a hook let us through, i.e. if we are about to abort anyway.
     let _ = std::fs::remove_file(&outside);
 

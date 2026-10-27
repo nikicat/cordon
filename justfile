@@ -4,6 +4,12 @@
 # is a Linux-kernel facility. The planned macOS Endpoint Security backend is a separate
 # build path and will get its own `[macos]` recipes here.
 
+# The bpf-linker release that links the eBPF object, and the sha256 of its Linux x86_64
+# tarball. Every build of the object uses this one, CI included. Bump both together.
+bpf_linker_version := "v0.12.0"
+bpf_linker_sha256 := "6789717c8cb6a2a5d920f3b6bfac2bd7efc00f6228ecd149108a99699a75c679"
+bpf_linker_dir := justfile_directory() / "target/tools/bpf-linker-" + bpf_linker_version
+
 # List available recipes.
 default:
     @just --list
@@ -26,26 +32,48 @@ build:
 build:
     cargo build --workspace
 
-# Run the test suite and the lints that CI gates on.
+# Run the test suite and the lints that CI gates on, with the same flags as the `test`
+# job in .github/workflows/ci.yml.
 test:
-    cargo test --workspace
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo fmt --all --check
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo test --workspace --all-features
 
 # Build the eBPF object and stage it at target/bpf/cordon.bpf.o (Linux only).
 [linux]
-build-ebpf:
+build-ebpf: bpf-linker
     #!/usr/bin/env bash
     set -euo pipefail
-    # Prerequisites, declared rather than discovered:
-    #   - the pinned nightly and rust-src, from crates/bpf/rust-toolchain.toml (fetched
-    #     automatically)
-    #   - bpf-linker on PATH, from `cargo install bpf-linker`
+    # The pinned nightly and rust-src come from crates/bpf/rust-toolchain.toml, fetched
+    # automatically. rustc's BPF target runs `bpf-linker` from PATH, so the pinned one
+    # goes first.
+    export PATH="{{ bpf_linker_dir }}:$PATH"
     cd crates/bpf
     cargo build --release
     mkdir -p ../../target/bpf
     cp target/bpfel-unknown-none/release/cordon ../../target/bpf/cordon.bpf.o
     echo "staged eBPF object → target/bpf/cordon.bpf.o"
+
+# Fetch the pinned bpf-linker release into target/tools, unless it is there already. The
+# release binary links its own LLVM, so it needs no system LLVM. Only the Linux x86_64
+# tarball is pinned.
+[linux]
+bpf-linker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="{{ bpf_linker_dir }}"
+    [ -x "$dir/bpf-linker" ] && exit 0
+    [ "$(uname -m)" = x86_64 ] || { echo "bpf-linker: only the x86_64 release is pinned" >&2; exit 1; }
+    mkdir -p "{{ justfile_directory() }}/target/tools"
+    tmp=$(mktemp -d "{{ justfile_directory() }}/target/tools/.fetch.XXXXXX")
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fsSLo "$tmp/bpf-linker.tar.zst" \
+        "https://github.com/aya-rs/bpf-linker/releases/download/{{ bpf_linker_version }}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+    echo "{{ bpf_linker_sha256 }}  $tmp/bpf-linker.tar.zst" | sha256sum -c --quiet
+    tar -xpf "$tmp/bpf-linker.tar.zst" -C "$tmp"
+    mkdir -p "$dir"
+    mv "$tmp/bpf-linker" "$dir/bpf-linker"
+    "$dir/bpf-linker" --version
 
 # Install and activate the local dev unit. It is the packaged
 # packaging/systemd/cordond.service, unchanged, plus a `cordond.service.d/dev.conf` drop-in

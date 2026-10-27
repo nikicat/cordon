@@ -17,7 +17,9 @@ use cordon_bpf_common::{
 };
 use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
-use cordon_core::policy::{ClassName, ClassRegistry, CompiledPolicy, PolicySource, UserName};
+use cordon_core::policy::{
+    ClassName, ClassRegistry, CompiledPolicy, Diagnostic, Loc, PolicySource, UserName,
+};
 use cordon_core::{Context, Error, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::HashMap;
@@ -167,7 +169,7 @@ fn apply(
     sources: &[PolicySource],
     runtime: &mut Runtime,
 ) -> ApplyOutcome {
-    let compiled = super::compile_sources(sources);
+    let mut compiled = super::compile_sources(sources);
     let applied = if compiled.has_errors() {
         false
     } else {
@@ -182,6 +184,12 @@ fn apply(
             }
             Err(e) => {
                 error!(error = %e, "policy apply: seeding the maps failed; live policy unchanged");
+                // The policy itself compiled clean, so the requester needs this to say why
+                // nothing was applied.
+                compiled.diagnostics.push(Diagnostic::error(
+                    Loc::default(),
+                    format!("the daemon could not load the policy into the kernel: {e}"),
+                ));
                 false
             }
         }

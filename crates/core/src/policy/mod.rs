@@ -28,7 +28,7 @@ mod resolve;
 mod ruleline;
 
 pub use compile::{ClassRegistry, CompiledObject, CompiledPolicy, compile, stat_resolver};
-pub use parse::{ParsedPolicy, parse};
+pub use parse::{Include, ParsedPolicy, parse};
 pub use resolve::{ResolvedPolicy, ResolvedRule, SubjectSpec, resolve};
 
 use crate::{Context, Result};
@@ -136,7 +136,7 @@ impl Diagnostic {
             loc,
         }
     }
-    pub(crate) fn error(loc: Loc, msg: impl Into<String>) -> Diagnostic {
+    pub fn error(loc: Loc, msg: impl Into<String>) -> Diagnostic {
         Diagnostic {
             severity: Severity::Error,
             message: msg.into(),
@@ -359,10 +359,12 @@ impl fmt::Display for GroupName {
 /// up with the other strings of the policy layer, such as group names, paths and tokens.
 /// The compiler assigns each distinct name a dense [`cordon_bpf_common::ClassId`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct ClassName(String);
 
 impl ClassName {
+    /// Wraps `name` without the charset check. Input from a policy, a request or a
+    /// directory name goes through [`str::parse`] instead.
     pub fn new(name: impl Into<String>) -> ClassName {
         ClassName(name.into())
     }
@@ -372,11 +374,34 @@ impl ClassName {
     }
 }
 
+impl TryFrom<String> for ClassName {
+    type Error = crate::Error;
+    fn try_from(s: String) -> Result<ClassName> {
+        s.parse()
+    }
+}
+
+impl From<ClassName> for String {
+    fn from(name: ClassName) -> String {
+        name.0
+    }
+}
+
 impl std::str::FromStr for ClassName {
-    type Err = std::convert::Infallible;
-    /// Accepts any string as a candidate class name. Whether the policy declares it is
-    /// checked later against the compiled registry.
-    fn from_str(s: &str) -> std::result::Result<ClassName, Self::Err> {
+    type Err = crate::Error;
+    /// Parses a class name. Errors when it is empty or has a character outside
+    /// `[A-Za-z0-9_-]`. The daemon embeds the name in a carrier cgroup's directory name,
+    /// and that charset keeps the encoding unambiguous. Whether the policy declares the
+    /// class is checked later, against the compiled registry.
+    fn from_str(s: &str) -> Result<ClassName> {
+        let valid = !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid {
+            return Err(crate::Error::msg(format!(
+                "invalid blessing class {s:?}: use only letters, digits, `_` and `-`"
+            )));
+        }
         Ok(ClassName::new(s))
     }
 }
@@ -385,6 +410,15 @@ impl fmt::Display for ClassName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Returns the home that `~` expands to in a fragment with no `user =` header. It is
+/// `$HOME`, or `/root` when that is unset. The daemon and the CLI's local compile both use
+/// it, so they expand a fragment alike.
+pub fn fallback_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
 /// Returns the home directory that `~` expands to in a policy. That is the home of the
@@ -544,12 +578,12 @@ pub fn load_policy(path: &Path) -> Result<Vec<PolicySource>> {
                 Err(e) => {
                     return Err(crate::Error::msg(format!(
                         "read user policy {}: {e}",
-                        inc.path()
+                        inc.path().display()
                     )));
                 }
             };
             included.push(PolicySource {
-                name: inc.path().to_string(),
+                name: inc.path().display().to_string(),
                 text,
                 origin: SourceOrigin::User {
                     user: inc.user().clone(),
@@ -571,7 +605,7 @@ pub fn user_include_path(policy_root: &Path, user: &str) -> Result<Option<PathBu
         };
         for inc in parsed.includes() {
             if inc.user().as_str() == user {
-                return Ok(Some(PathBuf::from(inc.path())));
+                return Ok(Some(inc.path().to_path_buf()));
             }
         }
     }
@@ -690,6 +724,20 @@ pub(crate) fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A class name outside `[A-Za-z0-9_-]` is refused, both as an argument and in a
+    /// policy's `blessing =` predicate, so a bad name fails at compile rather than at mint.
+    #[test]
+    fn class_name_charset() {
+        for good in ["ro", "Aws_prod-2"] {
+            assert_eq!(good.parse::<ClassName>().unwrap().as_str(), good);
+        }
+        for bad in ["", "a.b", "a b", "a/b", "é"] {
+            assert!(bad.parse::<ClassName>().is_err(), "{bad:?} must be refused");
+        }
+        let policy = "[group.subject.x]\nblessing = \"a.b\"\n";
+        assert!(parse(policy).is_err());
+    }
 
     /// A name that could escape `users/` or match a malformed passwd line is refused, both
     /// from the command line and from a policy's `user =` header.

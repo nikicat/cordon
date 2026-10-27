@@ -136,7 +136,7 @@ impl std::str::FromStr for BlessId {
 pub enum Response {
     Status(StatusInfo),
     /// Answers `PolicyApply` with the compile diagnostics. When `applied` is false, the
-    /// policy had errors and the live policy is unchanged.
+    /// live policy is unchanged, and the diagnostics include an error that says why.
     PolicyApplied {
         applied: bool,
         diagnostics: Vec<Diagnostic>,

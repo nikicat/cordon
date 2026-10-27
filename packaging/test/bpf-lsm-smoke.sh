@@ -750,7 +750,8 @@ fake_sudo_start() {
     exec 9<>"$fifo"
     ( while IFS= read -r line; do [ -n "$line" ] && eval "$line" & done <"$fifo" ) &
     FAKE_SUDO_PID=$!
-    printf '#!/bin/sh\nprintf "%%s\\n" "$*" > %s\n' "$fifo" > "$TMP/fakesudo"
+    # `%q` quotes each argument, so the root loop's `eval` gets back the same argv.
+    printf '#!/bin/bash\n{ printf "%%q " "$@"; echo; } > %s\n' "$fifo" > "$TMP/fakesudo"
     chmod 755 "$TMP/fakesudo"
     export CORDON_SUDO="$TMP/fakesudo"
     on_cleanup fake_sudo_stop
@@ -779,10 +780,9 @@ bless_root() {
 }
 # Prints the live carrier dirs (cordon-bless-<id>.<class>), if any.
 bless_dirs() { ls -d "$(bless_root)"/cordon-bless-* 2>/dev/null; }
-# Prints the value of every `"$1": VALUE` field in the `cordon --json` output on stdin,
-# unquoted and one per line. It relies on `--json` pretty-printing one field per line, and
-# it matches the reply's schema, not its human rendering.
-json_field() { sed -n 's/^ *"'"$1"'": "\{0,1\}\([^",]*\)"\{0,1\},\{0,1\}$/\1/p'; }
+# Prints the value of every `"$1"` field, at any depth, in the `cordon --json` output on
+# stdin. Strings print unquoted, one per line.
+json_field() { jq -r --arg k "$1" '.. | objects | select(has($k)) | .[$k] | scalars'; }
 # Prints the live blessing ids, one per line.
 bless_ids() { "$CORDON" --json bless list 2>/dev/null | json_field id; }
 # Prints the first live blessing's id, or nothing when there is none.

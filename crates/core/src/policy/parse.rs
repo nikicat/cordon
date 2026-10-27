@@ -8,9 +8,10 @@
 //! and paths, belongs to [`super::resolve`].
 
 use super::{ClassName, GroupName, LineIndex, PolicyName, Pos, UserName};
-use crate::{Context, Result};
-use serde::Deserialize;
+use crate::{Context, Error, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use toml::Spanned;
 
 /// A policy that is parsed but not yet resolved, which [`super::resolve`] consumes. It
@@ -48,18 +49,43 @@ impl ParsedPolicy {
 /// One `[[include]]` directive, by which a system fragment pulls in a user-tier policy
 /// file (DESIGN §15.8). [`super::load_policy`] reads the file as a
 /// [`super::SourceOrigin::User`] fragment.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Include {
     user: UserName,
-    path: String,
+    path: PathBuf,
 }
 
 impl Include {
+    /// Returns the include of `path` for `user`. Errors when `path` is not absolute, because
+    /// the CLI and the daemon would otherwise resolve it against different directories.
+    pub fn new(user: UserName, path: PathBuf) -> Result<Include> {
+        if !path.is_absolute() {
+            return Err(Error::msg(format!(
+                "an `[[include]]` path must be absolute: {}",
+                path.display()
+            )));
+        }
+        Ok(Include { user, path })
+    }
+
     pub fn user(&self) -> &UserName {
         &self.user
     }
-    pub fn path(&self) -> &str {
+
+    pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns this include as a TOML `[[include]]` table, which [`parse`] reads back.
+    /// Errors when the path is not valid UTF-8, which TOML cannot hold.
+    pub fn to_toml(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct Table<'a> {
+            include: [&'a Include; 1],
+        }
+        toml::to_string(&Table { include: [self] })
+            .with_context(|| format!("render the include of {}", self.path.display()))
     }
 }
 
@@ -98,15 +124,7 @@ struct RawPolicy {
     /// The `[[include]]` tables, which name the user-tier files that this system
     /// fragment pulls in (DESIGN §15.8).
     #[serde(default, rename = "include")]
-    includes: Vec<Spanned<IncludeDef>>,
-}
-
-/// One `[[include]] user = "name" path = "…"` table.
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
-struct IncludeDef {
-    user: UserName,
-    path: String,
+    includes: Vec<Spanned<Include>>,
 }
 
 /// The three group namespaces (DESIGN §15.7), each mapping a group name to its
@@ -265,15 +283,13 @@ pub fn parse(text: &str) -> Result<ParsedPolicy> {
 
     let includes = raw
         .includes
-        .iter()
+        .into_iter()
         .map(|spanned| {
-            let def = spanned.get_ref();
-            Include {
-                user: def.user.clone(),
-                path: def.path.clone(),
-            }
+            let pos = lines.pos(spanned.span().start);
+            let inc = spanned.into_inner();
+            Include::new(inc.user, inc.path).map_err(|e| Error::at(pos, e.to_string()))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     Ok(ParsedPolicy {
         groups: raw.group,
@@ -369,7 +385,10 @@ mod tests {
         .unwrap();
         assert_eq!(p.includes().len(), 2);
         assert_eq!(p.includes()[0].user().as_str(), "alice");
-        assert_eq!(p.includes()[0].path(), "/etc/cordon/users/alice.toml");
+        assert_eq!(
+            p.includes()[0].path(),
+            Path::new("/etc/cordon/users/alice.toml")
+        );
         assert_eq!(p.includes()[1].user().as_str(), "bob");
         // a policy with no include directive has an empty list.
         assert!(
@@ -378,6 +397,23 @@ mod tests {
                 .includes()
                 .is_empty()
         );
+    }
+
+    /// Checks that a rendered include reads back unchanged, also for a path that Rust's
+    /// `Debug` would escape in a form TOML rejects, and that a relative path is refused.
+    #[test]
+    fn include_round_trips_and_must_be_absolute() {
+        let inc = Include::new(
+            UserName::new("alice"),
+            PathBuf::from("/etc/cordon/users/äl \"q\".toml"),
+        )
+        .unwrap();
+        let parsed = parse(&inc.to_toml().unwrap()).unwrap();
+        assert_eq!(parsed.includes(), [inc]);
+
+        assert!(Include::new(UserName::new("alice"), PathBuf::from("users/a.toml")).is_err());
+        let err = parse("[[include]]\nuser = \"alice\"\npath = \"users/a.toml\"\n").unwrap_err();
+        assert!(err.to_string().contains("must be absolute"), "{err}");
     }
 
     #[test]

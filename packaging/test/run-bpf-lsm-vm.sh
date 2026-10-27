@@ -2,7 +2,7 @@
 # Runs the bpf-lsm smoke suite in a virtme-ng VM with `bpf` appended to the active LSM
 # list. That is the only way to exercise the BPF-LSM boundary without rebooting the host,
 # whose kernel usually omits `bpf` from `lsm=`. Needs only /dev/kvm, virtme-ng and qemu,
-# plus the eBPF toolchain (nightly and bpf-linker) to build the object.
+# The eBPF toolchain (the nightly and bpf-linker) is fetched by `just build-ebpf`.
 #
 #   packaging/test/run-bpf-lsm-vm.sh                          # pinned kernel v6.12 (== CI)
 #   CORDON_VM_KERNEL=host packaging/test/run-bpf-lsm-vm.sh    # host kernel (fast iteration)

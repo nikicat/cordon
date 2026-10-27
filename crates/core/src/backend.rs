@@ -165,7 +165,8 @@ pub struct ApplyRequest {
 }
 
 /// The result of one apply, which the backend sends back to the IPC side. When `applied`
-/// is false, the policy had errors and the live policy is unchanged.
+/// is false, the live policy is unchanged and `diagnostics` holds at least one error that
+/// says why.
 pub struct ApplyOutcome {
     pub applied: bool,
     pub diagnostics: Vec<Diagnostic>,

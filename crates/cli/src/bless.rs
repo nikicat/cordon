@@ -79,11 +79,13 @@ pub fn run(args: &BlessArgs, client: &Client) -> ExitCode {
 }
 
 /// Runs the command in `args` under a freshly minted blessing and returns its exit code,
-/// mapped as [`exit_byte`] describes. Errors when the socket can't be resolved, the mint
-/// handshake fails, or the command can't be spawned.
+/// mapped as [`exit_byte`] describes. Errors as [`Elevation::from_env`] does, and when the
+/// socket can't be resolved, the mint handshake fails, or the command can't be spawned.
 fn mint_and_exec(args: &BlessArgs, client: &Client) -> Result<ExitCode> {
+    // Before the daemon is asked, so a bad `$CORDON_SUDO` never parks a request there.
+    let elevation = Elevation::from_env()?;
     let socket = client.socket()?;
-    let procs = request_and_approve(&socket, args.class.clone())?;
+    let procs = request_and_approve(&socket, args.class.clone(), &elevation)?;
     let mut cmd = build_command(&args.command);
     sys::join_cgroup_on_exec(&mut cmd, procs);
     let status = cmd.status().context("spawn blessed command")?;
@@ -91,12 +93,16 @@ fn mint_and_exec(args: &BlessArgs, client: &Client) -> Result<ExitCode> {
 }
 
 /// Asks the daemon on `socket` to mint a blessing of `class`, gets the human's approval
-/// through [`elevate`], and returns the minted carrier's `cgroup.procs` descriptor. The
+/// through `elevation`, and returns the minted carrier's `cgroup.procs` descriptor. The
 /// daemon half of this handshake is `Ctx::serve_bless_request` in cordond.
 ///
 /// Errors when the daemon is unreachable or not root, when it refuses or replies out of
 /// protocol, when the elevation fails, or when the mint reply carries no descriptor.
-fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<CarrierProcs> {
+fn request_and_approve(
+    socket: &Path,
+    class: Option<ClassName>,
+    elevation: &Elevation,
+) -> Result<CarrierProcs> {
     // A dedicated connection rather than `crate::round_trip`, because any buffered read
     // loses the ancillary data that carries the descriptor (see `Conn::recv_with_fd`).
     let stream = UnixStream::connect(socket).map_err(|e| {
@@ -116,7 +122,7 @@ fn request_and_approve(socket: &Path, class: Option<ClassName>) -> Result<Carrie
     // Blocks while the human authenticates. Waiting for the helper to exit first means a
     // cancelled password prompt reports itself immediately, instead of stalling until the
     // daemon's approval timeout.
-    elevate(&nonce, socket)?;
+    elevation.approve(&nonce, socket)?;
 
     match reply(&conn)? {
         (Response::BlessMinted(_), Some(procs)) => Ok(CarrierProcs(procs)),
@@ -172,38 +178,56 @@ fn unexpected(resp: Response) -> Error {
     Error::msg(format!("unexpected daemon reply: {resp:?}"))
 }
 
-/// Runs `cordon bless-helper --nonce=…` under `$CORDON_SUDO` and waits for it. The helper
-/// approves `nonce` as root at the daemon on `socket`, and that authentication is the
-/// proof of human presence (see `authorize` in cordond). Errors when `$CORDON_SUDO` is
-/// empty, or when the elevation can't be spawned or doesn't succeed.
-fn elevate(nonce: &Nonce, socket: &Path) -> Result<()> {
-    let elevation = std::env::var(ELEVATION_ENV).unwrap_or_else(|_| DEFAULT_ELEVATION.to_string());
-    let mut words = elevation.split_whitespace();
-    let program = words
-        .next()
-        .ok_or_else(|| Error::msg(format!("${ELEVATION_ENV} is empty")))?;
-    let me = std::env::current_exe().context("cannot locate the cordon binary")?;
-    let status = Command::new(program)
-        .args(words)
-        .arg(me)
-        // The socket is named rather than re-derived by the helper. Elevation resets the
-        // environment, so the helper would read root's config and could approve at a
-        // different daemon, which silently breaks `--socket` and a per-user config. Naming
-        // it keeps both halves of the handshake on the daemon `require_root_daemon` vetted.
-        .arg("--socket")
-        .arg(socket)
-        .arg("bless-helper")
-        // One argv token, because elevation wrappers differ in how they re-split arguments
-        // and may rearrange a separate flag and value.
-        .arg(format!("--nonce={nonce}"))
-        .status()
-        .with_context(|| format!("spawn {program}"))?;
-    if !status.success() {
-        return Err(Error::msg(format!(
-            "elevation via {program} did not succeed ({status}) — blessing refused"
-        )));
+/// The privilege tool that runs the root bless helper, as `$CORDON_SUDO` names it.
+struct Elevation {
+    program: String,
+    args: Vec<String>,
+}
+
+impl Elevation {
+    /// Returns the elevation that `$CORDON_SUDO` names, or [`DEFAULT_ELEVATION`] when it is
+    /// unset. Errors when it is set but empty.
+    fn from_env() -> Result<Elevation> {
+        let spec = std::env::var(ELEVATION_ENV).unwrap_or_else(|_| DEFAULT_ELEVATION.to_string());
+        let mut words = spec.split_whitespace().map(String::from);
+        let program = words
+            .next()
+            .ok_or_else(|| Error::msg(format!("${ELEVATION_ENV} is empty")))?;
+        Ok(Elevation {
+            program,
+            args: words.collect(),
+        })
     }
-    Ok(())
+
+    /// Runs `cordon bless-helper --nonce=…` under this elevation and waits for it. The
+    /// helper approves `nonce` as root at the daemon on `socket`, and that authentication
+    /// is the proof of human presence (see `authorize` in cordond). Errors when the
+    /// elevation can't be spawned or doesn't succeed.
+    fn approve(&self, nonce: &Nonce, socket: &Path) -> Result<()> {
+        let program = &self.program;
+        let me = std::env::current_exe().context("cannot locate the cordon binary")?;
+        let status = Command::new(program)
+            .args(&self.args)
+            .arg(me)
+            // The socket is named rather than re-derived by the helper. Elevation resets the
+            // environment, so the helper would read root's config and could approve at a
+            // different daemon, which silently breaks `--socket` and a per-user config. Naming
+            // it keeps both halves of the handshake on the daemon `require_root_daemon` vetted.
+            .arg("--socket")
+            .arg(socket)
+            .arg("bless-helper")
+            // One argv token, because elevation wrappers differ in how they re-split arguments
+            // and may rearrange a separate flag and value.
+            .arg(format!("--nonce={nonce}"))
+            .status()
+            .with_context(|| format!("spawn {program}"))?;
+        if !status.success() {
+            return Err(Error::msg(format!(
+                "elevation via {program} did not succeed ({status}) — blessing refused"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Returns the command that runs `argv`, or the shell from [`default_shell`] when `argv`
@@ -278,7 +302,12 @@ mod tests {
             return; // As root, this listener is a legitimate daemon end.
         }
 
-        assert!(request_and_approve(&path, None).is_err());
+        // An elevation that would fail loudly if the check let it run.
+        let never = Elevation {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        assert!(request_and_approve(&path, None, &never).is_err());
 
         // The client has hung up by now, so an empty read is EOF rather than a
         // would-block. Either way, what matters is that zero bytes arrived.

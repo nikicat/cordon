@@ -22,7 +22,9 @@
 //! drops privilege. There is no new IPC. The read is a direct file read, validation is the
 //! in-process compiler that `policy check` also runs, and the commit reuses `PolicyApply`.
 
-use cordon_core::policy::{self, Diagnostic, PolicyRoot, PolicySource, SourceOrigin, UserName};
+use cordon_core::policy::{
+    self, Diagnostic, Include, PolicyRoot, PolicySource, SourceOrigin, UserName,
+};
 use cordon_core::proto::{Request, Response};
 use cordon_core::{Context, Error, Result, config};
 use nix::unistd::{Gid, Uid};
@@ -349,7 +351,7 @@ impl Session {
         Ok(Session {
             policy_root,
             file,
-            home: crate::home(),
+            home: policy::fallback_home(),
             socket: client.socket()?,
             editor: EditorCommand::lookup(),
             editor_as,
@@ -716,12 +718,8 @@ impl Scaffold {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        // `{:?}` renders a TOML basic string for ASCII login names and paths.
-        text.push_str(&format!(
-            "\n[[include]]\nuser = {:?}\npath = {:?}\n",
-            self.user.as_str(),
-            self.path.display().to_string(),
-        ));
+        text.push('\n');
+        text.push_str(&Include::new(self.user.clone(), self.path.clone())?.to_toml()?);
         install_atomically(&self.fragment, &text)
     }
 }

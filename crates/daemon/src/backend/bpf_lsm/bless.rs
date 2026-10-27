@@ -104,9 +104,8 @@ impl Blessings {
     /// process can write its `cgroup.procs` only through that descriptor.
     ///
     /// Errors when the carrier root is unknown, the class cannot be resolved
-    /// ([`resolve_class`]), the class name has characters outside `[A-Za-z0-9_-]`,
-    /// [`MAX_BLESSED`] blessings are already live, or the carrier cannot be created and
-    /// registered.
+    /// ([`resolve_class`]), [`MAX_BLESSED`] blessings are already live, or the carrier
+    /// cannot be created and registered.
     pub(super) fn mint(
         &mut self,
         maps: &mut Maps,
@@ -119,12 +118,6 @@ impl Blessings {
             Error::msg("blessing unavailable: the daemon's cgroup was unresolvable at startup")
         })?;
         let (class, class_id) = resolve_class(class, registry)?;
-        if !valid_class_dirname(class.as_str()) {
-            return Err(Error::msg(format!(
-                "blessing class '{class}' has characters outside [A-Za-z0-9_-]; \
-                 rename it in the policy"
-            )));
-        }
         if self.live.len() >= MAX_BLESSED {
             return Err(Error::msg(format!(
                 "too many live blessings (max {MAX_BLESSED})"
@@ -489,8 +482,8 @@ fn scan(root: &Path) -> Vec<Found> {
 }
 
 /// Returns the carrier directory name `cordon-bless-<id>.<class>`. [`parse_dir_name`] is
-/// its exact inverse. The class charset ([`valid_class_dirname`], enforced at mint) keeps
-/// the encoding unambiguous, because a class then has no `.` or `/`.
+/// its exact inverse. The [`ClassName`] charset keeps the encoding unambiguous, because a
+/// class has no `.` or `/`.
 fn dir_name(id: BlessId, class: &ClassName) -> String {
     format!("cordon-bless-{id}.{class}")
 }
@@ -498,20 +491,7 @@ fn dir_name(id: BlessId, class: &ClassName) -> String {
 fn parse_dir_name(name: &str) -> Option<(BlessId, ClassName)> {
     let rest = name.strip_prefix("cordon-bless-")?;
     let (id, class) = rest.split_once('.')?;
-    if !valid_class_dirname(class) {
-        return None;
-    }
-    Some((BlessId(id.parse().ok()?), ClassName::new(class)))
-}
-
-/// Checks whether a carrier directory name may embed `class`, which takes
-/// `^[A-Za-z0-9_-]+$`. Policy allows any string as a class name, but the directory
-/// encoding does not.
-fn valid_class_dirname(class: &str) -> bool {
-    !class.is_empty()
-        && class
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    Some((BlessId(id.parse().ok()?), class.parse().ok()?))
 }
 
 /// A process's unified-hierarchy cgroup, from the `0::<path>` line of
@@ -785,17 +765,6 @@ mod tests {
         // The first `.` splits, so a dotted suffix lands in the class and fails the
         // charset.
         assert!(parse_dir_name("cordon-bless-7.ro.bak").is_none());
-    }
-
-    #[test]
-    fn class_dirname_charset() {
-        assert!(valid_class_dirname("ro"));
-        assert!(valid_class_dirname("Aws_prod-2"));
-        assert!(!valid_class_dirname(""));
-        assert!(!valid_class_dirname("a.b"));
-        assert!(!valid_class_dirname("a b"));
-        assert!(!valid_class_dirname("a/b"));
-        assert!(!valid_class_dirname("é"));
     }
 
     #[test]

@@ -4,10 +4,11 @@
 //! compiled text file (DESIGN §15).
 
 mod backend;
-#[cfg(feature = "bpf-lsm")]
+// Both serve only the bpf-lsm backend, so they share its gate (see backend/mod.rs).
+#[cfg(all(target_os = "linux", feature = "bpf-lsm"))]
 mod btf;
 mod ipc;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "bpf-lsm"))]
 mod proc;
 
 use backend::Swept;
