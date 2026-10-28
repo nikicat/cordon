@@ -109,23 +109,43 @@ answers. The in-kernel LSM shape buys the following:
   between processes. `PinDir::pin_links` in `crates/daemon/src/backend/bpf_lsm/pin.rs` owns
   the layout and the handover. Turning enforcement off is the explicit `cordond --teardown`.
 
+**Two pinning designs were rejected.**
+- **Adopting existing pins on restart was specified, then dropped as unnecessary.** The first
+  plan said "pin program + maps + link; adopt existing pins on startup". Pinning the links
+  alone delivers the whole property, because a link holds its program and a program holds its
+  maps. So adoption has nothing left to buy. What adoption costs is real. It needs a mandatory
+  cross-process writer lock on the banked flip. It brings a stale-program-after-upgrade trap,
+  which needs an ABI or build-id check plus a replace path as a fallback. And it conflicts
+  directly with the startup self-test. The self-test writes bank 0 and `SETTINGS` before
+  `Maps::seed`, so it would briefly clobber a live adopted policy. Replacing on start has none
+  of these problems, and it is gap-free anyway, because the new generation attaches before
+  the old one is swept.
+- **"Pin the policy maps only, because a pinned `BLESSED` means grants that never expire" is
+  backwards.** Under a pinned program, an unpinned `BLESSED` is still alive, because the
+  program holds a reference to it. So its stale grants persist exactly the same and merely
+  become unreachable, which is strictly worse than pinning it. The point is moot under the
+  link-only design. That design pins no maps at all, so `BLESSED` keeps its fail-closed
+  behaviour on restart exactly as [ADR 0014](0014-blessing-lifecycle.md) step 9
+  specifies. Do not "fix" this by pinning maps.
+
 ## Consequences
 
 ### What shipped
 
-**Implemented in M1, and validated in a VM (see [STATUS](../../STATUS.md)).** M1 delivers the
-`file_open` verdict over the flat rule table. The program finds the deepest protected object
-with the `(dev,inode)` dentry walk, matches the subject by the exe's `(dev,inode)`, and derives
-the action (read, write or create) from `f_mode` and `f_flags`. It takes the first match in the
-bucket that copy-down resolved, and denies by default. The per-rule `policy` is the only
-enforcement level, and there is no global mode ([ADR 0008](0008-precedence.md)). M1 also
-delivers the text policy, which is compiled and seeded at startup and re-seeded by
-`cordon policy apply` with an atomic double-buffer swap. And it delivers the ring-buffer learn
-path, with event coalescing in the kernel. Structural-operation gating (M3, which closes the
-rename bypass and adds `execute`) and fail-safe pinning (M5) have shipped since. So `bpf-lsm`
-mediates opens and mutations, and it keeps enforcing when the daemon dies. Content-digest
-identity ([ADR 0006](0006-subject-predicates.md)) remains unshipped, and it is not what closes
-the `LD_PRELOAD` hole (see [ADR 0015](0015-fixed-code-grants.md)).
+**Implemented in M1, and validated in a VM (see [architecture](../architecture.md)).** M1
+delivers the `file_open` verdict over the flat rule table. The program finds the deepest
+protected object with the `(dev,inode)` dentry walk, matches the subject by the exe's
+`(dev,inode)`, and derives the action (read, write or create) from `f_mode` and `f_flags`. It
+takes the first match in the bucket that copy-down resolved, and denies by default. The
+per-rule `policy` is the only enforcement level, and there is no global mode ([ADR
+0008](0008-precedence.md)). M1 also delivers the text policy, which is compiled and seeded at
+startup and re-seeded by `cordon policy apply` with an atomic double-buffer swap. And it
+delivers the ring-buffer learn path, with event coalescing in the kernel. Structural-operation
+gating (M3, which closes the rename bypass and adds `execute`) and fail-safe pinning (M5) have
+shipped since. So `bpf-lsm` mediates opens and mutations, and it keeps enforcing when the
+daemon dies. Content-digest identity ([ADR 0006](0006-subject-predicates.md)) remains
+unshipped, and it is not what closes the `LD_PRELOAD` hole (see [ADR
+0015](0015-fixed-code-grants.md)).
 
 **Deny and learn records are delivered separately from the verdict.** The in-kernel program
 has already decided, and observability rides on a BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`).

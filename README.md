@@ -234,8 +234,8 @@ Milestones M1 (rule core), M3 (mutation and exec hooks) and M5 (fail-safe pinnin
 implemented and VM-validated, and so are blessing stages B1 and B2. M6, the code-identity fix,
 is the last must-have before cordon is worth trusting.
 
-- [`STATUS.md`](STATUS.md): what exists, what's left, and the facts that cost real time to
-  learn
+- [`docs/architecture.md`](docs/architecture.md): where each piece lives
+- [`docs/lessons.md`](docs/lessons.md): the facts that cost real time to learn
 - [`todo.md`](todo.md): what is left, in order
 - [`docs/adr/`](docs/adr/README.md): the design decisions
 
