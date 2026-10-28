@@ -267,7 +267,7 @@ impl Coalesced {
     }
 
     /// Writes this record to the journal as a `deny` or an `audit` line, as the policy
-    /// decides (DESIGN §15.6). An unblessed line carries no `blessing` field.
+    /// decides (ADR 0008). An unblessed line carries no `blessing` field.
     fn log(&self, live: &LivePolicy, passwd: &mut Passwd) {
         // Every field is a typed value with its own `Display`, so `tracing` renders it
         // lazily, with no eager `String`s.
@@ -292,8 +292,8 @@ impl Coalesced {
 /// decision, pid and path, and [`Coalesced::count`] gives the record's true volume.
 ///
 /// The key is the opened file (`leaf`), as in the in-kernel suppressor, so distinct files
-/// under one audited root each get their own journal line (DESIGN §15.10 flow B). The
-/// blessing is part of the key because bless is loud (DESIGN §16.3), and a blessed access
+/// under one audited root each get their own journal line (docs/authoring.md flow B). The
+/// blessing is part of the key because bless is loud (ADR 0012), and a blessed access
 /// must never coalesce into, or hide behind, an unblessed one.
 fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
     let mut records: Vec<Coalesced> = Vec::new();
@@ -439,7 +439,7 @@ impl JournalPath {
         }
     }
 
-    /// Returns the name of the file that `e` actually opened (DESIGN §15.10 flow B). It is
+    /// Returns the name of the file that `e` actually opened (docs/authoring.md flow B). It is
     /// the protected object's known path with the relative path that the kernel rebuilt
     /// joined on, so `object=~/.aws` and `config` give `path=~/.aws/config`. When the
     /// object's path is unknown, it is the relative path alone, and when that is missing
@@ -463,7 +463,7 @@ impl JournalPath {
 }
 
 /// An audit path as the journal prints it, with a regular user's home collapsed to `~`
-/// (DESIGN §15.8). `object=` and `path=` then read exactly as that user's policy would
+/// (ADR 0010). `object=` and `path=` then read exactly as that user's policy would
 /// write them, so a `deny` line copies straight into the policy. Both fields render
 /// through this, so they collapse the same way.
 enum AuditPath<'a> {
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(out[0].suppressed, SuppressedTotal(2));
     }
 
-    /// Checks the discovery property (DESIGN §15.10 flow B). Two files under the same
+    /// Checks the discovery property (docs/authoring.md flow B). Two files under the same
     /// protected object must not coalesce, because their leaves differ and each one
     /// surfaces its own path.
     #[test]

@@ -1,5 +1,5 @@
 //! Stage 3, which compiles a [`ResolvedPolicy`] into the flat per-object decision table
-//! that the kernel evaluates (DESIGN §15.3).
+//! that the kernel evaluates (ADR 0005).
 //!
 //! ## Copy-down object precedence
 //! Objects, the distinct `where` paths, form a forest under the path-prefix relation.
@@ -40,7 +40,7 @@ pub struct CompiledPolicy {
     pub classes: ClassRegistry,
 }
 
-/// The declared blessing classes (DESIGN §16.3) and their dense [`ClassId`]s. The kernel
+/// The declared blessing classes (ADR 0012) and their dense [`ClassId`]s. The kernel
 /// knows a class only by its id, so the daemon goes through this registry to turn a
 /// requested class name into an id at mint, and an id back into a name in the journal.
 /// Ids follow name order from `UNBLESSED + 1`, so every compile renumbers them. Nothing
@@ -315,7 +315,7 @@ where
     }
 }
 
-/// Sorts a bucket into the kernel's first-match order (DESIGN §15.6), most specific
+/// Sorts a bucket into the kernel's first-match order (ADR 0008), most specific
 /// first: (1) the depth of the object the rule was authored on, (2) subject specificity
 /// ([`subject_specificity`]), (3) a denying policy (`Policy::denies`) before a
 /// non-denying one, the fail-safe tie-break among rules equal on (1) and (2). A stable
@@ -336,11 +336,11 @@ fn sort_bucket(bucket: &mut [ProvRule]) {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Specificity(u32);
 
-/// Returns the number of subject predicates in `r` that are not wildcards (DESIGN §15.6
+/// Returns the number of subject predicates in `r` that are not wildcards (ADR 0008
 /// step 2). A higher count is more specific. Each concrete predicate, such as `exe` or
 /// `blessing`, clears its wildcard bit and adds one, so a concrete subject outranks a
 /// `who="*"` catch-all on the same object. A specific `allow` or `deny` therefore wins
-/// over a broad `audit` or `deny`. The audit, admit and enforce flow (§15.10 flow A)
+/// over a broad `audit` or `deny`. The audit, admit and enforce flow (docs/authoring.md flow A)
 /// rests on this. An admitted `allow exe=X` goes silent while the `*` catch-all keeps
 /// observing every program not yet admitted, and a blessing `allow` outranks the
 /// catch-all the same way.
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn concrete_subject_beats_wildcard_catchall() {
-        // §15.10 flow A step 2: an admitted `allow exe=X` sorts ahead of a `who="*"`
+        // docs/authoring.md flow A step 2: an admitted `allow exe=X` sorts ahead of a `who="*"`
         // audit catch-all. The catch-all is authored *first* to prove the order comes
         // from specificity, not insertion order.
         let text = format!(
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(d.rules[0].subject, SubjectMatch::ANY);
     }
 
-    // ---- blessing (DESIGN §16.3) ----
+    // ---- blessing (ADR 0012) ----
 
     /// Duplicates collapse, ids follow name order from `UNBLESSED + 1`, and every id maps
     /// back to its name.

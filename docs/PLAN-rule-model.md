@@ -1,7 +1,7 @@
 # Implementation plan — the rule model
 
 This is the concrete, reviewable plan for the architecture in
-[`DESIGN.md` §15](DESIGN.md). It replaces the v1 owner model with one flat rule model,
+[ADR 0005](adr/0005-flat-rule-model.md). It replaces the v1 owner model with one flat rule model,
 compiled in userspace and enforced in the kernel. The v1 model consisted of `owners`,
 `owner_identities` and `subtrees`, plus the `rules` table, which was never enforced.
 
@@ -9,10 +9,10 @@ compiled in userspace and enforced in the kernel. The v1 model consisted of `own
 > global mode, subject specificity, and leaf-path reconstruction) and the authoring
 > ergonomics (the compact DSL, the `user =` header, conf.d fragments, `policy edit`, and the
 > system and user tiers). [`STATUS.md`](../STATUS.md) summarizes what exists today, and
-> DESIGN §15 specifies it. The M1 task breakdown was retired once it became code. What
+> [ADR 0005](adr/0005-flat-rule-model.md) specifies it. The M1 task breakdown was retired once it became code. What
 > follows is what is left.
 
-These guiding constraints come from §15:
+These guiding constraints come from [ADR 0005](adr/0005-flat-rule-model.md):
 - **Compile in userspace, keep the kernel flat.** Groups, nesting and precedence resolve at
   compile time. The eBPF program evaluates a pre-resolved rule table for each object.
 - **Explicit apply, no autoreload.** A policy takes effect only on `cordon policy apply`.
@@ -28,7 +28,7 @@ The numbers identify milestones and do not set the schedule. This is the queue:
 1. ~~**Known bugs**~~: done. The self-test probe ran in a world-writable `TMPDIR` and reused
    any directory it found. So a planted symlink let root be tricked into truncating the
    policy and switching the boundary off. The probe now lives in the root-only `/run/cordon`.
-2. **Docs**: keep DESIGN, STATUS and the plans in step with what ships, because these files
+2. **Docs**: keep the ADRs, STATUS and the plans in step with what ships, because these files
    are the resume point.
 3. ~~**Finish M3**~~: done. `inode_mkdir`, `bprm_check_security` and `RENAME_EXCHANGE` are
    verified. Every hook in the map from actions to hooks now fires, except `listdir`, which
@@ -72,7 +72,7 @@ hole.
   shed. The tests are `task->seccomp.mode != 0` and `cred->user_ns != &init_user_ns`, the
   latter being Chrome's layer-1 namespace sandbox. That costs two dereferences, resolved
   through BTF like the existing chain from `file` to `inode` to `sb`, and one more
-  `SubjectFlags` bit. §15.4 notes that a fifth predicate bit extends matching and
+  `SubjectFlags` bit. [ADR 0006](adr/0006-subject-predicates.md) notes that a fifth predicate bit extends matching and
   specificity for free. The predicate is strictly fail-safe against an attacker, because it
   only ever narrows an `exe` grant. Someone who declines to sandbox themselves still fails
   the `exe` check.
@@ -125,7 +125,7 @@ hole.
 ## Milestone 3 — Mutation + exec hooks ← **done**
 - **Done (2026-07-27):** `inode_link`, `inode_rename`, `inode_unlink` and `inode_rmdir`. They
   cover the second-name escape, clobber and destroy. The design and its rationale are in
-  DESIGN §15.5.
+  [ADR 0007](adr/0007-action-hook-map.md).
 - **Done (2026-07-28): `inode_mkdir`.** `rmdir` was gated and `mkdir` was not. So a subject
   that could not remove a directory inside an object could still add one. The new dentry is
   negative, so `find_object` on it misses on the first step, and the verdict comes from the
@@ -151,7 +151,7 @@ hole.
     would then pass with the hook detached. So the exec probe gets its own object, which
     allows `read` and denies everything else. Its file also needs the x bit, or
     `may_open(MAY_EXEC)` fails with `EACCES` first.
-- **Done (2026-07-28): the `listdir` limitation is documented** (DESIGN §15.5), and it is
+- **Done (2026-07-28): the `listdir` limitation is documented** ([ADR 0007](adr/0007-action-hook-map.md)), and it is
   sharper than "coarse". There is no hook for each `getdents`, so listing a directory is a
   `file_open` on it. `requested_action` derives only `read`, `write` and `create`. So nothing
   ever requests `listdir`. A rule that names `listdir` alone matches no request, and the open
@@ -175,8 +175,7 @@ which is specified above as having no hook by design.
   destroyed it with no verdict, and left its `PROTECTED` entry dangling. `mv anything secret`
   did what `rm secret` is refused. `find_object` now runs on the destination dentry first and
   takes that object's `write` verdict. The daemon self-test and a `bpf-lsm-smoke.sh` scenario
-  both cover it, and the smoke scenario also pins that atomic save still works. See DESIGN
-  §15.5.
+  both cover it, and the smoke scenario also pins that atomic save still works. See [ADR 0007](adr/0007-action-hook-map.md).
 - **Done (2026-07-28): `renameat2(RENAME_EXCHANGE)` is verified.** An exchange re-parents both
   inodes and destroys neither, so the `write` floor of the destroy check does not cover it.
   When the protected side leaves its object, the unconditional escape refusal must catch it,
@@ -226,7 +225,7 @@ directory would force a gap between detaching and attaching. `PinDir::pin_links`
 - The old note "pin the policy maps only, because a pinned `BLESSED` means grants that never
   expire" was backwards, and it is retired. Under a pinned program, an unpinned `BLESSED` is
   still alive, and its stale grants persist anyway, only unreachably. Pinning no maps at all
-  leaves `BLESSED` failing closed on restart, exactly as DESIGN §16 step 9 specifies.
+  leaves `BLESSED` failing closed on restart, exactly as [ADR 0014](adr/0014-blessing-lifecycle.md) step 9 specifies.
 - **The singleton guard shipped.** It is an exclusive `flock` on `<socket>.lock`, taken before
   the daemon touches the kernel or the socket. It is keyed on the socket rather than on the
   pin directory, so it also covers dev daemons in user mode. It also fixes a standing bug.
@@ -319,7 +318,7 @@ and the code it runs is arbitrary. There is no runtime signal to find, so the ex
 to be static.
 
 It must be an allowlist, not a blocklist. Enumerating interpreters is an unbounded task, and
-§3 rejects exactly that shape (*unprofiled means unconfined*). The dangerous cases are not
+[ADR 0001](adr/0001-object-centric-gating.md) rejects exactly that shape (*unprofiled means unconfined*). The dangerous cases are not
 the obvious ones. They are fixed ELF binaries with embedded interpreters, such as `gdb`,
 `vim +python` and anything that links lua. These look like ordinary compiled tools and fire
 no hook. So the check is inverted. A subject that appears in an `allow` rule must positively
@@ -337,7 +336,7 @@ access goes through `bless`. That is the lever this plan already names, now reac
 deliberately instead of by attrition.
 
 **`bless` does not satisfy the invariant, and is not meant to.** A blessed `python` session
-reads secrets. Blessing proves human presence, not code identity (DESIGN §16), so it is the
+reads secrets. Blessing proves human presence, not code identity ([ADR 0012](adr/0012-blessing.md)), so it is the
 deliberate escape hatch from this rule. Naming it as an escape hatch keeps the invariant
 honest. Otherwise it would be quietly violated in the one place where people reach for it
 most.
@@ -400,7 +399,7 @@ library's constructor can run, so the taint lands before any attacker code execu
 
 ### Why this is not a per-tool profile
 
-It looks like AppArmor's `m` permission, but it is not. §3 rejects per-tool profiles because
+It looks like AppArmor's `m` permission, but it is not. [ADR 0001](adr/0001-object-centric-gating.md) rejects per-tool profiles because
 an unprofiled program is unconfined. Here a code set is a precondition for a grant, not a
 confinement mechanism. An exe with no code set gets no grant and falls to the catch-all deny.
 An unprofiled program is denied. So the failure that makes MAC profiles fragile cannot arise,
@@ -433,7 +432,7 @@ and no hashes or signatures are needed.
 So the set is a property of the binary plus the machine's configuration, and it cannot be read
 out of the ELF. A hook that ran `ldd` would emit a set that breaks ssh the first time ssh
 resolves a hostname, and that breaks differently on different machines. The set must be
-learned, not derived. That is M4's machinery and §15.10's audit, admit, enforce flow, applied
+learned, not derived. That is M4's machinery and [authoring flows](authoring.md)'s audit, admit, enforce flow, applied
 to a second axis.
 
 ### Policy surface
@@ -465,7 +464,7 @@ in a generated, root-owned sidecar file:
 …
 ```
 
-Groups keep the set small. §15.7 makes groups symmetric across the axes, and code is simply a
+Groups keep the set small. [ADR 0009](adr/0009-groups.md) makes groups symmetric across the axes, and code is simply a
 fourth axis. Nearly all of the bulk is shared, because libc, libcrypto and libz appear under
 every subject. So a `[group.code.base]` absorbs it. What is left for each subject is the
 genuinely distinctive handful, such as krb5 and NSS for ssh, and gpgme for gopass. Expect
@@ -634,7 +633,7 @@ file_open(~/.ssh/id_ed25519)
 - Taint: one bit, cleared on `execve`. The choice of map and the propagation across fork and
   threads are the open question in *The mechanism* above. Settle that before writing the
   hooks, because it decides whether `task_alloc` is a fourth attach point.
-- `SubjectFlags` gains an `UNTAINTED` bit. §15.4 notes that a fifth predicate bit extends
+- `SubjectFlags` gains an `UNTAINTED` bit. [ADR 0006](adr/0006-subject-predicates.md) notes that a fifth predicate bit extends
   matching and specificity for free.
 - No new BTF offsets are needed. The hooks hand over a `struct file *`, and the existing chain
   from `file_f_inode` through `inode_i_ino` and `inode_i_sb` to `sb_s_dev` already yields a
@@ -671,7 +670,7 @@ These are loose ends left by shipped work, and none of them is a milestone of it
 - **`MAX_RULES_PER_OBJ = 32`.** Raise it toward 64 if a verifier log demands it.
   `cordon policy check` errors when a compiled bucket exceeds it.
 - **A per-object default is deferred.** A protected object with no matching rule falls to the
-  global default-deny (§15.6.3). A per-object default was considered and parked.
+  global default-deny ([ADR 0008](adr/0008-precedence.md)). A per-object default was considered and parked.
 - **Group expansion is a lever, not a law.** Subject groups expand at compile time, so the
   number of bucket entries grows with the size of a subject group times the object nesting
   depth. If that ever binds, keep groups as a `(GroupId, exe)` membership map instead of
@@ -695,7 +694,7 @@ These are loose ends left by shipped work, and none of them is a milestone of it
     examples protect no policy file. But do not discover it the hard way.
 
 ## The policy surface
-DESIGN §15.8 specifies the authored TOML, and two regression-tested examples show it.
+[ADR 0010](adr/0010-policy-storage.md) specifies the authored TOML, and two regression-tested examples show it.
 [`packaging/cordon.example.policy.toml`](../packaging/cordon.example.policy.toml) uses
 verbose `[[rule]]` tables, and
 [`packaging/cordon.example.dsl.policy.toml`](../packaging/cordon.example.dsl.policy.toml) uses

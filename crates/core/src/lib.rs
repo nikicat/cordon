@@ -5,7 +5,7 @@
 //! operational `config`, the lexical `paths` helpers, the IPC `proto`, and the `backend`
 //! seam. Only the backend that loads the program and seeds the maps needs privilege.
 //!
-//! See `docs/DESIGN.md` §15 for the model this implements.
+//! See ADR 0005 (`docs/adr/`) for the model this implements.
 
 pub mod backend;
 pub mod config;

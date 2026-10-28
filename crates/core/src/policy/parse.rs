@@ -27,11 +27,11 @@ pub struct ParsedPolicy {
     pub(crate) rules: Vec<ParsedRule>,
     pub(crate) lines: LineIndex,
     /// The optional `user = "name"` header. It lets a root-owned, per-user policy file
-    /// write `~` instead of `/home/<name>` (DESIGN §15.8), and [`super::home_for`] turns
+    /// write `~` instead of `/home/<name>` (ADR 0010), and [`super::home_for`] turns
     /// it into the home that `~` expands to.
     pub(crate) user: Option<UserName>,
     /// The user-tier files that this system fragment pulls in with `[[include]]`
-    /// (DESIGN §15.8). [`super::PolicyRoot::load`] reads them, not the parser.
+    /// (ADR 0010). [`super::PolicyRoot::load`] reads them, not the parser.
     pub(crate) includes: Vec<Include>,
 }
 
@@ -48,7 +48,7 @@ impl ParsedPolicy {
 }
 
 /// One `[[include]]` directive, by which a system fragment pulls in a user-tier policy
-/// file (DESIGN §15.8). [`super::PolicyRoot::load`] reads the file as a
+/// file (ADR 0010). [`super::PolicyRoot::load`] reads the file as a
 /// [`super::SourceOrigin::User`] fragment.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -123,12 +123,12 @@ struct RawPolicy {
     #[serde(default)]
     rules: Option<Spanned<String>>,
     /// The `[[include]]` tables, which name the user-tier files that this system
-    /// fragment pulls in (DESIGN §15.8).
+    /// fragment pulls in (ADR 0010).
     #[serde(default, rename = "include")]
     includes: Vec<Spanned<Include>>,
 }
 
-/// The three group namespaces (DESIGN §15.7), each mapping a group name to its
+/// The three group namespaces (ADR 0009), each mapping a group name to its
 /// definition.
 #[derive(Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
@@ -151,9 +151,9 @@ pub(crate) struct MemberGroup {
 }
 
 /// A named subject group: a list of members, as a [`MemberGroup`] has, or a single
-/// `blessing = "<class>"` predicate (DESIGN §16.3), which declares a blessing class that
+/// `blessing = "<class>"` predicate (ADR 0012), which declares a blessing class that
 /// rules reference as `@<group>`. The other conjunctive subject predicates
-/// (`exe = … argv0 = …`, DESIGN §15.4) are not implemented, so they are rejected as
+/// (`exe = … argv0 = …`, ADR 0006) are not implemented, so they are rejected as
 /// unknown fields.
 #[derive(Deserialize, Debug)]
 #[serde(try_from = "RawSubjectGroup")]

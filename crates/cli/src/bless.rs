@@ -1,4 +1,4 @@
-//! `cordon bless`, which runs a command under a fresh blessing (DESIGN §16).
+//! `cordon bless`, which runs a command under a fresh blessing (ADR 0012).
 //!
 //! The command runs as you and never holds privilege (see [`build_command`]). The daemon
 //! hands over a carrier cgroup's descriptor, the target joins that carrier before it

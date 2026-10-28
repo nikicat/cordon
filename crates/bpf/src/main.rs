@@ -1,5 +1,5 @@
 //! cordon's eBPF data plane. Its LSM hooks (`file_open`, the inode mutation hooks and
-//! `bprm_check_security`) return the access verdict in the kernel (DESIGN §4, §15). The
+//! `bprm_check_security`) return the access verdict in the kernel (ADR 0002, ADR 0005). The
 //! userspace daemon (`crates/daemon`, `bpf-lsm` backend) compiles the text policy, loads
 //! this object, fills its maps and drains its ring buffer, but this program makes the
 //! decision, not the daemon.
@@ -15,7 +15,7 @@
 //!      action mask intersects and whose subject matches. The bucket is
 //!      `RULE_COUNT[(bank,obj)]` entries of the packed `RULES` array, at most
 //!      `MAX_RULES_PER_OBJ`. Copy-down resolved all precedence in userspace, so the first
-//!      match is the right one (DESIGN §15.3).
+//!      match is the right one (ADR 0005).
 //!   5. With no matching rule, the policy is default-deny. The open is blocked when the
 //!      policy [`denies`](Policy::denies), and journaled through the suppressor
 //!      (`kernel::suppress`) when it [`logs`](Policy::logs).
@@ -228,7 +228,7 @@ fn live_bank(pid: Pid) -> Option<Bank> {
 ///    check, `mv anything secret` would do exactly what `rm secret` is refused, and the
 ///    `PROTECTED` entry it leaves dangling is permanent, since objects resolve once. The
 ///    destroyed side gets its own `write` verdict, from the most specific object in play
-///    on the destination (§15.6). This question comes before the internal-shuffle check
+///    on the destination (ADR 0008). This question comes before the internal-shuffle check
 ///    below, because that check would otherwise swallow a more specific object nested
 ///    inside the one being shuffled within.
 /// 2. Escape. Is a protected inode acquiring a name outside its object? That is refused
@@ -406,7 +406,7 @@ fn decide(ctx: &LsmContext) -> Option<Verdict> {
 
     // (4) and (5) The subject match, the verdict and the journal. `file_open` logs exactly
     // the action it matched on, while the mutation hooks pass a wider `requested` than
-    // they log (§15.5).
+    // they log (ADR 0007).
     consult(&matched, requested, requested, pid, bank)
 }
 
@@ -468,7 +468,7 @@ fn consult(
 ///
 /// The leaf itself is tested first, so a rule that names a file matches that inode under
 /// any name, while a rule that names a directory protects its children only by ancestry
-/// (DESIGN §15.5). It takes a dentry so that every hook shares one resolver.
+/// (ADR 0007). It takes a dentry so that every hook shares one resolver.
 fn find_object(leaf_dentry: kernel::Dentry, bank: Bank) -> Option<Match> {
     let mut dentry = leaf_dentry;
     for _ in 0..MAX_ANCESTORS {
@@ -547,8 +547,8 @@ fn match_rule(
 }
 
 /// Checks whether `subject` matches the caller, meaning that every predicate that is not a
-/// wildcard equals the caller's value. It compares `exe` and the `blessing` class (DESIGN
-/// §16.3), so a blessing rule fires only for a caller in a blessed cgroup of its class. It
+/// wildcard equals the caller's value. It compares `exe` and the `blessing` class (ADR 0012),
+/// so a blessing rule fires only for a caller in a blessed cgroup of its class. It
 /// does not compare `uid` and `cgroup`, because they are reserved and the compiler always
 /// leaves them wildcard.
 fn subject_matches(subject: SubjectMatch, exe: FileId, class: ClassId) -> bool {
@@ -558,7 +558,7 @@ fn subject_matches(subject: SubjectMatch, exe: FileId, class: ClassId) -> bool {
     exe_ok && blessing_ok
 }
 
-/// Returns the caller's blessing class (DESIGN §16.3), looked up from its cgroup in
+/// Returns the caller's blessing class (ADR 0012), looked up from its cgroup in
 /// `BLESSED`, or [`ClassId::UNBLESSED`] when the cgroup is not a live blessing.
 fn current_class() -> ClassId {
     blessed_class(kernel::current_cgroup_id()).unwrap_or(ClassId::UNBLESSED)

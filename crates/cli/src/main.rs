@@ -1,4 +1,4 @@
-//! `cordon`, the command-line client for the flat rule model (DESIGN §15).
+//! `cordon`, the command-line client for the flat rule model (ADR 0005).
 //!
 //! The policy lives in a root-owned text file, and this binary is how a person checks it,
 //! sends it to the daemon and reads back what is enforced. The daemon compiles the policy

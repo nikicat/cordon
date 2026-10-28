@@ -84,7 +84,7 @@ impl Nanos {
     }
 }
 
-/// One generation of the double-buffered rule table (DESIGN §15.8). The kernel reads the
+/// One generation of the double-buffered rule table (ADR 0010). The kernel reads the
 /// live one from [`Settings::active_bank`](crate::Settings::active_bank). A
 /// `cordon policy apply` fills the other bank and [`flip`](Bank::flip)s to it in one
 /// `SETTINGS` write (the daemon's `Maps::seed`). Only `active_bank` changes in that record

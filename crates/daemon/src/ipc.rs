@@ -54,7 +54,7 @@ impl Ctx {
         // permission, so without this even the ungated read verbs are root-only in
         // practice. The mode carries no security weight, because authorization is
         // `authorize()`'s job. A multi-user host that must not disclose protected paths to
-        // every local account wants `0660` and a `cordon` group instead (DESIGN §15.8).
+        // every local account wants `0660` and a `cordon` group instead (ADR 0010).
         // Widening the mode after `bind` is safe. Until this call the mode is
         // `0777 & ~umask`, which is narrower, so the socket is never more open than
         // intended.
@@ -90,7 +90,7 @@ impl Ctx {
         Ok(())
     }
 
-    /// Serves the unprivileged half of the mint handshake (DESIGN §16.5). Waits for a uid-0
+    /// Serves the unprivileged half of the mint handshake (ADR 0013). Waits for a uid-0
     /// peer to approve this request, then mints and sends the new carrier's `cgroup.procs`
     /// back on `conn`.
     ///
@@ -259,7 +259,7 @@ fn authorize(req: &Request, peer_uid: Uid) -> Result<()> {
         Request::PolicyApply { .. } => Err(Error::msg(
             "applying policy requires root — invoke via `sudo cordon policy apply`",
         )),
-        // Reads stay open, as `BlessList` was specified (DESIGN §16.5). `BlessRequest` is
+        // Reads stay open, as `BlessList` was specified (ADR 0013). `BlessRequest` is
         // open too, because asking is not minting. The request stays inert until a uid-0
         // peer approves it. The backend checks ownership for `BlessRevoke`, because the
         // live table lives there.

@@ -1,4 +1,4 @@
-//! The live blessings table (DESIGN §16), which alone creates and removes the carrier
+//! The live blessings table (ADR 0012), which alone creates and removes the carrier
 //! cgroups and their `BLESSED` entries. A blessing is a carrier cgroup
 //! (`cordon-bless-<id>.<class>`, placed by [`carrier_parent`]). `MAP_BLESSED` maps the
 //! carrier's kernel id to the class's dense [`ClassId`]. Every mutation runs on the backend

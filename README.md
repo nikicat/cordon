@@ -30,7 +30,7 @@ compromised editor extension and an infostealer all run at your uid, and any of 
 the lot in one pass. AppArmor and SELinux do essentially nothing here by default, and not by
 oversight. Confinement is a property of the program, and an unknown program is unconfined. A
 scraper is by definition an unknown program.
-([The long version, with what each incumbent actually does.](docs/DESIGN.md#31-what-the-incumbents-actually-do-to-a-scraper))
+([The long version, with what each incumbent actually does.](docs/prior-art.md#what-the-incumbents-actually-do-to-a-scraper))
 
 ## What cordon does
 
@@ -100,7 +100,8 @@ policy.toml ──parse──> resolve groups ──compile──> flat per-obje
   `~/.kube/config` 464 times). So an in-kernel LRU suppressor emits at most one event per
   second for each `(exe, opened file, action)`, and folds the rest into a count.
 
-The full design, threat model and rationale are in [`docs/DESIGN.md`](docs/DESIGN.md).
+The design decisions are in [`docs/adr/`](docs/adr/README.md), and the threat model is in
+[`docs/threat-model.md`](docs/threat-model.md).
 
 ## Blessing — `sudo` for file reads
 
@@ -135,7 +136,7 @@ job control and desktop session survive. GUI apps, `run0` and `pkexec` work insi
 shell. The grant rides on a root-owned cgroup made for that one invocation. So the grant
 evaporates when the command exits, it reaches only the objects its rules name, and every
 blessed access is journaled with its class.
-([`DESIGN.md` §16](docs/DESIGN.md#16-blessing--runtime-authenticated-access-grants))
+([ADR 0012](docs/adr/0012-blessing.md))
 
 > Sudoers note. sudo caches authentication for about 15 minutes, so a second `bless` in that
 > window won't prompt. To require a human for every grant, add this line:
@@ -261,7 +262,7 @@ These are stated plainly, because a security tool that oversells itself is worse
   per-open prompt. That is a deliberate rejection of consent fatigue, the failure mode that
   killed the HIPS category.
 
-A longer list with the reasoning is in [`DESIGN.md` §10](docs/DESIGN.md#10-honest-limitations).
+A longer list with the reasoning is in [`docs/limitations.md`](docs/limitations.md).
 
 ## How it compares
 
@@ -277,7 +278,7 @@ A longer list with the reasoning is in [`DESIGN.md` §10](docs/DESIGN.md#10-hone
 Android proves that the enforcement works (a per-app uid plus a domain), and TCC proves that
 the model is usable. Windows ships the two halves separately and never joins them. None of it
 exists for the Linux desktop. A detailed prior-art survey, including Santa, KubeArmor,
-Tetragon and bpflock, is in [`DESIGN.md` §13](docs/DESIGN.md#13-related-work--prior-art) and
+Tetragon and bpflock, is in [`docs/prior-art.md`](docs/prior-art.md) and
 [`docs/SANTA.md`](docs/SANTA.md).
 
 ## Contributing

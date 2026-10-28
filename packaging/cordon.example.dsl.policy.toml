@@ -1,4 +1,4 @@
-# A cordon policy in the flat rule model (DESIGN §15), written in the compact rule DSL.
+# A cordon policy in the flat rule model (ADR 0005), written in the compact rule DSL.
 # It is the same model as cordon.example.policy.toml, which uses the verbose `[[rule]]`
 # form. This file shows the line-oriented alternative. Both forms may be mixed in one
 # file and compile identically.
@@ -41,7 +41,7 @@ rules = '''
 allow    @ssh-tools     @ro          ~/.ssh
 
 # A process run with `cordon bless --class ro` may read the cloud creds. This is a runtime
-# grant (DESIGN §16). It outranks the `*` audit catch-all below, which keeps logging
+# grant (ADR 0012). It outranks the `*` audit catch-all below, which keeps logging
 # everyone else.
 allow    @blessed-ro    @ro          @cloud-creds
 
@@ -62,7 +62,7 @@ silence  /usr/bin/aws   *            ~/.aws/.danger-token
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
-# A blessing class (DESIGN §16) is a subject group with a `blessing = "<name>"` predicate
+# A blessing class (ADR 0012) is a subject group with a `blessing = "<name>"` predicate
 # instead of `members`. `cordon bless --class ro -- <cmd>` tags the cgroup of <cmd> `ro`.
 # The rule above lets such a process read the cloud creds, and only those.
 [group.subject.blessed-ro]

@@ -1,5 +1,5 @@
 //! Keeps the boundary up with no daemon running, by pinning the LSM links in bpffs
-//! (DESIGN §4). See [`PinDir::pin_links`] for what is pinned and how a new run takes over,
+//! (ADR 0002). See [`PinDir::pin_links`] for what is pinned and how a new run takes over,
 //! and [`PinDir::teardown`] for how it comes down.
 
 use super::super::Swept;

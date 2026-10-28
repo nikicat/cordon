@@ -9,9 +9,9 @@ cordon, and why we still build cordon.
 
 > This is a dated comparison. The cordon side below is the owner model as of the research
 > date, which had TOFU creator-owns, an interactive prompt and a SQLite rule store. The rule
-> model in DESIGN §15 has since superseded it. That model has a static root-owned text policy
-> and no interactive prompt, plus the runtime `cordon bless` grant (§16). The Santa findings
-> stand. Read the cordon column against §15, where FAA's static-policy model is much closer to
+> model in [ADR 0005](adr/0005-flat-rule-model.md) has since superseded it. That model has a static root-owned text policy
+> and no interactive prompt, plus the runtime `cordon bless` grant ([ADR 0012](adr/0012-blessing.md)). The Santa findings
+> stand. Read the cordon column against [ADR 0005](adr/0005-flat-rule-model.md), where FAA's static-policy model is much closer to
 > cordon's than this table suggests.
 
 ## TL;DR verdict

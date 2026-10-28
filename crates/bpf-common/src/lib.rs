@@ -2,8 +2,7 @@
 //! (`crates/bpf`) and the userspace control plane (`crates/daemon`, `bpf-lsm` feature)
 //! exchange. Both sides compile against these types, so they cannot drift apart by a byte.
 //!
-//! The eBPF program reads policy from BPF maps and returns a verdict in the kernel (DESIGN
-//! §4, "BPF-LSM"). The daemon fills those maps from the compiled policy and drains the ring
+//! The eBPF program reads policy from BPF maps and returns a verdict in the kernel (ADR 0002). The daemon fills those maps from the compiled policy and drains the ring
 //! buffer.
 //!
 //! The crate is `#![no_std]` and has no `aya` dependency by default, so the eBPF crate can

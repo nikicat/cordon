@@ -31,7 +31,7 @@ backend = "bpf-lsm"
 # bpf_object = "${PWD}/target/bpf/cordon.bpf.o"
 #
 # The bpffs directory the LSM links are pinned under, so that the boundary outlives the
-# daemon (DESIGN §4). The default is /sys/fs/bpf/cordon.
+# daemon (ADR 0002). The default is /sys/fs/bpf/cordon.
 #
 # As a consequence, `systemctl stop cordond` does not stop enforcement.
 # `cordond --teardown` turns it off.

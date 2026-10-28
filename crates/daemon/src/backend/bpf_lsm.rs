@@ -1,4 +1,4 @@
-//! The Linux BPF-LSM enforcement backend (DESIGN §4, §15).
+//! The Linux BPF-LSM enforcement backend (ADR 0002, ADR 0005).
 //!
 //! The eBPF program (`crates/bpf`) returns every verdict in-kernel from the rule table in
 //! BPF maps, so this Rust code never sees an individual open. This module is the control

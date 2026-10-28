@@ -1,4 +1,4 @@
-//! The schema of the flat rule model (DESIGN §15), the compiled and pre-resolved decision
+//! The schema of the flat rule model (ADR 0005), the compiled and pre-resolved decision
 //! table that both sides read byte for byte.
 //!
 //! The userspace compiler (`cordon_core::policy::compile`) lowers an expressive text
@@ -6,7 +6,7 @@
 //! set of protected objects, each with a flat, pre-sorted list of [`CompiledRule`]s. The
 //! compiler resolves object precedence and inheritance by copying rules down, so the eBPF
 //! program only finds the most specific protected object and applies the first matching
-//! rule in its one bucket (DESIGN §15.3, "expressive source, dumb-fast binary form").
+//! rule in its one bucket (ADR 0005, "expressive source, dumb-fast binary form").
 //!
 //! The three rule maps are double-buffered, and each holds [`NUM_BANKS`] generations (see
 //! [`Bank`]).
@@ -36,7 +36,7 @@ pub const MAP_RULES: &str = "RULES";
 pub const MAP_RULE_COUNT: &str = "RULE_COUNT";
 
 /// The name of the `HashMap<CgroupId, ClassId>` that maps each live blessed cgroup to the
-/// [`ClassId`] it was minted with (DESIGN §16.3). The kernel resolves the caller's class as
+/// [`ClassId`] it was minted with (ADR 0012). The kernel resolves the caller's class as
 /// `BLESSED[current_cgroup_id]`, or as [`ClassId::UNBLESSED`] when the cgroup is absent,
 /// and a rule's `blessing` predicate matches that class.
 ///
@@ -89,7 +89,7 @@ pub const RULE_SLOTS: usize = BANKED_OBJECTS * MAX_RULES_PER_OBJ;
 pub struct ObjId(pub u32);
 
 /// A blessing class id. The compiler assigns a dense id to each named blessing class that
-/// policy declares (`[group.subject.*] blessing = "<name>"`, DESIGN §16.3), and
+/// policy declares (`[group.subject.*] blessing = "<name>"`, ADR 0012), and
 /// [`MAP_BLESSED`] stores it for a live blessed cgroup. A rule's
 /// [`SubjectMatch::blessing`] names the class it requires, and the kernel matches it
 /// against the caller's resolved class.
@@ -170,11 +170,11 @@ impl BankedObj {
 
 bitflags! {
     /// The set of actions that a rule covers, with one bit per LSM-mediated operation
-    /// (DESIGN §15.5). A rule carries a mask rather than one action, so
+    /// (ADR 0007). A rule carries a mask rather than one action, so
     /// `action = ["read","write"]` compiles to a single [`CompiledRule`], and the kernel
     /// matches when the mask intersects the requested actions. `file_open` requests
     /// `READ`, `WRITE` and `CREATE`, the mutation hooks request `LINK`, `RENAME`, `UNLINK`,
-    /// `RMDIR` and `MKDIR`, and `bprm_check_security` requests `EXECUTE` (§15.5).
+    /// `RMDIR` and `MKDIR`, and `bprm_check_security` requests `EXECUTE` (ADR 0007).
     ///
     /// `#[repr(transparent)]` is load-bearing. The type is read byte for byte out of the
     /// `RULES` map inside [`CompiledRule`], which is `repr(C)`, so its ABI must be exactly
@@ -247,8 +247,8 @@ impl core::fmt::Display for Action {
     }
 }
 
-/// A rule's effect, one of `{allow, deny} × {log, silent}` (DESIGN §15.2). This per-rule
-/// policy is the only enforcement level, and there is no global mode (§15.6). The kernel
+/// A rule's effect, one of `{allow, deny} × {log, silent}` (ADR 0005). This per-rule
+/// policy is the only enforcement level, and there is no global mode (ADR 0008). The kernel
 /// blocks exactly when the policy [`denies`](Policy::denies), so `audit` observes an object
 /// and `deny` enforces it, per object.
 #[repr(transparent)]
@@ -265,7 +265,7 @@ impl Policy {
     /// The effect that denies the access silently, with no learn record.
     pub const SILENCE: Policy = Policy(3);
     /// The synthetic effect that the kernel applies when no rule matched on a protected
-    /// object (the default-deny, DESIGN §15.6.3). Only a protected object can reach it. A
+    /// object (the default-deny, ADR 0008). Only a protected object can reach it. A
     /// path under no object is allowed, and `where = "*"` is rejected at resolve, so the
     /// filesystem as a whole is never default-denied. It is never authored or stored in a
     /// [`CompiledRule`]. It exists only as the cause carried on a [`crate::DecisionEvent`],
@@ -274,7 +274,7 @@ impl Policy {
     /// [`DENY`](Policy::DENY).
     pub const DEFAULT_DENY: Policy = Policy(4);
     /// The synthetic effect that the kernel applies when a protected inode would acquire a
-    /// name outside its object, through a hardlink or a rename out (DESIGN §15.5). Like
+    /// name outside its object, through a hardlink or a rename out (ADR 0007). Like
     /// [`DEFAULT_DENY`](Policy::DEFAULT_DENY), it is never authored or stored in a
     /// [`CompiledRule`]. Unlike every other cause, it comes from no rule at all, because
     /// the escape is refused unconditionally (see the program's `decide_reparent`). It is a
@@ -334,9 +334,9 @@ impl core::fmt::Display for Policy {
 bitflags! {
     /// The subject predicates that are wildcards. A set bit means "match any caller and
     /// skip the compare". `who = "*"` sets every bit, and a concrete predicate clears its
-    /// own bit. The kernel ANDs only the predicates that are not wildcards (DESIGN §15.4
-    /// and the §16.3 `blessing`). The compiler counts the cleared bits as the rule's
-    /// subject specificity (`subject_specificity`, §15.6), so a fifth predicate bit extends
+    /// own bit. The kernel ANDs only the predicates that are not wildcards (ADR 0006
+    /// and the ADR 0012 `blessing`). The compiler counts the cleared bits as the rule's
+    /// subject specificity (`subject_specificity`, ADR 0008), so a fifth predicate bit extends
     /// both for free.
     ///
     /// It is `#[repr(transparent)]` over `u32` for the same reason as [`Action`]. It is
@@ -358,7 +358,7 @@ bitflags! {
 
 padded_pod! {
     /// A subject predicate, which is a conjunction of cheap checks that the kernel ANDs
-    /// against the caller (DESIGN §15.4 and the §16.3 `blessing` predicate). The compiler
+    /// against the caller (ADR 0006 and the ADR 0012 `blessing` predicate). The compiler
     /// fills `exe` and `blessing`, while `uid` and `cgroup` are reserved and always
     /// wildcard. It rides inside [`CompiledRule`] as part of a map value, so its `_pad` is
     /// there for initialization soundness rather than key hashing (see the `layout` module
@@ -374,7 +374,7 @@ padded_pod! {
         pub cgroup: CgroupId,
         /// The caller's uid. It is reserved, and [`SubjectFlags::UID_ANY`] is always set.
         pub uid: Uid,
-        /// The blessing class that this rule requires (DESIGN §16.3). It is compared
+        /// The blessing class that this rule requires (ADR 0012). It is compared
         /// against the caller's resolved class, `BLESSED[cgroup]` or
         /// [`ClassId::UNBLESSED`], unless [`SubjectFlags::BLESSING_ANY`] is set.
         pub blessing: ClassId,
@@ -407,7 +407,7 @@ impl SubjectMatch {
         }
     }
 
-    /// Returns a subject that matches any caller in blessing class `class` (DESIGN §16.3),
+    /// Returns a subject that matches any caller in blessing class `class` (ADR 0012),
     /// which is the `@blessed-*` predicate. The exe, uid and cgroup are wildcards. The
     /// compiler combines it with [`exe`](Self::exe) by conjunction.
     pub const fn blessed(class: ClassId) -> SubjectMatch {

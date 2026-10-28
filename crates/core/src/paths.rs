@@ -41,26 +41,6 @@ pub fn depth(path: &Path) -> usize {
     path.components().count()
 }
 
-/// Returns the claimable subtree that holds `path`. It is the deepest zone that is a
-/// strict ancestor of `path`, extended by exactly one component. Returns `None` when
-/// `path` is itself a zone or lies outside every zone, because a zone root is never
-/// claimable (DESIGN §5).
-///
-/// For example, `~/.config/ctest-xdg/secret` with the zones `{~, ~/.config}` has
-/// `~/.config` as its deepest strict-ancestor zone, so its subtree is
-/// `~/.config/ctest-xdg`.
-pub fn claimable_subtree(path: &Path, zones: &[PathBuf]) -> Option<PathBuf> {
-    let path = normalize(path);
-    let zone = zones
-        .iter()
-        .map(|z| normalize(z))
-        .filter(|z| path.starts_with(z) && path != *z)
-        .max_by_key(|z| depth(z))?;
-    let rest = path.strip_prefix(&zone).ok()?;
-    let first = rest.components().next()?;
-    Some(zone.join(first.as_os_str()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,29 +59,5 @@ mod tests {
         assert!(is_within(Path::new("/a/b/c"), Path::new("/a/b")));
         assert!(is_within(Path::new("/a/b"), Path::new("/a/b")));
         assert!(!is_within(Path::new("/a/bc"), Path::new("/a/b")));
-    }
-
-    #[test]
-    fn claimable_picks_deepest_zone_plus_one() {
-        let zones = vec![PathBuf::from("/home/u"), PathBuf::from("/home/u/.config")];
-        assert_eq!(
-            claimable_subtree(Path::new("/home/u/.config/ctest-xdg/secret"), &zones),
-            Some(PathBuf::from("/home/u/.config/ctest-xdg"))
-        );
-        assert_eq!(
-            claimable_subtree(Path::new("/home/u/.ctest-old/secret"), &zones),
-            Some(PathBuf::from("/home/u/.ctest-old"))
-        );
-    }
-
-    #[test]
-    fn zone_itself_is_never_claimable() {
-        let zones = vec![PathBuf::from("/home/u/.config")];
-        assert_eq!(
-            claimable_subtree(Path::new("/home/u/.config"), &zones),
-            None
-        );
-        // outside every zone
-        assert_eq!(claimable_subtree(Path::new("/etc/passwd"), &zones), None);
     }
 }

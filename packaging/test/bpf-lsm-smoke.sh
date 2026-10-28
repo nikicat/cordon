@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of the bpf-lsm boundary (DESIGN §15), run in one VM boot. Each scenario
+# End-to-end tests of the bpf-lsm boundary (ADR 0005), run in one VM boot. Each scenario
 # starts a real cordond on its own policy and checks the in-kernel verdicts and the
 # daemon's JSON log. The comment above each scenario function says what it proves.
 #
@@ -368,7 +368,7 @@ EOF
     return $fail
 }
 
-# Checks DESIGN §15.6 step 2, under which a concrete subject outranks a `who="*"`
+# Checks ADR 0008 step 2, under which a concrete subject outranks a `who="*"`
 # catch-all on the same object. Both rules sit on $VAULT. Without subject specificity,
 # deny-beats-allow would sort the wildcard deny first and block the owner too. The check
 # reads outcomes, not log timing.
@@ -533,7 +533,7 @@ EOF
 }
 
 # Checks that auditing one exe over a dir yields a separate record for each distinct file
-# it opens, with the actual opened path (DESIGN §15.10 flow B). That includes a nested file
+# it opens, with the actual opened path (docs/authoring.md flow B). That includes a nested file
 # at depth 2. Siblings do not coalesce away, because the suppressor keys on the opened file
 # (see `SuppressKey`).
 scenario_leaf_path() {
@@ -541,7 +541,7 @@ scenario_leaf_path() {
     ws_new
     mkdir -p "$VAULT/sub"
     echo "DEEP" > "$VAULT/sub/nested"
-    # Audit the owner across the whole vault (DESIGN §15.10 flow B "smart strace -efile").
+    # Audit the owner across the whole vault (docs/authoring.md flow B "smart strace -efile").
     write_policy <<EOF
 $(rule "$OWNER" "$VAULT" read audit)
 EOF
@@ -603,7 +603,7 @@ EOF
 }
 
 # Checks that the journal renders object= and path= with a regular user's home collapsed
-# to ~, so that a deny or audit line drops straight into the user's policy (DESIGN §15.10).
+# to ~, so that a deny or audit line drops straight into the user's policy (docs/authoring.md).
 # The collapse depends on the caller rather than the tier, so a plain system policy is
 # enough. Skips when the guest cannot drop the uid or edit /etc/passwd.
 scenario_user_home_tilde() {
@@ -638,9 +638,9 @@ EOF
 }
 
 # --- policy-edit symlink scenarios: shared setup -----------------------------
-# The sudoedit-style boundary (DESIGN §15.8) runs the editor as the invoking user, while the
+# The sudoedit-style boundary (ADR 0010) runs the editor as the invoking user, while the
 # root parent seeds, reads and writes the root-owned copy. Both scenarios mount a same-uid
-# symlink attack on the user-owned temp copy, which is the threat DESIGN §2 puts in scope.
+# symlink attack on the user-owned temp copy, which is the threat docs/threat-model.md puts in scope.
 # They need no daemon, because the attack is resolved before the apply.
 
 # Creates a fresh workspace, the passwd entry for $TUSER, the root-only $SENTINEL and a

@@ -1,6 +1,6 @@
 //! Operational configuration, meaning the settings the daemon needs before, or apart
 //! from, the policy. The rules themselves live in the text policy file that `policy`
-//! names, not here (DESIGN §15.8).
+//! names, not here (ADR 0010).
 //!
 //! A CLI flag overrides the config file, and the config file overrides the built-in
 //! default. String values in the file may interpolate `${ENV}`, as in
@@ -19,16 +19,16 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub backend: BackendKind,
     pub socket: SocketPath,
-    /// The roots under which autolearn may propose rules (DESIGN §15.9). The setting is
+    /// The roots under which autolearn may propose rules (ADR 0011). The setting is
     /// accepted, but nothing enforces from it.
     pub zones: Vec<PathBuf>,
     /// The compiled eBPF object that the `bpf-lsm` backend loads at runtime, as
     /// `just build-ebpf` builds it.
     pub bpf_object: PathBuf,
     /// The bpffs directory under which the `bpf-lsm` backend pins its LSM links (the
-    /// daemon's `PinDir::pin_links`, DESIGN §4).
+    /// daemon's `PinDir::pin_links`, ADR 0002).
     pub bpf_pin_dir: PathBuf,
-    /// The root-owned text policy (the flat rule model, DESIGN §15.8). It is a single
+    /// The root-owned text policy (the flat rule model, ADR 0010). It is a single
     /// file or a conf.d directory of `*.toml` fragments
     /// ([`PolicyRoot`](crate::policy::PolicyRoot)). The `bpf-lsm` backend compiles it
     /// at startup and seeds its maps from it.

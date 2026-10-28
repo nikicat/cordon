@@ -1,17 +1,17 @@
 # Implementation plan — blessing (`cordon bless`)
 
-This is the concrete, reviewable plan for [`DESIGN.md` §16](DESIGN.md), the runtime access
+This is the concrete, reviewable plan for [ADR 0012](adr/0012-blessing.md), the runtime access
 grant that a human authenticates. A blessing lets an ad-hoc, interactive invocation (`cat`,
 `find`, `du` or a shell) and its descendants cross the cordon, under a class that the policy
-defines. It adds to the §15 rule model and reuses it as much as possible. A blessing is one
-more `SubjectMatch` predicate (`blessing = "<class>"`, §16.3), so a blessing rule is an
+defines. It adds to the [ADR 0005](adr/0005-flat-rule-model.md) rule model and reuses it as much as possible. A blessing is one
+more `SubjectMatch` predicate (`blessing = "<class>"`, [ADR 0012](adr/0012-blessing.md)), so a blessing rule is an
 ordinary rule. Its action, object scope, conjunction and precedence all come from the
 existing model. There are only four new pieces. One is a carrier, which is a root-owned
 cgroup made for one invocation. Another is a tiny runtime indirection map
 (`BLESSED`, from a cgroup id to a `ClassId`). The last two are a root-gated mint path in the
 daemon and the `cordon bless` CLI.
 
-> Status: B1 and B2 shipped on 2026-07-27, and the VM smoke is green. DESIGN §16 specifies
+> Status: B1 and B2 shipped on 2026-07-27, and the VM smoke is green. [ADR 0012](adr/0012-blessing.md) specifies
 > what exists today, and [`STATUS.md`](../STATUS.md) summarizes it. The detailed B1 and B2
 > commit plans were retired once they became code.
 >
@@ -19,16 +19,16 @@ daemon and the `cordon bless` CLI.
 > make `bless` usable, so neither B3 nor B4 blocks anything. The queue was bugs, then M3, then
 > M5, then M6, and blessing resumes once the boundary underneath it is sound. B3 is a
 > nice-to-have. It relaxes the mint gate, so no one is locked out in the meantime, and the
-> sudo grace window is an accepted delta (§16.5). B4 waits on the core by its own logic. A
+> sudo grace window is an accepted delta ([ADR 0013](adr/0013-bless-authentication.md)). B4 waits on the core by its own logic. A
 > blanket "uncordoned" class is a skeleton key, and widening the grant surface before M5 and
 > M6 close the fail-open and confused-deputy holes gets the order backwards.
 
-These guiding constraints come from §16, and they still bind B3 and B4:
-- **Authorization is the whole feature.** The carrier is forgeable (§8.1). So security rests
+These guiding constraints come from [ADR 0012](adr/0012-blessing.md), and they still bind B3 and B4:
+- **Authorization is the whole feature.** The carrier is forgeable ([ADR 0003](adr/0003-exe-inode-identity.md)). So security rests
   entirely on two things. One is a human authenticating at mint time. The other is that
   `cgroup.procs` is root-owned, so only a root process can place a task in a blessed cgroup.
 - **Blessing is an ordinary rule.** The `blessing` predicate composes with the rest of
-  `SubjectMatch`. The scope is the rule's object column, and precedence is the §15.6
+  `SubjectMatch`. The scope is the rule's object column, and precedence is the [ADR 0008](adr/0008-precedence.md)
   specificity. There is no bespoke grant table and no flip from deny to allow. There is just a
   first-match scan over the compiled buckets.
 - **Decoupled from `policy apply`.** The static `@blessed-*` rules compile into the banked
@@ -40,7 +40,7 @@ These guiding constraints come from §16, and they still bind B3 and B4:
 - **No hardcoding.** Classes are declared in policy with the `blessing` predicate. Class names
   such as `ro` and `rw` are conventions, not built-ins.
 - **No grace window.** Every mint authenticates, and repeated access means blessing a shell.
-  *(This is not true as shipped. sudo's timestamp cache is a grace window, which DESIGN §16.5
+  *(This is not true as shipped. sudo's timestamp cache is a grace window, which [ADR 0013](adr/0013-bless-authentication.md)
   documents as an accepted delta. B3 restores the property by construction.)*
 
 > One lesson from B2's derisk spike is kept here because it cost a cycle. The spike built the
@@ -56,7 +56,7 @@ These guiding constraints come from §16, and they still bind B3 and B4:
 ## Milestone B3 — PAM authenticator (replaces the uid-0 gate) ← **deferred, nice to have**
 B1 was deliberately shaped to accept this upgrade. The mint verb does not depend on the
 authenticator, so B3 adds frames beside it rather than reshaping the IPC. The full design is in
-DESIGN §16.5.
+[ADR 0013](adr/0013-bless-authentication.md).
 
 - **PAM in the daemon** (a new dependency). The daemon authenticates the user behind the peer
   uid against a `cordon` PAM service, taking the uid from `SO_PEERCRED` as it does today. The
@@ -82,7 +82,7 @@ DESIGN §16.5.
 - A richer `cordon bless list`, a structured journal, and polish for `revoke`. Optionally, an
   affordance for a blessed shell, such as a prompt marker or hint. It must be derived from
   cgroup membership and never carried in an environment variable, because the environment is
-  forgeable as a carrier (§16.2). Inheriting the environment into the child is fine.
+  forgeable as a carrier ([ADR 0012](adr/0012-blessing.md)). Inheriting the environment into the child is fine.
 - (Optional) A `--path P` option that narrows one invocation. It intersects the chosen class's
   scope down to `P` for that invocation. It can only tighten, and never widens past the policy
   class.
@@ -98,13 +98,13 @@ DESIGN §16.5.
   uncordoned, because an unprotected path is already unmediated. `resolve.rs` currently
   rejects `where = "*"` outright, because it can't work for deny. Two questions are open. One
   is what a bare `*` means in a home-scoped user-tier fragment. The other is that a blanket
-  class is a skeleton key that widens the ptrace and open-fd exposure of §16.7. So it must be
+  class is a skeleton key that widens the ptrace and open-fd exposure of [limitations](limitations.md). So it must be
   an opt-in second class, and never a change to what blessing means.
 
 ---
 
 ## Cross-milestone notes
-- **Relation to M2 (the §15.4 `cgroup` predicate).** Blessing shares the
+- **Relation to M2 (the [ADR 0006](adr/0006-subject-predicates.md) `cgroup` predicate).** Blessing shares the
   `bpf_get_current_cgroup_id` read and the `SubjectMatch` predicate pattern with it. But it is
   a distinct predicate. It matches any cgroup currently registered as class X in `BLESSED`,
   through the indirection, rather than one fixed cgroup id. The two stay independent.
@@ -112,19 +112,19 @@ DESIGN §16.5.
   (`PinDir::pin_links`). So `BLESSED` lives exactly as long as the program of its generation.
   A restarted daemon loads a fresh, empty `BLESSED`, which fails closed.
   `Blessings::reconcile` then re-registers the leftover carriers whose class is still declared
-  (§16.6). Pinning `BLESSED` separately would buy nothing. The old generation's program
+  ([ADR 0014](adr/0014-blessing-lifecycle.md)). Pinning `BLESSED` separately would buy nothing. The old generation's program
   already holds it, so its entries would be no more and no less stale, only reachable (see
   STATUS, *Settled*).
 - **cgroup v2 (the unified hierarchy) is assumed.** v1 and hybrid setups are out of scope.
   cordon should detect them and refuse with a clear diagnostic.
 - **Naming.** `bless` is reserved for this runtime grant. Authoring flow A is observe, then
-  admit, then enforce (§15.10). In the threat model, "blessed binary/ancestor" (§8.1) is
+  admit, then enforce ([authoring flows](authoring.md)). In the threat model, "blessed binary/ancestor" ([ADR 0003](adr/0003-exe-inode-identity.md)) is
   generic English for a statically trusted binary, and it is unrelated to this command.
 
 ## Open questions
 - Whether to ship the per-invocation `--path` narrowing (B4), or to leave scoping purely in
   the policy.
 - How to authorize a caller beyond authenticating it. `SO_PEERCRED` says who the caller is,
-  and the socket gate (§15.8) settles whether they may reach the verb. B3 decides whether some
+  and the socket gate ([ADR 0010](adr/0010-policy-storage.md)) settles whether they may reach the verb. B3 decides whether some
   users may bless without a full PAM conversation, for example with a `pam_u2f`-only or a
   group-gated policy.

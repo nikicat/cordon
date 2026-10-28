@@ -26,7 +26,7 @@ use tracing::{info, warn};
 pub(super) struct Maps<'a>(pub(super) &'a mut Ebpf);
 
 impl Maps<'_> {
-    /// Seeds a compiled policy atomically (DESIGN §15.8), so a re-seed is never
+    /// Seeds a compiled policy atomically (ADR 0010), so a re-seed is never
     /// half-visible. The three rule maps are banked, which means each holds two
     /// generations, and `Settings.active_bank` selects the live one (see [`Bank`]). This
     /// fills the inactive bank, which the kernel never reads, and then flips `active_bank`

@@ -1,4 +1,4 @@
-# A cordon policy in the flat rule model (DESIGN §15). The file is root-owned and must not
+# A cordon policy in the flat rule model (ADR 0005). The file is root-owned and must not
 # be writable by users, or a scraper could write itself in. You write it as text and apply
 # it explicitly with `cordon policy apply`. It is compiled in userspace and enforced
 # in-kernel by the bpf-lsm backend. The default location is /etc/cordon/policy.toml, and
@@ -18,7 +18,7 @@
 #   policy — allow (allow, silent) | audit (allow, log) | deny (deny, log) |
 #            silence (deny, silent).
 #
-# Precedence (DESIGN §15.6):
+# Precedence (ADR 0008):
 #   1. most-specific `where` wins (a file rule beats the subtree it sits in);
 #   2. ancestor rules are inherited downward, so a file is still governed by its
 #      subtree's rules for anything it doesn't override (copy-down);
@@ -36,7 +36,7 @@
 [group.subject.ssh-tools]
 members = ["/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/sftp"]
 
-# A blessing class (DESIGN §16) is a subject group with a `blessing = "<name>"` predicate
+# A blessing class (ADR 0012) is a subject group with a `blessing = "<name>"` predicate
 # instead of `members`. `cordon bless --class ro -- <cmd>` runs <cmd> in a cgroup tagged
 # `ro`. The rule below lets such a blessed process read the cloud creds, and only those,
 # because the object column is the scope.
@@ -48,7 +48,7 @@ members = ["~/.aws", "~/.config/gcloud", "~/.config/gh"]
 
 # `listdir` has no hook of its own yet. A directory open requests `read`, so it is `read`
 # that grants listing here. Do not write `listdir` alone. Nothing requests it, so the open
-# falls to default-deny, and the rule denies what it looks like it grants (DESIGN §15.5).
+# falls to default-deny, and the rule denies what it looks like it grants (ADR 0007).
 [group.action.ro]
 members = ["read", "listdir"]
 
@@ -62,7 +62,7 @@ action = "@ro"
 policy = "allow"
 
 # A process run with `cordon bless --class ro` may read the cloud creds. This is a runtime
-# grant that the human approves through `$CORDON_SUDO`, which defaults to sudo (DESIGN §16).
+# grant that the human approves through `$CORDON_SUDO`, which defaults to sudo (ADR 0012).
 # The blessed allow outranks the `*` audit catch-all below (precedence 3), so a blessed
 # reader goes silent while unknown readers stay logged.
 [[rule]]

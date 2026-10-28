@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `socket` and `uio` provide the `sendmsg` and `recvmsg` behind proto's SCM_RIGHTS
-# hand-off of a `CarrierProcs` (DESIGN §16.6). Both ends of the wire need them, so they
+# hand-off of a `CarrierProcs` (ADR 0014). Both ends of the wire need them, so they
 # live in core rather than in a copy in each of daemon and cli. `uio` gates the
 # scatter-gather msghdr calls, and `socket` alone stops at getsockopt and setsockopt.
 # `user` is the NSS account lookup behind `passwd`.
@@ -25,7 +25,7 @@ nix = { version = "0.31.3", features = ["socket", "uio", "user", "fs"] }
 
 [dependencies]
 serde = { workspace = true }
-# For the blessing nonce (DESIGN §16.5), which is the tree's only randomness and must be
+# For the blessing nonce (ADR 0013), which is the tree's only randomness and must be
 # unguessable. It is a thin wrapper over `getrandom(2)`. With no descriptor to open, it
 # cannot be defeated by exhausted fds or a missing /dev, and it blocks correctly on an
 # unseeded pool rather than handing back weak bytes. Its only dependency here is `libc`,

@@ -6,10 +6,10 @@
 
 ## Where things stand
 
-The architecture is the flat rule model (DESIGN §15). A root-owned text policy of
+The architecture is the flat rule model ([ADR 0005](docs/adr/0005-flat-rule-model.md)). A root-owned text policy of
 `(who, where, action, policy)` rules is compiled in userspace and enforced in the kernel by
 the `bpf-lsm` backend. M1, M3 and M5 are complete and VM-validated, and so are blessing stages
-B1 and B2 (DESIGN §16). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12 kernel.
+B1 and B2 ([ADR 0012](docs/adr/0012-blessing.md)). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12 kernel.
 The migration retired the earlier owner model, as *Pre-rule-model history* below describes.
 
 Enforcement is now fail-safe. The LSM links are pinned to bpffs, so the boundary survives the
@@ -32,7 +32,7 @@ Diagnostics carry a source `Pos`. The compiled form is the contract in
 **Precedence.** Precedence goes by object depth first, then by subject specificity, then deny
 over allow. There is no global mode. The per-rule `policy` is the only enforcement level, so
 `audit` observes an object and `deny` enforces it, one object at a time. That is what makes
-the audit, admit, enforce flow (§15.10) work object by object. "Off" means an empty policy or
+the audit, admit, enforce flow ([authoring flows](docs/authoring.md)) work object by object. "Off" means an empty policy or
 `cordond --teardown`. Stopping the daemon leaves enforcement up (see *Fail-safe pinning*
 below).
 
@@ -58,7 +58,7 @@ A rename over an existing name is a fourth case. It is classified by the destina
 rather than by its directory. Such a rename destroys the inode at the destination, and
 `inode_rename` is the only hook the kernel fires for it. Without this case,
 `mv anything secret` would do what `rm secret` is refused (`decide_reparent` in
-`crates/bpf/src/main.rs`). See DESIGN §15.5.
+`crates/bpf/src/main.rs`). See [ADR 0007](docs/adr/0007-action-hook-map.md).
 
 **Volume control.** Tools re-open one config hundreds of times per run (helm opens
 `~/.kube/config` 464 times). So an in-kernel LRU suppressor emits at most one event per key
@@ -98,7 +98,7 @@ merged in name order. Each fragment can expand `~` against its own `user =` head
 
 **CLI.** The commands are `policy check` (a lint that needs no daemon), `apply`, `show`,
 `status`, and `policy edit`. `policy edit` is the sudoedit analog. It runs `$EDITOR` as the
-invoking user, because a root editor on a same-uid box is an escalation (DESIGN §2). It then
+invoking user, because a root editor on a same-uid box is an escalation ([threat model](docs/threat-model.md)). It then
 validates the policy, and if the policy compiles, it applies and saves it in one step. Bare
 `edit` opens your own tier, and `--system` and `--user NAME` open the others.
 
@@ -170,7 +170,7 @@ and the remaining hole is in the core boundary. The rule is *soundness before er
   depends on it. B1 and B2 ship a usable `bless`, and B2 already did the structural work (the
   `SCM_RIGHTS` hand-off and the unprivileged CLI). So whenever B3 is picked up, it stays a
   swap of what proves that a human is present, and it relaxes the gate rather than tightening
-  it. Until then, sudo's timestamp cache is an accepted grace window (DESIGN §16.5). The
+  it. Until then, sudo's timestamp cache is an accepted grace window ([ADR 0013](docs/adr/0013-bless-authentication.md)). The
   deployment workaround is `Defaults!/usr/bin/cordon timestamp_timeout=0`.
 - **B4: the enumerated-scope gap.** A blessing class lists its object scope, so the list
   drifts against `@secrets`. Every directory added to one must be added to the other, or a
@@ -210,7 +210,7 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
   program holds a reference to it. So its stale grants persist exactly the same and merely
   become unreachable, which is strictly worse than pinning it. The point is moot under the
   link-only design. That design pins no maps at all, so `BLESSED` keeps its fail-closed
-  behaviour on restart exactly as DESIGN §16 step 9 specifies. Do not "fix" this by pinning
+  behaviour on restart exactly as [ADR 0014](docs/adr/0014-blessing-lifecycle.md) step 9 specifies. Do not "fix" this by pinning
   maps.
 - **The daemon fast-allow tests both `daemon_pid` and `daemon_exe`, and it must stay that
   way.** `live_bank` returns `None` for the daemon's own pid, and that is a total bypass of
@@ -309,5 +309,4 @@ VM-validated. One was a root `fanotify` `FAN_OPEN_PERM` backend (Phase 1). The o
 in-kernel `bpf-lsm` backend that enforced `subtrees` and `owner_identities` (Phase 3). The
 rule-model migration replaced all of it. Owners, TOFU and rules collapsed into one
 `(who, where, action, policy)` model. The SQLite store and the `mock` and `fanotify` backends
-were removed, and `bpf-lsm` is now the only backend. The detail lives in git history and in
-DESIGN §1 to §14, which are marked superseded there.
+were removed, and `bpf-lsm` is now the only backend. The detail lives in git history.

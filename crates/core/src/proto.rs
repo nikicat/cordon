@@ -28,7 +28,7 @@ pub enum Request {
     /// Asks for the effective (currently loaded) compiled policy.
     PolicyShow,
     /// Asks for a blessing under `class`, or under the sole declared class when `class`
-    /// is `None`. This is the unprivileged half of the mint handshake (DESIGN §16.5).
+    /// is `None`. This is the unprivileged half of the mint handshake (ADR 0013).
     ///
     /// The daemon replies [`Response::BlessPending`] with a [`Nonce`] and keeps this
     /// connection open. Once a matching [`Self::BlessApprove`] arrives on a second
@@ -198,7 +198,7 @@ pub struct BlessingView {
 /// Writing a pid into it moves that task into the blessing. It is a capability, not a path,
 /// because cgroup v2 checks migration permission against the credentials of whoever opened
 /// the file. Holding this descriptor is what lets an unprivileged `cordon bless` place its
-/// child in a root-owned carrier without ever being root (DESIGN §16.4). The flip side is
+/// child in a root-owned carrier without ever being root (ADR 0012). The flip side is
 /// that the holder can move any task it can name, as the same section explains.
 #[derive(Debug)]
 pub struct CarrierProcs(pub std::os::fd::OwnedFd);
@@ -321,7 +321,7 @@ impl Conn {
     }
 
     /// Sends one message with `fd` attached as `SCM_RIGHTS` ancillary data, as the blessing
-    /// hand-off of a [`CarrierProcs`] does (DESIGN §16.6). The peer must read it with
+    /// hand-off of a [`CarrierProcs`] does (ADR 0014). The peer must read it with
     /// [`recv_with_fd`](Self::recv_with_fd).
     #[cfg(target_os = "linux")]
     pub fn send_with_fd(
@@ -390,7 +390,7 @@ pub struct PeerCred {
     /// impossible uid, so every check that consults it fails closed.
     pub uid: crate::Uid,
     /// The peer's pid. The daemon reads the requester's cgroup through it to place a
-    /// blessing carrier in that process's own logind session scope (DESIGN §16.6).
+    /// blessing carrier in that process's own logind session scope (ADR 0014).
     ///
     /// It is weaker than `uid`, and the difference matters. No client asserts it, and a
     /// pid that the client supplied would let a caller aim the carrier at another user's
@@ -482,7 +482,7 @@ fn send_all_with_fd(
 /// The descriptor arrives close-on-exec (`MSG_CMSG_CLOEXEC`). That is not the kernel's
 /// default for `SCM_RIGHTS`, and it matters here. Without it, the carrier's `cgroup.procs`
 /// would survive into the blessed process and hand it a standing capability to move other
-/// tasks into its own blessing (DESIGN §16.4). The `pre_exec` join happens before the exec
+/// tasks into its own blessing (ADR 0012). The `pre_exec` join happens before the exec
 /// that drops the descriptor, so nothing legitimate needs it to persist.
 #[cfg(target_os = "linux")]
 fn read_msg_with_fd<T: DeserializeOwned>(

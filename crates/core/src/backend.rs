@@ -20,7 +20,7 @@ use std::time::Duration;
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     /// Linux BPF-LSM: in-kernel verdicts from BPF maps the daemon seeds from the compiled
-    /// policy (DESIGN §4, §15; kernel and capability requirements in the README).
+    /// policy (ADR 0002, ADR 0005; kernel and capability requirements in the README).
     #[default]
     #[serde(rename = "bpf-lsm")]
     BpfLsm,
@@ -147,7 +147,7 @@ pub enum ControlMsg {
     Bless(BlessOp),
 }
 
-/// A blessing operation (DESIGN §16). Each reply carries its failure as a `String`,
+/// A blessing operation (ADR 0012). Each reply carries its failure as a `String`,
 /// because the failure is only ever shown to the human at the CLI end, and a string
 /// keeps the backend's error types out of the seam.
 pub enum BlessOp {

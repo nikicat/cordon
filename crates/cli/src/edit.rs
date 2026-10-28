@@ -1,9 +1,9 @@
 //! `cordon policy edit`, the sudoedit analog for the root-owned text policy
-//! (DESIGN §15.8). Editing the policy that guards every secret has two hazards that a
+//! (ADR 0010). Editing the policy that guards every secret has two hazards that a
 //! plain `sudo $EDITOR /etc/cordon/policy.toml` walks straight into:
 //!
 //!  1. A same-uid escalation. cordon's in-scope adversary is a same-uid scraper
-//!     (DESIGN §2), which can write your `~/.vimrc`, your editor plugins and `$EDITOR`.
+//!     (docs/threat-model.md), which can write your `~/.vimrc`, your editor plugins and `$EDITOR`.
 //!     Run the editor as root and any of those execute as root. So the standard way to
 //!     edit the policy hands a clean escalation to exactly the attacker that cordon
 //!     exists to stop.
@@ -46,7 +46,7 @@ const DEFAULT_EDITOR: &str = "vi";
 /// over an empty `rules` block, which compiles to zero rules. Saving it untouched counts
 /// as no change (see [`Seed`]), so seeding it never silently wipes enforcement.
 const NEW_POLICY_TEMPLATE: &str = "\
-# cordon policy — the flat rule model (DESIGN §15). One rule per line:
+# cordon policy — the flat rule model (ADR 0005). One rule per line:
 #     POLICY  SUBJECT  ACTION  OBJECT
 # e.g. allow  /usr/bin/ssh  read  ~/.ssh
 # `audit` observes an object, `deny` enforces it; there is no global mode.
@@ -768,7 +768,7 @@ impl Scaffold {
 /// root-owned `0644` file matches the rest of the tree, and an unprivileged `cordon policy
 /// check` needs to read it. The file holds rules, which name paths and executables, not
 /// credentials. The daemon already serves a summary of them to any local user
-/// (DESIGN §15.8).
+/// (ADR 0010).
 const NEW_POLICY_MODE: u32 = 0o644;
 
 /// Replaces `path` with `text` atomically and durably, creating any missing parent

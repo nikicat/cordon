@@ -128,7 +128,7 @@ padded_pod! {
         /// The repeats that the in-kernel suppressor held back before this record (see
         /// [`Suppressed`]).
         pub suppressed: Suppressed,
-        /// The caller's resolved blessing class (DESIGN §16.3), or [`ClassId::UNBLESSED`]
+        /// The caller's resolved blessing class (ADR 0012), or [`ClassId::UNBLESSED`]
         /// when the caller is in no blessed cgroup. The daemon prints it by class name. It
         /// sits among the `u32` fields, before the `u8` fields `policy`, `depth` and
         /// `trunc`, so that the record has no interior padding.
@@ -149,7 +149,7 @@ padded_pod! {
         /// leaf-first order. `comps[0]` is the file's own name and `comps[1]` is its
         /// parent's, up to but not including the object. The kernel fills them by walking
         /// `d_name` up the dentry chain, since it has no path (see [`FileId`]). The daemon
-        /// reverses them and joins them onto the object's known path (DESIGN §15.10 flow
+        /// reverses them and joins them onto the object's known path (docs/authoring.md flow
         /// B).
         pub comps: [PathComp; PATH_MAX_DEPTH],
     }
@@ -172,7 +172,7 @@ padded_pod! {
     /// The key of the kernel's suppressor map `SUPPRESS`, which identifies one kind of
     /// decision by `(exe, leaf, action)`. It keys on the opened file (`leaf`) rather than
     /// the protected object, so distinct files under one audited object each get their own
-    /// suppression window and surface separately in the journal (DESIGN §15.10 flow B). Its
+    /// suppression window and surface separately in the journal (docs/authoring.md flow B). Its
     /// `padded_pod!` `_pad` pads the 16 + 16 + 4 bytes to 40 at 8-byte alignment, which
     /// keeps the hashed key zeroed (see the `layout` module docs).
     #[repr(C)]

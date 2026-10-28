@@ -1,4 +1,4 @@
-//! The flat rule model (DESIGN §15). It compiles a root-owned text policy, in userspace,
+//! The flat rule model (ADR 0005). It compiles a root-owned text policy, in userspace,
 //! into the flat per-object decision table that the kernel evaluates.
 //!
 //! Compilation runs in three pure stages, each testable on its own:
@@ -14,7 +14,7 @@
 //!      [`cordon_bpf_common::CompiledRule`] buckets.
 //!
 //! All group expansion, nesting and object precedence are settled here, so the kernel
-//! stays flat (DESIGN §15.3).
+//! stays flat (ADR 0005).
 //!
 //! Diagnostics carry the source [`Pos`] of their rule or group, so that
 //! `cordon policy check` can report `config.toml:LINE: …`. Positions come from the `toml`
@@ -240,7 +240,7 @@ impl fmt::Display for UserName {
 }
 
 /// The name of a `[group.{subject,object,action}.NAME]` group, which a rule references
-/// as `@NAME` (DESIGN §15.7). It is a newtype so that a group name cannot be confused with
+/// as `@NAME` (ADR 0009). It is a newtype so that a group name cannot be confused with
 /// the other strings of the policy layer, such as paths, leaves and class names. It
 /// serializes as a plain string or TOML table key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -275,7 +275,7 @@ impl fmt::Display for GroupName {
     }
 }
 
-/// The name of a blessing class (DESIGN §16.3), as a subject group's
+/// The name of a blessing class (ADR 0012), as a subject group's
 /// `blessing = "<name>"` predicate spells it. It is a newtype so that it cannot be mixed
 /// up with the other strings of the policy layer, such as group names, paths and tokens.
 /// The compiler assigns each distinct name a dense [`cordon_bpf_common::ClassId`].
@@ -354,7 +354,7 @@ pub fn home_for(user: Option<&UserName>, fallback: &Path) -> Result<PathBuf> {
         .ok_or_else(|| crate::Error::msg(format!("policy user {:?} has no account", user.as_str())))
 }
 
-/// The tier that a [`PolicySource`] belongs to (DESIGN §15.8). The tier decides how `~`
+/// The tier that a [`PolicySource`] belongs to (ADR 0010). The tier decides how `~`
 /// expands and whether the rules are confined to a home. The tiers merge flat, with no
 /// precedence between them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -369,7 +369,7 @@ pub enum SourceOrigin {
 }
 
 /// One named policy fragment, the unit of both the conf.d split and the system and user
-/// tiers (DESIGN §15.8). A set of them travels over IPC on `apply`, and
+/// tiers (ADR 0010). A set of them travels over IPC on `apply`, and
 /// [`compile_fragments`] compiles them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicySource {
@@ -392,7 +392,7 @@ impl PolicySource {
 }
 
 /// The configured policy path, classified as one file or as a conf.d directory of
-/// `*.toml` fragments (DESIGN §15.8). It owns how the system fragments and the
+/// `*.toml` fragments (ADR 0010). It owns how the system fragments and the
 /// `[[include]]`d user files are found and read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyRoot {
@@ -473,7 +473,7 @@ impl PolicyRoot {
     }
 
     /// Returns the full policy, which is the system fragments plus every user-tier file
-    /// that a system fragment pulls in with `[[include]]` (DESIGN §15.8). Each include
+    /// that a system fragment pulls in with `[[include]]` (ADR 0010). Each include
     /// names the owning `user` and a `path`, and its file comes back tagged
     /// [`SourceOrigin::User`]. A missing included file reads as empty and still takes its
     /// slot, so that `cordon policy edit` can create it later. Errors as
@@ -593,7 +593,7 @@ where
 }
 
 /// Checks that every object a user-tier policy names lies under the owning user's
-/// `home` (DESIGN §15.8). Errors at the first rule with an object outside it, so that a
+/// `home` (ADR 0010). Errors at the first rule with an object outside it, so that a
 /// rule reaching into `/etc` or another user's home fails instead of being dropped.
 /// [`compile_fragments`] enforces the rest of the user-tier scope by refusing
 /// `[[include]]` in a user tier, so only a system fragment binds a user to a file.
@@ -618,7 +618,7 @@ fn check_scope(resolved: &ResolvedPolicy, home: &Path) -> Result<()> {
 
 /// Returns `raw` with a leading `~` expanded to `home`, normalized lexically. Errors when
 /// `raw` is neither absolute nor `~`-relative, because a path in a reviewable, root-owned
-/// policy must not depend on the working directory (DESIGN §15.8).
+/// policy must not depend on the working directory (ADR 0010).
 pub(crate) fn expand_path(raw: &str, home: &Path) -> Result<PathBuf> {
     use crate::paths::normalize;
 
@@ -841,7 +841,7 @@ mod tests {
     fn action_and_policy_names_round_trip() {
         // The mutation-hook actions round-trip too: authored name → bit → journal name.
         // `link` has no `file_open` fallback, so a missing table row would surface as
-        // `action=read` on a `ln` denial (DESIGN §15.5).
+        // `action=read` on a `ln` denial (ADR 0007).
         for (bit, name) in bpf::Action::NAMED {
             assert_eq!(bpf::Action::from_authored(name), Some(bit));
             assert_eq!(bit.to_string(), name);

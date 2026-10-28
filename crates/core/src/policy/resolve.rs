@@ -24,7 +24,7 @@ pub enum SubjectSpec {
     /// A concrete executable path, which [`super::compile`] resolves to a `(dev,ino)`.
     Exe(PathBuf),
     /// A caller in a blessed cgroup of this class, written as a `@<group>` reference to a
-    /// `blessing = "<class>"` group (DESIGN §16.3). [`super::compile`] maps the class
+    /// `blessing = "<class>"` group (ADR 0012). [`super::compile`] maps the class
     /// name to a dense [`bpf::ClassId`].
     Blessed(ClassName),
 }
@@ -61,7 +61,7 @@ impl ResolvedRule {
 pub struct ResolvedPolicy {
     pub rules: Vec<ResolvedRule>,
     /// The blessing classes that this policy declares with a
-    /// `[group.subject.*] blessing = "…"` predicate (DESIGN §16.3). [`super::compile`]
+    /// `[group.subject.*] blessing = "…"` predicate (ADR 0012). [`super::compile`]
     /// turns them into the [`ClassRegistry`](super::ClassRegistry). A class may be
     /// declared without any rule that references it, and it then grants nothing.
     pub blessing_classes: BTreeSet<ClassName>,
@@ -234,7 +234,7 @@ impl Resolver<'_> {
 
     /// Returns `tokens` with every `@group` ref expanded against `groups`, the namespace
     /// of `axis`, each leaf paired with the position of its enclosing rule or group. A
-    /// group that is a blessing class (DESIGN §16.3) comes back as one
+    /// group that is a blessing class (ADR 0012) comes back as one
     /// [`Leaf::Blessing`]. Errors when the groups form a cycle or when a `@ref` names an
     /// unknown group.
     fn expand<G: Group>(
@@ -453,7 +453,7 @@ mod tests {
         );
     }
 
-    // ---- blessing (DESIGN §16.3) ----
+    // ---- blessing (ADR 0012) ----
 
     /// A subject group with `blessing = "…"` declares a class. `@<group>` in `who`
     /// resolves to a blessing predicate rather than an exe, and the class is collected.

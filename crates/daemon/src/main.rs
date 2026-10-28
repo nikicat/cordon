@@ -1,7 +1,7 @@
 //! The gater daemon. It runs the rule-model enforcement backend (`bpf-lsm`) on its own
 //! thread and serves the IPC control plane on a Unix socket, one thread per connection.
 //! The IPC threads reach the backend only through a [`ControlSender`]. The policy is the
-//! compiled text file (DESIGN §15).
+//! compiled text file (ADR 0005).
 
 mod backend;
 // Both serve only the bpf-lsm backend, so they share its gate (see backend/mod.rs).
@@ -35,7 +35,7 @@ pub struct Ctx {
     pub backend: BackendKind,
     pub socket: PathBuf,
     pub policy: PathBuf,
-    /// The blessing requests that await a root approval, by nonce (DESIGN §16.5). Sending
+    /// The blessing requests that await a root approval, by nonce (ADR 0013). Sending
     /// on an entry releases the connection thread parked in `serve_bless_request`. That
     /// thread removes its own entry on every exit path, so a nonce lives exactly as long
     /// as someone waits on it, and nothing needs to reap stale entries.
