@@ -20,10 +20,6 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{error, warn};
 
-/// How long a request waits for the backend thread's reply before giving up. The reply
-/// covers a compile and a seed for an apply, and a map write and a mkdir for a bless op.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long a `BlessRequest` waits for its approval before giving up. It is generous
 /// because a human is in the loop, and a polkit dialog or a mistyped password burns real
 /// seconds. Waiting costs one parked thread, which the requester holds open anyway.
@@ -181,22 +177,15 @@ impl Ctx {
     }
 
     /// Sends one bless op to the backend thread, which owns the maps and the carrier
-    /// cgroups, and returns its reply. It is the same round trip as `PolicyApply`.
+    /// cgroups, and returns its reply.
     ///
-    /// Errors when the backend thread is gone, does not reply within [`REPLY_TIMEOUT`],
-    /// or refuses the op.
+    /// Errors as [`ControlSender::call`] does, or when the backend refuses the op.
     fn bless<T>(
         &self,
         op: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> BlessOp,
     ) -> Result<T> {
-        let (reply_tx, reply_rx) = mpsc::channel();
         self.control
-            .msg_tx
-            .send(ControlMsg::Bless(op(reply_tx)))
-            .map_err(|_| Error::msg("backend is not accepting requests (is bpf-lsm running?)"))?;
-        reply_rx
-            .recv_timeout(REPLY_TIMEOUT)
-            .map_err(|_| Error::msg("timed out waiting for the backend"))?
+            .call(|reply| ControlMsg::Bless(op(reply)))?
             .map_err(Error::msg)
     }
 
@@ -208,13 +197,7 @@ impl Ctx {
             Request::BlessRequest { class } => return self.serve_bless_request(conn, class),
 
             Request::Status => {
-                let objects = self
-                    .control
-                    .current
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|v| v.objects.len());
+                let objects = self.control.view().map(|v| v.objects.len());
                 Response::Status(StatusInfo {
                     backend: self.backend,
                     socket: self.socket.clone(),
@@ -223,26 +206,14 @@ impl Ctx {
                 })
             }
 
-            Request::PolicyShow => {
-                Response::PolicyView(self.control.current.lock().unwrap().clone())
-            }
+            Request::PolicyShow => Response::PolicyView(self.control.view()),
 
             Request::PolicyApply { sources } => {
                 // The backend thread owns the BPF maps, so it compiles and re-seeds while
                 // this thread waits for the outcome.
-                let (reply_tx, reply_rx) = mpsc::channel();
-                self.control
-                    .msg_tx
-                    .send(ControlMsg::Apply(ApplyRequest {
-                        sources,
-                        reply: reply_tx,
-                    }))
-                    .map_err(|_| {
-                        Error::msg("backend is not accepting policy applies (is bpf-lsm running?)")
-                    })?;
-                let outcome = reply_rx.recv_timeout(REPLY_TIMEOUT).map_err(|_| {
-                    Error::msg("timed out waiting for the backend to apply the policy")
-                })?;
+                let outcome = self
+                    .control
+                    .call(|reply| ControlMsg::Apply(ApplyRequest { sources, reply }))?;
                 Response::PolicyApplied {
                     applied: outcome.applied,
                     diagnostics: outcome.diagnostics,

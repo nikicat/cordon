@@ -172,97 +172,19 @@ impl fmt::Display for Diagnostic {
     }
 }
 
-/// An action name as a policy author writes it (DESIGN §15.5). It is an enum rather than
-/// the kernel's [`bpf::Action`] bitset, so that the set of tokens is closed. Adding an
-/// action then forces an update to [`ActionName::bit`], because its match is exhaustive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActionName {
-    Read,
-    Write,
-    Create,
-    Execute,
-    Listdir,
-    Unlink,
-    Mkdir,
-    Rmdir,
-    Rename,
-    Link,
-}
-
-impl ActionName {
-    /// Parses one lower-case action token as authored. Returns `None` for an unknown
-    /// token.
-    pub fn parse(token: &str) -> Option<ActionName> {
-        Some(match token {
-            "read" => ActionName::Read,
-            "write" => ActionName::Write,
-            "create" => ActionName::Create,
-            "execute" => ActionName::Execute,
-            "listdir" => ActionName::Listdir,
-            "unlink" => ActionName::Unlink,
-            "mkdir" => ActionName::Mkdir,
-            "rmdir" => ActionName::Rmdir,
-            "rename" => ActionName::Rename,
-            "link" => ActionName::Link,
-            _ => return None,
-        })
-    }
-
-    /// Returns the single-bit [`bpf::Action`] for this name.
-    pub fn bit(self) -> bpf::Action {
-        use bpf::Action;
-        match self {
-            ActionName::Read => Action::READ,
-            ActionName::Write => Action::WRITE,
-            ActionName::Create => Action::CREATE,
-            ActionName::Execute => Action::EXECUTE,
-            ActionName::Listdir => Action::LISTDIR,
-            ActionName::Unlink => Action::UNLINK,
-            ActionName::Mkdir => Action::MKDIR,
-            ActionName::Rmdir => Action::RMDIR,
-            ActionName::Rename => Action::RENAME,
-            ActionName::Link => Action::LINK,
-        }
-    }
-}
-
-/// A policy name as a policy author writes it. A rule's `policy` field deserializes
-/// straight into it, so serde rejects anything but the four names. [`PolicyName::lower`]
-/// turns it into the kernel's [`bpf::Policy`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyName {
-    Allow,
-    Deny,
-    Audit,
-    Silence,
-}
-
-impl PolicyName {
-    /// Parses one policy keyword, the leading field of a DSL rule line. Returns `None`
-    /// for an unknown keyword. The names match the `#[serde(rename_all = "snake_case")]`
-    /// names that the `[[rule]]` form deserializes, so both authoring forms accept
-    /// exactly the same four words.
-    pub fn parse(token: &str) -> Option<PolicyName> {
-        Some(match token {
-            "allow" => PolicyName::Allow,
-            "deny" => PolicyName::Deny,
-            "audit" => PolicyName::Audit,
-            "silence" => PolicyName::Silence,
-            _ => return None,
-        })
-    }
-
-    /// Returns the kernel's POD [`bpf::Policy`] for this name.
-    pub fn lower(self) -> bpf::Policy {
-        use bpf::Policy;
-        match self {
-            PolicyName::Allow => Policy::ALLOW,
-            PolicyName::Deny => Policy::DENY,
-            PolicyName::Audit => Policy::AUDIT,
-            PolicyName::Silence => Policy::SILENCE,
-        }
-    }
+/// Parses a rule's authored policy name, the `policy` field of a `[[rule]]` and the leading
+/// field of a DSL rule line. Errors with a message that lists the accepted names.
+pub(crate) fn parse_policy(name: &str) -> std::result::Result<bpf::Policy, String> {
+    bpf::Policy::from_authored(name).ok_or_else(|| {
+        let authored: Vec<&str> = bpf::Policy::NAMED[..bpf::Policy::AUTHORED]
+            .iter()
+            .map(|(_, n)| *n)
+            .collect();
+        format!(
+            "unknown policy {name:?} (expected one of {})",
+            authored.join(", ")
+        )
+    })
 }
 
 /// The login name of the account that a policy's `user =` header names (see
@@ -917,18 +839,23 @@ mod tests {
     }
 
     #[test]
-    fn action_and_policy_lowering() {
-        assert_eq!(ActionName::parse("read"), Some(ActionName::Read));
-        assert_eq!(ActionName::parse("nope"), None);
-        assert_eq!(ActionName::Write.bit(), bpf::Action::WRITE);
-        assert_eq!(PolicyName::Silence.lower(), bpf::Policy::SILENCE);
-        // The mutation-hook actions round-trip: authored name → bit → journal name.
-        // `link` has no `file_open` fallback, so a missing arm here would surface as
+    fn action_and_policy_names_round_trip() {
+        // The mutation-hook actions round-trip too: authored name → bit → journal name.
+        // `link` has no `file_open` fallback, so a missing table row would surface as
         // `action=read` on a `ln` denial (DESIGN §15.5).
-        assert_eq!(ActionName::parse("link"), Some(ActionName::Link));
-        assert_eq!(ActionName::Link.bit(), bpf::Action::LINK);
-        assert_eq!(bpf::Action::LINK.to_string(), "link");
-        assert_eq!(bpf::Action::RENAME.to_string(), "rename");
+        for (bit, name) in bpf::Action::NAMED {
+            assert_eq!(bpf::Action::from_authored(name), Some(bit));
+            assert_eq!(bit.to_string(), name);
+        }
+        for (policy, name) in &bpf::Policy::NAMED[..bpf::Policy::AUTHORED] {
+            assert_eq!(parse_policy(name), Ok(*policy));
+            assert_eq!(policy.to_string(), *name);
+        }
+        assert!(
+            parse_policy("default-deny")
+                .unwrap_err()
+                .contains("allow, deny")
+        );
     }
 
     /// The shipped example policy must always parse and resolve, with its group

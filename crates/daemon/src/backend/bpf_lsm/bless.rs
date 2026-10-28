@@ -527,29 +527,66 @@ impl CgroupPath {
 
     /// Returns the ancestor of this cgroup where a carrier may live so that the blessed
     /// process stays attributable to its user, which is the property polkit needs in the
-    /// end. Returns `None` when no ancestor qualifies. Two shapes qualify, and the first
-    /// wins when both are present. Both are `root:root` on systemd.
+    /// end. Returns `None` when no ancestor qualifies. The units in [`PLACEMENT`] qualify,
+    /// and an earlier one wins when several are present.
     ///
-    /// 1. `session-N.scope` is a tty or login session. It is the deepest and most precise
-    ///    choice, because logind reads an exact session id straight from the cgroup.
-    /// 2. `user-<uid>.slice` is a desktop session. On a modern systemd the terminal does
-    ///    not live in the session scope. It lives under the delegated
-    ///    `user@UID.service/app.slice/app-*.scope`, and there is no session scope anywhere
-    ///    in its ancestry. What still works there is `cg_path_get_owner_uid`, which keys on
-    ///    this `user-<uid>.slice` component to attribute the process to a user. logind then
-    ///    falls back to that user's display session. That is exactly how an ordinary
-    ///    unblessed shell on such a desktop resolves, and matching it is the goal.
-    ///
-    /// Anything below those two is out. `user@UID.service` and everything under it is
+    /// Anything below those units is out. `user@UID.service` and everything under it is
     /// delegated to the user, so a carrier there would sit in a directory its own
     /// beneficiary can `rmdir`. See [`carrier_parent`] for why that matters.
     ///
     /// This is pure path work, so the rule is testable without a cgroup hierarchy. The
     /// ownership check that makes it safe is [`carrier_parent`]'s.
     fn placement(&self) -> Option<CgroupPath> {
-        named_ancestor(&self.0, "session-", ".scope")
-            .or_else(|| named_ancestor(&self.0, "user-", ".slice"))
+        PLACEMENT
+            .iter()
+            .find_map(|unit| unit.ancestor_of(&self.0))
             .map(CgroupPath::new)
+    }
+}
+
+/// A systemd unit's cgroup directory name, `<prefix>…<suffix>`.
+struct UnitDir {
+    prefix: &'static str,
+    suffix: &'static str,
+}
+
+/// A tty or login session, `session-N.scope`. It is the deepest and most precise carrier
+/// parent, because logind reads an exact session id straight from the cgroup.
+const SESSION_SCOPE: UnitDir = UnitDir {
+    prefix: "session-",
+    suffix: ".scope",
+};
+
+/// A user's slice, `user-<uid>.slice`, which is where a desktop session's carrier goes. On
+/// a modern systemd the terminal does not live in the session scope. It lives under the
+/// delegated `user@UID.service/app.slice/app-*.scope`, and there is no session scope
+/// anywhere in its ancestry. What still works there is `cg_path_get_owner_uid`, which keys
+/// on this `user-<uid>.slice` component to attribute the process to a user. logind then
+/// falls back to that user's display session. That is exactly how an ordinary unblessed
+/// shell on such a desktop resolves, and matching it is the goal.
+///
+/// The enclosing `user.slice` does not match, so the hyphen is load-bearing.
+const USER_SLICE: UnitDir = UnitDir {
+    prefix: "user-",
+    suffix: ".slice",
+};
+
+/// The units that [`CgroupPath::placement`] may put a carrier in, most preferred first.
+/// Both are `root:root` on systemd. [`carrier_roots`] searches exactly these.
+const PLACEMENT: [UnitDir; 2] = [SESSION_SCOPE, USER_SLICE];
+
+impl UnitDir {
+    fn matches(&self, name: &str) -> bool {
+        name.starts_with(self.prefix) && name.ends_with(self.suffix)
+    }
+
+    /// Returns the deepest ancestor of `path`, itself included, that is this unit.
+    fn ancestor_of<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        path.ancestors().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| self.matches(n))
+        })
     }
 }
 
@@ -673,23 +710,19 @@ fn owner_uid(path: &Path) -> Option<Uid> {
 /// is exactly how that happens.
 fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![daemon_cgroup.to_path_buf()];
-    let children = |dir: PathBuf, keep: fn(&str) -> bool| -> Vec<PathBuf> {
+    let children = |dir: PathBuf, unit: &UnitDir| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_name().to_str().is_some_and(keep))
+            .filter(|e| e.file_name().to_str().is_some_and(|n| unit.matches(n)))
             .map(|e| e.path())
             .collect()
     };
-    for per_user in children(cgroup_root.join("user.slice"), |n| {
-        n.starts_with("user-") && n.ends_with(".slice")
-    }) {
+    for per_user in children(cgroup_root.join("user.slice"), &USER_SLICE) {
         // The slice itself is the desktop placement, because a desktop terminal has no
         // session scope.
-        roots.extend(children(per_user.clone(), |n| {
-            n.starts_with("session-") && n.ends_with(".scope")
-        }));
+        roots.extend(children(per_user.clone(), &SESSION_SCOPE));
         roots.push(per_user);
     }
     // The daemon's own cgroup is a session scope when cordond is started from a login
@@ -699,17 +732,6 @@ fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     roots.sort();
     roots.dedup();
     roots
-}
-
-/// Returns the deepest ancestor of `path`, itself included, whose final component matches
-/// `<prefix>…<suffix>`. `user-1000.slice` matches `("user-", ".slice")` while the
-/// enclosing `user.slice` does not, so the hyphen is load-bearing.
-fn named_ancestor<'a>(path: &'a Path, prefix: &str, suffix: &str) -> Option<&'a Path> {
-    path.ancestors().find(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
-    })
 }
 
 /// Checks whether the carrier in `dir` has members now, as its `cgroup.events` says.

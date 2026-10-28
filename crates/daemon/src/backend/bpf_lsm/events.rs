@@ -170,7 +170,7 @@ fn apply(
     } else {
         match maps.seed(&compiled) {
             Ok(()) => {
-                *control.current.lock().unwrap() = Some(super::build_view(&compiled));
+                control.publish(&compiled);
                 runtime.refresh(&compiled);
                 // This compile renumbered the ClassIds (see `Blessings::remap`).
                 runtime.blessings.remap(maps, &runtime.classes);

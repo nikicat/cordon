@@ -3,12 +3,12 @@
 //!
 //! A leaf means something different on each axis. A subject leaf is an exe path, and `*`
 //! means any caller. An object leaf is a path, and `*` is rejected, because the whole
-//! filesystem cannot be protected. An action leaf is an [`ActionName`], and `*` means all
-//! actions. Paths are `~`-expanded and normalized lexically here, and [`super::compile`]
-//! resolves them to inodes.
+//! filesystem cannot be protected. An action leaf is a name from [`bpf::Action::NAMED`],
+//! and `*` means all actions. Paths are `~`-expanded and normalized lexically here, and
+//! [`super::compile`] resolves them to inodes.
 
 use super::parse::{GroupDef, Groups, ParsedPolicy, ParsedRule, Token};
-use super::{ActionName, ClassName, GroupName, Loc, Pos, expand_path};
+use super::{ClassName, GroupName, Loc, Pos, expand_path};
 use crate::{Error, Result};
 use cordon_bpf_common as bpf;
 use std::collections::{BTreeMap, BTreeSet};
@@ -175,7 +175,7 @@ impl Resolver<'_> {
             subjects,
             objects,
             actions,
-            policy: rule.policy.lower(),
+            policy: rule.policy,
             source: None,
             pos,
         })
@@ -224,9 +224,8 @@ impl Resolver<'_> {
             match tok {
                 Token::Wildcard => mask |= bpf::Action::all(),
                 Token::Leaf(s) => {
-                    let name = ActionName::parse(&s)
+                    mask |= bpf::Action::from_authored(&s)
                         .ok_or_else(|| Error::at(p, format!("unknown action: {s:?}")))?;
-                    mask |= name.bit();
                 }
                 Token::Blessing(_) => {
                     return Err(Error::at(

@@ -255,6 +255,23 @@ pub struct PolicyView {
     pub pending: Vec<PathBuf>,
 }
 
+impl PolicyView {
+    /// Returns the summary of `c`.
+    pub fn of(c: &crate::policy::CompiledPolicy) -> PolicyView {
+        PolicyView {
+            objects: c
+                .objects
+                .iter()
+                .map(|o| ObjectView {
+                    path: o.path.clone(),
+                    rules: o.rules.len(),
+                })
+                .collect(),
+            pending: c.pending.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObjectView {
     pub path: PathBuf,

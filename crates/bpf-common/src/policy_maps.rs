@@ -197,27 +197,40 @@ bitflags! {
     }
 }
 
-/// Writes the actions as `read|write|create|…`, or `none` for the empty set. The lower-case
-/// names match the policy authoring vocabulary.
+impl Action {
+    /// Each action bit with its name in the policy authoring vocabulary. The policy parser
+    /// reads names through this table and [`Display`](core::fmt::Display) writes them, so
+    /// the two cannot disagree.
+    pub const NAMED: [(Action, &'static str); 10] = [
+        (Action::READ, "read"),
+        (Action::WRITE, "write"),
+        (Action::CREATE, "create"),
+        (Action::EXECUTE, "execute"),
+        (Action::LISTDIR, "listdir"),
+        (Action::UNLINK, "unlink"),
+        (Action::MKDIR, "mkdir"),
+        (Action::RMDIR, "rmdir"),
+        (Action::RENAME, "rename"),
+        (Action::LINK, "link"),
+    ];
+
+    /// Returns the single action that `name` names, or `None` for an unknown name.
+    pub fn from_authored(name: &str) -> Option<Action> {
+        Self::NAMED
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(bit, _)| *bit)
+    }
+}
+
+/// Writes the actions as `read|write|create|…`, or `none` for the empty set.
 impl core::fmt::Display for Action {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        const NAMED: [(Action, &str); 10] = [
-            (Action::READ, "read"),
-            (Action::WRITE, "write"),
-            (Action::CREATE, "create"),
-            (Action::EXECUTE, "execute"),
-            (Action::LISTDIR, "listdir"),
-            (Action::UNLINK, "unlink"),
-            (Action::MKDIR, "mkdir"),
-            (Action::RMDIR, "rmdir"),
-            (Action::RENAME, "rename"),
-            (Action::LINK, "link"),
-        ];
         if self.is_empty() {
             return write!(f, "none");
         }
         let mut first = true;
-        for (bit, name) in NAMED {
+        for (bit, name) in Self::NAMED {
             if self.contains(bit) {
                 if !first {
                     write!(f, "|")?;
@@ -281,22 +294,36 @@ impl Policy {
             Policy::AUDIT | Policy::DENY | Policy::DEFAULT_DENY | Policy::ESCAPE_DENY
         )
     }
+
+    /// Each policy with its name. The first four are the authoring vocabulary, which
+    /// [`Policy::from_authored`] accepts. The last two name the synthetic causes, which only
+    /// the journal writes.
+    pub const NAMED: [(Policy, &'static str); 6] = [
+        (Policy::ALLOW, "allow"),
+        (Policy::DENY, "deny"),
+        (Policy::AUDIT, "audit"),
+        (Policy::SILENCE, "silence"),
+        (Policy::DEFAULT_DENY, "default-deny"),
+        (Policy::ESCAPE_DENY, "escape-deny"),
+    ];
+    /// The number of [`Policy::NAMED`] entries that a policy author may write.
+    pub const AUTHORED: usize = 4;
+
+    /// Returns the policy that an author's `name` names, or `None` for an unknown name or
+    /// a synthetic cause.
+    pub fn from_authored(name: &str) -> Option<Policy> {
+        Self::NAMED[..Self::AUTHORED]
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(p, _)| *p)
+    }
 }
 
-/// Writes the policy's name. The names are `allow`, `audit`, `deny` and `silence` from the
-/// authoring vocabulary, `default-deny` and `escape-deny` for the two synthetic causes, and
-/// `unknown` for any other value.
+/// Writes the policy's name from [`Policy::NAMED`], or `unknown` for any other value.
 impl core::fmt::Display for Policy {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match *self {
-            Policy::ALLOW => "allow",
-            Policy::AUDIT => "audit",
-            Policy::DENY => "deny",
-            Policy::SILENCE => "silence",
-            Policy::DEFAULT_DENY => "default-deny",
-            Policy::ESCAPE_DENY => "escape-deny",
-            _ => "unknown",
-        })
+        let name = Self::NAMED.iter().find(|(p, _)| p == self);
+        f.write_str(name.map_or("unknown", |(_, n)| n))
     }
 }
 
@@ -459,6 +486,27 @@ mod tests {
         assert!(Action::empty().is_empty());
         // `*` (all defined actions) is exactly the ten bits, no more.
         assert_eq!(Action::all().bits(), 0b11_1111_1111);
+    }
+
+    #[test]
+    fn every_action_has_one_name() {
+        let named = Action::NAMED.iter().fold(Action::empty(), |acc, (bit, _)| {
+            assert!(!acc.intersects(*bit), "{bit:?} is named twice");
+            acc | *bit
+        });
+        assert_eq!(named, Action::all());
+        for (bit, name) in Action::NAMED {
+            assert_eq!(Action::from_authored(name), Some(bit));
+        }
+        assert_eq!(Action::from_authored("nope"), None);
+    }
+
+    #[test]
+    fn only_authored_policies_parse() {
+        assert_eq!(Policy::from_authored("silence"), Some(Policy::SILENCE));
+        assert_eq!(Policy::from_authored("default-deny"), None);
+        assert_eq!(Policy::from_authored("escape-deny"), None);
+        assert_eq!(Policy::from_authored("nope"), None);
     }
 
     #[test]

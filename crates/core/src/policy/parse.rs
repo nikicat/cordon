@@ -7,8 +7,9 @@
 //! diagnostic at its source line. Semantic validation, such as `@ref` resolution, cycles
 //! and paths, belongs to [`super::resolve`].
 
-use super::{ClassName, GroupName, LineIndex, PolicyName, Pos, UserName};
+use super::{ClassName, GroupName, LineIndex, Pos, UserName, parse_policy};
 use crate::{Context, Error, Result};
+use cordon_bpf_common as bpf;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -95,7 +96,7 @@ pub(crate) struct ParsedRule {
     pub(crate) who: Vec<Token>,
     pub(crate) where_: Vec<Token>,
     pub(crate) action: Vec<Token>,
-    pub(crate) policy: PolicyName,
+    pub(crate) policy: bpf::Policy,
     /// The rule's source position for diagnostics, which is its `[[rule]]` header or the
     /// first field of its DSL line.
     pub(crate) pos: Pos,
@@ -168,7 +169,15 @@ pub(crate) struct RuleDef {
     #[serde(rename = "where")]
     pub(crate) where_: OneOrMany,
     pub(crate) action: OneOrMany,
-    pub(crate) policy: PolicyName,
+    #[serde(deserialize_with = "authored_policy")]
+    pub(crate) policy: bpf::Policy,
+}
+
+fn authored_policy<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<bpf::Policy, D::Error> {
+    let name = String::deserialize(d)?;
+    parse_policy(&name).map_err(serde::de::Error::custom)
 }
 
 /// A rule field, written as a bare value or as a list. It is not `Spanned`, because
@@ -191,8 +200,8 @@ impl From<OneOrMany> for Vec<Token> {
 }
 
 /// The text of a leaf token, which is an exe path, an object path or an action name.
-/// [`super::resolve`] decides which one on each axis, and turns it into a `PathBuf` or an
-/// [`ActionName`]. It is an alias rather than a newtype because every string is a valid
+/// [`super::resolve`] decides which one on each axis, and turns it into a `PathBuf` or a
+/// [`bpf::Action`]. It is an alias rather than a newtype because every string is a valid
 /// leaf at this lexical layer.
 pub(crate) type RawLeaf = String;
 

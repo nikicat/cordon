@@ -7,11 +7,12 @@
 //! The only backend is `bpf-lsm`, built into the daemon with the `bpf-lsm` cargo feature.
 
 use crate::Uid;
-use crate::policy::{ClassName, Diagnostic, PolicySource};
+use crate::policy::{ClassName, CompiledPolicy, Diagnostic, PolicySource};
 use crate::proto::{BlessId, BlessingView, CarrierProcs, Pid, PolicyView};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The enforcement backend to run. The config selects it, and the daemon's backend
 /// factory builds the backend it names.
@@ -76,16 +77,50 @@ impl Shutdown {
 /// `cordon policy show`. The IPC side holds the matching [`ControlSender`].
 pub struct PolicyControl {
     pub msg_rx: Receiver<ControlMsg>,
-    pub current: Arc<Mutex<Option<PolicyView>>>,
+    current: Arc<Mutex<Option<PolicyView>>>,
+}
+
+impl PolicyControl {
+    /// Publishes `compiled` as the effective policy, which [`ControlSender::view`] returns
+    /// from then on.
+    pub fn publish(&self, compiled: &CompiledPolicy) {
+        *self.current.lock().unwrap() = Some(PolicyView::of(compiled));
+    }
 }
 
 /// The IPC side of [`PolicyControl`]. It sends control messages to the backend thread
 /// and reads the policy that the thread last published.
 #[derive(Clone)]
 pub struct ControlSender {
-    pub msg_tx: Sender<ControlMsg>,
-    pub current: Arc<Mutex<Option<PolicyView>>>,
+    msg_tx: Sender<ControlMsg>,
+    current: Arc<Mutex<Option<PolicyView>>>,
 }
+
+impl ControlSender {
+    /// Returns the policy that the backend last published, or `None` before the first.
+    pub fn view(&self) -> Option<PolicyView> {
+        self.current.lock().unwrap().clone()
+    }
+
+    /// Sends the message that `msg` builds around a fresh reply channel, and returns the
+    /// backend's reply.
+    ///
+    /// Errors when the backend thread is gone or does not reply within [`REPLY_TIMEOUT`].
+    pub fn call<R>(&self, msg: impl FnOnce(Sender<R>) -> ControlMsg) -> crate::Result<R> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.msg_tx.send(msg(reply_tx)).map_err(|_| {
+            crate::Error::msg("backend is not accepting requests (is bpf-lsm running?)")
+        })?;
+        reply_rx
+            .recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| crate::Error::msg("timed out waiting for the backend"))
+    }
+}
+
+/// How long [`ControlSender::call`] waits for the backend thread's reply before giving up.
+/// The reply covers a compile and a seed for an apply, and a map write and a mkdir for a
+/// bless op.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Creates a connected [`PolicyControl`] / [`ControlSender`] pair.
 pub fn control() -> (PolicyControl, ControlSender) {

@@ -30,7 +30,6 @@ use cordon_bpf_common::{
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, CompiledPolicy, PolicySource, Severity};
-use cordon_core::proto::{ObjectView, PolicyView};
 use cordon_core::{Context, Error, Result};
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -135,7 +134,7 @@ impl Backend for BpfLsmBackend {
 
         // Seed the real, compiled policy and publish it for `cordon policy show`.
         Maps(&mut ebpf).seed(&compiled)?;
-        *control.current.lock().unwrap() = Some(build_view(&compiled));
+        control.publish(&compiled);
 
         // Pinned last, with `_pinned` held for the run. `PinDir::pin_links` says why.
         let _pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
@@ -197,21 +196,6 @@ pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
         }
     }
     compiled
-}
-
-/// Returns the human-facing summary of `c` that `cordon policy show` prints.
-pub(super) fn build_view(c: &CompiledPolicy) -> PolicyView {
-    PolicyView {
-        objects: c
-            .objects
-            .iter()
-            .map(|o| ObjectView {
-                path: o.path.clone(),
-                rules: o.rules.len(),
-            })
-            .collect(),
-        pending: c.pending.clone(),
-    }
 }
 
 /// Returns the path of each protected object by its inode, which names objects in the

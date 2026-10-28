@@ -209,16 +209,7 @@ impl Elevation {
         let status = Command::new(program)
             .args(&self.args)
             .arg(me)
-            // The socket is named rather than re-derived by the helper. Elevation resets the
-            // environment, so the helper would read root's config and could approve at a
-            // different daemon, which silently breaks `--socket` and a per-user config. Naming
-            // it keeps both halves of the handshake on the daemon `require_root_daemon` vetted.
-            .arg("--socket")
-            .arg(socket)
-            .arg("bless-helper")
-            // One argv token, because elevation wrappers differ in how they re-split arguments
-            // and may rearrange a separate flag and value.
-            .arg(format!("--nonce={nonce}"))
+            .args(helper_args(nonce, socket))
             .status()
             .with_context(|| format!("spawn {program}"))?;
         if !status.success() {
@@ -228,6 +219,23 @@ impl Elevation {
         }
         Ok(())
     }
+}
+
+/// Returns the arguments, after the program name, that run `cordon bless-helper` to approve
+/// `nonce` at the daemon on `socket`.
+fn helper_args(nonce: &Nonce, socket: &Path) -> [OsString; 4] {
+    [
+        // The socket is named rather than re-derived by the helper. Elevation resets the
+        // environment, so the helper would read root's config and could approve at a
+        // different daemon, which silently breaks `--socket` and a per-user config. Naming
+        // it keeps both halves of the handshake on the daemon `require_root_daemon` vetted.
+        "--socket".into(),
+        socket.into(),
+        "bless-helper".into(),
+        // One argv token, because elevation wrappers differ in how they re-split arguments
+        // and may rearrange a separate flag and value.
+        format!("--nonce={nonce}").into(),
+    ]
 }
 
 /// Returns the command that runs `argv`, or the shell from [`default_shell`] when `argv`
@@ -363,6 +371,20 @@ mod tests {
         // under the sole class.
         let a = parse(&["cordon", "bless"]);
         assert!(a.cmd.is_none() && a.command.is_empty() && a.class.is_none());
+    }
+
+    #[test]
+    fn helper_args_parse_as_bless_helper() {
+        let nonce = Nonce::generate().unwrap();
+        let socket = Path::new("/run/user/1000/cordon.sock");
+        let mut argv = vec![OsString::from("cordon")];
+        argv.extend(helper_args(&nonce, socket));
+        let cli = crate::Cli::try_parse_from(argv).expect("parse");
+        assert_eq!(cli.socket.as_deref(), Some(socket));
+        match cli.cmd {
+            crate::Cmd::BlessHelper { nonce: parsed } => assert_eq!(parsed, nonce),
+            other => panic!("expected bless-helper, got {other:?}"),
+        }
     }
 
     #[test]

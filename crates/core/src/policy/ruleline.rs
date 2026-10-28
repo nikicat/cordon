@@ -23,7 +23,7 @@
 //! `[[rule]]` field produces, so [`super::resolve`] and every later stage stay unchanged.
 
 use super::parse::{ParsedRule, Token};
-use super::{LineIndex, PolicyName};
+use super::{LineIndex, parse_policy};
 use crate::{Error, Result};
 
 /// Parses the text of a `rules = '''…'''` block into rules. `content_start` is the
@@ -63,13 +63,7 @@ pub(crate) fn parse_block(
         }
 
         let (pcol, ptext) = fields[0];
-        let policy = PolicyName::parse(ptext).ok_or_else(|| {
-            at(
-                lines,
-                base + pcol,
-                format!("unknown policy {ptext:?} (expected allow, deny, audit, or silence)"),
-            )
-        })?;
+        let policy = parse_policy(ptext).map_err(|msg| at(lines, base + pcol, msg))?;
         let who = field_tokens(fields[1].1, base + fields[1].0, lines)?;
         let action = field_tokens(fields[2].1, base + fields[2].0, lines)?;
         let where_ = field_tokens(fields[3].1, base + fields[3].0, lines)?;
@@ -235,7 +229,7 @@ mod tests {
     fn single_rule_fields() {
         let r = block("allow /usr/bin/ssh read ~/.ssh\n").unwrap();
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].policy, PolicyName::Allow);
+        assert_eq!(r[0].policy, cordon_bpf_common::Policy::ALLOW);
         assert_eq!(r[0].who, vec![Token::Leaf("/usr/bin/ssh".into())]);
         assert_eq!(r[0].action, vec![Token::Leaf("read".into())]);
         assert_eq!(r[0].where_, vec![Token::Leaf("~/.ssh".into())]);
@@ -272,8 +266,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].policy, PolicyName::Allow);
-        assert_eq!(r[1].policy, PolicyName::Deny);
+        assert_eq!(r[0].policy, cordon_bpf_common::Policy::ALLOW);
+        assert_eq!(r[1].policy, cordon_bpf_common::Policy::DENY);
     }
 
     #[test]
