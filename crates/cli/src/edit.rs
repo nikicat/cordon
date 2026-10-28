@@ -23,6 +23,7 @@
 //! in-process compiler that `policy check` also runs, and the commit reuses `PolicyApply`.
 
 use cordon_core::passwd::Account;
+use cordon_core::paths::normalize;
 use cordon_core::policy::{
     self, Diagnostic, Include, PolicyRoot, PolicySource, SourceOrigin, UserName,
 };
@@ -121,9 +122,11 @@ enum EditorAs {
         home: PathBuf,
         name: UserName,
     },
-    /// The editor runs as the current user, because the caller is already unprivileged or
-    /// root explicitly opted in.
-    Current,
+    /// The editor runs as the unprivileged caller itself.
+    Caller,
+    /// The editor runs as root, because root has no invoker to drop to and passed
+    /// `--allow-root-editor`.
+    Root,
 }
 
 /// The starting editor buffer, tagged by whether the policy file already existed. The
@@ -160,9 +163,10 @@ enum Prompt {
 
 /// What `cordon policy edit` opens.
 pub(crate) enum EditTarget {
-    /// A system-tier policy file. `None` is the configured path, and `Some` holds a
-    /// conf.d fragment name or a path.
-    System(Option<PathBuf>),
+    /// The configured system policy path, which must be a single file.
+    SystemRoot,
+    /// A system-tier file, named by a conf.d fragment name or a path.
+    SystemFile(PathBuf),
     /// The user-tier policy that a system `[[include]]` binds to this user.
     User(UserName),
 }
@@ -172,19 +176,24 @@ impl EditTarget {
     /// resolved or is a directory.
     fn locate(self, policy_root: &PolicyRoot) -> Result<EditFile> {
         let file = match self {
-            EditTarget::System(file) => EditFile {
-                path: resolve_target(file.as_deref(), policy_root)?,
+            EditTarget::SystemRoot => EditFile {
+                path: root_file(policy_root)?,
                 origin: SourceOrigin::System,
-                scaffold: None,
+                binding: Binding::Bound,
+            },
+            EditTarget::SystemFile(file) => EditFile {
+                path: named_file(&file, policy_root)?,
+                origin: SourceOrigin::System,
+                binding: Binding::Bound,
             },
             // A user target is the file that a system `[[include]]` binds. With no include
             // yet, it is the convention path, and the include is registered on first save.
             EditTarget::User(user) => {
-                let (path, scaffold) = resolve_user_target(policy_root, user.clone())?;
+                let (path, binding) = resolve_user_target(policy_root, user.clone())?;
                 EditFile {
                     path,
                     origin: SourceOrigin::User { user },
-                    scaffold,
+                    binding,
                 }
             }
         };
@@ -206,9 +215,17 @@ struct EditFile {
     /// The tier that the file belongs to. It lets the candidate validate the file with the
     /// right scope even before any `[[include]]` for it exists on disk.
     origin: SourceOrigin,
-    /// The `[[include]]` that saving must register. It is `Some` only on a first
-    /// user-tier edit, when no binding exists yet (see [`Session::save`]).
-    scaffold: Option<Scaffold>,
+    /// Whether saving must also register the file's `[[include]]`.
+    binding: Binding,
+}
+
+/// Whether the edited file is part of the policy once it is saved.
+enum Binding {
+    /// It is: a system file, or a user file that an `[[include]]` already names.
+    Bound,
+    /// A first user-tier edit, with no `[[include]]` yet. Saving registers this one (see
+    /// [`Session::save`]).
+    Owed(Scaffold),
 }
 
 /// The mutually exclusive ways to name the policy to edit, which clap enforces. Naming
@@ -233,13 +250,13 @@ impl EditTargetArgs {
     /// errors.
     fn resolve(self, invoker: impl FnOnce() -> Result<UserName>) -> Result<EditTarget> {
         Ok(match self {
-            EditTargetArgs { system: true, .. } => EditTarget::System(None),
+            EditTargetArgs { system: true, .. } => EditTarget::SystemRoot,
             EditTargetArgs {
                 user: Some(user), ..
             } => EditTarget::User(user),
             EditTargetArgs {
                 file: Some(file), ..
-            } => EditTarget::System(Some(file)),
+            } => EditTarget::SystemFile(file),
             _ => EditTarget::User(invoker()?),
         })
     }
@@ -351,7 +368,7 @@ impl Session {
         sudo: Option<&SudoInvoker>,
         client: &Client,
     ) -> Result<Session> {
-        let policy_root = PolicyRoot::at(&client.policy_path(None)?)?;
+        let policy_root = client.policy_root(None)?;
         let file = target.locate(&policy_root)?;
         let editor_as = editor_identity(root_editor, sudo)?;
         let seed = read_seed(&file.path)?;
@@ -373,8 +390,8 @@ impl Session {
         let new = matches!(self.seed, Seed::New(_));
         let who = match &self.editor_as {
             EditorAs::User { uid, .. } => format!(" as uid {uid}"),
-            EditorAs::Current if config::is_root() => " as root (--allow-root-editor)".to_string(),
-            EditorAs::Current => String::new(),
+            EditorAs::Root => " as root (--allow-root-editor)".to_string(),
+            EditorAs::Caller => String::new(),
         };
         eprintln!(
             "cordon: editing {}{} with {:?}{who}",
@@ -382,7 +399,7 @@ impl Session {
             if new { " (new)" } else { "" },
             self.editor.as_str(),
         );
-        if let Some(s) = &self.file.scaffold {
+        if let Binding::Owed(s) = &self.file.binding {
             eprintln!(
                 "cordon: user {:?} has no `[[include]]` yet — one will be registered in {} \
                  once you save a valid policy.",
@@ -403,7 +420,7 @@ impl Session {
             let edited = read_edited(&self.tmp.file)?;
             // An unchanged buffer is a no-op, unless an include registration is still owed.
             // Then even an untouched valid file is registered and applied.
-            if edited == self.seed.text() && self.file.scaffold.is_none() {
+            if edited == self.seed.text() && matches!(self.file.binding, Binding::Bound) {
                 println!("cordon: no changes — policy left unchanged");
                 return Ok(ExitCode::SUCCESS);
             }
@@ -446,7 +463,7 @@ impl Session {
     fn save(&self, edited: &str) -> Result<()> {
         // A fresh write, never a move of the temp copy (see `TempEdit`).
         install_atomically(&self.file.path, edited)?;
-        if let Some(s) = &self.file.scaffold {
+        if let Binding::Owed(s) = &self.file.binding {
             s.register()?;
             eprintln!(
                 "cordon: registered `[[include]]` for user {:?} in {}",
@@ -523,32 +540,49 @@ fn is_daemon_down(err: &Error) -> bool {
     ))
 }
 
-/// Returns the file to open for `file` under `policy_root`:
-///
-/// - With no `file`, it is the policy path itself.
-/// - A bare name such as `local` under a conf.d directory is the fragment
-///   `<dir>/local.toml`. `.toml` is appended only when the name has no extension.
-/// - Any other `file` is taken literally.
-///
-/// Errors when `file` is `None` and the policy is a conf.d directory, which has no single
-/// file to open.
-fn resolve_target(file: Option<&Path>, policy_root: &PolicyRoot) -> Result<PathBuf> {
-    match (file, policy_root) {
-        (None, PolicyRoot::ConfD(dir)) => Err(Error::msg(format!(
+/// Returns the configured policy file. Errors when the policy is a conf.d directory, which
+/// has no single file to open.
+fn root_file(policy_root: &PolicyRoot) -> Result<PathBuf> {
+    match policy_root {
+        PolicyRoot::File(path) => Ok(path.clone()),
+        PolicyRoot::ConfD(dir) => Err(Error::msg(format!(
             "policy path {} is a conf.d directory — name a fragment to edit, \
              e.g. `cordon policy edit local`",
             dir.display(),
         ))),
-        (None, PolicyRoot::File(path)) => Ok(path.clone()),
-        (Some(arg), PolicyRoot::ConfD(dir)) if is_bare_name(arg) => {
-            let mut p = dir.join(arg);
-            if p.extension().is_none() {
-                p.set_extension("toml");
-            }
-            Ok(p)
-        }
-        (Some(arg), _) => Ok(arg.to_path_buf()),
     }
+}
+
+/// Returns the file that `file` names under `policy_root`. A bare name such as `local`
+/// under a conf.d directory is the fragment `<dir>/local.toml`, with the extension added
+/// only when the name has none. Any other `file` is taken literally.
+///
+/// Errors when the file would sit in the conf.d directory without the fragment extension,
+/// because the edit would apply live and then be skipped at the next load.
+fn named_file(file: &Path, policy_root: &PolicyRoot) -> Result<PathBuf> {
+    let PolicyRoot::ConfD(dir) = policy_root else {
+        return Ok(file.to_path_buf());
+    };
+    let path = if is_bare_name(file) {
+        let mut p = dir.join(file);
+        if p.extension().is_none() {
+            p.set_extension(PolicyRoot::FRAGMENT_EXT);
+        }
+        p
+    } else {
+        file.to_path_buf()
+    };
+    let in_dir = path
+        .parent()
+        .is_some_and(|p| normalize(p) == normalize(dir));
+    if in_dir && !PolicyRoot::is_fragment(&path) {
+        return Err(Error::msg(format!(
+            "{} would not load: conf.d fragments end in .{}",
+            path.display(),
+            PolicyRoot::FRAGMENT_EXT,
+        )));
+    }
+    Ok(path)
 }
 
 /// Checks whether `p` is a single-component relative path such as `local` or
@@ -570,11 +604,11 @@ fn is_bare_name(p: &Path) -> bool {
 /// - The invoking uid has no passwd home.
 fn editor_identity(root_editor: RootEditor, sudo: Option<&SudoInvoker>) -> Result<EditorAs> {
     if !config::is_root() {
-        return Ok(EditorAs::Current);
+        return Ok(EditorAs::Caller);
     }
     let Some(&SudoInvoker { uid, gid }) = sudo else {
         return match root_editor {
-            RootEditor::Allow => Ok(EditorAs::Current),
+            RootEditor::Allow => Ok(EditorAs::Root),
             RootEditor::Refuse => Err(Error::msg(
                 "running as root with no non-root sudo invoker — refusing to launch the \
                  editor as root (a same-uid attacker who can write your editor config would \
@@ -631,15 +665,14 @@ fn candidate_sources(
     new_text: &str,
     target_origin: &SourceOrigin,
 ) -> Result<Vec<PolicySource>> {
-    use cordon_core::paths::normalize;
-    // An empty conf.d directory (no `*.toml` yet) is a hard error from `load_policy`, but
+    // An empty conf.d directory (no `*.toml` yet) is a hard error from `PolicyRoot::load`, but
     // here it just means "no siblings": the new fragment is the whole policy. Any other
     // load error must fail, or the candidate would silently drop the unreadable siblings
     // and the apply would replace the live policy with this one fragment.
     let mut sources = if policy_root.fragments()?.is_empty() {
         Vec::new()
     } else {
-        policy::load_policy(policy_root.path())?
+        policy_root.load()?
     };
     // Normalized paths, so that a fragment or an included user file matches its source.
     let tgt = normalize(target);
@@ -665,12 +698,9 @@ fn candidate_sources(
 /// binding when none exists yet. An existing `[[include]]` for `user` names the file, and
 /// otherwise it is at [`convention_user_path`]. Errors when the existing includes can't be
 /// read.
-fn resolve_user_target(
-    policy_root: &PolicyRoot,
-    user: UserName,
-) -> Result<(PathBuf, Option<Scaffold>)> {
-    if let Some(path) = policy::user_include_path(policy_root.path(), user.as_str())? {
-        return Ok((path, None));
+fn resolve_user_target(policy_root: &PolicyRoot, user: UserName) -> Result<(PathBuf, Binding)> {
+    if let Some(path) = policy_root.include_for(&user)? {
+        return Ok((path, Binding::Bound));
     }
     let path = convention_user_path(policy_root, &user);
     let scaffold = Scaffold {
@@ -678,7 +708,7 @@ fn resolve_user_target(
         user,
         path: path.clone(),
     };
-    Ok((path, Some(scaffold)))
+    Ok((path, Binding::Owed(scaffold)))
 }
 
 /// Returns where the tier file of `user` goes when no `[[include]]` names it yet. It is
@@ -906,11 +936,11 @@ mod tests {
 
         assert!(matches!(
             args(None, None, true).resolve(no_invoker).unwrap(),
-            EditTarget::System(None)
+            EditTarget::SystemRoot
         ));
         assert!(matches!(
             args(Some("local"), None, false).resolve(no_invoker).unwrap(),
-            EditTarget::System(Some(p)) if p == Path::new("local")
+            EditTarget::SystemFile(p) if p == Path::new("local")
         ));
         assert!(matches!(
             args(None, Some("someone"), false).resolve(no_invoker).unwrap(),
@@ -1085,22 +1115,25 @@ mod tests {
         // A bare name becomes `<dir>/<name>.toml`, an existing extension is kept, and a
         // path is taken literally.
         assert_eq!(
-            resolve_target(Some(Path::new("local")), &confd).unwrap(),
+            named_file(Path::new("local"), &confd).unwrap(),
             dir.join("local.toml")
         );
         assert_eq!(
-            resolve_target(Some(Path::new("local.toml")), &confd).unwrap(),
+            named_file(Path::new("local.toml"), &confd).unwrap(),
             dir.join("local.toml")
         );
         assert_eq!(
-            resolve_target(Some(Path::new("/etc/cordon/x.toml")), &confd).unwrap(),
+            named_file(Path::new("/etc/cordon/x.toml"), &confd).unwrap(),
             PathBuf::from("/etc/cordon/x.toml")
         );
+        // A file in conf.d that the load would skip is refused, by name or by path.
+        assert!(named_file(Path::new("local.conf"), &confd).is_err());
+        assert!(named_file(Path::new("/etc/cordon/conf.d/local.conf"), &confd).is_err());
         // With no argument, a conf.d directory needs a fragment named.
-        assert!(resolve_target(None, &confd).is_err());
+        assert!(root_file(&confd).is_err());
         // With no argument, a one-file policy resolves to that file.
         let file = PolicyRoot::File(PathBuf::from("/etc/cordon/policy.toml"));
-        assert_eq!(resolve_target(None, &file).unwrap(), file.path());
+        assert_eq!(root_file(&file).unwrap(), file.path());
     }
 
     /// An empty conf.d means the edited fragment is the whole policy. A sibling that fails

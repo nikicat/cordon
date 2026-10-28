@@ -1079,7 +1079,7 @@ group*. An example in TOML:
   a user can't write rules about `/etc` or about another home. The binding lives on the system
   side as an opt-in by the admin, so a user file can't declare its own scope. A user-tier file
   may not `[[include]]` anything itself. Each `PolicySource` now carries its tier as a
-  [`SourceOrigin`]. `load_policy` expands the includes, in the CLI on `apply` and in the
+  [`SourceOrigin`]. `PolicyRoot::load` expands the includes, in the CLI on `apply` and in the
   daemon at startup.
 
   Precedence between the tiers is deferred. The intended semantics is that the system tier is

@@ -391,49 +391,9 @@ impl PolicySource {
     }
 }
 
-/// Returns the system fragments at `path`. A file yields one fragment, and a conf.d
-/// directory yields every `*.toml` inside it, sorted by name so that the load order is
-/// deterministic (DESIGN §15.8). Errors when a file cannot be read, or when the directory
-/// holds no fragments, because a policy without fragments is a misconfiguration rather
-/// than an empty allow-all.
-pub fn read_sources(path: &Path) -> Result<Vec<PolicySource>> {
-    let meta = std::fs::metadata(path).with_context(|| format!("policy {}", path.display()))?;
-    if !meta.is_dir() {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read policy {}", path.display()))?;
-        return Ok(vec![PolicySource::system(path.display().to_string(), text)]);
-    }
-    let files = fragment_paths(path)?;
-    if files.is_empty() {
-        return Err(crate::Error::msg(format!(
-            "policy dir {} has no *.toml fragments",
-            path.display()
-        )));
-    }
-    files
-        .into_iter()
-        .map(|p| {
-            let text = std::fs::read_to_string(&p)
-                .with_context(|| format!("read policy {}", p.display()))?;
-            Ok(PolicySource::system(p.display().to_string(), text))
-        })
-        .collect()
-}
-
-/// Returns the `*.toml` fragments of the conf.d directory `dir`, sorted by name. Errors
-/// when the directory cannot be read.
-pub fn fragment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("read policy dir {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-        .collect();
-    files.sort();
-    Ok(files)
-}
-
 /// The configured policy path, classified as one file or as a conf.d directory of
-/// `*.toml` fragments (DESIGN §15.8).
+/// `*.toml` fragments (DESIGN §15.8). It owns how the system fragments and the
+/// `[[include]]`d user files are found and read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyRoot {
     /// A single policy file, which may not exist yet.
@@ -442,6 +402,9 @@ pub enum PolicyRoot {
 }
 
 impl PolicyRoot {
+    /// The extension a file needs to load as a conf.d fragment.
+    pub const FRAGMENT_EXT: &str = "toml";
+
     /// Classifies `path`, treating a path that does not exist as a [`File`](Self::File).
     /// Errors when `path` cannot be inspected.
     pub fn at(path: &Path) -> Result<PolicyRoot> {
@@ -461,72 +424,108 @@ impl PolicyRoot {
         }
     }
 
+    /// Checks whether `path` has the extension that a conf.d fragment needs to load.
+    pub fn is_fragment(path: &Path) -> bool {
+        path.extension().is_some_and(|x| x == Self::FRAGMENT_EXT)
+    }
+
     /// Returns the system fragment files that exist, which are the file itself or the
-    /// directory's `*.toml` fragments sorted by name. Errors when the path cannot be
-    /// inspected or the directory cannot be read.
+    /// directory's `*.toml` fragments sorted by name, so that the load order is
+    /// deterministic. Errors when the path cannot be inspected or the directory cannot be
+    /// read.
     pub fn fragments(&self) -> Result<Vec<PathBuf>> {
         match self {
             PolicyRoot::File(p) if p.try_exists()? => Ok(vec![p.clone()]),
             PolicyRoot::File(_) => Ok(Vec::new()),
-            PolicyRoot::ConfD(dir) => fragment_paths(dir),
-        }
-    }
-}
-
-/// Returns the full policy, which is the system fragments at `path` ([`read_sources`])
-/// plus every user-tier file that a system fragment pulls in with `[[include]]`
-/// (DESIGN §15.8). Each include names the owning `user` and a `path`, and its file comes
-/// back tagged [`SourceOrigin::User`]. A missing included file reads as empty and still
-/// takes its slot, so that `cordon policy edit` can create it later. Errors when a system
-/// fragment or an existing included file cannot be read.
-pub fn load_policy(path: &Path) -> Result<Vec<PolicySource>> {
-    let mut sources = read_sources(path)?;
-    let mut included = Vec::new();
-    for src in &sources {
-        // A system fragment that does not parse still reports its error in
-        // `compile_fragments`. Its includes cannot be read, so it is skipped here.
-        let Ok(parsed) = parse(&src.text) else {
-            continue;
-        };
-        for inc in parsed.includes() {
-            let text = match std::fs::read_to_string(inc.path()) {
-                Ok(t) => t,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(e) => {
-                    return Err(crate::Error::msg(format!(
-                        "read user policy {}: {e}",
-                        inc.path().display()
-                    )));
-                }
-            };
-            included.push(PolicySource {
-                name: inc.path().display().to_string(),
-                text,
-                origin: SourceOrigin::User {
-                    user: inc.user().clone(),
-                },
-            });
-        }
-    }
-    sources.append(&mut included);
-    Ok(sources)
-}
-
-/// Returns the file that the first system `[[include]]` for `user` names, from the system
-/// fragments at `policy_root`. Returns `None` when no system fragment includes `user`.
-/// Errors when the system fragments cannot be read.
-pub fn user_include_path(policy_root: &Path, user: &str) -> Result<Option<PathBuf>> {
-    for src in &read_sources(policy_root)? {
-        let Ok(parsed) = parse(&src.text) else {
-            continue;
-        };
-        for inc in parsed.includes() {
-            if inc.user().as_str() == user {
-                return Ok(Some(inc.path().to_path_buf()));
+            PolicyRoot::ConfD(dir) => {
+                let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+                    .with_context(|| format!("read policy dir {}", dir.display()))?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| Self::is_fragment(p))
+                    .collect();
+                files.sort();
+                Ok(files)
             }
         }
     }
-    Ok(None)
+
+    /// Returns the system fragments, read. Errors when one cannot be read, or when there
+    /// are none, because a policy without fragments is a misconfiguration rather than an
+    /// empty allow-all.
+    fn system_sources(&self) -> Result<Vec<PolicySource>> {
+        let files = self.fragments()?;
+        if files.is_empty() {
+            return Err(crate::Error::msg(match self {
+                PolicyRoot::File(p) => format!("policy {} does not exist", p.display()),
+                PolicyRoot::ConfD(d) => {
+                    format!("policy dir {} has no *.toml fragments", d.display())
+                }
+            }));
+        }
+        files
+            .into_iter()
+            .map(|p| {
+                let text = std::fs::read_to_string(&p)
+                    .with_context(|| format!("read policy {}", p.display()))?;
+                Ok(PolicySource::system(p.display().to_string(), text))
+            })
+            .collect()
+    }
+
+    /// Returns the full policy, which is the system fragments plus every user-tier file
+    /// that a system fragment pulls in with `[[include]]` (DESIGN §15.8). Each include
+    /// names the owning `user` and a `path`, and its file comes back tagged
+    /// [`SourceOrigin::User`]. A missing included file reads as empty and still takes its
+    /// slot, so that `cordon policy edit` can create it later. Errors as
+    /// [`fragments`](Self::fragments) does, when there are no system fragments, and when a
+    /// fragment or an existing included file cannot be read.
+    pub fn load(&self) -> Result<Vec<PolicySource>> {
+        let mut sources = self.system_sources()?;
+        let mut included = Vec::new();
+        for src in &sources {
+            // A system fragment that does not parse still reports its error in
+            // `compile_fragments`. Its includes cannot be read, so it is skipped here.
+            let Ok(parsed) = parse(&src.text) else {
+                continue;
+            };
+            for inc in parsed.includes() {
+                let text = match std::fs::read_to_string(inc.path()) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        return Err(crate::Error::msg(format!(
+                            "read user policy {}: {e}",
+                            inc.path().display()
+                        )));
+                    }
+                };
+                included.push(PolicySource {
+                    name: inc.path().display().to_string(),
+                    text,
+                    origin: SourceOrigin::User {
+                        user: inc.user().clone(),
+                    },
+                });
+            }
+        }
+        sources.append(&mut included);
+        Ok(sources)
+    }
+
+    /// Returns the file that the first system `[[include]]` for `user` names, or `None`
+    /// when no system fragment includes `user`. Errors when the system fragments cannot be
+    /// read.
+    pub fn include_for(&self, user: &UserName) -> Result<Option<PathBuf>> {
+        for src in &self.system_sources()? {
+            let Ok(parsed) = parse(&src.text) else {
+                continue;
+            };
+            if let Some(inc) = parsed.includes().iter().find(|inc| inc.user() == user) {
+                return Ok(Some(inc.path().to_path_buf()));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Compiles a set of fragments into one decision table. Each fragment resolves on its
@@ -803,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn load_policy_expands_includes() {
+    fn load_expands_includes() {
         // A system fragment that includes a user file → two sources, tagged by tier.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -824,7 +823,7 @@ mod tests {
         )
         .unwrap();
 
-        let sources = load_policy(&sys_file).unwrap();
+        let sources = PolicyRoot::at(&sys_file).unwrap().load().unwrap();
         assert_eq!(sources.len(), 2);
         assert!(matches!(sources[0].origin, SourceOrigin::System));
         match &sources[1].origin {
@@ -833,7 +832,7 @@ mod tests {
         }
         // A missing included file is tolerated (empty slot, not an error).
         std::fs::remove_file(&user_file).unwrap();
-        let sources = load_policy(&sys_file).unwrap();
+        let sources = PolicyRoot::at(&sys_file).unwrap().load().unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[1].text, "");
     }

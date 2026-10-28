@@ -31,7 +31,7 @@ pub struct ParsedPolicy {
     /// it into the home that `~` expands to.
     pub(crate) user: Option<UserName>,
     /// The user-tier files that this system fragment pulls in with `[[include]]`
-    /// (DESIGN §15.8). [`super::load_policy`] reads them, not the parser.
+    /// (DESIGN §15.8). [`super::PolicyRoot::load`] reads them, not the parser.
     pub(crate) includes: Vec<Include>,
 }
 
@@ -48,7 +48,7 @@ impl ParsedPolicy {
 }
 
 /// One `[[include]]` directive, by which a system fragment pulls in a user-tier policy
-/// file (DESIGN §15.8). [`super::load_policy`] reads the file as a
+/// file (DESIGN §15.8). [`super::PolicyRoot::load`] reads the file as a
 /// [`super::SourceOrigin::User`] fragment.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -3,14 +3,6 @@
 Refactors and fixes found by the code-smell surveys. Each step is one commit, and each
 must pass `packaging/test/run-bpf-lsm-vm.sh` before it counts as done.
 
-1. PolicyRoot everywhere. It fixes a bug: `cordon policy edit local.conf` saves
-   `conf.d/local.conf`, which the daemon applies live, but fragment_paths reads only
-   `*.toml`, so the fragment is dropped at the next restart. The `toml` extension is
-   spelled in edit.rs and in core.
-   - The CLI's `policy check` and `policy apply` each resolve the policy path and load it;
-     one PolicyRoot load replaces both.
-   - edit.rs types name their cases: EditFile.scaffold, EditorAs::Current and
-     EditTarget::System(None) become variants that say what they are.
 2. PeerCred, the events receiver and the Runtime split.
 3. Policy types at parse: the GroupDef enum and the expand leaf type.
 4. Split docs/DESIGN.md into ADRs under docs/adr/, one decision each (context, decision,

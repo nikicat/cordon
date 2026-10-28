@@ -30,7 +30,7 @@ pub struct Config {
     pub bpf_pin_dir: PathBuf,
     /// The root-owned text policy (the flat rule model, DESIGN §15.8). It is a single
     /// file or a conf.d directory of `*.toml` fragments
-    /// ([`read_sources`](crate::policy::read_sources)). The `bpf-lsm` backend compiles it
+    /// ([`PolicyRoot`](crate::policy::PolicyRoot)). The `bpf-lsm` backend compiles it
     /// at startup and seeds its maps from it.
     pub policy: PathBuf,
 }

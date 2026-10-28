@@ -153,7 +153,7 @@ impl BpfLsmBackend {
     /// Errors when the policy cannot be read or has any error-severity finding, because a
     /// bad startup policy must not silently run.
     fn compile_policy(&self) -> Result<CompiledPolicy> {
-        let sources = policy::load_policy(&self.policy)?;
+        let sources = policy::PolicyRoot::at(&self.policy)?.load()?;
         let compiled = compile_sources(&sources);
         if compiled.has_errors() {
             return Err(Error::msg(format!(

@@ -9,6 +9,7 @@ mod edit;
 mod sys;
 
 use clap::{Parser, Subcommand};
+use cordon_core::policy::PolicyRoot;
 use cordon_core::proto::{Conn, Nonce, Pid, Request, Response};
 use cordon_core::{Config, Error, Result, policy};
 use std::path::{Path, PathBuf};
@@ -104,9 +105,9 @@ fn main() -> ExitCode {
             PolicyCmd::Show => client.run_request(&Request::PolicyShow),
             PolicyCmd::Apply { file } => {
                 // The daemon compiles the sources itself (see `compile_fragments`), so
-                // every source that `load_policy` gathers is sent.
-                let path = client.policy_path(file.as_deref());
-                path.and_then(|p| policy::load_policy(&p))
+                // every source that `PolicyRoot::load` gathers is sent.
+                let root = client.policy_root(file.as_deref());
+                root.and_then(|r| r.load())
                     .and_then(|sources| client.run_request(&Request::PolicyApply { sources }))
             }
             // `edit` runs its own loop of editing, validating, applying and saving. It
@@ -172,12 +173,13 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// Returns `file` when it is given, and the configured `policy` path otherwise. Errors
-    /// when `file` is `None` and the config does not load.
-    fn policy_path(&self, file: Option<&Path>) -> Result<PathBuf> {
+    /// Returns the policy at `file` when it is given, and at the configured `policy` path
+    /// otherwise. Errors when `file` is `None` and the config does not load, or when the
+    /// path cannot be inspected.
+    fn policy_root(&self, file: Option<&Path>) -> Result<PolicyRoot> {
         match file {
-            Some(p) => Ok(p.to_path_buf()),
-            None => Ok(self.config()?.policy.clone()),
+            Some(p) => PolicyRoot::at(p),
+            None => PolicyRoot::at(&self.config()?.policy),
         }
     }
 
@@ -264,8 +266,9 @@ impl std::fmt::Display for Enforcement {
 /// exit code, which is failure when the policy has errors. Errors when the file or the
 /// config does not load.
 fn policy_check(file: Option<&Path>, client: &Client) -> Result<ExitCode> {
-    let path = client.policy_path(file)?;
-    let sources = policy::load_policy(&path)?;
+    let root = client.policy_root(file)?;
+    let sources = root.load()?;
+    let path = root.path();
     let compiled =
         policy::compile_fragments(&sources, &policy::fallback_home(), policy::stat_resolver);
     for d in &compiled.diagnostics {
