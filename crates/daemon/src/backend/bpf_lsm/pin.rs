@@ -52,7 +52,7 @@ impl PinDir {
     pub(super) fn pin_links(
         &self,
         ebpf: &mut Ebpf,
-        links: Vec<(&'static str, LsmLinkId)>,
+        links: Vec<(String, LsmLinkId)>,
     ) -> Result<Vec<PinnedLink>> {
         let generation = self.generation();
         std::fs::create_dir_all(&generation).map_err(|e| {
@@ -65,7 +65,7 @@ impl PinDir {
         let mut pinned = Vec::with_capacity(links.len());
         for (hook, id) in links {
             let program: &mut Lsm = ebpf
-                .program_mut(hook)
+                .program_mut(&hook)
                 .ok_or_else(|| {
                     Error::msg(format!("bpf-lsm: program '{hook}' vanished before pin"))
                 })?
@@ -74,7 +74,7 @@ impl PinDir {
             let link = program
                 .take_link(id)
                 .with_context(|| format!("bpf-lsm: take link {hook}"))?;
-            let path = generation.join(hook);
+            let path = generation.join(&hook);
             // No bpffs pre-check, because `BPF_OBJ_PIN` itself refuses any path outside a
             // bpffs with `EINVAL`. A `statfs` here would only duplicate the kernel's own
             // guard. All it would add is a better message, and the error below adds that.

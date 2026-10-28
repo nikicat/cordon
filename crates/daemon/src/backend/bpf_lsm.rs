@@ -37,24 +37,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// The LSM hooks the program attaches to. Each name does double duty. aya keys programs
-/// by their function symbol, and the same string is the kernel hook name that BTF resolves
-/// as `bpf_lsm_<hook>`. The eBPF side keeps the two equal by naming each
-/// `#[lsm(hook = …)]` fn after its hook.
-///
-/// `file_open` decides reads, writes and creates. The mutation hooks make a directory
-/// object sound, because a directory protects its children only by ancestry, and a second
-/// name (a hardlink or a rename) is an ancestry that avoids it (DESIGN §15.5).
-const HOOKS: &[&str] = &[
-    "file_open",
-    "inode_link",
-    "inode_rename",
-    "inode_unlink",
-    "inode_rmdir",
-    "inode_mkdir",
-    "bprm_check_security",
-];
-
 /// The test-only environment variable that forces deliberately wrong field offsets, so
 /// that the self-test's failure path can be exercised end to end.
 const POISON_OFFSETS_ENV: &str = "CORDON_SELFTEST_POISON_OFFSETS";
@@ -111,13 +93,14 @@ impl Backend for BpfLsmBackend {
         // Keep the `LsmLinkId`s, because they are the handle `PinDir::pin_links` takes. A
         // link left inside its `Program` detaches when `ebpf` drops, and enforcement would
         // end with the daemon.
-        let mut links = Vec::with_capacity(HOOKS.len());
-        for &hook in HOOKS {
-            let program: &mut Lsm = ebpf
-                .program_mut(hook)
-                .ok_or_else(|| {
-                    Error::msg(format!("bpf-lsm: program '{hook}' missing from object"))
-                })?
+        //
+        // Every program in the object is an LSM program named after its hook, because aya
+        // keys programs by their function symbol, and BTF resolves the same string as
+        // `bpf_lsm_<hook>`. The object is the one list of hooks, and the self-test proves
+        // each one mediates.
+        let mut links = Vec::new();
+        for (hook, program) in ebpf.programs_mut() {
+            let program: &mut Lsm = program
                 .try_into()
                 .with_context(|| format!("bpf-lsm: '{hook}' is not an LSM program"))?;
             program
@@ -126,7 +109,7 @@ impl Backend for BpfLsmBackend {
             let id = program
                 .attach()
                 .with_context(|| format!("bpf-lsm: attach {hook}"))?;
-            links.push((hook, id));
+            links.push((hook.to_owned(), id));
         }
         self_test(&mut ebpf).inspect_err(|e| {
             error!(event = "self_test_failed", error = %e, "bpf-lsm self-test failed");
@@ -136,18 +119,18 @@ impl Backend for BpfLsmBackend {
         Maps(&mut ebpf).seed(&compiled)?;
         control.publish(&compiled);
 
-        // Pinned last, with `_pinned` held for the run. `PinDir::pin_links` says why.
-        let _pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
+        // Pinned last, with `pinned` held for the run. `PinDir::pin_links` says why.
+        let pinned = self.pin_dir.pin_links(&mut ebpf, links)?;
 
         // The message is a fixed phrase that marks readiness, so it can be grepped for.
         // Context goes in fields, which tracing renders after the message.
         info!(
             event = "ready",
             objects = compiled.objects.len(),
-            hooks = HOOKS.len(),
+            hooks = pinned.len(),
             policy = %self.policy.display(),
             object = %self.object.display(),
-            "bpf-lsm active on the file_open hook (self-test passed)",
+            "bpf-lsm active (self-test passed)",
         );
 
         // Build the per-run state that sits beside the `Ebpf` handle, and adopt the

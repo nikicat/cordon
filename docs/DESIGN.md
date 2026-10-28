@@ -587,8 +587,8 @@ Both OSes have the same shape: a root in-kernel authorizer, a root-owned text po
   (`CONFIG_BPF_LSM` off, or `bpf` not in the LSM list), there is still no hardened Linux
   boundary at all.
 - **Only some operations are mediated.** The program hooks `file_open`, link, rename,
-  unlink, rmdir, mkdir and exec (§15.5; the list is `HOOKS` in
-  crates/daemon/src/backend/bpf_lsm.rs). Other operations on a protected inode are not
+  unlink, rmdir, mkdir and exec (§15.5; the list is the
+  `#[lsm]` programs in crates/bpf/src/main.rs). Other operations on a protected inode are not
   hooked. These include changing its mode or owner, changing its extended attributes, and
   truncating it by path.
 - **Identity beyond the exe is best-effort.** The exe `(dev,inode)` is race-free. But a double
