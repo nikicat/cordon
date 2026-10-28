@@ -33,9 +33,9 @@ use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
-    rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule,
-    FileId, ObjId, Pid, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS,
-    MAX_RULES_PER_OBJ, NUM_BANKS,
+    rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, FileId, ObjId,
+    Pid, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS, MAX_RULES_PER_OBJ,
+    NUM_BANKS,
 };
 
 /// The verdict that the decision flow returns. It is converted once, at the hook boundary,
@@ -121,7 +121,11 @@ fn clamped(verdict: Option<Verdict>) -> i32 {
     // though the laxer host kernel accepts it. LLVM knows that `ret` is 0 or -1 and would
     // drop the clamp as redundant, so `black_box` hides that and the clamp survives.
     let ret = core::hint::black_box(ret);
-    if ret < -4095 || ret > 0 { 0 } else { ret }
+    if ret < -4095 || ret > 0 {
+        0
+    } else {
+        ret
+    }
 }
 
 #[lsm(hook = "file_open")]
@@ -160,21 +164,30 @@ pub fn inode_rename(ctx: LsmContext) -> i32 {
 /// `inode_unlink(struct inode *dir, struct dentry *dentry)`.
 #[lsm(hook = "inode_unlink")]
 pub fn inode_unlink(ctx: LsmContext) -> i32 {
-    clamped(decide_remove(kernel::Dentry::from_arg(&ctx, 1), Action::UNLINK))
+    clamped(decide_remove(
+        kernel::Dentry::from_arg(&ctx, 1),
+        Action::UNLINK,
+    ))
 }
 
 /// Gates removing a directory. The kernel prototype is
 /// `inode_rmdir(struct inode *dir, struct dentry *dentry)`.
 #[lsm(hook = "inode_rmdir")]
 pub fn inode_rmdir(ctx: LsmContext) -> i32 {
-    clamped(decide_remove(kernel::Dentry::from_arg(&ctx, 1), Action::RMDIR))
+    clamped(decide_remove(
+        kernel::Dentry::from_arg(&ctx, 1),
+        Action::RMDIR,
+    ))
 }
 
 /// Gates creating a directory. The kernel prototype is
 /// `inode_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)`.
 #[lsm(hook = "inode_mkdir")]
 pub fn inode_mkdir(ctx: LsmContext) -> i32 {
-    clamped(decide_create(kernel::Dentry::from_arg(&ctx, 1), Action::MKDIR))
+    clamped(decide_create(
+        kernel::Dentry::from_arg(&ctx, 1),
+        Action::MKDIR,
+    ))
 }
 
 /// Gates executing a binary. The kernel prototype is

@@ -283,10 +283,11 @@ Tetragon and bpflock, is in [`DESIGN.md` §13](docs/DESIGN.md#13-related-work--p
 ## Contributing
 
 cordon is pre-1.0 and moving fast, so please open an issue to discuss a large PR before you
-send it. There are two gates:
+send it. Run `just install-hooks` once, so that a pre-commit hook checks the formatting of
+staged files. There are two gates:
 
 ```sh
-just test                          # fmt + clippy -D warnings + cargo test
+just test                          # the lints and unit tests
 packaging/test/run-bpf-lsm-vm.sh   # the VM smoke test, which is the definition of done
 ```
 

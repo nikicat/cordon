@@ -22,7 +22,7 @@ pub mod maps;
 pub mod offsets;
 pub mod policy_maps;
 
-pub use ids::{Bank, CgroupId, Dev, Ino, Nanos, Opens, Pid, Suppressed, SuppressedTotal, Uid};
+pub use ids::{Bank, CgroupId, Dev, Ino, Nanos, Pid, Suppressed, Uid};
 pub use maps::{
     DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, PATH_MAX_DEPTH, PATH_NAME_MAX, PathComp,
     Settings, SuppressKey, SuppressVal,

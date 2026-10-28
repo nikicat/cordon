@@ -32,10 +32,21 @@ build:
 build:
     cargo build --workspace
 
-# Run the test suite and the lints that CI gates on, with the same flags as the `test`
-# job in .github/workflows/ci.yml.
-test:
-    cargo fmt --all -- --check
+# Format both workspaces: the root one and the standalone eBPF crate. Extra arguments go
+# to rustfmt.
+fmt *args:
+    cargo fmt --all -- {{ args }}
+    cd crates/bpf && cargo fmt -- {{ args }}
+
+# Check that both workspaces are rustfmt-clean.
+fmt-check: (fmt "--check")
+
+# Enable the tracked git hooks in .githooks, such as the pre-commit rustfmt check.
+install-hooks:
+    git config core.hooksPath .githooks
+
+# Run the lints and the test suite. CI's `test` job runs this recipe.
+test: fmt-check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace --all-features
 

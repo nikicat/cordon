@@ -441,7 +441,9 @@ impl Session {
     /// include is registered only after the file is saved, so a cancelled or rejected edit
     /// never leaves a stale binding. Errors when either write fails.
     fn save(&self, edited: &str) -> Result<()> {
-        self.tmp.commit(&self.file.path, edited)?;
+        // The temp copy belonged to the user while the editor ran, so only this validated
+        // string crosses back, never the file itself.
+        install_atomically(&self.file.path, edited)?;
         if let Some(s) = &self.file.scaffold {
             s.register()?;
             eprintln!(
@@ -842,12 +844,6 @@ impl TempEdit {
                 .with_context(|| format!("chown {}", tmp.dir.path().display()))?;
         }
         Ok(tmp)
-    }
-
-    /// Installs `text` at `target` as [`install_atomically`] does. The temp copy belonged
-    /// to the user while the editor ran, so only this validated string crosses back.
-    fn commit(&self, target: &Path, text: &str) -> Result<()> {
-        install_atomically(target, text)
     }
 }
 

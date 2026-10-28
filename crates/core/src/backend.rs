@@ -9,8 +9,9 @@
 use crate::Uid;
 use crate::policy::{ClassName, Diagnostic, PolicySource};
 use crate::proto::{BlessId, BlessingView, CarrierProcs, Pid, PolicyView};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 /// The enforcement backend to run. The config selects it, and the daemon's backend
 /// factory builds the backend it names.
@@ -50,34 +51,23 @@ impl std::str::FromStr for BackendKind {
     }
 }
 
-/// A cooperative shutdown signal shared between the daemon and its backend thread.
+/// A cooperative shutdown signal shared between the daemon and its backend thread. Once it
+/// is triggered, [`Backend::run`] returns within one turn of its event loop.
 #[derive(Default)]
-pub struct Shutdown {
-    state: Mutex<bool>,
-    cv: Condvar,
-}
+pub struct Shutdown(AtomicBool);
 
 impl Shutdown {
     pub fn new() -> Arc<Shutdown> {
         Arc::new(Shutdown::default())
     }
 
-    /// Requests shutdown and wakes every waiter.
+    /// Requests shutdown.
     pub fn trigger(&self) {
-        *self.state.lock().unwrap() = true;
-        self.cv.notify_all();
+        self.0.store(true, Ordering::Relaxed);
     }
 
     pub fn is_triggered(&self) -> bool {
-        *self.state.lock().unwrap()
-    }
-
-    /// Blocks until [`Shutdown::trigger`] is called.
-    pub fn wait(&self) {
-        let mut tripped = self.state.lock().unwrap();
-        while !*tripped {
-            tripped = self.cv.wait(tripped).unwrap();
-        }
+        self.0.load(Ordering::Relaxed)
     }
 }
 

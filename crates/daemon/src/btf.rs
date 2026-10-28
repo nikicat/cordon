@@ -4,12 +4,7 @@
 //! and injects them into the program's `.rodata` (see `backend::bpf_lsm`).
 //!
 //! aya-obj already parses BTF, but its member and offset accessors are `pub(crate)`, so
-//! this module parses the slice it needs itself. The format is small and stable
-//! (`Documentation/bpf/btf.rst`). Only the kinds that resolution traverses are kept, which
-//! are STRUCT, UNION and the modifier kinds, and every other kind is skipped. Resolution
-//! follows member names and descends anonymous unions and structs, so a field the kernel
-//! tucks inside an anonymous union (e.g. `mm_struct.exe_file`) is still found without
-//! hard-coding bindgen's `__bindgen_anon_N` names.
+//! this module parses the small part of the format it needs (`Documentation/bpf/btf.rst`).
 
 use cordon_bpf_common::Offsets;
 use cordon_core::{Context, Error, Result};
@@ -29,13 +24,16 @@ const KIND_ARRAY: u32 = 3;
 const KIND_STRUCT: u32 = 4;
 const KIND_UNION: u32 = 5;
 const KIND_ENUM: u32 = 6;
+const KIND_FWD: u32 = 7;
 const KIND_TYPEDEF: u32 = 8;
 const KIND_VOLATILE: u32 = 9;
 const KIND_CONST: u32 = 10;
 const KIND_RESTRICT: u32 = 11;
+const KIND_FUNC: u32 = 12;
 const KIND_FUNC_PROTO: u32 = 13;
 const KIND_VAR: u32 = 14;
 const KIND_DATASEC: u32 = 15;
+const KIND_FLOAT: u32 = 16;
 const KIND_DECL_TAG: u32 = 17;
 const KIND_TYPE_TAG: u32 = 18;
 const KIND_ENUM64: u32 = 19;
@@ -89,15 +87,16 @@ impl KernelBtf {
 
     /// Returns the BTF that the raw blob `bytes` holds.
     ///
-    /// Errors when the blob is truncated or is not BTF.
+    /// Errors when the blob is truncated, is not BTF, or holds a type kind newer than this
+    /// parser.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        parse_btf(bytes).ok_or_else(|| Error::msg("bpf-lsm: malformed kernel BTF"))
+        parse_btf(bytes).ok_or_else(|| Error::msg("bpf-lsm: malformed or unsupported kernel BTF"))
     }
 
     /// Returns the offset of every field the hooks read.
     ///
-    /// Errors when any of those fields is missing, because a kernel that different must not
-    /// be silently mis-read.
+    /// Errors when any of those fields is missing. A missing field means the kernel's layout
+    /// changed, and a guessed offset would make the hooks read the wrong memory.
     pub fn offsets(&self) -> Result<Offsets> {
         let m = |s: &str, p: &[&str]| {
             self.member_offset(s, p)
@@ -123,42 +122,46 @@ impl KernelBtf {
         })
     }
 
-    /// Returns the byte offset of the member that `path` names hop by hop inside the
-    /// struct `struct_name`, or `None` when a hop is missing. A hop may sit inside an
-    /// anonymous struct or union. For example, `("file", ["f_path", "dentry"])` adds
-    /// `file`'s offset to `f_path`, wherever the kernel keeps it, to `path`'s offset to
-    /// `dentry`.
+    /// Returns the byte offset of `struct_name.path[0].path[1]…`, or `None` when a hop is
+    /// missing. A hop may sit inside an anonymous struct or union, as
+    /// `mm_struct.exe_file` does, and the path does not name that anonymous member.
     fn member_offset(&self, struct_name: &str, path: &[&str]) -> Option<u32> {
         let mut agg = self.named_aggregate(struct_name)?;
         let mut total = 0u32;
         for (i, want) in path.iter().enumerate() {
-            let (off, member_ty) = self.find_member(agg, want)?;
-            total = total.checked_add(off)?;
+            let found = self.find_member(agg, want)?;
+            total = total.checked_add(found.byte_offset)?;
             if i + 1 < path.len() {
-                agg = self.aggregate_of(member_ty)?; // must be an aggregate to descend
+                agg = self.aggregate_of(found.type_id)?; // must be an aggregate to descend
             }
         }
         Some(total)
     }
 
-    /// Returns the byte offset and the type id of the member called `want` in the
-    /// aggregate `agg_id`, or `None` when there is none. The member may sit inside an
-    /// anonymous member, but a direct member of that name wins.
-    fn find_member(&self, agg_id: usize, want: &str) -> Option<(u32, u32)> {
+    /// Returns the member called `want` in the aggregate `agg_id`, or `None` when there is
+    /// none. The member may sit inside an anonymous member, but a direct member of that
+    /// name wins.
+    fn find_member(&self, agg_id: usize, want: &str) -> Option<MemberAt> {
         let Ty::Aggregate { members, .. } = self.types.get(agg_id)? else {
             return None;
         };
         for m in members {
             if self.name(m.name_off) == want {
-                return Some((m.bit_offset / 8, m.type_id));
+                return Some(MemberAt {
+                    byte_offset: m.bit_offset / 8,
+                    type_id: m.type_id,
+                });
             }
         }
         for m in members {
             if self.name(m.name_off).is_empty()
                 && let Some(inner) = self.aggregate_of(m.type_id)
-                && let Some((off, ty)) = self.find_member(inner, want)
+                && let Some(found) = self.find_member(inner, want)
             {
-                return Some((m.bit_offset / 8 + off, ty));
+                return Some(MemberAt {
+                    byte_offset: m.bit_offset / 8 + found.byte_offset,
+                    ..found
+                });
             }
         }
         None
@@ -194,6 +197,13 @@ impl KernelBtf {
     }
 }
 
+/// A member that [`KernelBtf::find_member`] found, placed relative to the aggregate it
+/// was looked up in.
+struct MemberAt {
+    byte_offset: u32,
+    type_id: u32,
+}
+
 /// A bounds-checked cursor over the blob, in either byte order.
 struct Reader<'a> {
     buf: &'a [u8],
@@ -202,15 +212,6 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn u16(&mut self) -> Option<u16> {
-        let b: [u8; 2] = self.buf.get(self.pos..self.pos + 2)?.try_into().ok()?;
-        self.pos += 2;
-        Some(if self.le {
-            u16::from_le_bytes(b)
-        } else {
-            u16::from_be_bytes(b)
-        })
-    }
     fn u32(&mut self) -> Option<u32> {
         let b: [u8; 4] = self.buf.get(self.pos..self.pos + 4)?.try_into().ok()?;
         self.pos += 4;
@@ -231,50 +232,50 @@ impl<'a> Reader<'a> {
 fn parse_btf(bytes: &[u8]) -> Option<KernelBtf> {
     // Detect byte order from the magic. The blob is the running kernel's, so it is
     // native, but honoring the magic costs little and avoids a latent assumption.
-    let le = match bytes.get(0..2)? {
-        [0x9f, 0xeb] => true,
-        [0xeb, 0x9f] => false,
-        _ => return None,
+    let magic = bytes.get(0..2)?;
+    let le = if magic == BTF_MAGIC.to_le_bytes() {
+        true
+    } else if magic == BTF_MAGIC.to_be_bytes() {
+        false
+    } else {
+        return None;
     };
+    // Skip the magic and the one-byte version and flags, which nothing here depends on.
     let mut hdr = Reader {
         buf: bytes,
-        pos: 0,
+        pos: 4,
         le,
     };
-    if hdr.u16()? != BTF_MAGIC {
-        return None;
-    }
-    let _version = bytes.get(2)?;
-    let _flags = bytes.get(3)?;
-    hdr.pos = 4;
     let hdr_len = hdr.u32()?;
     let type_off = hdr.u32()?;
     let type_len = hdr.u32()?;
     let str_off = hdr.u32()?;
     let str_len = hdr.u32()?;
 
-    let type_start = (hdr_len as usize).checked_add(type_off as usize)?;
-    let type_end = type_start.checked_add(type_len as usize)?;
-    let str_start = (hdr_len as usize).checked_add(str_off as usize)?;
-    let str_end = str_start.checked_add(str_len as usize)?;
-    let strings = bytes.get(str_start..str_end)?.to_vec();
+    // Each section's offset is relative to the end of the header.
+    let section = |off: u32, len: u32| {
+        let start = (hdr_len as usize).checked_add(off as usize)?;
+        Some(start..start.checked_add(len as usize)?)
+    };
+    let type_sec = section(type_off, type_len)?;
+    let strings = bytes.get(section(str_off, str_len)?)?.to_vec();
 
     let mut r = Reader {
-        buf: bytes.get(..type_end)?,
-        pos: type_start,
+        buf: bytes.get(..type_sec.end)?,
+        pos: type_sec.start,
         le,
     };
     let mut types = Vec::new();
     types.push(Ty::Other); // id 0 == void
-    while r.pos < type_end {
+    while r.pos < type_sec.end {
         types.push(parse_type(&mut r)?);
     }
     Some(KernelBtf { types, strings })
 }
 
-/// Reads one `btf_type` record and returns the part that resolution needs, or `None`
-/// when the record is truncated. A record is a 12-byte common header and a kind-specific
-/// tail, and the reader is left at the next record whatever the kind.
+/// Reads one `btf_type` record and returns the part that resolution needs, or `None` when
+/// the record is truncated or its kind is unknown. A record is a 12-byte common header and
+/// a kind-specific tail, and the reader is left at the next record.
 fn parse_type(r: &mut Reader) -> Option<Ty> {
     let name_off = r.u32()?;
     let info = r.u32()?;
@@ -307,18 +308,16 @@ fn parse_type(r: &mut Reader) -> Option<Ty> {
                 ref_id: size_or_type,
             })
         }
-        // Kinds we don't follow but must skip the trailing bytes of.
-        KIND_INT => r.skip(4).map(|()| Ty::Other),
+        // Resolution never looks inside the other kinds, but the reader must still step
+        // over each one's tail to reach the next record.
+        KIND_PTR | KIND_FWD | KIND_FUNC | KIND_FLOAT => Some(Ty::Other),
+        KIND_INT | KIND_VAR | KIND_DECL_TAG => r.skip(4).map(|()| Ty::Other),
         KIND_ARRAY => r.skip(12).map(|()| Ty::Other),
-        KIND_ENUM => r.skip(vlen * 8).map(|()| Ty::Other),
-        KIND_FUNC_PROTO => r.skip(vlen * 8).map(|()| Ty::Other),
-        KIND_VAR => r.skip(4).map(|()| Ty::Other),
-        KIND_DATASEC => r.skip(vlen * 12).map(|()| Ty::Other),
-        KIND_DECL_TAG => r.skip(4).map(|()| Ty::Other),
-        KIND_ENUM64 => r.skip(vlen * 12).map(|()| Ty::Other),
-        KIND_PTR => Some(Ty::Other), // no trailing
-        // FWD, FUNC, FLOAT and any other kind have no tail this parser depends on.
-        _ => Some(Ty::Other),
+        KIND_ENUM | KIND_FUNC_PROTO => r.skip(vlen * 8).map(|()| Ty::Other),
+        KIND_DATASEC | KIND_ENUM64 => r.skip(vlen * 12).map(|()| Ty::Other),
+        // A newer kernel's kind has a tail of unknown length, so every later record would
+        // be misread.
+        _ => None,
     }
 }
 
@@ -328,7 +327,6 @@ mod tests {
 
     /// A tiny well-formed BTF blob under construction. It exercises the parser against
     /// known offsets, including an anonymous-union descent, without a real kernel.
-    #[derive(Default)]
     struct BtfBuilder {
         types: Vec<u8>,
         strings: Vec<u8>,
@@ -434,5 +432,12 @@ mod tests {
     fn rejects_garbage() {
         assert!(KernelBtf::parse(b"not btf at all").is_err());
         assert!(KernelBtf::parse(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_an_unknown_kind() {
+        let mut b = BtfBuilder::new();
+        b.ty(0, 31, 0, false, 0);
+        assert!(KernelBtf::parse(&b.build()).is_err());
     }
 }

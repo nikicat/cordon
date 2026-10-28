@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Refuses a commit whose staged Rust files are not rustfmt-clean. It checks the staged
+# content of the changed files only, so unstaged edits and untouched files do not count.
+# `just install-hooks` enables it.
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+status=0
+while IFS= read -r -d '' f; do
+    # Each workspace formats with its own edition, and rustfmt runs from the workspace
+    # directory so that its rust-toolchain.toml applies.
+    case $f in
+        crates/bpf/*) dir=$root/crates/bpf ;;
+        *) dir=$root ;;
+    esac
+    edition=$(sed -n 's/^edition = "\(.*\)"$/\1/p' "$dir/Cargo.toml")
+    # rustfmt --check exits 0 on stdin even when it would reformat, so compare its output
+    # with the staged blob instead.
+    if ! diff -u --label "$f (staged)" --label "$f (rustfmt)" \
+        <(git show ":$f") <(git show ":$f" | (cd "$dir" && rustfmt --edition "$edition" --emit stdout)); then
+        status=1
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
+[ "$status" = 0 ] || echo "pre-commit: run \`just fmt\` and stage the result" >&2
+exit "$status"

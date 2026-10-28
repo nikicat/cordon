@@ -86,17 +86,10 @@ pub const PATH_NAME_MAX: usize = 32;
 pub struct PathComp(pub [u8; PATH_NAME_MAX]);
 
 impl PathComp {
-    /// The all-NUL component that fills unused slots.
-    pub const EMPTY: PathComp = PathComp([0; PATH_NAME_MAX]);
-
     /// Returns the component name, which is the bytes before the first NUL, or the whole
-    /// slot if it has no NUL. It needs no allocation, so the kernel can call it as well as
-    /// the daemon.
+    /// slot if it has no NUL.
     pub fn name(&self) -> &[u8] {
-        let end = match self.0.iter().position(|&b| b == 0) {
-            Some(i) => i,
-            None => self.0.len(),
-        };
+        let end = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
         &self.0[..end]
     }
 }
@@ -150,40 +143,6 @@ padded_pod! {
         /// reverses them and joins them onto the object's known path (DESIGN §15.10 flow
         /// B).
         pub comps: [PathComp; PATH_MAX_DEPTH],
-    }
-}
-
-impl DecisionEvent {
-    /// Creates a record with no path, so `depth` is 0 and every component is empty. The
-    /// kernel does not use it, because it writes the path straight into its per-CPU scratch
-    /// record.
-    #[allow(clippy::too_many_arguments)]
-    pub const fn new(
-        pid: Pid,
-        uid: Uid,
-        exe: FileId,
-        object: FileId,
-        leaf: FileId,
-        action: Action,
-        policy: crate::policy_maps::Policy,
-        suppressed: Suppressed,
-        blessing: ClassId,
-    ) -> DecisionEvent {
-        DecisionEvent {
-            exe,
-            object,
-            leaf,
-            action,
-            pid,
-            uid,
-            suppressed,
-            policy,
-            blessing,
-            depth: 0,
-            trunc: 0,
-            comps: [PathComp::EMPTY; PATH_MAX_DEPTH],
-            _pad: [0; Self::PAD],
-        }
     }
 }
 

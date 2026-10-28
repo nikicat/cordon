@@ -12,8 +12,8 @@ use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
 use cordon_bpf_common::{
-    Action, ClassId, DecisionEvent, FileId, MAP_EVENTS, Opens, PATH_MAX_DEPTH, PathComp, Pid,
-    Policy, SuppressedTotal, Uid,
+    Action, ClassId, DecisionEvent, FileId, MAP_EVENTS, PATH_MAX_DEPTH, PathComp, Pid, Policy,
+    Suppressed, Uid,
 };
 use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
@@ -28,7 +28,6 @@ use std::fmt;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// The longest the reader sleeps in one poll, in milliseconds. Each wakeup re-checks
@@ -72,7 +71,7 @@ impl Runtime {
 pub(super) fn serve(
     ebpf: &mut Ebpf,
     control: &PolicyControl,
-    shutdown: &Arc<Shutdown>,
+    shutdown: &Shutdown,
     mut runtime: Runtime,
 ) -> Result<()> {
     let mut ring = RingBuf::try_from(
@@ -86,14 +85,12 @@ pub(super) fn serve(
     // when /etc/passwd changes.
     let mut passwd = Passwd::new();
 
-    // The ring poll's timeout doubles as the control tick. Every wakeup, by an event or by
-    // the timeout, also serves pending control messages and runs the blessing GC.
     while !shutdown.is_triggered() {
         // SAFETY: `raw` is the ring buffer's fd, owned by `ring` for this scope.
         let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(POLL_TIMEOUT_MS)) {
-            Ok(0) => {} // A timeout only re-checks shutdown and the control channel.
+            Ok(0) => {} // A timeout has no records to drain.
             Ok(_) => {
                 // Drain the whole ready batch, then coalesce it.
                 let mut batch: Vec<DecisionEvent> = Vec::new();
@@ -198,6 +195,48 @@ fn apply(
     }
 }
 
+/// The opens that the in-kernel suppressor held back behind one coalesced journal line,
+/// summed from the wire [`Suppressed`] counts. One window's count fits a `u32`, but a sum
+/// over a whole drain batch needs a `u64`, so the total has its own type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SuppressedTotal(u64);
+
+/// Starts a total from a single wire count. The widening is lossless, so it is a typed
+/// `From` rather than an `as` cast.
+impl From<Suppressed> for SuppressedTotal {
+    fn from(s: Suppressed) -> SuppressedTotal {
+        SuppressedTotal(u64::from(s.0))
+    }
+}
+
+impl std::ops::AddAssign<Suppressed> for SuppressedTotal {
+    fn add_assign(&mut self, s: Suppressed) {
+        self.0 += u64::from(s.0);
+    }
+}
+
+/// Writes the bare number for the journal's `suppressed=` field. The `Value` trait of
+/// `tracing` is sealed, so a typed field can only be recorded through `Display`, with the
+/// `%` sigil.
+impl fmt::Display for SuppressedTotal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The number of opens that one coalesced journal line stands for, as [`Coalesced::count`]
+/// sums them. It also counts the opens that reached the ring, so it is not a
+/// [`SuppressedTotal`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Opens(u64);
+
+/// Writes the bare number for the journal's `count=` field.
+impl fmt::Display for Opens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The decisions in one drain batch that share a [`coalesce`] key, folded into a single
 /// journal record.
 struct Coalesced {
@@ -233,7 +272,7 @@ impl Coalesced {
     /// Returns the total opens that this record stands for. They are the folded ring
     /// records plus the opens that the in-kernel suppressor held back.
     fn count(&self) -> Opens {
-        Opens(u64::from(self.events) + u64::from(self.suppressed))
+        Opens(u64::from(self.events) + self.suppressed.0)
     }
 
     /// Writes this record to the journal as a `deny` or an `audit` line. An unblessed
@@ -536,7 +575,10 @@ fn parse_event(bytes: &[u8]) -> Option<DecisionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordon_bpf_common::{ClassId, Dev, Ino, Policy, Suppressed, SuppressedTotal};
+    use cordon_bpf_common::{ClassId, Dev, Ino, PATH_NAME_MAX, Policy};
+
+    /// An unused path component slot.
+    const EMPTY_COMP: PathComp = PathComp([0; PATH_NAME_MAX]);
 
     /// The protected root (the `object`) that the test events share. Their `leaf` is what
     /// varies.
@@ -545,17 +587,21 @@ mod tests {
     /// Returns an unblessed `DecisionEvent` with the given exe and opened-file (`leaf`)
     /// inodes, action and in-kernel suppressed count.
     fn ev(exe: Ino, leaf: Ino, action: Action, suppressed: Suppressed) -> DecisionEvent {
-        DecisionEvent::new(
-            Pid(1),
-            Uid(1000),
-            FileId::new(Dev(1), exe),
-            OBJECT,
-            FileId::new(Dev(1), leaf),
+        DecisionEvent {
+            exe: FileId::new(Dev(1), exe),
+            object: OBJECT,
+            leaf: FileId::new(Dev(1), leaf),
             action,
-            Policy::DENY,
+            pid: Pid(1),
+            uid: Uid(1000),
             suppressed,
-            ClassId::UNBLESSED,
-        )
+            blessing: ClassId::UNBLESSED,
+            policy: Policy::DENY,
+            depth: 0,
+            trunc: 0,
+            comps: [EMPTY_COMP; PATH_MAX_DEPTH],
+            _pad: [0; DecisionEvent::PAD],
+        }
     }
 
     /// Returns [`ev`] with the caller resolved to the blessing `class`, which is the fourth
@@ -568,7 +614,7 @@ mod tests {
 
     /// Returns a NUL-padded path component that holds the short name `s`.
     fn comp(s: &str) -> PathComp {
-        let mut c = PathComp::EMPTY;
+        let mut c = EMPTY_COMP;
         c.0[..s.len()].copy_from_slice(s.as_bytes());
         c
     }
@@ -581,7 +627,7 @@ mod tests {
             ev(Ino(10), Ino(20), Action::READ, Suppressed(3)),
         ];
         let out = coalesce(&batch);
-        assert_eq!(out.len(), 1, "one (exe,leaf,action) → one record");
+        assert_eq!(out.len(), 1, "one coalesce key → one record");
         assert_eq!(out[0].events, 3, "three ring records folded");
         assert_eq!(
             out[0].suppressed,
@@ -663,7 +709,7 @@ mod tests {
 
     #[test]
     fn relative_path_reverses_leaf_first_components() {
-        let mut comps = [PathComp::EMPTY; PATH_MAX_DEPTH];
+        let mut comps = [EMPTY_COMP; PATH_MAX_DEPTH];
         comps[0] = comp("config"); // leaf
         comps[1] = comp(".aws"); // its parent
         assert_eq!(

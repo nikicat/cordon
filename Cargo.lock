@@ -188,7 +188,6 @@ dependencies = [
  "clap",
  "cordon-core",
  "nix",
- "serde",
  "serde_json",
  "tempfile",
 ]

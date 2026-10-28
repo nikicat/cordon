@@ -3,9 +3,6 @@
 # into its own target dir.
 /crates/bpf/target
 **/*.rs.bk
-*.db
-*.db-wal
-*.db-shm
 /cordon-audit.toml
 /cordon-audit.policy.toml
 /cordond.service

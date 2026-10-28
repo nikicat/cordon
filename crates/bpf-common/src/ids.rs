@@ -57,67 +57,10 @@ pub struct CgroupId(pub u64);
 
 /// The number of identical decisions that the in-kernel suppressor folded since the last
 /// ring record for one [`crate::SuppressKey`]. It is `0` on a first occurrence. It travels
-/// in [`crate::DecisionEvent`] and is held in [`crate::SuppressVal`], and a sum of these
-/// across a drain batch is a [`SuppressedTotal`].
+/// in [`crate::DecisionEvent`] and is held in [`crate::SuppressVal`].
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Suppressed(pub u32);
-
-/// The daemon's running total of folded decisions behind one coalesced journal line,
-/// summed from the wire [`Suppressed`] counts (see the daemon's `coalesce`). A single
-/// per-window count fits a `u32`, but a sum over a whole batch needs more headroom. So the
-/// total is a different quantity with its own `u64` type, not a widened count. It never
-/// goes on the wire, and it lives here only to keep the suppressor's counters together.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SuppressedTotal(pub u64);
-
-/// Starts a total from a single wire count. The widening is lossless, so it is a typed
-/// `From` rather than an `as` cast.
-impl From<Suppressed> for SuppressedTotal {
-    fn from(s: Suppressed) -> SuppressedTotal {
-        SuppressedTotal(u64::from(s.0))
-    }
-}
-
-/// Adds a wire count to the running total.
-impl core::ops::AddAssign<Suppressed> for SuppressedTotal {
-    fn add_assign(&mut self, s: Suppressed) {
-        self.0 += u64::from(s.0);
-    }
-}
-
-/// Returns the bare total, so that it can be summed into an [`Opens`] count without `.0`.
-impl From<SuppressedTotal> for u64 {
-    fn from(t: SuppressedTotal) -> u64 {
-        t.0
-    }
-}
-
-/// Writes the bare number for the journal's `suppressed=` field. The `Value` trait of
-/// `tracing` is sealed, so a typed field can only be recorded through `Display`, with the
-/// `%` sigil.
-impl core::fmt::Display for SuppressedTotal {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// The number of opens that one coalesced journal record stands for. It counts the opens
-/// that surfaced as ring records (`events`) plus the [`SuppressedTotal`] that the in-kernel
-/// suppressor held back. It is a superset of the suppressed count, so it has its own type,
-/// because calling it a `SuppressedTotal` would claim that every open was suppressed. Like
-/// the other suppressor counters, it is userspace only.
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Opens(pub u64);
-
-/// Writes the bare number for the journal's `count=` field.
-impl core::fmt::Display for Opens {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// A reading of the kernel's monotonic `bpf_ktime_get_ns()` clock, in nanoseconds. It holds
 /// either an instant, such as [`crate::SuppressVal::last_ns`], or the time elapsed since

@@ -12,13 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 cordon-core = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 # `policy edit`'s private temp dir and the atomic install of the saved policy.
 tempfile = { workspace = true }
-# `policy edit` drops privileges to run the editor as the invoking user, chowns the temp
-# copy to them and looks up their home. That is its sudoedit-style safety boundary. The
-# `user` feature provides setuid, setgid, setgroups and the passwd lookup, and `fs`
-# provides chown.
+# `policy edit` runs the editor as the invoking user and chowns the temp copy to them.
+# That is its sudoedit-style safety boundary. The `user` feature provides
+# setuid, setgid and setgroups, and `fs` provides chown.
 nix = { version = "0.31.3", features = ["user", "fs"] }

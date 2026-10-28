@@ -21,8 +21,8 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{LruHashMap, PerCpuArray, RingBuf};
 use cordon_bpf_common::{
-    Action, CgroupId, ClassId, DecisionEvent, Dev, FileId, Ino, Nanos, ObjId, Offsets,
-    PathComp, Pid, Policy, Suppressed, Uid, SuppressKey, SuppressVal, PATH_MAX_DEPTH, PATH_NAME_MAX,
+    Action, CgroupId, ClassId, DecisionEvent, Dev, FileId, Ino, Nanos, Offsets, PathComp, Pid,
+    Policy, SuppressKey, SuppressVal, Suppressed, Uid, PATH_MAX_DEPTH, PATH_NAME_MAX,
 };
 
 /// The running kernel's field offsets, which the daemon injects into `.rodata` with
@@ -376,7 +376,10 @@ pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed>
         Some(prev) if now.wrapping_sub(prev.last_ns) < SUPPRESS_WINDOW_NS => {
             let _ = SUPPRESS.insert(
                 &key,
-                &SuppressVal::new(prev.last_ns, Suppressed(prev.suppressed.0.saturating_add(1))),
+                &SuppressVal::new(
+                    prev.last_ns,
+                    Suppressed(prev.suppressed.0.saturating_add(1)),
+                ),
                 0,
             );
             None
