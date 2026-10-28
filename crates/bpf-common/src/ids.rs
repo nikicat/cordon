@@ -118,9 +118,9 @@ impl Bank {
         self.0 & 1
     }
 
-    /// Returns this bank normalized to `0` or `1`. When the kernel keys the banked maps
-    /// with a garbage `active_bank` read, it finds an empty bucket and allows the access,
-    /// instead of making a wild lookup.
+    /// Returns this bank normalized to `0` or `1`. A garbage `active_bank` read therefore
+    /// keys one of the two real generations, possibly the stale one, and never a bank the
+    /// maps do not hold.
     pub const fn masked(self) -> Bank {
         Bank(self.index())
     }

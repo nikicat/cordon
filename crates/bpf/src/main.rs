@@ -20,9 +20,10 @@
 //!      policy [`denies`](Policy::denies), and journaled through the suppressor
 //!      (`kernel::suppress`) when it [`logs`](Policy::logs).
 //!
-//! Anything unreadable fails open (see [`clamped`]). All `unsafe` code, the kernel reads
-//! and the ring writes, lives in [`kernel`], and this file holds the decision flow. Field
-//! offsets come from the running kernel at load time (see [`kernel`]).
+//! Unreadable kernel state fails open (see [`clamped`]); an unreadable rule fails closed
+//! (see [`match_rule`]). The kernel reads and the ring writes live in [`kernel`], with
+//! field offsets taken from the running kernel at load time. The only `unsafe` left here
+//! is the map lookups at the end of this file.
 
 #![no_std]
 #![no_main]
@@ -523,7 +524,8 @@ fn requested_action(file: kernel::File) -> Option<Action> {
 
 /// Returns the policy of the first rule in the pre-sorted bucket of object `obj` in `bank`
 /// that covers `requested` and matches the caller's `exe` and blessing `class`. Returns
-/// `None` when no rule matches or a rule slot is unreadable.
+/// `None` when no rule matches, which the caller turns into the default deny. An unreadable
+/// rule slot or count ends the scan the same way, so it fails closed.
 fn match_rule(
     obj: ObjId,
     requested: Action,
@@ -564,13 +566,7 @@ fn current_class() -> ClassId {
     blessed_class(kernel::current_cgroup_id()).unwrap_or(ClassId::UNBLESSED)
 }
 
-/// Returns the class that `cgroup` is blessed with, or `None` when it is not a live
-/// blessing.
-fn blessed_class(cgroup: CgroupId) -> Option<ClassId> {
-    unsafe { BLESSED.get(&cgroup).copied() }
-}
-
-// ---- safe wrappers over the policy-map lookups ----------------------------
+// ---- safe wrappers over the map lookups ----------------------------
 // aya's `HashMap::get` is `unsafe` because it hands back a reference into map memory that
 // can change concurrently. Copying the value out behind a safe fn keeps the decision flow
 // free of `unsafe`. `Array::get` is already safe, since it is bounds-checked.
@@ -584,6 +580,12 @@ fn settings() -> Option<Settings> {
 /// protected there.
 fn protected_obj(bank: Bank, key: FileId) -> Option<ObjId> {
     unsafe { PROTECTED.get(&BankedFile::new(bank, key)).copied() }
+}
+
+/// Returns the class that `cgroup` is blessed with, or `None` when it is not a live
+/// blessing.
+fn blessed_class(cgroup: CgroupId) -> Option<ClassId> {
+    unsafe { BLESSED.get(&cgroup).copied() }
 }
 
 /// Returns how many rules object `obj` has in `bank`, or `None` when it has no entry.

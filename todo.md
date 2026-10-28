@@ -6,10 +6,6 @@ others keep their numbers. The decisions behind the work are in [docs/adr](docs/
 
 ## Cleanup
 
-5. Code docs: false claims, long comments, duplicated facts and garbled sentences.
-   - match_rule stays fail-closed; only its doc changes.
-   - bpf main.rs: "all unsafe lives in kernel.rs" and "fails open" are false.
-   - Bank::masked's doc is wrong about what a garbage bank finds.
 6. Markdown:
    - Fix the false claims.
    - Replace README's example.
