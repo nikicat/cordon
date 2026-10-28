@@ -134,30 +134,57 @@ struct RawPolicy {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Groups {
     #[serde(default)]
-    pub(crate) subject: BTreeMap<GroupName, Spanned<GroupDef>>,
+    pub(crate) subject: BTreeMap<GroupName, Spanned<SubjectGroup>>,
     #[serde(default)]
-    pub(crate) object: BTreeMap<GroupName, Spanned<GroupDef>>,
+    pub(crate) object: BTreeMap<GroupName, Spanned<MemberGroup>>,
     #[serde(default)]
-    pub(crate) action: BTreeMap<GroupName, Spanned<GroupDef>>,
+    pub(crate) action: BTreeMap<GroupName, Spanned<MemberGroup>>,
 }
 
-/// A named group, usually a list of `members`. A subject group may instead carry a single
-/// `blessing = "<class>"` predicate (DESIGN §16.3), which declares a blessing class that
-/// rules reference as `@<group>`. [`super::resolve`] rejects `blessing` on an object or
-/// action group, and rejects it next to `members`. The other conjunctive subject
-/// predicates (`exe = … argv0 = …`, DESIGN §15.4) are not implemented, so
-/// `deny_unknown_fields` rejects them.
+/// A named object or action group. Its member tokens (`@ref`, `*` or a leaf) follow the
+/// same grammar as a rule field, so groups nest.
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GroupDef {
-    /// The member tokens (`@ref`, `*` or a leaf). They follow the same grammar as a rule
-    /// field, so groups nest.
+pub(crate) struct MemberGroup {
     #[serde(default)]
     pub(crate) members: Vec<Token>,
-    /// The blessing class that this subject group matches (DESIGN §16.3), or `None` for
-    /// an ordinary group of members. It cannot appear together with `members`.
+}
+
+/// A named subject group: a list of members, as a [`MemberGroup`] has, or a single
+/// `blessing = "<class>"` predicate (DESIGN §16.3), which declares a blessing class that
+/// rules reference as `@<group>`. The other conjunctive subject predicates
+/// (`exe = … argv0 = …`, DESIGN §15.4) are not implemented, so they are rejected as
+/// unknown fields.
+#[derive(Deserialize, Debug)]
+#[serde(try_from = "RawSubjectGroup")]
+pub(crate) enum SubjectGroup {
+    Members(Vec<Token>),
+    Blessing(ClassName),
+}
+
+/// A subject group as written, before [`SubjectGroup`] picks its form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSubjectGroup {
     #[serde(default)]
-    pub(crate) blessing: Option<ClassName>,
+    members: Option<Vec<Token>>,
+    #[serde(default)]
+    blessing: Option<ClassName>,
+}
+
+impl TryFrom<RawSubjectGroup> for SubjectGroup {
+    type Error = &'static str;
+
+    fn try_from(raw: RawSubjectGroup) -> std::result::Result<SubjectGroup, Self::Error> {
+        match (raw.members, raw.blessing) {
+            (members, None) => Ok(SubjectGroup::Members(members.unwrap_or_default())),
+            (None, Some(class)) => Ok(SubjectGroup::Blessing(class)),
+            (Some(_), Some(_)) => Err(
+                "a subject group has `members` or a `blessing` predicate, not both — a \
+                 blessing class group declares only `blessing`",
+            ),
+        }
+    }
 }
 
 /// One `[[rule]]` table. Each of `who`, `where` and `action` is a single token or a list
@@ -226,11 +253,6 @@ pub(crate) enum Token {
     /// A literal leaf, which is an exe path, an object path or an action name (see
     /// [`RawLeaf`]).
     Leaf(RawLeaf),
-    /// A blessing class (DESIGN §16.3). [`super::resolve`] creates it when a `@ref`
-    /// resolves to a `blessing = "<class>"` group. [`classify`](Token::classify) never
-    /// returns it, because a blessing is not a surface token. The subject axis turns it
-    /// into a blessing predicate, and the object and action axes reject it.
-    Blessing(ClassName),
 }
 
 impl<'de> serde::Deserialize<'de> for Token {

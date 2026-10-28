@@ -3,7 +3,6 @@
 Refactors and fixes found by the code-smell surveys. Each step is one commit, and each
 must pass `packaging/test/run-bpf-lsm-vm.sh` before it counts as done.
 
-3. Policy types at parse: the GroupDef enum and the expand leaf type.
 4. Split docs/DESIGN.md into ADRs under docs/adr/, one decision each (context, decision,
    consequences, status). It goes before the doc steps, because the code cites
    `DESIGN §N` about 140 times and those citations move to ADR numbers.
@@ -33,3 +32,5 @@ must pass `packaging/test/run-bpf-lsm-vm.sh` before it counts as done.
    - Consolidate the duplicated facts.
    - Delete docs/PLAN-unsmell.md.
 7. A fresh re-check over the touched files.
+8. `cordon policy check` prints each diagnostic's file twice (`policy.toml:policy.toml: error…`):
+   it prefixes the path, and the diagnostic already names its source.

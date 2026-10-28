@@ -7,11 +7,12 @@
 //! and `*` means all actions. Paths are `~`-expanded and normalized lexically here, and
 //! [`super::compile`] resolves them to inodes.
 
-use super::parse::{GroupDef, Groups, ParsedPolicy, ParsedRule, Token};
+use super::parse::{MemberGroup, ParsedPolicy, ParsedRule, RawLeaf, SubjectGroup, Token};
 use super::{ClassName, GroupName, Loc, Pos, expand_path};
 use crate::{Error, Result};
 use cordon_bpf_common as bpf;
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use toml::Spanned;
 
@@ -72,9 +73,16 @@ pub struct ResolvedPolicy {
 /// - a group cycle, or a `@ref` to an unknown group
 /// - an unknown action name, or a path that is not absolute
 /// - an axis that resolves to nothing
-/// - a `blessing` predicate outside a subject group, or next to `members`
 pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
-    let blessing_classes = declared_classes(&parsed.groups)?;
+    let blessing_classes = parsed
+        .groups
+        .subject
+        .values()
+        .filter_map(|g| match g.get_ref() {
+            SubjectGroup::Blessing(class) => Some(class.clone()),
+            SubjectGroup::Members(_) => None,
+        })
+        .collect();
     let resolver = Resolver { parsed, home };
     let rules = parsed
         .rules
@@ -87,39 +95,6 @@ pub fn resolve(parsed: &ParsedPolicy, home: &Path) -> Result<ResolvedPolicy> {
     })
 }
 
-/// Returns the distinct blessing classes that the subject groups declare (DESIGN §16.3).
-/// Errors when a `blessing` predicate sits on an object or action group, or next to
-/// `members` in a subject group.
-fn declared_classes(groups: &Groups) -> Result<BTreeSet<ClassName>> {
-    // `blessing` is a subject predicate, so the object and action namespaces reject it.
-    for axis in [Axis::Object, Axis::Action] {
-        if let Some(name) = axis
-            .groups(groups)
-            .iter()
-            .find(|(_, g)| g.get_ref().blessing.is_some())
-            .map(|(name, _)| name)
-        {
-            return Err(Error::msg(format!(
-                "group @{name} in the {axis} namespace has a `blessing` predicate, which is \
-                 only valid on a subject group"
-            )));
-        }
-    }
-    let mut classes = BTreeSet::new();
-    for (name, g) in &groups.subject {
-        if let Some(class) = &g.get_ref().blessing {
-            if !g.get_ref().members.is_empty() {
-                return Err(Error::msg(format!(
-                    "subject group @{name} mixes a `blessing` predicate with `members` — a \
-                     blessing class group declares only `blessing`"
-                )));
-            }
-            classes.insert(class.clone());
-        }
-    }
-    Ok(classes)
-}
-
 /// One of a rule's three axes, each with its own group namespace.
 #[derive(Clone, Copy, Debug)]
 enum Axis {
@@ -128,13 +103,41 @@ enum Axis {
     Action,
 }
 
-impl Axis {
-    /// Returns this axis's group namespace.
-    fn groups(self, groups: &Groups) -> &BTreeMap<GroupName, Spanned<GroupDef>> {
+/// A token after group expansion, with no `@ref` left. `B` is what a group can stand
+/// for besides its members: a blessing class on the subject axis, and nothing on the
+/// others.
+enum Leaf<B> {
+    Wildcard,
+    Name(RawLeaf),
+    Blessing(B),
+}
+
+/// What a `@ref` to a group expands to.
+enum GroupBody<'g, B> {
+    Members(&'g [Token]),
+    /// A group that is one leaf rather than a member list.
+    Blessing(&'g B),
+}
+
+/// A group definition as expansion sees it.
+trait Group {
+    type Blessing: Clone;
+    fn body(&self) -> GroupBody<'_, Self::Blessing>;
+}
+
+impl Group for MemberGroup {
+    type Blessing = Infallible;
+    fn body(&self) -> GroupBody<'_, Infallible> {
+        GroupBody::Members(&self.members)
+    }
+}
+
+impl Group for SubjectGroup {
+    type Blessing = ClassName;
+    fn body(&self) -> GroupBody<'_, ClassName> {
         match self {
-            Axis::Subject => &groups.subject,
-            Axis::Object => &groups.object,
-            Axis::Action => &groups.action,
+            SubjectGroup::Members(members) => GroupBody::Members(members),
+            SubjectGroup::Blessing(class) => GroupBody::Blessing(class),
         }
     }
 }
@@ -182,13 +185,13 @@ impl Resolver<'_> {
     }
 
     fn subjects(&self, tokens: &[Token], pos: Pos) -> Result<Vec<SubjectSpec>> {
+        let groups = &self.parsed.groups.subject;
         let mut out = Vec::new();
-        for (tok, _) in self.expand(Axis::Subject, tokens, pos)? {
-            let spec = match tok {
-                Token::Wildcard => SubjectSpec::Any,
-                Token::Leaf(s) => SubjectSpec::Exe(expand_path(&s, self.home)?),
-                Token::Blessing(class) => SubjectSpec::Blessed(class),
-                Token::Group(_) => unreachable!("group tokens are consumed by expand"),
+        for (leaf, _) in self.expand(Axis::Subject, groups, tokens, pos)? {
+            let spec = match leaf {
+                Leaf::Wildcard => SubjectSpec::Any,
+                Leaf::Name(s) => SubjectSpec::Exe(expand_path(&s, self.home)?),
+                Leaf::Blessing(class) => SubjectSpec::Blessed(class),
             };
             push_unique(&mut out, spec);
         }
@@ -196,77 +199,80 @@ impl Resolver<'_> {
     }
 
     fn objects(&self, tokens: &[Token], pos: Pos) -> Result<Vec<PathBuf>> {
+        let groups = &self.parsed.groups.object;
         let mut out = Vec::new();
-        for (tok, p) in self.expand(Axis::Object, tokens, pos)? {
-            match tok {
-                Token::Wildcard => {
+        for (leaf, p) in self.expand(Axis::Object, groups, tokens, pos)? {
+            match leaf {
+                Leaf::Wildcard => {
                     return Err(Error::at(
                         p,
                         "`where` cannot be `*` — the filesystem can't be default-denied wholesale",
                     ));
                 }
-                Token::Leaf(s) => push_unique(&mut out, expand_path(&s, self.home)?),
-                Token::Blessing(_) => {
-                    return Err(Error::at(
-                        p,
-                        "a blessing group is a subject predicate; it can't appear in `where`",
-                    ));
-                }
-                Token::Group(_) => unreachable!("group tokens are consumed by expand"),
+                Leaf::Name(s) => push_unique(&mut out, expand_path(&s, self.home)?),
+                Leaf::Blessing(never) => match never {},
             }
         }
         Ok(out)
     }
 
     fn actions(&self, tokens: &[Token], pos: Pos) -> Result<bpf::Action> {
+        let groups = &self.parsed.groups.action;
         let mut mask = bpf::Action::empty();
-        for (tok, p) in self.expand(Axis::Action, tokens, pos)? {
-            match tok {
-                Token::Wildcard => mask |= bpf::Action::all(),
-                Token::Leaf(s) => {
+        for (leaf, p) in self.expand(Axis::Action, groups, tokens, pos)? {
+            match leaf {
+                Leaf::Wildcard => mask |= bpf::Action::all(),
+                Leaf::Name(s) => {
                     mask |= bpf::Action::from_authored(&s)
                         .ok_or_else(|| Error::at(p, format!("unknown action: {s:?}")))?;
                 }
-                Token::Blessing(_) => {
-                    return Err(Error::at(
-                        p,
-                        "a blessing group is a subject predicate; it can't appear in `action`",
-                    ));
-                }
-                Token::Group(_) => unreachable!("group tokens are consumed by expand"),
+                Leaf::Blessing(never) => match never {},
             }
         }
         Ok(mask)
     }
 
-    /// Returns `tokens` with every `@group` ref expanded, each paired with the position of
-    /// its enclosing rule or group. A `@ref` to a `blessing = "…"` group (DESIGN §16.3) is
-    /// a leaf, not a member list, so it comes back as one [`Token::Blessing`]. The subject
-    /// axis accepts that token, and the other axes reject it. Errors when the groups form a
-    /// cycle or when a `@ref` names an unknown group.
-    fn expand(&self, axis: Axis, tokens: &[Token], enclosing: Pos) -> Result<Vec<(Token, Pos)>> {
+    /// Returns `tokens` with every `@group` ref expanded against `groups`, the namespace
+    /// of `axis`, each leaf paired with the position of its enclosing rule or group. A
+    /// group that is a blessing class (DESIGN §16.3) comes back as one
+    /// [`Leaf::Blessing`]. Errors when the groups form a cycle or when a `@ref` names an
+    /// unknown group.
+    fn expand<G: Group>(
+        &self,
+        axis: Axis,
+        groups: &BTreeMap<GroupName, Spanned<G>>,
+        tokens: &[Token],
+        enclosing: Pos,
+    ) -> Result<Vec<(Leaf<G::Blessing>, Pos)>> {
         let mut out = Vec::new();
-        self.expand_within(axis, tokens, enclosing, &mut Vec::new(), &mut out)?;
+        self.expand_within(axis, groups, tokens, enclosing, &mut Vec::new(), &mut out)?;
         Ok(out)
     }
 
     /// Behaves like [`expand`](Self::expand), but inside the groups on `stack`, and
     /// appends to `out`. A reference back to any group on `stack` is a cycle.
-    fn expand_within(
+    fn expand_within<G: Group>(
         &self,
         axis: Axis,
+        groups: &BTreeMap<GroupName, Spanned<G>>,
         tokens: &[Token],
         enclosing: Pos,
         stack: &mut Vec<GroupName>,
-        out: &mut Vec<(Token, Pos)>,
+        out: &mut Vec<(Leaf<G::Blessing>, Pos)>,
     ) -> Result<()> {
-        let groups = axis.groups(&self.parsed.groups);
         for tok in tokens {
-            let Token::Group(name) = tok else {
-                out.push((tok.clone(), enclosing));
-                continue;
+            let name = match tok {
+                Token::Wildcard => {
+                    out.push((Leaf::Wildcard, enclosing));
+                    continue;
+                }
+                Token::Leaf(s) => {
+                    out.push((Leaf::Name(s.clone()), enclosing));
+                    continue;
+                }
+                Token::Group(name) => name,
             };
-            let group_pos = |g: &Spanned<GroupDef>| self.parsed.lines.pos(g.span().start);
+            let group_pos = |g: &Spanned<G>| self.parsed.lines.pos(g.span().start);
             if stack.contains(name) {
                 let chain = stack
                     .iter()
@@ -283,15 +289,14 @@ impl Resolver<'_> {
                 .get(name)
                 .ok_or_else(|| Error::at(enclosing, format!("unknown {axis} group: @{name}")))?;
             let gpos = group_pos(g);
-            // A blessing-class group is a subject predicate, not a member list. It has no
-            // members to recurse into, so it becomes one synthesized `Blessing` leaf.
-            if let Some(class) = &g.get_ref().blessing {
-                out.push((Token::Blessing(class.clone()), gpos));
-                continue;
+            match g.get_ref().body() {
+                GroupBody::Blessing(b) => out.push((Leaf::Blessing(b.clone()), gpos)),
+                GroupBody::Members(members) => {
+                    stack.push(name.clone());
+                    self.expand_within(axis, groups, members, gpos, stack, out)?;
+                    stack.pop();
+                }
             }
-            stack.push(name.clone());
-            self.expand_within(axis, &g.get_ref().members, gpos, stack, out)?;
-            stack.pop();
         }
         Ok(())
     }
@@ -492,7 +497,7 @@ mod tests {
     /// Two declarations of the same class collapse to one, and distinct classes come out
     /// sorted.
     #[test]
-    fn declared_classes_dedup_and_sort() {
+    fn blessing_classes_dedup_and_sort() {
         let text = r#"
             [group.subject.a]
             blessing = "rw"
@@ -525,8 +530,8 @@ mod tests {
             action = "read"
             policy = "allow"
         "#;
-        let err = format!("{}", resolve_text(text).unwrap_err());
-        assert!(err.contains("only valid on a subject group"), "got: {err}");
+        let err = format!("{:#}", parse(text).unwrap_err());
+        assert!(err.contains("unknown field `blessing`"), "got: {err}");
     }
 
     /// …and on an action group.
@@ -541,8 +546,8 @@ mod tests {
             action = "@bad"
             policy = "allow"
         "#;
-        let err = format!("{}", resolve_text(text).unwrap_err());
-        assert!(err.contains("only valid on a subject group"), "got: {err}");
+        let err = format!("{:#}", parse(text).unwrap_err());
+        assert!(err.contains("unknown field `blessing`"), "got: {err}");
     }
 
     /// A blessing group cannot also carry `members`, because it declares only the class.
@@ -558,11 +563,8 @@ mod tests {
             action = "read"
             policy = "allow"
         "#;
-        let err = format!("{}", resolve_text(text).unwrap_err());
-        assert!(
-            err.contains("mixes a `blessing` predicate with `members`"),
-            "got: {err}"
-        );
+        let err = format!("{:#}", parse(text).unwrap_err());
+        assert!(err.contains("not both"), "got: {err}");
     }
 
     /// A blessing group lives in the subject namespace, so a reference from `where`, the
