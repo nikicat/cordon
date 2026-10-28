@@ -145,7 +145,7 @@ fn request_and_approve(
 /// carrier is root-owned and membership is the boundary (see `Blessings::mint` in
 /// cordond), so a user-owned daemon has nothing to grant.
 fn require_root_daemon(conn: &Conn, socket: &Path) -> Result<()> {
-    let uid = conn.peer_uid();
+    let uid = conn.peer().uid;
     if uid != Uid::ROOT {
         return Err(Error::msg(format!(
             "the daemon on {} runs as uid {}, not root — refusing to request a blessing \
@@ -277,7 +277,7 @@ mod tests {
     fn the_daemon_end_must_be_root() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
         let ours = Conn::new(ours).unwrap();
-        let peer_is_root = ours.peer_uid() == Uid::ROOT;
+        let peer_is_root = ours.peer().uid == Uid::ROOT;
         let verdict = require_root_daemon(&ours, Path::new("/socketpair"));
         assert_eq!(
             verdict.is_err(),
@@ -300,7 +300,7 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let path = dir.join("cordon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        if Conn::connect(&path).unwrap().peer_uid() == Uid::ROOT {
+        if Conn::connect(&path).unwrap().peer().uid == Uid::ROOT {
             return; // As root, this listener is a legitimate daemon end.
         }
 

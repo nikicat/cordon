@@ -3,7 +3,6 @@
 Refactors and fixes found by the code-smell surveys. Each step is one commit, and each
 must pass `packaging/test/run-bpf-lsm-vm.sh` before it counts as done.
 
-2. PeerCred, the events receiver and the Runtime split.
 3. Policy types at parse: the GroupDef enum and the expand leaf type.
 4. Split docs/DESIGN.md into ADRs under docs/adr/, one decision each (context, decision,
    consequences, status). It goes before the doc steps, because the code cites

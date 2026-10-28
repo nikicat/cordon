@@ -25,12 +25,11 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, Bank, CompiledRule, FileId, ObjId, Offsets, Policy, Settings, SubjectMatch,
+    Action, Bank, CompiledRule, ObjId, Offsets, Policy, Settings, SubjectMatch,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, CompiledPolicy, PolicySource, Severity};
 use cordon_core::{Context, Error, Result};
-use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -132,17 +131,8 @@ impl Backend for BpfLsmBackend {
             "bpf-lsm active (self-test passed)",
         );
 
-        // Build the per-run state that sits beside the `Ebpf` handle, and adopt the
-        // carrier cgroups that a previous daemon run left behind (see
-        // `Blessings::reconcile`).
-        let mut runtime = events::Runtime::new(&compiled);
-        runtime
-            .blessings
-            .reconcile(&mut Maps(&mut ebpf), &runtime.classes);
-
-        // Drain the ring buffer and serve control requests until shutdown. The apply path
-        // refreshes the runtime's maps on each re-seed.
-        events::serve(&mut ebpf, &control, &shutdown, runtime)
+        // Drain the ring buffer and serve control requests until shutdown.
+        events::serve(&mut ebpf, &control, &shutdown, &compiled)
     }
 }
 
@@ -178,13 +168,6 @@ pub(super) fn compile_sources(sources: &[PolicySource]) -> CompiledPolicy {
         }
     }
     compiled
-}
-
-/// Returns the path of each protected object by its inode, which names objects in the
-/// journal. A `DecisionEvent` carries only the object's [`FileId`], so this map reverses
-/// the path-to-inode resolution done at seed time.
-pub(super) fn object_paths(c: &CompiledPolicy) -> HashMap<FileId, PathBuf> {
-    c.objects.iter().map(|o| (o.file, o.path.clone())).collect()
 }
 
 /// Replaces the offsets of the fields read out of kernel memory with [`Offsets::POISON`]

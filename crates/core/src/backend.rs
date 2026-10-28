@@ -8,7 +8,7 @@
 
 use crate::Uid;
 use crate::policy::{ClassName, CompiledPolicy, Diagnostic, PolicySource};
-use crate::proto::{BlessId, BlessingView, CarrierProcs, Pid, PolicyView};
+use crate::proto::{BlessId, BlessingView, CarrierProcs, PeerCred, PolicyView};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -156,14 +156,10 @@ pub enum BlessOp {
     /// `cgroup.procs`, opened by the root backend thread ([`CarrierProcs`]).
     Mint {
         class: Option<ClassName>,
-        /// The requester's uid ([`Conn::peer_uid`](crate::proto::Conn::peer_uid)),
-        /// recorded on the blessing so that [`Self::Revoke`] can let the requester revoke
-        /// it.
-        owner: Uid,
-        /// The requester's pid ([`Conn::peer_pid`](crate::proto::Conn::peer_pid)). The
-        /// carrier is placed in that process's logind session scope, so the blessed
-        /// command keeps a session that polkit can resolve.
-        requester: Pid,
+        /// The requester. Its uid is recorded on the blessing so that [`Self::Revoke`] can
+        /// let the requester revoke it, and the carrier is placed in its pid's logind
+        /// session scope, so the blessed command keeps a session that polkit can resolve.
+        requester: PeerCred,
         reply: Sender<std::result::Result<(BlessingView, CarrierProcs), String>>,
     },
     /// Lists the live blessings.
@@ -171,7 +167,7 @@ pub enum BlessOp {
         reply: Sender<std::result::Result<Vec<BlessingView>, String>>,
     },
     /// Kills a blessing's carrier and unregisters it. `by` holds the caller's
-    /// [`Conn::peer_uid`](crate::proto::Conn::peer_uid), and the daemon's `may_revoke`
+    /// [`PeerCred::uid`](crate::proto::PeerCred::uid), and the daemon's `may_revoke`
     /// decides whether that caller may revoke this blessing. The check runs behind this
     /// channel rather than in the IPC `authorize` gate because it needs the live table.
     /// The gate only answers whether a uid may use the verb at all.

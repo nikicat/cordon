@@ -27,7 +27,7 @@ pub struct Pid(pub u32);
 /// A real user id that the kernel reported, never one that a client claimed. The eBPF
 /// program reads it from `bpf_get_current_uid_gid()` into [`crate::DecisionEvent`] for the
 /// audit line, and the IPC server reads it from `SO_PEERCRED` (`cordon_core`'s
-/// `Conn::peer_uid`) to authorize a request. It is a `u32` to match the kernel and passwd
+/// `PeerCred::uid`) to authorize a request. It is a `u32` to match the kernel and passwd
 /// width, and it is ordered so that it can be checked against `cordon_core`'s
 /// `REGULAR_UID_RANGE`.
 #[repr(transparent)]

@@ -31,53 +31,67 @@ use tracing::{error, info, warn};
 /// shutdown and the control channel, and ticks the blessing GC.
 const POLL_TIMEOUT_MS: u16 = 500;
 
-/// The backend thread's per-run state that sits beside the `Ebpf` handle. Only that
-/// thread touches it, and each successful apply refreshes it from the new compile.
-pub(super) struct Runtime {
-    /// The path of each protected object by inode, which names objects in the journal.
-    pub object_paths: HashMap<FileId, PathBuf>,
-    /// The class registry of the live compile. Mints resolve against it, an apply remaps
-    /// live blessings with it, and the journal names a blessed caller's class from it.
-    pub classes: ClassRegistry,
-    pub blessings: Blessings,
+/// What the live compile says, for the journal and for blessings. Each apply replaces it
+/// whole, through [`Server::replace_policy`].
+struct LivePolicy {
+    /// The path of each protected object by inode, which names objects in the journal. A
+    /// `DecisionEvent` carries only the object's [`FileId`], so this reverses the
+    /// path-to-inode resolution done at seed time.
+    object_paths: HashMap<FileId, PathBuf>,
+    /// The class registry. Mints resolve against it, live blessings are remapped with it,
+    /// and the journal names a blessed caller's class from it.
+    classes: ClassRegistry,
 }
 
-impl Runtime {
-    pub(super) fn new(compiled: &CompiledPolicy) -> Runtime {
-        Runtime {
-            object_paths: super::object_paths(compiled),
+impl LivePolicy {
+    fn of(compiled: &CompiledPolicy) -> LivePolicy {
+        LivePolicy {
+            object_paths: compiled
+                .objects
+                .iter()
+                .map(|o| (o.file, o.path.clone()))
+                .collect(),
             classes: compiled.classes.clone(),
-            blessings: Blessings::new(),
         }
     }
-
-    /// Replaces the object paths and the class registry with those of `compiled`. The
-    /// class ids have just been renumbered, so live blessings carry stale ids until
-    /// `blessings.remap` runs.
-    fn refresh(&mut self, compiled: &CompiledPolicy) {
-        self.object_paths = super::object_paths(compiled);
-        self.classes = compiled.classes.clone();
-    }
 }
 
-/// Writes logged decisions to the journal and serves control requests until shutdown.
-/// Applies land, and dead blessing carriers are reaped, within one poll interval
-/// ([`POLL_TIMEOUT_MS`]).
+/// The backend thread's state beside the `Ebpf` handle, which only that thread touches.
+struct Server<'a> {
+    maps: Maps<'a>,
+    control: &'a PolicyControl,
+    policy: LivePolicy,
+    /// Outlives each policy: an apply remaps the blessings rather than replacing them.
+    blessings: Blessings,
+}
+
+/// Writes logged decisions to the journal and serves control requests until shutdown,
+/// starting from the policy `compiled`. It first adopts the carrier cgroups that a
+/// previous daemon run left behind (see [`Blessings::reconcile`]). Applies land, and dead
+/// blessing carriers are reaped, within one poll interval ([`POLL_TIMEOUT_MS`]).
 ///
 /// Errors when the object has no events ring buffer or polling it fails.
 pub(super) fn serve(
     ebpf: &mut Ebpf,
     control: &PolicyControl,
     shutdown: &Shutdown,
-    mut runtime: Runtime,
+    compiled: &CompiledPolicy,
 ) -> Result<()> {
     let mut ring = RingBuf::try_from(
         ebpf.take_map(MAP_EVENTS)
             .ok_or_else(|| Error::msg(format!("bpf-lsm: {MAP_EVENTS} missing from object")))?,
     )
     .with_context(|| format!("bpf-lsm: {MAP_EVENTS}"))?;
-    let mut maps = Maps(ebpf);
     let raw = ring.as_raw_fd();
+    let mut server = Server {
+        maps: Maps(ebpf),
+        control,
+        policy: LivePolicy::of(compiled),
+        blessings: Blessings::new(),
+    };
+    server
+        .blessings
+        .reconcile(&mut server.maps, &server.policy.classes);
     // Names callers on the audit line. NSS is asked once per uid, and the cache empties
     // when /etc/passwd changes.
     let mut passwd = Passwd::new();
@@ -102,7 +116,7 @@ pub(super) fn serve(
                 }
                 passwd.refresh();
                 for record in coalesce(&batch) {
-                    record.log(&runtime.object_paths, &runtime.classes, &mut passwd);
+                    record.log(&server.policy, &mut passwd);
                 }
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -111,84 +125,80 @@ pub(super) fn serve(
         // Service the control messages that arrived since the last tick, in order (see
         // `ControlMsg` for why applies and bless ops share one channel).
         while let Ok(msg) = control.msg_rx.try_recv() {
-            match msg {
-                ControlMsg::Apply(req) => {
-                    // The apply takes effect even when the requester no longer waits.
-                    let _ = req
-                        .reply
-                        .send(apply(&mut maps, control, &req.sources, &mut runtime));
-                }
-                ControlMsg::Bless(op) => bless_op(&mut maps, &mut runtime, op),
-            }
+            server.handle(msg);
         }
         // Reap dead blessing carriers (`populated 0`) each tick.
-        runtime.blessings.gc(&mut maps);
+        server.blessings.gc(&mut server.maps);
     }
     Ok(())
 }
 
-/// Applies one bless op to the blessings table and the maps, and sends the outcome on the
-/// op's reply channel. The op takes effect even when the requester no longer waits for it.
-fn bless_op(maps: &mut Maps, runtime: &mut Runtime, op: BlessOp) {
-    match op {
-        BlessOp::Mint {
-            class,
-            owner,
-            requester,
-            reply,
-        } => {
-            let outcome = runtime
-                .blessings
-                .mint(maps, class, owner, requester, &runtime.classes)
-                .map_err(|e| e.to_string());
-            let _ = reply.send(outcome);
-        }
-        BlessOp::List { reply } => {
-            let _ = reply.send(Ok(runtime.blessings.list()));
-        }
-        BlessOp::Revoke { id, by, reply } => {
-            let _ = reply.send(runtime.blessings.revoke(id, by).map_err(|e| e.to_string()));
+impl Server<'_> {
+    /// Serves one control message and sends the outcome on its reply channel. The message
+    /// takes effect even when the requester no longer waits for it.
+    fn handle(&mut self, msg: ControlMsg) {
+        match msg {
+            ControlMsg::Apply(req) => {
+                let _ = req.reply.send(self.apply(&req.sources));
+            }
+            ControlMsg::Bless(BlessOp::Mint {
+                class,
+                requester,
+                reply,
+            }) => {
+                let outcome = self
+                    .blessings
+                    .mint(&mut self.maps, class, requester, &self.policy.classes)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(outcome);
+            }
+            ControlMsg::Bless(BlessOp::List { reply }) => {
+                let _ = reply.send(Ok(self.blessings.list()));
+            }
+            ControlMsg::Bless(BlessOp::Revoke { id, by, reply }) => {
+                let _ = reply.send(self.blessings.revoke(id, by).map_err(|e| e.to_string()));
+            }
         }
     }
-}
 
-/// Recompiles the policy fragments `sources`. When they have no errors, it re-seeds the
-/// maps ([`Maps::seed`]), republishes the effective view, refreshes `runtime` and remaps
-/// live blessings. Returns the diagnostics, with whether the policy was applied.
-fn apply(
-    maps: &mut Maps,
-    control: &PolicyControl,
-    sources: &[PolicySource],
-    runtime: &mut Runtime,
-) -> ApplyOutcome {
-    let mut compiled = super::compile_sources(sources);
-    let applied = if compiled.has_errors() {
-        false
-    } else {
-        match maps.seed(&compiled) {
-            Ok(()) => {
-                control.publish(&compiled);
-                runtime.refresh(&compiled);
-                // This compile renumbered the ClassIds (see `Blessings::remap`).
-                runtime.blessings.remap(maps, &runtime.classes);
-                info!(objects = compiled.objects.len(), "policy applied");
-                true
+    /// Recompiles the policy fragments `sources`. When they have no errors, it re-seeds
+    /// the maps ([`Maps::seed`]), republishes the effective view and makes the compile
+    /// live. Returns the diagnostics, with whether the policy was applied.
+    fn apply(&mut self, sources: &[PolicySource]) -> ApplyOutcome {
+        let mut compiled = super::compile_sources(sources);
+        let applied = if compiled.has_errors() {
+            false
+        } else {
+            match self.maps.seed(&compiled) {
+                Ok(()) => {
+                    self.control.publish(&compiled);
+                    self.replace_policy(&compiled);
+                    info!(objects = compiled.objects.len(), "policy applied");
+                    true
+                }
+                Err(e) => {
+                    error!(error = %e, "policy apply: seeding the maps failed; live policy unchanged");
+                    // The policy itself compiled clean, so the requester needs this to say
+                    // why nothing was applied.
+                    compiled.diagnostics.push(Diagnostic::error(
+                        Loc::default(),
+                        format!("the daemon could not load the policy into the kernel: {e}"),
+                    ));
+                    false
+                }
             }
-            Err(e) => {
-                error!(error = %e, "policy apply: seeding the maps failed; live policy unchanged");
-                // The policy itself compiled clean, so the requester needs this to say why
-                // nothing was applied.
-                compiled.diagnostics.push(Diagnostic::error(
-                    Loc::default(),
-                    format!("the daemon could not load the policy into the kernel: {e}"),
-                ));
-                false
-            }
+        };
+        ApplyOutcome {
+            applied,
+            diagnostics: compiled.diagnostics,
         }
-    };
-    ApplyOutcome {
-        applied,
-        diagnostics: compiled.diagnostics,
+    }
+
+    /// Makes `compiled` the live policy. Its compile renumbered the class ids, so the live
+    /// blessings are remapped in the same step (see [`Blessings::remap`]).
+    fn replace_policy(&mut self, compiled: &CompiledPolicy) {
+        self.policy = LivePolicy::of(compiled);
+        self.blessings.remap(&mut self.maps, &self.policy.classes);
     }
 }
 
@@ -258,24 +268,20 @@ impl Coalesced {
 
     /// Writes this record to the journal as a `deny` or an `audit` line, as the policy
     /// decides (DESIGN §15.6). An unblessed line carries no `blessing` field.
-    fn log(
-        &self,
-        object_paths: &HashMap<FileId, PathBuf>,
-        classes: &ClassRegistry,
-        passwd: &mut Passwd,
-    ) {
+    fn log(&self, live: &LivePolicy, passwd: &mut Passwd) {
         // Every field is a typed value with its own `Display`, so `tracing` renders it
         // lazily, with no eager `String`s.
         let e = &self.first;
         let user = CallerUser::resolve(e.uid, passwd);
         let home = user.home();
         let exe = CallerExe::resolve(e.pid, e.exe);
-        let object = JournalPath::object(e.object, object_paths).into_audit(home);
-        let path = JournalPath::opened(e, object_paths).into_audit(home);
+        let object = JournalPath::object(e.object, &live.object_paths).into_audit(home);
+        let path = JournalPath::opened(e, &live.object_paths).into_audit(home);
         let (action, policy) = (e.action, e.policy);
         let (count, suppressed) = (self.count(), self.suppressed);
         // An `Option` field is recorded only when it is `Some`.
-        let blessing = BlessingName::resolve(e.blessing, classes).map(tracing::field::display);
+        let blessing =
+            BlessingName::resolve(e.blessing, &live.classes).map(tracing::field::display);
         let verdict = if policy.denies() { "deny" } else { "audit" };
         info!(pid = e.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, blessing, "{verdict}");
     }

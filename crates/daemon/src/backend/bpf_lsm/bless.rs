@@ -13,7 +13,7 @@
 use super::seed::Maps;
 use cordon_bpf_common::{CgroupId, ClassId, MAX_BLESSED};
 use cordon_core::policy::{ClassName, ClassRegistry};
-use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, Pid};
+use cordon_core::proto::{BlessId, BlessingView, CarrierProcs, PeerCred, Pid};
 use cordon_core::{Context, Error, Result, Uid};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -96,7 +96,7 @@ impl Blessings {
         }
     }
 
-    /// Mints a blessing for `owner` by creating its carrier cgroup as root and registering
+    /// Mints a blessing for `requester` by creating its carrier cgroup as root and registering
     /// it in `MAP_BLESSED`. Returns the blessing's view and the carrier's `cgroup.procs`,
     /// opened for write. A process joins the carrier when its pid is written through that
     /// descriptor. Membership is the boundary, and the carrier is root-owned, so a non-root
@@ -109,8 +109,7 @@ impl Blessings {
         &mut self,
         maps: &mut Maps,
         class: Option<ClassName>,
-        owner: Uid,
-        requester: Pid,
+        requester: PeerCred,
         registry: &ClassRegistry,
     ) -> Result<(BlessingView, CarrierProcs)> {
         let root = self.root.as_ref().ok_or_else(|| {
@@ -125,7 +124,8 @@ impl Blessings {
 
         let id = self.next;
         // In the requester's own user subtree where possible (see `carrier_parent`).
-        let dir = CarrierDir::create(carrier_parent(requester, root).join(dir_name(id, &class)))?;
+        let dir =
+            CarrierDir::create(carrier_parent(requester.pid, root).join(dir_name(id, &class)))?;
         let registered = (|| -> Result<_> {
             let cgroup = dir.cgroup_id()?;
             // Open `cgroup.procs` here, as root, before handing anything back, because
@@ -143,14 +143,14 @@ impl Blessings {
             id,
             class: class.clone(),
             dir: dir.clone(),
-            owner: Some(owner),
+            owner: Some(requester.uid),
             cgroup,
             registered: true,
             saw_populated: false,
             revoked: false,
             minted: Instant::now(),
         });
-        info!(%id, %class, %owner, cgroup = %dir, "blessing minted");
+        info!(%id, %class, owner = %requester.uid, cgroup = %dir, "blessing minted");
         Ok((
             BlessingView {
                 id,

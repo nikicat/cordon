@@ -80,7 +80,7 @@ impl Ctx {
         while let Some(req) = conn.recv::<Request>()? {
             // Any failure — refused, timed out, backend error — becomes an `Error` reply
             // rather than a dropped connection, so the CLI can say why.
-            if let Err(e) = authorize(&req, conn.peer_uid()).and_then(|()| self.handle(&conn, req))
+            if let Err(e) = authorize(&req, conn.peer().uid).and_then(|()| self.handle(&conn, req))
             {
                 conn.send(&Response::Error {
                     message: e.to_string(),
@@ -107,12 +107,11 @@ impl Ctx {
     /// human-presence check rests on the approver's. Neither is a client's assertion.
     fn serve_bless_request(&self, conn: &Conn, class: Option<ClassName>) -> Result<()> {
         self.await_approval(conn)?;
-        // The carrier's placement follows *this* peer; see `Conn::peer_pid` for why a
+        // The carrier's placement follows *this* peer; see `PeerCred::pid` for why a
         // pid is good enough for placement.
         let (view, procs) = self.bless(|reply| BlessOp::Mint {
             class,
-            owner: conn.peer_uid(),
-            requester: conn.peer_pid(),
+            requester: conn.peer(),
             reply,
         })?;
         conn.send_with_fd(&Response::BlessMinted(view), procs.0.as_fd())
@@ -227,7 +226,7 @@ impl Ctx {
             Request::BlessRevoke { id } => {
                 self.bless(|reply| BlessOp::Revoke {
                     id,
-                    by: conn.peer_uid(),
+                    by: conn.peer().uid,
                     reply,
                 })?;
                 Response::BlessRevoked { id }
