@@ -22,6 +22,6 @@ read configs they didn't create, so the exe alone is too coarse a subject.
 ## Consequences
 
 Only `exe`, and the `blessing` predicate of [ADR 0012](0012-blessing.md), ship today. `uid`,
-`cgroup`, the hash, argv0 and ancestor are later milestones (PLAN-rule-model M2). No rule
+`cgroup`, the hash, argv0 and ancestor are not built yet ([todo.md](../../todo.md)). No rule
 grammar fixes the granularity of identity. This axis is where the security
 actually lives.

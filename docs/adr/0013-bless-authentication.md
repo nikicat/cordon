@@ -1,6 +1,6 @@
 # ADR 0013: Bless authenticates by client-side elevation
 
-Status: Accepted (shipped in B2); PAM in the daemon is the planned upgrade (PLAN-bless B3)
+Status: Accepted (shipped in B2); PAM in the daemon is the planned upgrade (B3 in [todo.md](../../todo.md))
 
 ## Context
 

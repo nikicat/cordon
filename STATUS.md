@@ -15,9 +15,7 @@ The migration retired the earlier owner model, as *Pre-rule-model history* below
 Enforcement is now fail-safe. The LSM links are pinned to bpffs, so the boundary survives the
 daemon crashing, being killed, or being restarted. M6 is the last must-have.
 
-The milestones live in [docs/PLAN-rule-model.md](docs/PLAN-rule-model.md), where M6 is what's
-left, and in [docs/PLAN-bless.md](docs/PLAN-bless.md), whose B3 and B4 are deferred until the
-core is done.
+What is left is in [`todo.md`](todo.md).
 
 ## What's implemented
 
@@ -122,76 +120,10 @@ job control and session are inherited by construction.
 
 ## What's left
 
-**Order.** It was set on 2026-07-28 and updated as M3 and M5 landed. M3 and M5 are done, and M6
-is the only remaining must-have. Blessing work waits. B1 and B2 already make `bless` usable,
-and the remaining hole is in the core boundary. The rule is *soundness before ergonomics.*
-
-### Next — the last must-have
-
-- **M6: fixed code as the precondition for a grant.** This is the `exe`-identity fix and it
-  closes the largest known hole. The invariant is that a grant attaches only to a process
-  that runs the code it shipped with. So a process that executes foreign code in its own
-  address space is not grantable. That covers a JIT, an interpreter running a script, and a
-  preloaded library. `exec` and the process boundary make the invariant reachable. `ssh`'s
-  `ProxyCommand` and `git`'s hooks spawn a new exe and lose the grant, and a browser's
-  renderers are separate sandboxed processes. But `python script.py` never is. M6 has three
-  enforcement points: an attestation lint in `policy check`, the runtime taint, and M2's
-  `unsandboxed` predicate for privilege-separated apps.
-
-  `exe` is `mm->exe_file`, which is what was exec'd and not what is running.
-  `LD_PRELOAD=evil.so ssh -V` runs attacker code with ssh's identity and inherits its grants,
-  so every static `allow` is a confused-deputy grant. No M2 predicate closes the hole, and IMA
-  exe hashing least of all, because the exe genuinely is ssh, unmodified. Nor can the hole be
-  detected at decision time. The attacker can launder the evidence, and `ptrace` or anonymous
-  `PROT_EXEC` memory touch no file at all. So the fix must be a sticky taint set at load time
-  and read as a predicate. The subject was never `exe`. It is `exe AND untainted`.
-
-  The set of allowed code is enumerated for each subject. It is not inferred from provenance,
-  because a legitimate root-owned library preloaded into ssh defeats provenance. It is not
-  derived statically either, because `ldd` sees 17 libraries while the real set includes
-  `libnss_*` modules that `/etc/nsswitch.conf` picks at runtime. The full design, the policy
-  surface, the user flows and the rejected alternatives are in
-  [PLAN-rule-model](docs/PLAN-rule-model.md) M6.
-
-  Until M6 ships, the deployment answer is `bless`. A per-invocation grant has no standing exe
-  rule to inject into, so the lever is the ratio of static `allow` rules to blessings. `bless`
-  is the deliberate escape hatch from the invariant and not an instance of it, because it
-  proves human presence rather than code identity. Expect the invariant to make static
-  `allow` rules rare. It retires `allow /usr/bin/aws` (the CLI is Python), and most npm and
-  Electron tooling with it. The open question that decides the mechanism is where the taint
-  is stored. It could be per task or per `mm`, and it may or may not survive `clone`. See
-  PLAN M6 *Store*.
-
-### Deferred — until the core is sound
-
-- **B3: the PAM authenticator** ([PLAN-bless](docs/PLAN-bless.md)). It is nice to have and
-  postponed. It replaces the uid-0 mint gate with "the authenticated peer", so a non-sudoer
-  could bless their own tools, and it restores "no grace window" by construction. Nothing
-  depends on it. B1 and B2 ship a usable `bless`, and B2 already did the structural work (the
-  `SCM_RIGHTS` hand-off and the unprivileged CLI). So whenever B3 is picked up, it stays a
-  swap of what proves that a human is present, and it relaxes the gate rather than tightening
-  it. Until then, sudo's timestamp cache is an accepted grace window ([ADR 0013](docs/adr/0013-bless-authentication.md)). The
-  deployment workaround is `Defaults!/usr/bin/cordon timestamp_timeout=0`.
-- **B4: the enumerated-scope gap.** A blessing class lists its object scope, so the list
-  drifts against `@secrets`. Every directory added to one must be added to the other, or a
-  blessed session hits a surprise denial. PLAN-bless B4 sketches an "uncordoned" class. But a
-  blanket class is a skeleton key, so it waits until the boundary underneath it is sound.
-- **M2 and M4 are no longer scheduled on their own.** M6 pulls in the parts it needs. M2's
-  `unsandboxed` predicate is M6's enforcement point (3). It has been measured, but it is gated
-  on a Chrome version check (see the browser fact below). M4's learning machinery is how code
-  sets get built (M6 task 6). The rest is opportunistic and gets taken when a real policy
-  needs it. That covers `uid`, `gid` and `cgroup` predicates, IMA and fsverity, argv0 and
-  ancestor matching, and autolearn for objects.
-
-- **VM coverage of the systemd packaging.** The VM smoke starts `cordond` directly, so nothing
-  tests `packaging/systemd/cordond.service` or `just install-service`. Only
-  `systemd-analyze verify` and manual checks cover the unit's ordering
-  (`DefaultDependencies=no`, `Before=basic.target`, `RequiresMountsFor=/sys/fs/bpf`), the
-  `Delegate=yes` that bless carriers need, and the dev drop-in. Closing this gap needs a guest
-  booted by systemd. Today `run-bpf-lsm-vm.sh` runs the suite under virtme-ng's own init
-  (`vng --run -- bash …`), and there is no systemd to start the unit.
-
-Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
+[`todo.md`](todo.md) holds every remaining step, in order. M6 is the last must-have
+([ADR 0015](docs/adr/0015-fixed-code-grants.md)), and blessing's B3 and B4 wait behind it. The
+rule is *soundness before ergonomics*. Until M6 ships, the deployment answer is `bless`: a
+per-invocation grant has no standing exe rule to inject into.
 
 ## Settled, do not redo
 
@@ -281,8 +213,7 @@ Smaller carried-over notes live in [PLAN-rule-model](docs/PLAN-rule-model.md).
   sandboxed on Windows and macOS, so this can break. In both browsers, both signals exclude
   every process that runs web JS. Use the conjunction `Seccomp == 0 && ns/user == init`.
   Chrome's renderer zygotes are `Seccomp 0` in the sandboxed namespace, so either signal alone
-  lets them through. The details and caveats are in [PLAN-rule-model](docs/PLAN-rule-model.md)
-  M2.
+  lets them through. The details and caveats are in [ADR 0015](docs/adr/0015-fixed-code-grants.md).
 - **BPF passes at most five arguments in registers**, and it has no call stack for the rest.
   So a wider function must be `#[inline(always)]`, or it fails to link with "stack arguments
   are not supported". Inlining is more than a linkage workaround, too. Outlining `emit` added

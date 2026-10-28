@@ -31,5 +31,5 @@ two advantages over `strace`. The `where="~"` scope leaves `/usr/lib/*.so`, `/de
 unprotected, so they are never logged, and only access inside the home surfaces. And
 coalescing prevents a flood. The discovered paths then graduate into `@secrets` under flow A.
 Each opened file surfaces with its real `path=`. That is because the record carries the leaf
-path rebuilt from `d_name`, and the suppressor keys on the opened file ([ADR 0002](adr/0002-bpf-lsm-boundary.md)). M4's autolearn
-needs the same mechanism to collapse per-file opens into a subtree rule.
+path rebuilt from `d_name`, and the suppressor keys on the opened file ([ADR 0002](adr/0002-bpf-lsm-boundary.md)). Autolearn
+([ADR 0011](adr/0011-autolearn.md)) needs the same mechanism to collapse per-file opens into a subtree rule.

@@ -1,7 +1,7 @@
 # ADR 0012: Blessing is a carrier-cgroup subject predicate
 
 Status: Accepted. B1 and B2 shipped (2026-07-27); B3 and B4 are in
-[`PLAN-bless.md`](../PLAN-bless.md)
+[todo.md](../../todo.md)
 
 ## Context
 
@@ -78,7 +78,7 @@ bound that.
 > **As shipped ([ADR 0013](0013-bless-authentication.md)).** The check for human presence is `sudo`, which runs PAM itself. So
 > this argument holds unchanged for the *presence* property. The one caveat is the cache. sudo
 > caches its timestamp, so the shipped flow has a grace window, unless sudoers sets
-> `Defaults!/usr/bin/cordon timestamp_timeout=0`. PAM in the daemon (PLAN-bless B3) closes the
+> `Defaults!/usr/bin/cordon timestamp_timeout=0`. PAM in the daemon (B3) closes the
 > window by construction.
 
 ## Decision

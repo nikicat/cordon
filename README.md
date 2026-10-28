@@ -236,8 +236,8 @@ is the last must-have before cordon is worth trusting.
 
 - [`STATUS.md`](STATUS.md): what exists, what's left, and the facts that cost real time to
   learn
-- [`docs/PLAN-rule-model.md`](docs/PLAN-rule-model.md): the remaining milestone
-- [`docs/PLAN-bless.md`](docs/PLAN-bless.md): the blessing roadmap (PAM auth, scope classes)
+- [`todo.md`](todo.md): what is left, in order
+- [`docs/adr/`](docs/adr/README.md): the design decisions
 
 ## Known limitations
 
@@ -246,7 +246,7 @@ These are stated plainly, because a security tool that oversells itself is worse
 - **`LD_PRELOAD` and interpreted subjects break `exe` identity.** `LD_PRELOAD=evil.so ssh -V`
   runs attacker code with `ssh`'s identity and inherits its grants. A script surfaces as its
   interpreter (`python3`, not `aws`). So today every static `allow` is a potential
-  confused-deputy grant. M6 closes this hole with a sticky load-time taint. Until it ships,
+  confused-deputy grant. M6 ([ADR 0015](docs/adr/0015-fixed-code-grants.md)) closes this hole with a sticky load-time taint. Until it ships,
   `bless` is the honest answer for anything sensitive, because it proves human presence rather
   than code identity.
 - **Root is out of scope.** So is a resident attacker who uses ptrace, waits for unlocks or

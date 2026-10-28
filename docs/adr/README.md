@@ -19,7 +19,8 @@ cites them as `ADR NNNN`.
 | [0012](0012-blessing.md) | Blessing is a carrier-cgroup subject predicate |
 | [0013](0013-bless-authentication.md) | Bless authenticates by client-side elevation |
 | [0014](0014-blessing-lifecycle.md) | The blessing lifecycle |
+| [0015](0015-fixed-code-grants.md) | Fixed code as the precondition for a grant (proposed) |
 
 Reference material that is not a decision: the [threat model](../threat-model.md),
 [limitations](../limitations.md), [testing](../testing.md), [authoring flows](../authoring.md)
-and [prior art](../prior-art.md). Milestones live in [STATUS](../../STATUS.md) and the plans.
+and [prior art](../prior-art.md). What exists is in [STATUS](../../STATUS.md), and what is left in [todo.md](../../todo.md).

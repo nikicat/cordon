@@ -115,8 +115,7 @@ answers. The in-kernel LSM shape buys the following:
 
 ### What shipped
 
-**Implemented in M1, and validated in a VM (see STATUS and
-[`PLAN-rule-model.md`](../PLAN-rule-model.md)).**
+**Implemented in M1, and validated in a VM (see [STATUS](../../STATUS.md)).**
 M1 delivers the `file_open` verdict over the flat rule table. The program finds the deepest
 protected object with the `(dev,inode)` dentry walk, matches the subject by the exe's
 `(dev,inode)`, and derives the action (read, write or create) from `f_mode` and `f_flags`. It
@@ -129,8 +128,7 @@ path, with event coalescing in the kernel. Structural-operation gating (M3, whic
 rename bypass and adds `execute`) and fail-safe pinning (M5) have shipped since. So `bpf-lsm`
 mediates opens and mutations, and it keeps enforcing when the daemon dies. Content-digest
 identity ([ADR 0006](0006-subject-predicates.md)) remains unshipped, and it is not what
-closes the `LD_PRELOAD` hole (see
-M6).
+closes the `LD_PRELOAD` hole (see [ADR 0015](0015-fixed-code-grants.md)).
 
 **Deny and learn records are delivered separately from the verdict.** The in-kernel program
 has already decided, and observability rides on a BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`).

@@ -55,3 +55,12 @@ parser and the copy-down compiler.
   and deny, per-action rules, subject and object groups, copy-down precedence, audit to deny,
   silence, runtime `policy apply` and event coalescing. It is green in the virtme-ng VM, on
   both the host kernel and the pinned `v6.12`, booted with `lsm=…,bpf`.
+
+## A probe must not build its own premise
+
+B2's derisk spike made a cgroup under `session-3.scope` with `mkdir`, confirmed that logind
+saw the session, and concluded that blessing could place carriers there. It never asked where
+the user's processes actually are: under the delegated `user@UID.service`, with no session
+scope above them. A probe that builds its own world proves only that the world is
+self-consistent. The `bless_placement` and `bless_reconcile_ownership` smoke scenarios now
+cover the placement rule against where processes really run.

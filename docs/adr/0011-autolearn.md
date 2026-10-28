@@ -1,6 +1,6 @@
 # ADR 0011: Autolearn
 
-Status: Accepted, not implemented (PLAN-rule-model M4)
+Status: Accepted, not implemented ([todo.md](../../todo.md))
 
 ## Context
 

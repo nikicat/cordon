@@ -45,12 +45,12 @@ why cordon assigns identity to the *object* instead and lets subjects stay anony
   modes are ours to avoid. The first is consent fatigue. [authoring flows](authoring.md)'s audit, admit, enforce flow
   exists partly for this, because it admits from observed evidence rather than from a modal
   prompt. The second is identity that rests on a code signature, which is the same question
-  that [PLAN-rule-model](PLAN-rule-model.md) M6 is working through.
+  that [ADR 0015](adr/0015-fixed-code-grants.md) works through.
 - **Windows has the right shape twice, and points it at the wrong verb both times.**
   *Controlled Folder Access* is almost exactly this design, with designated folders and an app
   allowlist. But it gates writes only, because it was built against ransomware. A scraper
   reads, so CFA never sees it. *WDAC/AppLocker* is genuinely default-deny. With DLL-level
-  enforcement it is the closest shipping analogue to M6's fixed-code invariant, because an
+  enforcement it is the closest shipping analogue to the fixed-code invariant of [ADR 0015](adr/0015-fixed-code-grants.md), because an
   unsigned DLL cannot load into a signed process. But it governs what may execute, not what a
   running program may read, and consumer machines effectively never run it in enforcement
   mode. *Credential Guard* shows that Microsoft can do hard isolation when a target matters
@@ -66,10 +66,10 @@ why cordon assigns identity to the *object* instead and lets subjects stay anony
   within months. Attackers injected into Chrome and asked as an authorized process, abused the
   elevation service, or simply ran elevated. Google has kept hardening it since, and its
   current state is not verified here. But the lesson is stable, and it is the strongest
-  external argument for M6: *a privileged broker that authenticates by executable identity is
+  external argument for ADR 0015: *a privileged broker that authenticates by executable identity is
   only as strong as its code-identity story, and injection into the authorized process
   defeats it.* Our `allow /usr/bin/ssh read ~/.ssh` is structurally the same grant and fails
-  the same way. That is why M6 is not an optional hardening pass. On Linux, Chrome uses the
+  the same way. That is why ADR 0015 is not an optional hardening pass. On Linux, Chrome uses the
   login keyring, which any process at your uid can reach over D-Bus. So the file gate is the
   only control available there at all.
 - **Per-app file gating exists commercially.** Examples are ThreatLocker's Storage Control and

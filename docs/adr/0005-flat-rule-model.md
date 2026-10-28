@@ -47,7 +47,7 @@ authoring gets.
 
 ## Consequences
 
-Milestone status is in [`PLAN-rule-model.md`](../PLAN-rule-model.md). Every later decision
+What is left is in [todo.md](../../todo.md). Every later decision
 about the policy is a decision about one axis of this rule: the subject ([ADR
 0006](0006-subject-predicates.md)), the action ([ADR 0007](0007-action-hook-map.md)),
 precedence ([ADR 0008](0008-precedence.md)), groups ([ADR 0009](0009-groups.md)) and storage
