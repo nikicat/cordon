@@ -12,6 +12,8 @@ use crate::policy_maps::{Action, ClassId};
 
 /// The name of the one-element `Array<Settings>`, read at index 0.
 pub const MAP_SETTINGS: &str = "SETTINGS";
+/// The index of the one [`Settings`] record in [`MAP_SETTINGS`].
+pub const SETTINGS_INDEX: u32 = 0;
 /// The name of the `RingBuf` of [`DecisionEvent`]s that the daemon drains into the journal.
 pub const MAP_EVENTS: &str = "EVENTS";
 
@@ -65,6 +67,13 @@ impl Settings {
             _pad: [0; Self::PAD],
         }
     }
+
+    /// Returns settings that name no daemon, so no process is fast-allowed. No process
+    /// runs as pid `u32::MAX`, and no real inode is `dev=0 ino=0`, so neither half of the
+    /// identity can match.
+    pub const fn no_daemon(active_bank: Bank) -> Self {
+        Settings::new(Pid(u32::MAX), active_bank, FileId::new(Dev(0), Ino(0)))
+    }
 }
 
 /// The most path components that the kernel reconstructs between the leaf and the matched
@@ -116,7 +125,7 @@ padded_pod! {
         pub pid: Pid,
         /// The caller's real uid, which the daemon names on the audit line.
         pub uid: Uid,
-        /// The repeats that the in-kernel suppressor folded into this record (see
+        /// The repeats that the in-kernel suppressor held back before this record (see
         /// [`Suppressed`]).
         pub suppressed: Suppressed,
         /// The caller's resolved blessing class (DESIGN §16.3), or [`ClassId::UNBLESSED`]
@@ -146,11 +155,24 @@ padded_pod! {
     }
 }
 
+impl DecisionEvent {
+    /// Returns the valid entries of [`comps`](Self::comps), leaf first. A `depth` past
+    /// [`PATH_MAX_DEPTH`] counts as the whole array.
+    pub fn valid_comps(&self) -> &[PathComp] {
+        &self.comps[..(self.depth as usize).min(PATH_MAX_DEPTH)]
+    }
+
+    /// Checks whether the path walk was cut short (see [`trunc`](Self::trunc)).
+    pub const fn is_truncated(&self) -> bool {
+        self.trunc != 0
+    }
+}
+
 padded_pod! {
     /// The key of the kernel's suppressor map `SUPPRESS`, which identifies one kind of
     /// decision by `(exe, leaf, action)`. It keys on the opened file (`leaf`) rather than
     /// the protected object, so distinct files under one audited object each get their own
-    /// throttle window and surface separately in the journal (DESIGN §15.10 flow B). Its
+    /// suppression window and surface separately in the journal (DESIGN §15.10 flow B). Its
     /// `padded_pod!` `_pad` pads the 16 + 16 + 4 bytes to 40 at 8-byte alignment, which
     /// keeps the hashed key zeroed (see the `layout` module docs).
     #[repr(C)]

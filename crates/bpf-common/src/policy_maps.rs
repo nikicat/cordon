@@ -25,9 +25,9 @@ use bitflags::bitflags;
 /// device and inode to its object id. The deepest ancestor of a file that it holds under
 /// the active bank is the most specific object covering that file.
 pub const MAP_PROTECTED: &str = "PROTECTED";
-/// The name of the packed rule table for every bank and object. The rules of object `o` in
-/// bank `b` fill the contiguous slots at [`rule_slot`]`(b, o, 0..RULE_COUNT[(b,o)])`, so
-/// the kernel scans them from one base index, which suits the cache better than a hash
+/// The name of the packed rule table for every bank and object. The rules of one
+/// [`BankedObj`] fill the contiguous slots from its [`rule_slot`](BankedObj::rule_slot)`(0)`
+/// up to its `RULE_COUNT`, so the kernel scans them from one base index, which suits the cache better than a hash
 /// lookup per rule.
 pub const MAP_RULES: &str = "RULES";
 /// The name of the `HashMap<BankedObj, u32>` that holds how many rules object `o` in bank
@@ -75,6 +75,11 @@ pub const MAX_OBJECTS: usize = 1024;
 /// time. The daemon refuses a new mint past this. It does not limit the number of policy
 /// classes, since many invocations can share one [`ClassId`].
 pub const MAX_BLESSED: usize = 1024;
+
+/// The capacity of the banked object-keyed maps, [`MAP_PROTECTED`] and [`MAP_RULE_COUNT`].
+pub const BANKED_OBJECTS: usize = NUM_BANKS * MAX_OBJECTS;
+/// The capacity of [`MAP_RULES`], which [`BankedObj::rule_slot`] indexes.
+pub const RULE_SLOTS: usize = BANKED_OBJECTS * MAX_RULES_PER_OBJ;
 
 /// A protected object's dense id, which the compiler assigns to address the object's slot
 /// in [`MAP_RULES`] and [`MAP_RULE_COUNT`]. It differs from the object's [`FileId`], which
@@ -148,20 +153,19 @@ impl BankedObj {
     pub const fn new(bank: Bank, obj: ObjId) -> Self {
         BankedObj { obj, bank }
     }
-}
 
-/// Returns the flat index of rule `i` of object `obj` in bank `bank`, within the banked
-/// [`MAP_RULES`] array of `NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ` slots. The kernel
-/// scans with it and the loader fills with it, so the stride has one definition. Any bank
-/// value is masked to `0` or `1`, and valid inputs (`obj < MAX_OBJECTS`,
-/// `i < MAX_RULES_PER_OBJ`) stay in range.
-pub const fn rule_slot(bank: Bank, obj: ObjId, i: u32) -> u32 {
-    // `Bank::index` masks the bank, and wrapping arithmetic keeps the result defined for
-    // any input. `Array::get` bounds-checks the index regardless.
-    (bank.index().wrapping_mul(MAX_OBJECTS as u32))
-        .wrapping_add(obj.0)
-        .wrapping_mul(MAX_RULES_PER_OBJ as u32)
-        .wrapping_add(i)
+    /// Returns the flat index of this object's rule `i` within [`MAP_RULES`]. The kernel
+    /// scans with it and the loader fills with it, so the stride has one definition. Any
+    /// bank value is masked to `0` or `1`, and valid inputs (`obj < MAX_OBJECTS`,
+    /// `i < MAX_RULES_PER_OBJ`) stay below [`RULE_SLOTS`].
+    pub const fn rule_slot(self, i: u32) -> u32 {
+        // `Bank::index` masks the bank, and wrapping arithmetic keeps the result defined
+        // for any input. `Array::get` bounds-checks the index regardless.
+        (self.bank.index().wrapping_mul(MAX_OBJECTS as u32))
+            .wrapping_add(self.obj.0)
+            .wrapping_mul(MAX_RULES_PER_OBJ as u32)
+            .wrapping_add(i)
+    }
 }
 
 bitflags! {
@@ -397,12 +401,9 @@ impl SubjectMatch {
     pub const fn exe(exe: FileId) -> SubjectMatch {
         SubjectMatch {
             exe,
-            cgroup: CgroupId(0),
-            uid: Uid(0),
-            blessing: ClassId::UNBLESSED,
             // Every predicate is a wildcard except the concrete `exe`.
             flags: SubjectFlags::all().difference(SubjectFlags::EXE_ANY),
-            _pad: [0; Self::PAD],
+            ..Self::ANY
         }
     }
 
@@ -411,13 +412,10 @@ impl SubjectMatch {
     /// compiler combines it with [`exe`](Self::exe) by conjunction.
     pub const fn blessed(class: ClassId) -> SubjectMatch {
         SubjectMatch {
-            exe: FileId::new(Dev(0), Ino(0)),
-            cgroup: CgroupId(0),
-            uid: Uid(0),
             blessing: class,
             // Every predicate is a wildcard except the concrete `blessing`.
             flags: SubjectFlags::all().difference(SubjectFlags::BLESSING_ANY),
-            _pad: [0; Self::PAD],
+            ..Self::ANY
         }
     }
 }
@@ -567,22 +565,16 @@ mod tests {
     #[test]
     fn rule_slot_banks_dont_overlap() {
         // Each bank occupies a disjoint MAX_OBJECTS*MAX_RULES_PER_OBJ window, and every
-        // valid slot stays inside the NUM_BANKS-sized array.
+        // valid slot stays inside the array.
+        let slot = |bank, obj, i| BankedObj::new(Bank(bank), ObjId(obj)).rule_slot(i);
         let span = (MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32;
-        assert_eq!(rule_slot(Bank(0), ObjId(0), 0), 0);
-        assert_eq!(rule_slot(Bank(1), ObjId(0), 0), span);
+        assert_eq!(slot(0, 0, 0), 0);
+        assert_eq!(slot(1, 0, 0), span);
         assert_eq!(
-            rule_slot(
-                Bank(1),
-                ObjId(MAX_OBJECTS as u32 - 1),
-                MAX_RULES_PER_OBJ as u32 - 1
-            ),
-            (NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32 - 1
+            slot(1, MAX_OBJECTS as u32 - 1, MAX_RULES_PER_OBJ as u32 - 1),
+            RULE_SLOTS as u32 - 1
         );
         // A garbage bank is masked back into range, never out the top of the array.
-        assert!(
-            rule_slot(Bank(u32::MAX), ObjId(0), 0)
-                < (NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32
-        );
+        assert!(slot(u32::MAX, 0, 0) < RULE_SLOTS as u32);
     }
 }

@@ -247,8 +247,8 @@ impl EditTargetArgs {
 
 /// Returns the login name of the account whose tier a bare `cordon policy edit` opens.
 /// Errors as [`invoker_uid`] does, and when that uid has no account.
-fn invoking_user() -> Result<UserName> {
-    let uid = invoker_uid(Uid::from_raw(config::euid()), SudoInvoker::from_env)?;
+fn invoking_user(sudo: Option<&SudoInvoker>) -> Result<UserName> {
+    let uid = invoker_uid(Uid::from_raw(config::euid().0), sudo)?;
     Ok(account_of(uid)?.name)
 }
 
@@ -259,14 +259,14 @@ fn account_of(uid: Uid) -> Result<Account> {
 }
 
 /// Returns the uid whose tier a bare `cordon policy edit` opens. That is `euid` when it is
-/// not root, and the `sudo` invoker when it is. `sudo` is called only for root. Errors as
-/// `sudo` does, and when root has no invoker. Such a caller has no tier of its own, so it
-/// must name `--system` or `--user` instead of silently editing the system policy.
-fn invoker_uid(euid: Uid, sudo: impl FnOnce() -> Result<Option<SudoInvoker>>) -> Result<Uid> {
+/// not root, and the `sudo` invoker when it is. Errors when root has no invoker. Such a
+/// caller has no tier of its own, so it must name `--system` or `--user` instead of
+/// silently editing the system policy.
+fn invoker_uid(euid: Uid, sudo: Option<&SudoInvoker>) -> Result<Uid> {
     if !euid.is_root() {
         return Ok(euid);
     }
-    match sudo()? {
+    match sudo {
         Some(invoker) => Ok(invoker.uid),
         None => Err(Error::msg(
             "running as root with no invoking user — name what to edit: \
@@ -310,20 +310,18 @@ impl SudoInvoker {
     }
 }
 
-/// Runs `cordon policy edit` on `target` and returns the exit code. Any error is printed
-/// and becomes a failure code.
-pub fn run(target: EditTargetArgs, root_editor: RootEditor, client: &Client) -> ExitCode {
-    match target
-        .resolve(invoking_user)
-        .and_then(|t| Session::open(t, root_editor, client))
-        .and_then(Session::edit_loop)
-    {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            ExitCode::FAILURE
-        }
-    }
+/// Runs `cordon policy edit` on `target` and returns the exit code. Errors as
+/// [`SudoInvoker::from_env`], [`EditTargetArgs::resolve`] and [`Session::open`] do, and when
+/// the edit loop fails.
+pub fn run(target: EditTargetArgs, root_editor: RootEditor, client: &Client) -> Result<ExitCode> {
+    // Only root has a sudo invoker to drop to, so only root reads `SUDO_UID`.
+    let sudo = if config::is_root() {
+        SudoInvoker::from_env()?
+    } else {
+        None
+    };
+    let target = target.resolve(|| invoking_user(sudo.as_ref()))?;
+    Session::open(target, root_editor, sudo.as_ref(), client)?.edit_loop()
 }
 
 /// One run of `cordon policy edit`, from the resolved target to the saved file. It holds
@@ -347,10 +345,15 @@ impl Session {
     /// Opens a session on `target` and creates the temp copy that the editor will work on.
     /// Errors as [`EditTarget::locate`] and [`editor_identity`] do, and when the config,
     /// the current file or the temp copy can't be read or created.
-    fn open(target: EditTarget, root_editor: RootEditor, client: &Client) -> Result<Session> {
+    fn open(
+        target: EditTarget,
+        root_editor: RootEditor,
+        sudo: Option<&SudoInvoker>,
+        client: &Client,
+    ) -> Result<Session> {
         let policy_root = PolicyRoot::at(&client.policy_path(None)?)?;
         let file = target.locate(&policy_root)?;
-        let editor_as = editor_identity(root_editor)?;
+        let editor_as = editor_identity(root_editor, sudo)?;
         let seed = read_seed(&file.path)?;
         let tmp = TempEdit::create(&file.path, seed.text(), &editor_as)?;
         Ok(Session {
@@ -441,8 +444,7 @@ impl Session {
     /// include is registered only after the file is saved, so a cancelled or rejected edit
     /// never leaves a stale binding. Errors when either write fails.
     fn save(&self, edited: &str) -> Result<()> {
-        // The temp copy belonged to the user while the editor ran, so only this validated
-        // string crosses back, never the file itself.
+        // A fresh write, never a move of the temp copy (see `TempEdit`).
         install_atomically(&self.file.path, edited)?;
         if let Some(s) = &self.file.scaffold {
             s.register()?;
@@ -559,19 +561,18 @@ fn is_bare_name(p: &Path) -> bool {
 }
 
 /// Returns who the editor runs as, which is never root unless `root_editor` allows it. An
-/// unprivileged caller edits as itself. Under `sudo`, the editor drops to the
-/// [`SudoInvoker`] with that user's own home and name.
+/// unprivileged caller edits as itself. Under `sudo`, the editor drops to the `sudo`
+/// invoker with that user's own home and name.
 ///
-/// Errors on any of these:
-/// - Root has no [`SudoInvoker`] and `root_editor` is [`RootEditor::Refuse`]. A root
-///   editor is the same-uid escalation that the module doc describes.
-/// - `SUDO_UID` or `SUDO_GID` does not parse.
+/// Errors on either of these:
+/// - Root has no invoker and `root_editor` is [`RootEditor::Refuse`]. A root editor is the
+///   same-uid escalation that the module doc describes.
 /// - The invoking uid has no passwd home.
-fn editor_identity(root_editor: RootEditor) -> Result<EditorAs> {
+fn editor_identity(root_editor: RootEditor, sudo: Option<&SudoInvoker>) -> Result<EditorAs> {
     if !config::is_root() {
         return Ok(EditorAs::Current);
     }
-    let Some(SudoInvoker { uid, gid }) = SudoInvoker::from_env()? else {
+    let Some(&SudoInvoker { uid, gid }) = sudo else {
         return match root_editor {
             RootEditor::Allow => Ok(EditorAs::Current),
             RootEditor::Refuse => Err(Error::msg(
@@ -797,8 +798,9 @@ fn reprompt() -> Result<Prompt> {
 }
 
 /// The temp copy of the policy that the editor works on, in a private 0700 directory that
-/// is removed on drop. It is the only file the unprivileged editor touches, and the
-/// privileged parent reads it back.
+/// is removed on drop. It is the only file the unprivileged editor touches. It belongs to
+/// the editing user while the editor runs, so the privileged parent takes only its text
+/// back ([`read_edited`]) and writes the validated text fresh, never the file itself.
 struct TempEdit {
     dir: tempfile::TempDir,
     file: PathBuf,
@@ -850,9 +852,8 @@ impl TempEdit {
 /// Returns the text of the edited temp copy at `path` without following a symlink.
 /// Errors when `path` is a symlink or not a regular file.
 ///
-/// The temp directory belongs to the invoking user while the editor runs, so a same-uid
-/// attacker could replace the file with a symlink to a root-only file such as
-/// `/etc/shadow`. This read runs as root, so following the link would leak that file into
+/// A same-uid attacker could replace the user-owned temp copy ([`TempEdit`]) with a
+/// symlink to a root-only file such as `/etc/shadow`. This read runs as root, so following the link would leak that file into
 /// the policy, or into the diagnostics on a parse failure. A legitimate editor's atomic
 /// save renames a regular file into place, which still reads fine.
 fn read_edited(path: &Path) -> Result<String> {
@@ -933,14 +934,17 @@ mod tests {
     fn invoker_uid_prefers_sudo_then_self() {
         let root = Uid::from_raw(0);
         let nb = Uid::from_raw(1000);
-        let sudo = |u| move || SudoInvoker::parse(u, Some("1000"));
-        // An unprivileged caller is the answer, and the invoker is never parsed.
-        assert_eq!(invoker_uid(nb, sudo(Some("junk"))).unwrap(), nb);
+        let invoker = SudoInvoker {
+            uid: nb,
+            gid: Gid::from_raw(1000),
+        };
+        // An unprivileged caller is the answer, whatever the invoker.
+        assert_eq!(invoker_uid(nb, Some(&invoker)).unwrap(), nb);
         // Under sudo, the answer is the invoking user.
-        assert_eq!(invoker_uid(root, sudo(Some("1000"))).unwrap(), nb);
-        // Real root and sudo to root have no tier of their own.
-        assert!(invoker_uid(root, sudo(None)).is_err());
-        assert!(invoker_uid(root, sudo(Some("0"))).is_err());
+        assert_eq!(invoker_uid(root, Some(&invoker)).unwrap(), nb);
+        // Real root and sudo to root, which parses as no invoker, have no tier of their
+        // own.
+        assert!(invoker_uid(root, None).is_err());
     }
 
     /// Checks that a root or missing invoker is none, and that a malformed one is loud

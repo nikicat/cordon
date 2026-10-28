@@ -57,8 +57,7 @@ struct Blessing {
     /// The blessing class it was minted for. The name, not the id, is the durable identity
     /// (see [`Blessings::remap`]).
     class: ClassName,
-    /// The carrier cgroup directory (root-owned, see [`Blessings::mint`]).
-    dir: PathBuf,
+    dir: CarrierDir,
     /// The requester's kernel-attested uid, which [`may_revoke`] checks. It is `None` for a
     /// blessing adopted from a previous daemon run.
     owner: Option<Uid>,
@@ -126,39 +125,18 @@ impl Blessings {
 
         let id = self.next;
         // In the requester's own user subtree where possible (see `carrier_parent`).
-        let dir = carrier_parent(requester, root).join(dir_name(id, &class));
-        std::fs::create_dir(&dir).with_context(|| format!("bless: mkdir {}", dir.display()))?;
-        // The carrier's kernel cgroup id. cgroup2 (kernfs) guarantees that st_ino equals
-        // the id `bpf_get_current_cgroup_id()` returns from kernel 5.5 on, and BPF-LSM
-        // needs 5.7 anyway. st_ino is the full 64-bit id, with no 32-bit truncation on a
-        // 64-bit kernel. The smoke's scoped-grant scenario is the end-to-end proof of this
-        // equality.
-        let cgroup = match std::fs::metadata(&dir) {
-            Ok(meta) => CgroupId(std::os::unix::fs::MetadataExt::ino(&meta)),
-            Err(e) => {
-                let _ = std::fs::remove_dir(&dir);
-                return Err(Error::msg(format!("bless: stat fresh carrier: {e}")));
-            }
-        };
-        // Open `cgroup.procs` here, as root, before handing anything back, because this
-        // fd is the grant (see `CarrierProcs`).
-        let procs = match std::fs::File::options()
-            .write(true)
-            .open(dir.join("cgroup.procs"))
-        {
-            Ok(f) => CarrierProcs(f.into()),
-            Err(e) => {
-                let _ = std::fs::remove_dir(&dir);
-                return Err(Error::msg(format!(
-                    "bless: open {}/cgroup.procs: {e}",
-                    dir.display()
-                )));
-            }
-        };
-        if let Err(e) = maps.blessed_insert(cgroup, class_id) {
-            let _ = std::fs::remove_dir(&dir);
-            return Err(e);
-        }
+        let dir = CarrierDir::create(carrier_parent(requester, root).join(dir_name(id, &class)))?;
+        let registered = (|| -> Result<_> {
+            let cgroup = dir.cgroup_id()?;
+            // Open `cgroup.procs` here, as root, before handing anything back, because
+            // this fd is the grant (see `CarrierProcs`).
+            let procs = dir.open_procs()?;
+            maps.blessed_insert(cgroup, class_id)?;
+            Ok((cgroup, procs))
+        })();
+        let (cgroup, procs) = registered.inspect_err(|_| {
+            let _ = dir.remove();
+        })?;
 
         self.next = id.successor();
         self.live.push(Blessing {
@@ -172,12 +150,12 @@ impl Blessings {
             revoked: false,
             minted: Instant::now(),
         });
-        info!(%id, %class, %owner, cgroup = %dir.display(), "blessing minted");
+        info!(%id, %class, %owner, cgroup = %dir, "blessing minted");
         Ok((
             BlessingView {
                 id,
                 class,
-                cgroup: dir,
+                cgroup: dir.0,
                 pids: Vec::new(),
                 age: Duration::ZERO,
             },
@@ -193,8 +171,8 @@ impl Blessings {
             .map(|b| BlessingView {
                 id: b.id,
                 class: b.class.clone(),
-                cgroup: b.dir.clone(),
-                pids: read_pids(&b.dir),
+                cgroup: b.dir.0.clone(),
+                pids: b.dir.pids(),
                 age: b.minted.elapsed(),
             })
             .collect()
@@ -219,45 +197,28 @@ impl Blessings {
         b.revoked = true;
         // A write error means the carrier is already gone or dying. `revoked` alone lets
         // GC reap it, so report success either way.
-        if let Err(e) = std::fs::write(b.dir.join("cgroup.kill"), "1") {
+        if let Err(e) = b.dir.kill() {
             warn!(id = %b.id, error = %e, "bless: cgroup.kill write failed; GC will reap");
         }
         info!(id = %b.id, class = %b.class, "blessing revoked");
         Ok(())
     }
 
-    /// Reaps every dead carrier. A carrier is dead once it reads `populated 0` and that
-    /// emptiness is meaningful ([`should_reap`]), or once its directory is gone. Reaping
-    /// removes its `MAP_BLESSED` entry, its directory and its table row.
+    /// Reaps every dead carrier ([`Blessing::check_dead`]). Reaping removes its
+    /// `MAP_BLESSED` entry, its directory and its table row.
     pub(super) fn gc(&mut self, maps: &mut Maps) {
-        self.live.retain_mut(|b| {
-            match read_populated(&b.dir) {
-                Some(true) => {
-                    b.saw_populated = true;
-                    true
-                }
-                Some(false) if should_reap(b.saw_populated, b.revoked, b.minted.elapsed()) => {
-                    reap(maps, b);
-                    false
-                }
-                Some(false) => true,
-                // The carrier directory, or its cgroup.events, vanished. Nothing is left
-                // to keep alive, so drop the map entry and the table row.
-                None => {
-                    reap(maps, b);
-                    false
-                }
-            }
-        });
+        for b in self.live.extract_if(.., Blessing::check_dead) {
+            reap(maps, &b);
+        }
     }
 
     /// Re-points every live blessing at the id that its class name has in `registry`.
     /// Every compile renumbers the ids (see `ClassRegistry`), so without this a live
     /// blessing would silently change meaning. A blessing whose class has vanished goes
-    /// inert, and [`remap_plan`] decides what each entry becomes.
+    /// inert, and [`Blessing::remap_plan`] decides what each entry becomes.
     pub(super) fn remap(&mut self, maps: &mut Maps, registry: &ClassRegistry) {
         for b in &mut self.live {
-            match remap_plan(b.registered, registry.id(&b.class)) {
+            match b.remap_plan(registry.id(&b.class)) {
                 Remap::Register(class_id) => match maps.blessed_insert(b.cgroup, class_id) {
                     Ok(()) => b.registered = true,
                     Err(e) => {
@@ -301,10 +262,10 @@ impl Blessings {
         {
             // One stat serves both checks: who owns it, and its inode, which is the cgroup
             // id (see `Blessings::mint`).
-            let meta = match std::fs::metadata(&found.dir) {
+            let meta = match std::fs::metadata(found.dir.path()) {
                 Ok(meta) => meta,
                 Err(e) => {
-                    warn!(dir = %found.dir.display(), error = %e, "bless: reconcile stat failed; skipped");
+                    warn!(dir = %found.dir, error = %e, "bless: reconcile stat failed; skipped");
                     continue;
                 }
             };
@@ -312,14 +273,14 @@ impl Blessings {
             if !adoptable(owner) {
                 warn!(
                     event = "carrier_not_adopted",
-                    dir = %found.dir.display(), %owner,
+                    dir = %found.dir, %owner,
                     "bless: leftover carrier is not root-owned; ignored (not ours to adopt)"
                 );
                 continue;
             }
             if !found.populated {
-                let _ = std::fs::remove_dir(&found.dir);
-                info!(dir = %found.dir.display(), "bless: removed empty leftover carrier");
+                let _ = found.dir.remove();
+                info!(dir = %found.dir, "bless: removed empty leftover carrier");
                 continue;
             }
             let cgroup = CgroupId(std::os::unix::fs::MetadataExt::ino(&meta));
@@ -327,13 +288,13 @@ impl Blessings {
                 Some(class_id) => match maps.blessed_insert(cgroup, class_id) {
                     Ok(()) => true,
                     Err(e) => {
-                        warn!(dir = %found.dir.display(), error = %e, "bless: reconcile re-register failed; adopted inert");
+                        warn!(dir = %found.dir, error = %e, "bless: reconcile re-register failed; adopted inert");
                         false
                     }
                 },
                 None => {
                     warn!(
-                        dir = %found.dir.display(), class = %found.class,
+                        dir = %found.dir, class = %found.class,
                         "bless: leftover carrier's class is no longer declared; adopted inert (GC only)"
                     );
                     false
@@ -365,7 +326,7 @@ fn reap(maps: &mut Maps, b: &Blessing) {
     {
         warn!(id = %b.id, error = %e, "bless: MAP_BLESSED remove failed");
     }
-    if let Err(e) = std::fs::remove_dir(&b.dir) {
+    if let Err(e) = b.dir.remove() {
         warn!(id = %b.id, error = %e, "bless: carrier rmdir failed");
     }
     info!(id = %b.id, class = %b.class, revoked = b.revoked, "blessing reaped");
@@ -378,11 +339,38 @@ fn may_revoke(owner: Option<Uid>, by: Uid) -> bool {
     by == Uid::ROOT || owner == Some(by)
 }
 
-/// Checks whether an empty carrier (`populated 0`) should be reaped. Its emptiness counts
-/// once it had members that exited, once it was revoked, or once the mint grace expired,
-/// which covers a CLI that died before joining.
-fn should_reap(saw_populated: bool, revoked: bool, age: Duration) -> bool {
-    saw_populated || revoked || age > MINT_GRACE
+impl Blessing {
+    /// Checks whether the carrier is dead, from a fresh read of its `cgroup.events`. It is
+    /// dead once it reads `populated 0` and that emptiness counts ([`should_reap`](Self::should_reap)),
+    /// or once its directory is gone. A first member is recorded on the way.
+    fn check_dead(&mut self) -> bool {
+        match self.dir.populated() {
+            Some(true) => {
+                self.saw_populated = true;
+                false
+            }
+            Some(false) => self.should_reap(),
+            // The carrier directory, or its cgroup.events, vanished. Nothing is left to
+            // keep alive.
+            None => true,
+        }
+    }
+
+    /// Checks whether an empty carrier (`populated 0`) should be reaped. Its emptiness
+    /// counts once it had members that exited, once it was revoked, or once the mint grace
+    /// expired, which covers a CLI that died before joining.
+    fn should_reap(&self) -> bool {
+        self.saw_populated || self.revoked || self.minted.elapsed() > MINT_GRACE
+    }
+
+    /// Returns what an apply does to this blessing's entry, given its class's `new_id`.
+    fn remap_plan(&self, new_id: Option<ClassId>) -> Remap {
+        match (new_id, self.registered) {
+            (Some(id), _) => Remap::Register(id),
+            (None, true) => Remap::Unregister,
+            (None, false) => Remap::Keep,
+        }
+    }
 }
 
 /// What a policy apply does to one live blessing's `MAP_BLESSED` entry, now that its
@@ -398,14 +386,6 @@ enum Remap {
     Unregister,
     /// The class vanished and the entry is already gone, so nothing changes.
     Keep,
-}
-
-fn remap_plan(registered: bool, new_id: Option<ClassId>) -> Remap {
-    match (new_id, registered) {
-        (Some(id), _) => Remap::Register(id),
-        (None, true) => Remap::Unregister,
-        (None, false) => Remap::Keep,
-    }
 }
 
 /// Returns the class a mint is for, with its id. When no class is requested, it is the
@@ -453,7 +433,7 @@ fn resolve_class(
 struct Found {
     id: BlessId,
     class: ClassName,
-    dir: PathBuf,
+    dir: CarrierDir,
     populated: bool,
 }
 
@@ -469,8 +449,8 @@ fn scan(root: &Path) -> Vec<Found> {
         .filter_map(|entry| {
             let name = entry.file_name();
             let (id, class) = parse_dir_name(name.to_str()?)?;
-            let dir = entry.path();
-            let populated = read_populated(&dir).unwrap_or(false);
+            let dir = CarrierDir(entry.path());
+            let populated = dir.populated().unwrap_or(false);
             Some(Found {
                 id,
                 class,
@@ -734,13 +714,6 @@ fn carrier_roots(daemon_cgroup: &Path, cgroup_root: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// Checks whether the carrier in `dir` has members now, as its `cgroup.events` says.
-/// Returns `None` when that file, or the carrier itself, is gone.
-fn read_populated(dir: &Path) -> Option<bool> {
-    let text = std::fs::read_to_string(dir.join("cgroup.events")).ok()?;
-    events_populated(&text)
-}
-
 /// Returns the `populated` value in the `cgroup.events` text, or `None` when the key is
 /// missing.
 fn events_populated(text: &str) -> Option<bool> {
@@ -749,17 +722,78 @@ fn events_populated(text: &str) -> Option<bool> {
         .map(|v| v.trim() == "1")
 }
 
-/// Returns the member pids of the carrier in `dir`, from its `cgroup.procs`. An
-/// unreadable or vanished carrier has none.
-fn read_pids(dir: &Path) -> Vec<Pid> {
-    std::fs::read_to_string(dir.join("cgroup.procs"))
-        .map(|text| {
-            text.lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .map(Pid)
-                .collect()
-        })
-        .unwrap_or_default()
+/// A carrier cgroup directory, which this daemon creates as root (see [`Blessings::mint`]).
+#[derive(Clone, Debug)]
+struct CarrierDir(PathBuf);
+
+impl CarrierDir {
+    /// Creates the carrier at `path`. Errors when the directory cannot be created, which
+    /// includes when it exists already.
+    fn create(path: PathBuf) -> Result<CarrierDir> {
+        std::fs::create_dir(&path).with_context(|| format!("bless: mkdir {}", path.display()))?;
+        Ok(CarrierDir(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Returns the carrier's kernel cgroup id. cgroup2 (kernfs) guarantees that `st_ino`
+    /// equals the id `bpf_get_current_cgroup_id()` returns from kernel 5.5 on, and BPF-LSM
+    /// needs 5.7 anyway. `st_ino` is the full 64-bit id, with no 32-bit truncation on a
+    /// 64-bit kernel. The smoke's scoped-grant scenario is the end-to-end proof of this
+    /// equality. Errors when the carrier cannot be stat'ed.
+    fn cgroup_id(&self) -> Result<CgroupId> {
+        let meta = std::fs::metadata(&self.0).context("bless: stat fresh carrier")?;
+        Ok(CgroupId(std::os::unix::fs::MetadataExt::ino(&meta)))
+    }
+
+    /// Opens the carrier's `cgroup.procs` for write. A process joins the carrier when its
+    /// pid is written through it. Errors when the file cannot be opened.
+    fn open_procs(&self) -> Result<CarrierProcs> {
+        let path = self.0.join("cgroup.procs");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("bless: open {}", path.display()))?;
+        Ok(CarrierProcs(file.into()))
+    }
+
+    /// Checks whether the carrier has members now, as its `cgroup.events` says. Returns
+    /// `None` when that file, or the carrier itself, is gone.
+    fn populated(&self) -> Option<bool> {
+        let text = std::fs::read_to_string(self.0.join("cgroup.events")).ok()?;
+        events_populated(&text)
+    }
+
+    /// Returns the member pids, from `cgroup.procs`. An unreadable or vanished carrier has
+    /// none.
+    fn pids(&self) -> Vec<Pid> {
+        std::fs::read_to_string(self.0.join("cgroup.procs"))
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| l.trim().parse().ok())
+                    .map(Pid)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Kills every member through `cgroup.kill`.
+    fn kill(&self) -> std::io::Result<()> {
+        std::fs::write(self.0.join("cgroup.kill"), "1")
+    }
+
+    /// Removes the carrier, which the kernel allows only once it is empty.
+    fn remove(&self) -> std::io::Result<()> {
+        std::fs::remove_dir(&self.0)
+    }
+}
+
+impl std::fmt::Display for CarrierDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
 }
 
 #[cfg(test)]
@@ -814,39 +848,68 @@ mod tests {
         assert!(resolve_class(Some(ro), &none).is_err());
     }
 
+    /// Returns a blessing as `mint` leaves it, `age` ago.
+    fn blessing(age: Duration) -> Blessing {
+        Blessing {
+            id: BlessId(1),
+            class: ClassName::new("ro"),
+            dir: CarrierDir(PathBuf::from("/nonexistent")),
+            owner: None,
+            cgroup: CgroupId(1),
+            registered: true,
+            saw_populated: false,
+            revoked: false,
+            minted: Instant::now() - age,
+        }
+    }
+
     #[test]
     fn gc_reaps_only_meaningful_emptiness() {
         let fresh = Duration::from_secs(1);
-        let expired = MINT_GRACE + Duration::from_secs(1);
         // A fresh carrier that was never populated or revoked stays, because the CLI may
         // still be about to join.
-        assert!(!should_reap(false, false, fresh));
+        assert!(!blessing(fresh).should_reap());
         // A carrier whose members all exited is reaped.
-        assert!(should_reap(true, false, fresh));
+        let exited = Blessing {
+            saw_populated: true,
+            ..blessing(fresh)
+        };
+        assert!(exited.should_reap());
         // A revoked carrier is reaped as soon as it reads empty.
-        assert!(should_reap(false, true, fresh));
+        let revoked = Blessing {
+            revoked: true,
+            ..blessing(fresh)
+        };
+        assert!(revoked.should_reap());
         // A carrier nobody joined before the grace expired is reaped, because the CLI
         // died first.
-        assert!(should_reap(false, false, expired));
+        assert!(blessing(MINT_GRACE + Duration::from_secs(1)).should_reap());
+        // A carrier whose directory is gone is dead.
+        assert!(blessing(fresh).check_dead());
     }
 
     #[test]
     fn remap_plan_covers_rename_renumber_vanish() {
+        let live = blessing(Duration::ZERO);
+        let inert = Blessing {
+            registered: false,
+            ..blessing(Duration::ZERO)
+        };
         // A class that is still declared, under the same or a new id, is always
         // registered again.
         assert!(matches!(
-            remap_plan(true, Some(ClassId(3))),
+            live.remap_plan(Some(ClassId(3))),
             Remap::Register(ClassId(3))
         ));
         assert!(matches!(
-            remap_plan(false, Some(ClassId(1))),
+            inert.remap_plan(Some(ClassId(1))),
             Remap::Register(ClassId(1))
         ));
         // A vanished class with a live entry is unregistered. The blessing goes inert and
         // its tree survives.
-        assert!(matches!(remap_plan(true, None), Remap::Unregister));
+        assert!(matches!(live.remap_plan(None), Remap::Unregister));
         // A vanished class that is already inert needs nothing.
-        assert!(matches!(remap_plan(false, None), Remap::Keep));
+        assert!(matches!(inert.remap_plan(None), Remap::Keep));
     }
 
     #[test]

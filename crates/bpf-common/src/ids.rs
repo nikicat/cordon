@@ -55,12 +55,17 @@ impl core::fmt::Display for Uid {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CgroupId(pub u64);
 
-/// The number of identical decisions that the in-kernel suppressor folded since the last
+/// The number of identical decisions that the in-kernel suppressor held back since the last
 /// ring record for one [`crate::SuppressKey`]. It is `0` on a first occurrence. It travels
 /// in [`crate::DecisionEvent`] and is held in [`crate::SuppressVal`].
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Suppressed(pub u32);
+
+impl Suppressed {
+    /// No opens were held back.
+    pub const NONE: Suppressed = Suppressed(0);
+}
 
 /// A reading of the kernel's monotonic `bpf_ktime_get_ns()` clock, in nanoseconds. It holds
 /// either an instant, such as [`crate::SuppressVal::last_ns`], or the time elapsed since
@@ -93,6 +98,9 @@ impl Nanos {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Bank(pub u32);
 
+// `index` masks with `& 1` and `flip` toggles with `^ 1`, so both assume two banks.
+const _: () = assert!(crate::NUM_BANKS == 2);
+
 impl Bank {
     /// The bank that a zero-initialized `SETTINGS` reads as, so the first apply fills bank
     /// `1`.
@@ -104,7 +112,8 @@ impl Bank {
     }
 
     /// Returns the bank as an array index, masked to `0` or `1`. A stray value read from
-    /// map memory therefore cannot push a [`crate::rule_slot`] index out of range.
+    /// map memory therefore cannot push a [`BankedObj::rule_slot`](crate::BankedObj::rule_slot)
+    /// index out of range.
     pub const fn index(self) -> u32 {
         self.0 & 1
     }

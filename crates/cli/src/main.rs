@@ -96,50 +96,45 @@ enum PolicyCmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let client = Client::new(&cli);
-
-    // `policy check` must work without a daemon, so it never touches the socket.
-    if let Cmd::Policy {
-        cmd: PolicyCmd::Check { file },
-    } = &cli.cmd
-    {
-        return policy_check(file.as_deref(), &client);
-    }
-
-    // `policy edit` runs its own loop of editing, validating, applying and saving. It
-    // reaches the daemon only through `PolicyApply`, so it skips the single round trip
-    // below.
-    if let Cmd::Policy {
-        cmd: PolicyCmd::Edit {
-            target,
-            allow_root_editor,
+    exit_on(match &cli.cmd {
+        Cmd::Status => client.run_request(&Request::Status),
+        Cmd::Policy { cmd } => match cmd {
+            // `check` must work without a daemon, so it never touches the socket.
+            PolicyCmd::Check { file } => policy_check(file.as_deref(), &client),
+            PolicyCmd::Show => client.run_request(&Request::PolicyShow),
+            PolicyCmd::Apply { file } => {
+                // The daemon compiles the sources itself (see `compile_fragments`), so
+                // every source that `load_policy` gathers is sent.
+                let path = client.policy_path(file.as_deref());
+                path.and_then(|p| policy::load_policy(&p))
+                    .and_then(|sources| client.run_request(&Request::PolicyApply { sources }))
+            }
+            // `edit` runs its own loop of editing, validating, applying and saving. It
+            // reaches the daemon only through `PolicyApply`.
+            PolicyCmd::Edit {
+                target,
+                allow_root_editor,
+            } => edit::run(
+                target.clone(),
+                edit::RootEditor::from_flag(*allow_root_editor),
+                &client,
+            ),
         },
-    } = &cli.cmd
-    {
-        let root_editor = edit::RootEditor::from_flag(*allow_root_editor);
-        return edit::run(target.clone(), root_editor, &client);
-    }
-
-    // `bless` runs its own flow (see `bless::run`). Its `list` and `revoke` subcommands
-    // still end in `run_request`, like any other command.
-    if let Cmd::Bless(args) = &cli.cmd {
-        return bless::run(args, &client);
-    }
-
-    // `bless-helper` is the approval half of the bless handshake (see `bless::Elevation::approve`).
-    if let Cmd::BlessHelper { nonce } = &cli.cmd {
-        return client.run_request(&Request::BlessApprove {
+        // `bless` runs its own flow (see `bless::run`).
+        Cmd::Bless(args) => bless::run(args, &client),
+        // The approval half of the bless handshake (see `bless::Elevation::approve`).
+        Cmd::BlessHelper { nonce } => client.run_request(&Request::BlessApprove {
             nonce: nonce.clone(),
-        });
-    }
+        }),
+    })
+}
 
-    let req = match build_request(&client) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    client.run_request(&req)
+/// Returns `result`'s exit code, or prints its error and returns failure.
+fn exit_on(result: Result<ExitCode>) -> ExitCode {
+    result.unwrap_or_else(|e| {
+        eprintln!("cordon: {e}");
+        ExitCode::FAILURE
+    })
 }
 
 /// The parsed command line together with the config it names. Every command reads its
@@ -187,116 +182,90 @@ impl<'a> Client<'a> {
     }
 
     /// Sends `req` to the daemon, prints the reply and returns the exit code for it. With
-    /// `--json` the reply prints as raw JSON. When the daemon can't be reached, it prints
-    /// the error with a note on enforcement and returns failure.
-    fn run_request(&self, req: &Request) -> ExitCode {
-        let socket = match self.socket() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("cordon: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let resp = match round_trip(&socket, req) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("cordon: {e}");
-                eprintln!("       (is cordond running? socket: {})", socket.display());
-                eprintln!("       {}", self.enforcement_note());
-                return ExitCode::FAILURE;
-            }
-        };
+    /// `--json` the reply prints as raw JSON. Errors when the socket can't be resolved or
+    /// the daemon can't be reached, with a note on enforcement for the latter.
+    fn run_request(&self, req: &Request) -> Result<ExitCode> {
+        let socket = self.socket()?;
+        let resp = round_trip(&socket, req).map_err(|e| {
+            Error::msg(format!(
+                "{e}\n       (is cordond running? socket: {})\n       {}",
+                socket.display(),
+                self.enforcement()
+            ))
+        })?;
 
         if self.cli.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&resp).unwrap_or_default()
             );
-            return exit_for(&resp);
+            return Ok(exit_for(&resp));
         }
         render(&resp);
-        exit_for(&resp)
+        Ok(exit_for(&resp))
     }
 
-    /// Returns a one-line note, read from the bpffs pins, on whether enforcement is still
-    /// up while the daemon can't be reached.
+    /// Returns whether enforcement is still up while the daemon can't be reached, as the
+    /// bpffs pins say.
     ///
     /// The pinned LSM links keep the boundary up without the daemon (see
     /// `PinDir::pin_links` in cordond), so "connection refused" must not read as "nothing
     /// is enforced". A wrong answer misleads either way. Claiming the boundary is up when
     /// it is down invites a false sense of safety, and claiming it is down when it is up
-    /// sends someone to debug a denial that works as designed. So there are three answers.
-    /// Any pin in the directory means active, and an absent or empty directory means off.
-    /// An unreadable directory or config means unknown rather than a guess. The pins are
-    /// root-only on bpffs, so an unprivileged caller always gets unknown.
-    fn enforcement_note(&self) -> String {
+    /// sends someone to debug a denial that works as designed. So an unreadable directory
+    /// or config is [`Enforcement::Unknown`] rather than a guess. The pins are root-only
+    /// on bpffs, so an unprivileged caller always gets that.
+    fn enforcement(&self) -> Enforcement {
         let Ok(cfg) = self.config() else {
-            return "enforcement state unknown (no readable config)".into();
+            return Enforcement::Unknown("no readable config".into());
         };
-        let dir = &cfg.bpf_pin_dir;
-        match std::fs::read_dir(dir) {
+        let dir = cfg.bpf_pin_dir.clone();
+        match std::fs::read_dir(&dir) {
             Ok(entries) => match entries.count() {
-                0 => format!("no pins under {} — enforcement is OFF", dir.display()),
-                n => format!(
-                    "enforcement is STILL ACTIVE ({n} pinned generation(s) in {}); \
-                     events are not being journaled while the daemon is down. \
-                     `cordond --teardown` turns it off",
-                    dir.display()
-                ),
+                0 => Enforcement::Off(dir),
+                generations => Enforcement::Active { dir, generations },
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                format!("no pins under {} — enforcement is OFF", dir.display())
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Enforcement::Off(dir),
             // Almost always EACCES.
-            Err(_) => format!(
-                "enforcement state unknown — {} is not readable as this user",
-                dir.display()
-            ),
+            Err(_) => {
+                Enforcement::Unknown(format!("{} is not readable as this user", dir.display()))
+            }
         }
     }
 }
 
-/// Returns the request for a daemon-bound command, reading the policy file for `policy
-/// apply`. Errors when that file or the config does not load. Panics on a command that
-/// `main` handles locally.
-fn build_request(client: &Client) -> Result<Request> {
-    match &client.cli.cmd {
-        Cmd::Status => Ok(Request::Status),
-        Cmd::Policy { cmd } => match cmd {
-            PolicyCmd::Show => Ok(Request::PolicyShow),
-            PolicyCmd::Apply { file } => {
-                let path = client.policy_path(file.as_deref())?;
-                // The daemon compiles the sources itself (see `compile_fragments`), so
-                // every source that `load_policy` gathers is sent.
-                let sources = policy::load_policy(&path)?;
-                Ok(Request::PolicyApply { sources })
+/// Whether the pinned LSM links still enforce, from [`Client::enforcement`]. Any pin in
+/// the pin directory means active, and an absent or empty directory means off.
+enum Enforcement {
+    Active { dir: PathBuf, generations: usize },
+    Off(PathBuf),
+    Unknown(String),
+}
+
+impl std::fmt::Display for Enforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Enforcement::Active { dir, generations } => write!(
+                f,
+                "enforcement is STILL ACTIVE ({generations} pinned generation(s) in {}); \
+                 events are not being journaled while the daemon is down. \
+                 `cordond --teardown` turns it off",
+                dir.display()
+            ),
+            Enforcement::Off(dir) => {
+                write!(f, "no pins under {} — enforcement is OFF", dir.display())
             }
-            PolicyCmd::Check { .. } => unreachable!("check is handled locally"),
-            PolicyCmd::Edit { .. } => unreachable!("edit is handled locally"),
-        },
-        Cmd::Bless(_) => unreachable!("bless is handled locally"),
-        Cmd::BlessHelper { .. } => unreachable!("bless-helper is handled locally"),
+            Enforcement::Unknown(why) => write!(f, "enforcement state unknown ({why})"),
+        }
     }
 }
 
 /// Compiles a policy file locally, prints its diagnostics and a summary, and returns the
-/// exit code. The code is failure when the file or the config does not load, or when the
-/// policy has errors.
-fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
-    let path = match client.policy_path(file) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let sources = match policy::load_policy(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cordon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+/// exit code, which is failure when the policy has errors. Errors when the file or the
+/// config does not load.
+fn policy_check(file: Option<&Path>, client: &Client) -> Result<ExitCode> {
+    let path = client.policy_path(file)?;
+    let sources = policy::load_policy(&path)?;
     let compiled =
         policy::compile_fragments(&sources, &policy::fallback_home(), policy::stat_resolver);
     for d in &compiled.diagnostics {
@@ -307,7 +276,7 @@ fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
             "cordon: {} has errors — `apply` would reject it",
             path.display()
         );
-        return ExitCode::FAILURE;
+        return Ok(ExitCode::FAILURE);
     }
     let rules: usize = compiled.objects.iter().map(|o| o.rules.len()).sum();
     println!(
@@ -317,7 +286,7 @@ fn policy_check(file: Option<&Path>, client: &Client) -> ExitCode {
         rules,
         compiled.pending.len(),
     );
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
 fn render(resp: &Response) {

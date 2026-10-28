@@ -12,8 +12,8 @@ use aya::maps::{Array, HashMap as BpfHashMap, MapData};
 use aya::{Ebpf, Pod};
 use cordon_bpf_common::{
     Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, FileId, MAP_BLESSED,
-    MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES, MAP_SETTINGS, MAX_OBJECTS, ObjId, Pid, Settings,
-    rule_slot,
+    MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES, MAP_SETTINGS, MAX_OBJECTS, ObjId, Pid,
+    SETTINGS_INDEX, Settings,
 };
 use cordon_core::policy::CompiledPolicy;
 use cordon_core::{Context, Error, Result};
@@ -54,15 +54,15 @@ impl Maps<'_> {
         self.clear_bank(target)?;
 
         for obj in &compiled.objects {
-            self.protected_insert(target, obj.file, obj.id)?;
-            self.rule_count_insert(target, obj.id, obj.rules.len() as u32)?;
-            for (i, rule) in obj.rules.iter().enumerate() {
-                self.rules_set(rule_slot(target, obj.id, i as u32), *rule)?;
-            }
+            self.seed_object(target, obj.file, obj.id, &obj.rules)?;
         }
 
         // The flip.
-        self.set_settings(Pid(std::process::id()), daemon_exe()?, target)?;
+        self.set_settings(Settings::new(
+            Pid(std::process::id()),
+            target,
+            daemon_exe()?,
+        ))?;
 
         info!(
             objects = compiled.objects.len(),
@@ -85,30 +85,42 @@ impl Maps<'_> {
     fn current_bank(&mut self) -> Result<Bank> {
         let s = self
             .array::<Settings>(MAP_SETTINGS)?
-            .get(&0, 0)
+            .get(&SETTINGS_INDEX, 0)
             .context("bpf-lsm: read settings")?;
         Ok(s.active_bank.masked())
     }
 
-    pub(super) fn protected_insert(&mut self, bank: Bank, file: FileId, obj: ObjId) -> Result<()> {
+    /// Makes the object `obj`, whose inode is `file`, protected in `bank` with `rules` as
+    /// its bucket, in first-match order.
+    pub(super) fn seed_object(
+        &mut self,
+        bank: Bank,
+        file: FileId,
+        obj: ObjId,
+        rules: &[CompiledRule],
+    ) -> Result<()> {
         self.hash::<BankedFile, ObjId>(MAP_PROTECTED)?
             .insert(BankedFile::new(bank, file), obj, 0)
-            .context("bpf-lsm: insert protected")
-    }
-
-    pub(super) fn protected_remove(&mut self, bank: Bank, file: FileId) -> Result<()> {
-        self.hash::<BankedFile, ObjId>(MAP_PROTECTED)?
-            .remove(&BankedFile::new(bank, file))
-            .context("bpf-lsm: remove protected")
-    }
-
-    pub(super) fn rule_count_insert(&mut self, bank: Bank, obj: ObjId, count: u32) -> Result<()> {
+            .context("bpf-lsm: insert protected")?;
+        let bucket = BankedObj::new(bank, obj);
+        let mut slots = self.array::<CompiledRule>(MAP_RULES)?;
+        for (i, rule) in (0..).zip(rules) {
+            let slot = bucket.rule_slot(i);
+            slots
+                .set(slot, *rule, 0)
+                .with_context(|| format!("bpf-lsm: set rule[{slot}]"))?;
+        }
         self.hash::<BankedObj, u32>(MAP_RULE_COUNT)?
-            .insert(BankedObj::new(bank, obj), count, 0)
+            .insert(bucket, rules.len() as u32, 0)
             .context("bpf-lsm: insert rule count")
     }
 
-    pub(super) fn rule_count_remove(&mut self, bank: Bank, obj: ObjId) -> Result<()> {
+    /// Undoes [`seed_object`](Self::seed_object). The rule slots stay, because the rule
+    /// count gates the scan.
+    pub(super) fn unseed_object(&mut self, bank: Bank, file: FileId, obj: ObjId) -> Result<()> {
+        self.hash::<BankedFile, ObjId>(MAP_PROTECTED)?
+            .remove(&BankedFile::new(bank, file))
+            .context("bpf-lsm: remove protected")?;
         self.hash::<BankedObj, u32>(MAP_RULE_COUNT)?
             .remove(&BankedObj::new(bank, obj))
             .context("bpf-lsm: remove rule count")
@@ -128,17 +140,11 @@ impl Maps<'_> {
             .context("bpf-lsm: remove blessed")
     }
 
-    pub(super) fn rules_set(&mut self, index: u32, rule: CompiledRule) -> Result<()> {
-        self.array::<CompiledRule>(MAP_RULES)?
-            .set(index, rule, 0)
-            .with_context(|| format!("bpf-lsm: set rule[{index}]"))
-    }
-
     /// Sets the one-element `SETTINGS` record, which holds the fast-allowed daemon
     /// identity and the live bank.
-    pub(super) fn set_settings(&mut self, pid: Pid, exe: FileId, bank: Bank) -> Result<()> {
+    pub(super) fn set_settings(&mut self, settings: Settings) -> Result<()> {
         self.array::<Settings>(MAP_SETTINGS)?
-            .set(0, Settings::new(pid, bank, exe), 0)
+            .set(SETTINGS_INDEX, settings, 0)
             .context("bpf-lsm: set settings")
     }
 

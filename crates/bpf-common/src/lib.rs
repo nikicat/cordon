@@ -25,11 +25,11 @@ pub mod policy_maps;
 pub use ids::{Bank, CgroupId, Dev, Ino, Nanos, Pid, Suppressed, Uid};
 pub use maps::{
     DecisionEvent, FileId, MAP_EVENTS, MAP_SETTINGS, PATH_MAX_DEPTH, PATH_NAME_MAX, PathComp,
-    Settings, SuppressKey, SuppressVal,
+    SETTINGS_INDEX, Settings, SuppressKey, SuppressVal,
 };
 pub use offsets::Offsets;
 pub use policy_maps::{
-    Action, BankedFile, BankedObj, ClassId, CompiledRule, MAP_BLESSED, MAP_PROTECTED,
-    MAP_RULE_COUNT, MAP_RULES, MAX_BLESSED, MAX_OBJECTS, MAX_RULES_PER_OBJ, NUM_BANKS, ObjId,
-    Policy, SubjectFlags, SubjectMatch, rule_slot,
+    Action, BANKED_OBJECTS, BankedFile, BankedObj, ClassId, CompiledRule, MAP_BLESSED,
+    MAP_PROTECTED, MAP_RULE_COUNT, MAP_RULES, MAX_BLESSED, MAX_OBJECTS, MAX_RULES_PER_OBJ,
+    NUM_BANKS, ObjId, Policy, RULE_SLOTS, SubjectFlags, SubjectMatch,
 };

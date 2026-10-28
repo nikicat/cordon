@@ -25,8 +25,7 @@ use aya::programs::Lsm;
 use aya::{Btf, Ebpf, EbpfLoader};
 use cordon_bpf_common::offsets::GLOBAL_OFFSETS;
 use cordon_bpf_common::{
-    Action, Bank, CompiledRule, Dev, FileId, Ino, ObjId, Offsets, Pid, Policy, SubjectMatch,
-    rule_slot,
+    Action, Bank, CompiledRule, FileId, ObjId, Offsets, Policy, Settings, SubjectMatch,
 };
 use cordon_core::backend::{Backend, PolicyControl, Shutdown};
 use cordon_core::policy::{self, CompiledPolicy, PolicySource, Severity};
@@ -314,19 +313,21 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     // Seed bank 0, which `active_bank` points at as its zero-initialized default, so the
     // probe is live. The real `Maps::seed` then fills bank 1 and flips away from this one.
     let bank = Bank::ZERO;
-    // A silent deny-all rule (any subject, any action) on the probe object. The
-    // fast-allowed identity is pid u32::MAX with a zero exe id, so this process is not
-    // fast-allowed. No real inode is `dev=0 ino=0`, so the exe half can never match
-    // either, and the identity is unsatisfiable on both fields. The rule is SILENCE (deny
-    // with no log) rather than DENY, because the self-test only needs the open blocked,
-    // and a logged probe deny would add a spurious record on every startup.
-    maps.set_settings(Pid(u32::MAX), FileId::new(Dev(0), Ino(0)), bank)?;
-    maps.protected_insert(bank, id, obj)?;
-    maps.rules_set(
-        rule_slot(bank, obj, 0),
-        CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
+    // A silent deny-all rule (any subject, any action) on the probe object, with no
+    // daemon fast-allowed, so this process is refused too. The rule is SILENCE (deny with
+    // no log) rather than DENY, because the self-test only needs the open blocked, and a
+    // logged probe deny would add a spurious record on every startup.
+    maps.set_settings(Settings::no_daemon(bank))?;
+    maps.seed_object(
+        bank,
+        id,
+        obj,
+        &[CompiledRule::new(
+            SubjectMatch::ANY,
+            Action::all(),
+            Policy::SILENCE,
+        )],
     )?;
-    maps.rule_count_insert(bank, obj, 1)?;
 
     // A second object, for `execute` alone. It cannot be proven under the deny-all rule
     // above, because an exec opens the file first. `file_open` would refuse it, the
@@ -338,16 +339,15 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
     let exec_path = probe.join("exe");
     let exec_id = proc::file_id(&exec_path)
         .ok_or_else(|| Error::msg("bpf-lsm self-test: cannot resolve exec probe FileId"))?;
-    maps.protected_insert(bank, exec_id, exec_obj)?;
-    maps.rules_set(
-        rule_slot(bank, exec_obj, 0),
-        CompiledRule::new(SubjectMatch::ANY, Action::READ, Policy::ALLOW),
+    maps.seed_object(
+        bank,
+        exec_id,
+        exec_obj,
+        &[
+            CompiledRule::new(SubjectMatch::ANY, Action::READ, Policy::ALLOW),
+            CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
+        ],
     )?;
-    maps.rules_set(
-        rule_slot(bank, exec_obj, 1),
-        CompiledRule::new(SubjectMatch::ANY, Action::all(), Policy::SILENCE),
-    )?;
-    maps.rule_count_insert(bank, exec_obj, 2)?;
 
     // One operation per attached hook. `outside` is in the same directory as the probe, so
     // link and rename really reach the LSM hook instead of failing with `EXDEV` at the VFS
@@ -373,10 +373,8 @@ fn run_self_test(maps: &mut Maps, probe: &Path) -> Result<()> {
 
     // Remove the probe entries. The first real seed fills bank 1 and leaves bank 0 alone, so
     // nothing else clears them until a later seed flips back here.
-    let _ = maps.protected_remove(bank, id);
-    let _ = maps.rule_count_remove(bank, obj);
-    let _ = maps.protected_remove(bank, exec_id);
-    let _ = maps.rule_count_remove(bank, exec_obj);
+    let _ = maps.unseed_object(bank, id, obj);
+    let _ = maps.unseed_object(bank, exec_id, exec_obj);
     // Only exists if a hook let us through, i.e. if we are about to abort anyway.
     let _ = std::fs::remove_file(&outside);
 

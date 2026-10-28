@@ -4,17 +4,14 @@
 //!
 //! Tools re-open the same config hundreds of times per run. The in-kernel suppressor
 //! (keyed by [`SuppressKey`](cordon_bpf_common::SuppressKey)) thins the ring, and
-//! [`coalesce`] folds whatever one drain still surfaces, so a burst becomes one line.
+//! [`coalesce`] merges whatever one drain still surfaces, so a burst becomes one line.
 
 use super::bless::Blessings;
 use super::seed::Maps;
 use crate::proc;
 use aya::Ebpf;
 use aya::maps::RingBuf;
-use cordon_bpf_common::{
-    Action, ClassId, DecisionEvent, FileId, MAP_EVENTS, PATH_MAX_DEPTH, PathComp, Pid, Policy,
-    Suppressed, Uid,
-};
+use cordon_bpf_common::{Action, ClassId, DecisionEvent, FileId, MAP_EVENTS, Pid, Suppressed, Uid};
 use cordon_core::backend::{ApplyOutcome, BlessOp, ControlMsg, PolicyControl, Shutdown};
 use cordon_core::passwd::Passwd;
 use cordon_core::policy::{
@@ -237,46 +234,30 @@ impl fmt::Display for Opens {
     }
 }
 
-/// The decisions in one drain batch that share a [`coalesce`] key, folded into a single
+/// The decisions in one drain batch that share a [`coalesce`] key, coalesced into a single
 /// journal record.
 struct Coalesced {
-    exe: FileId,
-    /// The matched protected object (the rule's `where`), which the `object=` field names.
-    object: FileId,
-    action: Action,
-    /// The matched rule's policy, taken from the first occurrence. It is the same across
-    /// the group, because the same `(exe, leaf, action)` hits the same rule. It decides
-    /// between the `deny` and `audit` message words, and it names the cause (DESIGN §15.6).
-    policy: Policy,
-    pid: Pid,
-    /// The caller's real uid, taken from the first occurrence like `pid`. The uid is not
-    /// part of the [`coalesce`] key, so a group can carry only one.
-    uid: Uid,
-    /// The caller's resolved blessing class, or [`ClassId::UNBLESSED`] when it has none. It
-    /// is part of the [`coalesce`] key, and [`BlessingName`] renders it.
-    blessing: ClassId,
-    /// The opened file's path components, leaf first, for the `path=` field. `depth` says
-    /// how many are valid and `trunc` whether the walk was cut short. All three come
-    /// verbatim from the first occurrence.
-    comps: [PathComp; PATH_MAX_DEPTH],
-    depth: u8,
-    trunc: u8,
-    /// How many ring records were folded. Each one is an open that passed the in-kernel
+    /// The first decision with this key. It supplies every field of the record except the
+    /// counts. Its `policy` is the same across the group, because the same
+    /// `(exe, leaf, action)` hits the same rule, but `pid` and `uid` are not part of the key,
+    /// so the record names only the first caller.
+    first: DecisionEvent,
+    /// How many ring records were coalesced. Each one is an open that passed the in-kernel
     /// suppressor.
     events: u32,
-    /// The sum of the folded records' in-kernel suppressed counts.
+    /// The sum of the coalesced records' in-kernel suppressed counts.
     suppressed: SuppressedTotal,
 }
 
 impl Coalesced {
-    /// Returns the total opens that this record stands for. They are the folded ring
+    /// Returns the total opens that this record stands for. They are the coalesced ring
     /// records plus the opens that the in-kernel suppressor held back.
     fn count(&self) -> Opens {
         Opens(u64::from(self.events) + self.suppressed.0)
     }
 
-    /// Writes this record to the journal as a `deny` or an `audit` line. An unblessed
-    /// line carries no `blessing` field.
+    /// Writes this record to the journal as a `deny` or an `audit` line, as the policy
+    /// decides (DESIGN §15.6). An unblessed line carries no `blessing` field.
     fn log(
         &self,
         object_paths: &HashMap<FileId, PathBuf>,
@@ -285,42 +266,29 @@ impl Coalesced {
     ) {
         // Every field is a typed value with its own `Display`, so `tracing` renders it
         // lazily, with no eager `String`s.
-        let user = CallerUser::resolve(self.uid, passwd);
+        let e = &self.first;
+        let user = CallerUser::resolve(e.uid, passwd);
         let home = user.home();
-        let exe = CallerExe::resolve(self.pid, self.exe);
-        let object = ObjectName::resolve(self.object, object_paths).into_audit(home);
-        let path = OpenedPath::resolve(self, object_paths).into_audit(home);
-        let action = self.action;
-        let policy = self.policy;
+        let exe = CallerExe::resolve(e.pid, e.exe);
+        let object = JournalPath::object(e.object, object_paths).into_audit(home);
+        let path = JournalPath::opened(e, object_paths).into_audit(home);
+        let (action, policy) = (e.action, e.policy);
         let (count, suppressed) = (self.count(), self.suppressed);
-        match (
-            policy.denies(),
-            BlessingName::resolve(self.blessing, classes),
-        ) {
-            (true, Some(blessing)) => {
-                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, %blessing, "deny")
-            }
-            (true, None) => {
-                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "deny")
-            }
-            (_, Some(blessing)) => {
-                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, %blessing, "audit")
-            }
-            (_, None) => {
-                info!(pid = self.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, "audit")
-            }
-        }
+        // An `Option` field is recorded only when it is `Some`.
+        let blessing = BlessingName::resolve(e.blessing, classes).map(tracing::field::display);
+        let verdict = if policy.denies() { "deny" } else { "audit" };
+        info!(pid = e.pid.0, %user, %exe, %object, %path, %action, %policy, %count, %suppressed, blessing, "{verdict}");
     }
 }
 
-/// Folds a drain batch into one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
+/// Coalesces a drain batch into one [`Coalesced`] record per `(exe, leaf, action, blessing)`,
 /// in the order each key first occurs. The first occurrence supplies the record's
 /// decision, pid and path, and [`Coalesced::count`] gives the record's true volume.
 ///
 /// The key is the opened file (`leaf`), as in the in-kernel suppressor, so distinct files
 /// under one audited root each get their own journal line (DESIGN §15.10 flow B). The
 /// blessing is part of the key because bless is loud (DESIGN §16.3), and a blessed access
-/// must never fold into, or hide behind, an unblessed one.
+/// must never coalesce into, or hide behind, an unblessed one.
 fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
     let mut records: Vec<Coalesced> = Vec::new();
     let mut index: HashMap<(FileId, FileId, Action, ClassId), usize> = HashMap::new();
@@ -333,16 +301,7 @@ fn coalesce(events: &[DecisionEvent]) -> Vec<Coalesced> {
             None => {
                 index.insert((e.exe, e.leaf, e.action, e.blessing), records.len());
                 records.push(Coalesced {
-                    exe: e.exe,
-                    object: e.object,
-                    action: e.action,
-                    policy: e.policy,
-                    pid: e.pid,
-                    uid: e.uid,
-                    blessing: e.blessing,
-                    comps: e.comps,
-                    depth: e.depth,
-                    trunc: e.trunc,
+                    first: *e,
                     events: 1,
                     suppressed: e.suppressed.into(),
                 });
@@ -457,65 +416,50 @@ impl fmt::Display for CallerExe {
     }
 }
 
-/// The protected object as the journal names it. That is its policy path when the daemon
-/// knows the inode, because it seeded the object from that path, or else the raw inode.
-/// The kernel only ever hands over the `FileId`.
-enum ObjectName {
+/// A path as the journal names it, or the raw inode when the daemon cannot name it. The
+/// kernel only ever hands over [`FileId`]s and path components.
+enum JournalPath {
     Path(PathBuf),
     Inode(FileId),
 }
 
-impl ObjectName {
-    fn resolve(object: FileId, object_paths: &HashMap<FileId, PathBuf>) -> ObjectName {
+impl JournalPath {
+    /// Returns the protected object's name, which is its policy path when the daemon knows
+    /// the inode, because it seeded the object from that path.
+    fn object(object: FileId, object_paths: &HashMap<FileId, PathBuf>) -> JournalPath {
         match object_paths.get(&object) {
-            Some(p) => ObjectName::Path(p.clone()),
-            None => ObjectName::Inode(object),
+            Some(p) => JournalPath::Path(p.clone()),
+            None => JournalPath::Inode(object),
         }
     }
 
-    /// Returns the journal rendering of this name, with `home` collapsed to `~`.
-    fn into_audit(self, home: Option<&Path>) -> AuditPath<'_> {
-        match self {
-            ObjectName::Path(path) => AuditPath::Path { path, home },
-            ObjectName::Inode(id) => AuditPath::Inode(id),
-        }
-    }
-}
-
-/// The file that was actually opened, as the journal names it (DESIGN §15.10 flow B). It
-/// is the protected object's known path with the relative path that the kernel rebuilt
-/// joined on, so `object=~/.aws` and `config` give `path=~/.aws/config` (see
-/// [`DecisionEvent::comps`]). When the object's path is unknown, it is the relative path
-/// alone, and when that is missing too, it is the inode.
-enum OpenedPath {
-    Path(PathBuf),
-    Inode(FileId),
-}
-
-impl OpenedPath {
-    fn resolve(c: &Coalesced, object_paths: &HashMap<FileId, PathBuf>) -> OpenedPath {
-        let rel = relative_path(&c.comps, c.depth, c.trunc != 0);
-        match (object_paths.get(&c.object), rel) {
-            (Some(base), Some(rel)) => OpenedPath::Path(base.join(rel)),
-            (Some(base), None) => OpenedPath::Path(base.clone()),
-            (None, Some(rel)) => OpenedPath::Path(rel),
-            (None, None) => OpenedPath::Inode(c.object),
+    /// Returns the name of the file that `e` actually opened (DESIGN §15.10 flow B). It is
+    /// the protected object's known path with the relative path that the kernel rebuilt
+    /// joined on, so `object=~/.aws` and `config` give `path=~/.aws/config`. When the
+    /// object's path is unknown, it is the relative path alone, and when that is missing
+    /// too, it is the object's inode.
+    fn opened(e: &DecisionEvent, object_paths: &HashMap<FileId, PathBuf>) -> JournalPath {
+        match (object_paths.get(&e.object), relative_path(e)) {
+            (Some(base), Some(rel)) => JournalPath::Path(base.join(rel)),
+            (Some(base), None) => JournalPath::Path(base.clone()),
+            (None, Some(rel)) => JournalPath::Path(rel),
+            (None, None) => JournalPath::Inode(e.object),
         }
     }
 
     /// Returns the journal rendering of this path, with `home` collapsed to `~`.
     fn into_audit(self, home: Option<&Path>) -> AuditPath<'_> {
         match self {
-            OpenedPath::Path(path) => AuditPath::Path { path, home },
-            OpenedPath::Inode(id) => AuditPath::Inode(id),
+            JournalPath::Path(path) => AuditPath::Path { path, home },
+            JournalPath::Inode(id) => AuditPath::Inode(id),
         }
     }
 }
 
 /// An audit path as the journal prints it, with a regular user's home collapsed to `~`
 /// (DESIGN §15.8). `object=` and `path=` then read exactly as that user's policy would
-/// write them, so a `deny` line copies straight into the policy. Both [`ObjectName`] and
-/// [`OpenedPath`] render through this, so the two fields collapse the same way.
+/// write them, so a `deny` line copies straight into the policy. Both fields render
+/// through this, so they collapse the same way.
 enum AuditPath<'a> {
     Path {
         path: PathBuf,
@@ -541,21 +485,20 @@ impl fmt::Display for AuditPath<'_> {
     }
 }
 
-/// Returns the opened file's path relative to the matched object, built from the
-/// leaf-first components `comps`. Returns `None` when `depth` is 0, because the object is
-/// then the opened file. A truncated walk (`trunc`) starts with `…/`, so a partial path
-/// never reads as exact. The components are raw kernel names, kept as [`OsStr`] rather
-/// than lossy UTF-8.
-fn relative_path(comps: &[PathComp; PATH_MAX_DEPTH], depth: u8, trunc: bool) -> Option<PathBuf> {
-    let depth = (depth as usize).min(PATH_MAX_DEPTH);
-    if depth == 0 {
+/// Returns the opened file's path relative to the matched object, built from `e`'s
+/// leaf-first components. Returns `None` when there are none, because the object is then
+/// the opened file. A truncated walk starts with `…/`, so a partial path never reads as
+/// exact. The components are raw kernel names, kept as [`OsStr`] rather than lossy UTF-8.
+fn relative_path(e: &DecisionEvent) -> Option<PathBuf> {
+    let comps = e.valid_comps();
+    if comps.is_empty() {
         return None;
     }
     let mut rel = PathBuf::new();
-    if trunc {
+    if e.is_truncated() {
         rel.push("…");
     }
-    for slot in comps[..depth].iter().rev() {
+    for slot in comps.iter().rev() {
         rel.push(OsStr::from_bytes(slot.name()));
     }
     Some(rel)
@@ -575,7 +518,7 @@ fn parse_event(bytes: &[u8]) -> Option<DecisionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordon_bpf_common::{ClassId, Dev, Ino, PATH_NAME_MAX, Policy};
+    use cordon_bpf_common::{Dev, Ino, PATH_MAX_DEPTH, PATH_NAME_MAX, PathComp, Policy};
 
     /// An unused path component slot.
     const EMPTY_COMP: PathComp = PathComp([0; PATH_NAME_MAX]);
@@ -607,7 +550,7 @@ mod tests {
     /// Returns [`ev`] with the caller resolved to the blessing `class`, which is the fourth
     /// part of the coalesce key.
     fn ev_blessed(exe: Ino, leaf: Ino, action: Action, class: ClassId) -> DecisionEvent {
-        let mut e = ev(exe, leaf, action, Suppressed(0));
+        let mut e = ev(exe, leaf, action, Suppressed::NONE);
         e.blessing = class;
         e
     }
@@ -620,15 +563,15 @@ mod tests {
     }
 
     #[test]
-    fn folds_identical_events_summing_counts() {
+    fn coalesces_identical_events_summing_counts() {
         let batch = vec![
-            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)),
+            ev(Ino(10), Ino(20), Action::READ, Suppressed::NONE),
             ev(Ino(10), Ino(20), Action::READ, Suppressed(5)),
             ev(Ino(10), Ino(20), Action::READ, Suppressed(3)),
         ];
         let out = coalesce(&batch);
         assert_eq!(out.len(), 1, "one coalesce key → one record");
-        assert_eq!(out[0].events, 3, "three ring records folded");
+        assert_eq!(out[0].events, 3, "three ring records coalesced");
         assert_eq!(
             out[0].suppressed,
             SuppressedTotal(8),
@@ -644,16 +587,16 @@ mod tests {
     #[test]
     fn distinct_keys_stay_separate() {
         let batch = vec![
-            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)),
-            ev(Ino(11), Ino(20), Action::READ, Suppressed(0)), // different exe
-            ev(Ino(10), Ino(21), Action::READ, Suppressed(0)), // different leaf (a different opened file)
-            ev(Ino(10), Ino(20), Action::WRITE, Suppressed(0)), // different action
-            ev(Ino(10), Ino(20), Action::READ, Suppressed(2)), // dup of the first → folds in
+            ev(Ino(10), Ino(20), Action::READ, Suppressed::NONE),
+            ev(Ino(11), Ino(20), Action::READ, Suppressed::NONE), // different exe
+            ev(Ino(10), Ino(21), Action::READ, Suppressed::NONE), // different leaf (a different opened file)
+            ev(Ino(10), Ino(20), Action::WRITE, Suppressed::NONE), // different action
+            ev(Ino(10), Ino(20), Action::READ, Suppressed(2)),    // dup of the first → coalesces in
         ];
         let out = coalesce(&batch);
         assert_eq!(out.len(), 4, "four distinct identities");
-        // Insertion order preserved; the first key folded the trailing dup.
-        assert_eq!(out[0].action, Action::READ);
+        // Insertion order preserved; the first key coalesced the trailing dup.
+        assert_eq!(out[0].first.action, Action::READ);
         assert_eq!(out[0].events, 2);
         assert_eq!(out[0].suppressed, SuppressedTotal(2));
     }
@@ -664,28 +607,28 @@ mod tests {
     #[test]
     fn distinct_leaves_under_one_object_stay_separate() {
         let batch = vec![
-            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)),
-            ev(Ino(10), Ino(21), Action::READ, Suppressed(0)), // same exe + object, different opened file
+            ev(Ino(10), Ino(20), Action::READ, Suppressed::NONE),
+            ev(Ino(10), Ino(21), Action::READ, Suppressed::NONE), // same exe + object, different opened file
         ];
         assert_eq!(coalesce(&batch).len(), 2);
     }
 
-    /// Checks that a blessed access never folds into, or hides behind, an unblessed one
+    /// Checks that a blessed access never coalesces into, or hides behind, an unblessed one
     /// with the same `(exe, leaf, action)`. The blessing is part of the coalesce identity.
     #[test]
-    fn distinct_blessings_stay_separate_identical_ones_fold() {
+    fn distinct_blessings_stay_separate_identical_ones_coalesce() {
         let batch = vec![
-            ev(Ino(10), Ino(20), Action::READ, Suppressed(0)), // unblessed
+            ev(Ino(10), Ino(20), Action::READ, Suppressed::NONE), // unblessed
             ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(1)),
             ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(2)), // different class
-            ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(1)), // dup → folds into the first
+            ev_blessed(Ino(10), Ino(20), Action::READ, ClassId(1)), // dup → coalesces into the first
         ];
         let out = coalesce(&batch);
         assert_eq!(out.len(), 3, "unblessed + class 1 + class 2");
-        assert_eq!(out[0].blessing, ClassId::UNBLESSED);
-        assert_eq!(out[1].blessing, ClassId(1));
-        assert_eq!(out[1].events, 2, "same class folded");
-        assert_eq!(out[2].blessing, ClassId(2));
+        assert_eq!(out[0].first.blessing, ClassId::UNBLESSED);
+        assert_eq!(out[1].first.blessing, ClassId(1));
+        assert_eq!(out[1].events, 2, "same class coalesced");
+        assert_eq!(out[2].first.blessing, ClassId(2));
     }
 
     #[test]
@@ -709,34 +652,29 @@ mod tests {
 
     #[test]
     fn relative_path_reverses_leaf_first_components() {
-        let mut comps = [EMPTY_COMP; PATH_MAX_DEPTH];
-        comps[0] = comp("config"); // leaf
-        comps[1] = comp(".aws"); // its parent
-        assert_eq!(
-            relative_path(&comps, 2, false).unwrap(),
-            PathBuf::from(".aws/config")
-        );
+        let mut e = ev(Ino(10), Ino(20), Action::READ, Suppressed::NONE);
+        e.comps[0] = comp("config"); // leaf
+        e.comps[1] = comp(".aws"); // its parent
         // At depth 0 the object is the opened file, so there is no relative path.
-        assert!(relative_path(&comps, 0, false).is_none());
+        assert!(relative_path(&e).is_none());
+        e.depth = 2;
+        assert_eq!(relative_path(&e).unwrap(), PathBuf::from(".aws/config"));
         // truncation prefixes `…/` so a partial path never reads as exact.
-        assert_eq!(
-            relative_path(&comps, 2, true).unwrap(),
-            PathBuf::from("…/.aws/config")
-        );
+        e.trunc = 1;
+        assert_eq!(relative_path(&e).unwrap(), PathBuf::from("…/.aws/config"));
     }
 
     #[test]
     fn opened_path_joins_object_base() {
         let mut object_paths = HashMap::new();
         object_paths.insert(OBJECT, PathBuf::from("/home/u"));
-        let mut e = ev(Ino(10), Ino(20), Action::READ, Suppressed(0));
+        let mut e = ev(Ino(10), Ino(20), Action::READ, Suppressed::NONE);
         e.comps[0] = comp("config");
         e.comps[1] = comp(".aws");
         e.depth = 2;
-        let record = coalesce(&[e]).pop().unwrap();
-        match OpenedPath::resolve(&record, &object_paths) {
-            OpenedPath::Path(p) => assert_eq!(p, PathBuf::from("/home/u/.aws/config")),
-            OpenedPath::Inode(_) => panic!("expected a joined path"),
+        match JournalPath::opened(&e, &object_paths) {
+            JournalPath::Path(p) => assert_eq!(p, PathBuf::from("/home/u/.aws/config")),
+            JournalPath::Inode(_) => panic!("expected a joined path"),
         }
     }
 

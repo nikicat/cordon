@@ -8,7 +8,7 @@
 //! every setting takes its default.
 
 use crate::backend::BackendKind;
-use crate::{Context, Error, Result};
+use crate::{Context, Error, Result, Uid};
 use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -125,16 +125,16 @@ fn interpolate(s: &str) -> Result<String> {
 // ---- defaults ---------------------------------------------------------------
 
 /// Returns the effective uid of this process.
-pub fn euid() -> u32 {
+pub fn euid() -> Uid {
     // A direct libc symbol, so that the core pulls in no extra crate.
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
-    unsafe { geteuid() }
+    Uid(unsafe { geteuid() })
 }
 
 pub fn is_root() -> bool {
-    euid() == 0
+    euid() == Uid::ROOT
 }
 
 fn home() -> PathBuf {
@@ -143,16 +143,21 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Returns the default config file path, which is `/etc/cordon/config.toml` for root and
-/// `$XDG_CONFIG_HOME/cordon/config.toml` for anyone else.
-fn default_config_path() -> PathBuf {
+/// Returns cordon's config directory, which is `/etc/cordon` for root and
+/// `$XDG_CONFIG_HOME/cordon` for anyone else.
+fn config_dir() -> PathBuf {
     if is_root() {
-        return PathBuf::from("/etc/cordon/config.toml");
+        return PathBuf::from("/etc/cordon");
     }
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"));
-    base.join("cordon/config.toml")
+    base.join("cordon")
+}
+
+/// Returns the default config file path, `config.toml` in [`config_dir`].
+fn default_config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 /// The socket that the system daemon listens on. A packaged `cordond` binds it, and an
@@ -226,17 +231,10 @@ fn default_bpf_pin_dir() -> PathBuf {
     PathBuf::from("/sys/fs/bpf/cordon")
 }
 
-/// Returns the default text policy path, which is the root-owned
-/// `/etc/cordon/policy.toml` for root and `$XDG_CONFIG_HOME/cordon/policy.toml` for
-/// anyone else.
+/// Returns the default text policy path, `policy.toml` in [`config_dir`]. For root that
+/// is the root-owned `/etc/cordon/policy.toml`.
 fn default_policy() -> PathBuf {
-    if is_root() {
-        return PathBuf::from("/etc/cordon/policy.toml");
-    }
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    base.join("cordon/policy.toml")
+    config_dir().join("policy.toml")
 }
 
 fn default_zones() -> Vec<PathBuf> {

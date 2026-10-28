@@ -57,7 +57,7 @@ enum BlessCmd {
     Revoke { id: BlessId },
 }
 
-pub fn run(args: &BlessArgs, client: &Client) -> ExitCode {
+pub fn run(args: &BlessArgs, client: &Client) -> Result<ExitCode> {
     match &args.cmd {
         // `list` and `revoke` are plain round trips, rendered like any other command. The
         // daemon decides who may revoke (see `may_revoke` in cordond).
@@ -68,13 +68,7 @@ pub fn run(args: &BlessArgs, client: &Client) -> ExitCode {
             };
             client.run_request(&req)
         }
-        None => match mint_and_exec(args, client) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("cordon: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        None => mint_and_exec(args, client),
     }
 }
 

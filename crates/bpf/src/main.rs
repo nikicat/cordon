@@ -18,7 +18,7 @@
 //!      match is the right one (DESIGN §15.3).
 //!   5. With no matching rule, the policy is default-deny. The open is blocked when the
 //!      policy [`denies`](Policy::denies), and journaled through the suppressor
-//!      (`kernel::throttle`) when it [`logs`](Policy::logs).
+//!      (`kernel::suppress`) when it [`logs`](Policy::logs).
 //!
 //! Anything unreadable fails open (see [`clamped`]). All `unsafe` code, the kernel reads
 //! and the ring writes, lives in [`kernel`], and this file holds the decision flow. Field
@@ -33,9 +33,9 @@ use aya_ebpf::macros::{lsm, map};
 use aya_ebpf::maps::{Array, HashMap};
 use aya_ebpf::programs::LsmContext;
 use cordon_bpf_common::{
-    rule_slot, Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, FileId, ObjId,
-    Pid, Policy, Settings, SubjectFlags, SubjectMatch, MAX_BLESSED, MAX_OBJECTS, MAX_RULES_PER_OBJ,
-    NUM_BANKS,
+    Action, Bank, BankedFile, BankedObj, CgroupId, ClassId, CompiledRule, FileId, ObjId, Pid,
+    Policy, Settings, SubjectFlags, SubjectMatch, BANKED_OBJECTS, MAX_BLESSED, MAX_RULES_PER_OBJ,
+    RULE_SLOTS, SETTINGS_INDEX,
 };
 
 /// The verdict that the decision flow returns. It is converted once, at the hook boundary,
@@ -73,16 +73,13 @@ const O_CREAT: u32 = 0o100;
 
 /// The protected objects of both banks (see `MAP_PROTECTED`).
 #[map]
-static PROTECTED: HashMap<BankedFile, ObjId> =
-    HashMap::with_max_entries((NUM_BANKS * MAX_OBJECTS) as u32, 0);
+static PROTECTED: HashMap<BankedFile, ObjId> = HashMap::with_max_entries(BANKED_OBJECTS as u32, 0);
 /// The packed rule table of both banks (see `MAP_RULES`).
 #[map]
-static RULES: Array<CompiledRule> =
-    Array::with_max_entries((NUM_BANKS * MAX_OBJECTS * MAX_RULES_PER_OBJ) as u32, 0);
+static RULES: Array<CompiledRule> = Array::with_max_entries(RULE_SLOTS as u32, 0);
 /// The number of rules of each object in each bank (see `MAP_RULE_COUNT`).
 #[map]
-static RULE_COUNT: HashMap<BankedObj, u32> =
-    HashMap::with_max_entries((NUM_BANKS * MAX_OBJECTS) as u32, 0);
+static RULE_COUNT: HashMap<BankedObj, u32> = HashMap::with_max_entries(BANKED_OBJECTS as u32, 0);
 /// The one-element control record ([`Settings`]).
 #[map]
 static SETTINGS: Array<Settings> = Array::with_max_entries(1, 0);
@@ -368,7 +365,7 @@ fn deny_escape(matched: &Match, op: Action, pid: Pid, bank: Bank) -> Verdict {
         if !policy.logs() {
             return Verdict::Deny;
         }
-        if let Some(suppressed) = kernel::throttle(exe, matched.leaf, op) {
+        if let Some(suppressed) = kernel::suppress(exe, matched.leaf, op) {
             kernel::emit(&kernel::Record {
                 pid,
                 uid: kernel::current_uid(),
@@ -440,7 +437,7 @@ fn consult(
 
     let blocked = policy.denies();
     if policy.logs() {
-        if let Some(suppressed) = kernel::throttle(exe, matched.leaf, logged) {
+        if let Some(suppressed) = kernel::suppress(exe, matched.leaf, logged) {
             // The uid is read only on the logged path, so the unprotected majority pays
             // nothing for it.
             kernel::emit(&kernel::Record {
@@ -534,13 +531,14 @@ fn match_rule(
     class: ClassId,
     bank: Bank,
 ) -> Option<Policy> {
-    let count = rule_count(bank, obj).unwrap_or(0);
+    let bucket = BankedObj::new(bank, obj);
+    let count = rule_count(bucket).unwrap_or(0);
     for i in 0..MAX_RULES_PER_OBJ {
         if i as u32 >= count {
             break;
         }
         // `Array::get` is bounds-checked and safe in aya, so a stray index yields `None`.
-        let rule: CompiledRule = *RULES.get(rule_slot(bank, obj, i as u32))?;
+        let rule: CompiledRule = *RULES.get(bucket.rule_slot(i as u32))?;
         if rule.action_mask.intersects(requested) && subject_matches(rule.subject, exe, class) {
             return Some(rule.policy);
         }
@@ -579,7 +577,7 @@ fn blessed_class(cgroup: CgroupId) -> Option<ClassId> {
 
 /// Returns the [`Settings`] record, or `None` when it is unreadable.
 fn settings() -> Option<Settings> {
-    SETTINGS.get(0).copied()
+    SETTINGS.get(SETTINGS_INDEX).copied()
 }
 
 /// Returns the `ObjId` of the protected object `key` in `bank`, or `None` when `key` is not
@@ -589,8 +587,8 @@ fn protected_obj(bank: Bank, key: FileId) -> Option<ObjId> {
 }
 
 /// Returns how many rules object `obj` has in `bank`, or `None` when it has no entry.
-fn rule_count(bank: Bank, obj: ObjId) -> Option<u32> {
-    unsafe { RULE_COUNT.get(&BankedObj::new(bank, obj)).copied() }
+fn rule_count(bucket: BankedObj) -> Option<u32> {
+    unsafe { RULE_COUNT.get(&bucket).copied() }
 }
 
 /// The program's license. The verifier rejects a program that calls GPL-only helpers, such

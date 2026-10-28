@@ -67,10 +67,21 @@ mk_exe() { local p="$TMP/$1"; cp "$(command -v bash)" "$p"; echo "$p"; }
 # The exe copy itself is the process image, so the kernel sees its inode as the caller.
 read_as()  { "$1" -c 'exec 3<"$1"' bash "$2" 2>/dev/null; }   # $1 exe  $2 file
 write_as() { "$1" -c 'exec 3>"$1"' bash "$2" 2>/dev/null; }   # opens O_WRONLY|O_CREAT|O_TRUNC
+# Prints the command prefix that drops root to uid $1, with gid $1 and no supplementary
+# groups, so the kernel attributes what follows to that user. It is a string because
+# CORDON_SUDO takes a command line.
+as_uid_prefix() { echo "setpriv --reuid $1 --regid $1 --clear-groups"; }
+# Runs CMD [ARGS] as uid $1 (see as_uid_prefix).
+run_as() { local uid=$1; shift; $(as_uid_prefix "$uid") "$@"; }
+# Succeeds when setpriv is there for run_as, and otherwise prints a SKIP that names why
+# the scenario needs it ($1, optional) and fails.
+need_setpriv() {
+    command -v setpriv >/dev/null && return 0
+    echo "  SKIP: setpriv unavailable${1:+ — $1}"; return 1
+}
 # Opens a file for read as the exe, running as the given uid instead of root. Fails when
-# the open is denied. setpriv drops root before the exec, so the kernel attributes the
-# open to that uid.
-read_as_uid() { setpriv --reuid "$1" --regid "$1" --clear-groups "$2" -c 'exec 3<"$1"' bash "$3" 2>/dev/null; } # $1 uid $2 exe $3 file
+# the open is denied.
+read_as_uid() { run_as "$1" "$2" -c 'exec 3<"$1"' bash "$3" 2>/dev/null; } # $1 uid $2 exe $3 file
 
 # Commands queued by `on_cleanup` for the current scenario.
 CLEANUPS=()
@@ -598,9 +609,7 @@ EOF
 scenario_user_home_tilde() {
     echo "### scenario: audit-log ~ collapse (a regular user's home renders as ~)"
     ws_new
-    if ! command -v setpriv >/dev/null; then
-        echo "  SKIP: setpriv unavailable — cannot run the reader as a non-root uid"; return 0
-    fi
+    need_setpriv "cannot run the reader as a non-root uid" || return 0
     local tuser="cordontilde$$" tuid=4242
     local thome="$TMP/home" tvault tsecret
     tvault="$thome/.creds"; tsecret="$tvault/key"
@@ -638,7 +647,7 @@ EOF
 # config. Echoes a SKIP and fails when the guest cannot support that.
 edit_env_setup() {
     ws_new
-    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 1; }
+    need_setpriv || return 1
     local thome="$TMP/ehome"; mkdir -p "$thome"; chown "$TUID:$TUID" "$thome"; chmod 755 "$TMP"
     printf '%s:x:%s:%s:Cordon Edit:%s:/bin/sh\n' "$TUSER" "$TUID" "$TUID" "$thome" >> /etc/passwd 2>/dev/null \
         || { echo "  SKIP: /etc/passwd not writable"; return 1; }
@@ -691,7 +700,7 @@ done
 RACER
     chmod 755 "$TMP/racer.sh"
     FLAG="$flag" SENTINEL="$SENTINEL" EDITDIR="$EDITDIR" \
-        setpriv --reuid "$TUID" --regid "$TUID" --clear-groups "$TMP/racer.sh" &
+        run_as "$TUID" "$TMP/racer.sh" &
     local racer=$!
     for _ in $(seq 1 20); do run_policy_edit /bin/true >/dev/null 2>&1; done
     rm -f "$flag"; wait "$racer" 2>/dev/null
@@ -855,7 +864,7 @@ scenario_bless_boundary() {
     echo "### scenario: bless boundary (non-root write to the carrier cgroup.procs fails)"
     ws_new
     bless_env_ready || return 0
-    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
+    need_setpriv || return 0
     write_policy <<EOF
 [group.subject.blessed-ro]
 blessing = "ro"
@@ -881,7 +890,7 @@ EOF
     # The membership boundary. A non-root uid must not be able to write itself into the
     # root-owned carrier, or any process could bless itself.
     expect_deny "non-root write to the carrier cgroup.procs" \
-        setpriv --reuid 4242 --regid 4242 --clear-groups sh -c "echo \$\$ > '$dir/cgroup.procs'" || fail=1
+        run_as 4242 sh -c "echo \$\$ > '$dir/cgroup.procs'" || fail=1
     # Clean up by revoking, letting the CLI reap its child and letting GC drain the carrier.
     "$CORDON" bless revoke "$(bless_first_id)" >/dev/null 2>&1
     wait "$clipid" 2>/dev/null
@@ -1001,9 +1010,9 @@ EOF
 scenario_bless_unprivileged() {
     echo "### scenario: unprivileged bless (runs as you, env survives, still blessed)"
     ws_new
-    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
+    need_setpriv || return 0
     bless_env_ready || return 0
-    local buid=4244 bgid=4244
+    local buid=4244
     local cordon; cordon="$(unpriv_cordon)"
     local out="$TMP/blessed.id"; : > "$out"; chmod 666 "$out"
     # The script records its uid and the canary, and its blessed read exits nonzero when
@@ -1028,7 +1037,7 @@ EOF
     local fail=0
     # The CLI itself runs as uid 4244. Only the helper it spawns reaches root.
     local blesslog="$TMP/bless.log"
-    if setpriv --reuid "$buid" --regid "$bgid" --clear-groups \
+    if run_as "$buid" \
          env CORDON_SUDO="$CORDON_SUDO" CORDON_CONFIG="$CORDON_CONFIG" CORDON_CANARY=alive \
          "$cordon" bless --class ro -- "$TMP/blessed-id.sh" >"$blesslog" 2>&1; then
         echo "  OK: an UNPRIVILEGED bless read the secret (fd delegation joined the carrier)"
@@ -1051,7 +1060,7 @@ EOF
     # The security property the seam rests on. A faked elevation that never reaches root
     # produces a non-root helper, and the daemon refuses that helper's approval.
     local refused="$TMP/refused.log"
-    CORDON_SUDO="setpriv --reuid $buid --regid $bgid --clear-groups" \
+    CORDON_SUDO="$(as_uid_prefix "$buid")" \
         "$CORDON" bless --class ro -- /bin/true >"$refused" 2>&1 && fail=1
     if grep -qi 'requires root' "$refused"; then
         echo "  OK: a faked elevation is refused by the daemon (uid gate, not the tool)"
@@ -1067,9 +1076,7 @@ EOF
 scenario_socket_authz() {
     echo "### scenario: socket authorization — unprivileged reads work, apply is refused"
     ws_new
-    if ! command -v setpriv >/dev/null; then
-        echo "  SKIP: setpriv unavailable — cannot run the CLI as a non-root uid"; return 0
-    fi
+    need_setpriv "cannot run the CLI as a non-root uid" || return 0
     local uid=4246
     chmod 755 "$TMP"   # let $uid traverse to the socket, config and policy
     write_policy <<EOF
@@ -1079,7 +1086,7 @@ EOF
     started || return 1
     local fail=0
     # Runs `cordon` as an ordinary user, with the workspace config it can read.
-    as_uid() { setpriv --reuid "$uid" --regid "$uid" --clear-groups "$CORDON" "$@"; }
+    as_uid() { run_as "$uid" "$CORDON" "$@"; }
 
     local mode; mode="$(stat -c %a "$SOCK")"
     if [ "$mode" = 666 ]; then
@@ -1109,7 +1116,7 @@ EOF
 scenario_bless_rejects_fake_daemon() {
     echo "### scenario: bless refuses a non-root daemon (no nonce, no password prompt)"
     ws_new
-    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
+    need_setpriv || return 0
     command -v python3 >/dev/null || { echo "  SKIP: python3 unavailable (needed to bind a fake socket)"; return 0; }
     local buid=4247
     local cordon; cordon="$(unpriv_cordon)"
@@ -1128,7 +1135,7 @@ EOF
     # $XDG_RUNTIME_DIR or /tmp, which it can write.
     local squatdir="$TMP/squat"; mkdir -p "$squatdir"; chown "$buid:$buid" "$squatdir"
     local fake="$squatdir/cordon.sock"
-    setpriv --reuid "$buid" --regid "$buid" --clear-groups python3 -c '
+    run_as "$buid" python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1]); s.listen(8)
@@ -1146,7 +1153,7 @@ while True: s.accept()
     chmod 755 "$TMP/marker-sudo"
 
     local out="$TMP/fake.log"
-    setpriv --reuid "$buid" --regid "$buid" --clear-groups \
+    run_as "$buid" \
         env CORDON_SUDO="$TMP/marker-sudo" CORDON_CONFIG="$CORDON_CONFIG" \
         "$cordon" --socket "$fake" bless --class ro -- /bin/true >"$out" 2>&1
     if [ $? -ne 0 ] && grep -q 'not root' "$out"; then
@@ -1197,8 +1204,10 @@ placement_tree_clean() {
 # travels through a file, because a variable would never reach the caller.
 bless_from() { # $1 requester cgroup  $2 uid  $3 cordon binary  $4 marker prefix
     rm -f "$4" "$4.cg" "$4.pid"
+    # The prefix splits into words on purpose, because `exec` can't run a function.
+    # shellcheck disable=SC2046
     sh -c 'echo $$ > "$1/cgroup.procs" && shift && exec "$@"' _ "$1" \
-        setpriv --reuid "$2" --regid "$2" --clear-groups \
+        $(as_uid_prefix "$2") \
         env CORDON_SUDO="$CORDON_SUDO" CORDON_CONFIG="$CORDON_CONFIG" \
         "$3" bless --class ro -- /bin/sh -c "cat /proc/self/cgroup > '$4.cg'; touch '$4'; sleep 5" &
     echo $! > "$4.pid"
@@ -1240,7 +1249,7 @@ expect_placement() { # $1 requester cgroup  $2 expected parent (mount-relative) 
 scenario_bless_placement() {
     echo "### scenario: the carrier lands where logind can still attribute the user"
     ws_new
-    command -v setpriv >/dev/null || { echo "  SKIP: setpriv unavailable"; return 0; }
+    need_setpriv || return 0
     bless_env_ready || return 0
     P_UID=4248
     P_CORDON="$(unpriv_cordon)"

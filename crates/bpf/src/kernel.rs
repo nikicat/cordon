@@ -250,7 +250,7 @@ pub struct Record {
     /// How the access was handled and why: an explicit `deny` rule, the `default-deny`
     /// fallthrough, the structural `escape-deny`, or an `audit`.
     pub policy: Policy,
-    /// The repeats that the in-kernel throttle folded into this record.
+    /// The repeats that the in-kernel suppressor held back before this record.
     pub suppressed: Suppressed,
     /// The caller's resolved blessing class, or [`ClassId::UNBLESSED`] if it has none.
     pub blessing: ClassId,
@@ -364,11 +364,11 @@ const SUPPRESS_WINDOW_NS: Nanos = Nanos(1_000_000_000);
 static SUPPRESS: LruHashMap<SuppressKey, SuppressVal> = LruHashMap::with_max_entries(4096, 0);
 
 /// Decides whether a logged decision for `(exe, leaf, action)` emits a ring record, and
-/// records the decision in `SUPPRESS`. Returns the number of identical decisions folded in
+/// records the decision in `SUPPRESS`. Returns the number of identical decisions held back
 /// since the key's previous record when it emits, or `None` when the decision falls inside
 /// the suppression window and only bumps the key's count. A failed map write costs a
 /// slightly wrong count, never a missed first occurrence.
-pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed> {
+pub fn suppress(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed> {
     let now = now_ns();
     let key = SuppressKey::new(exe, leaf, action);
     match suppress_get(&key) {
@@ -386,13 +386,13 @@ pub fn throttle(exe: FileId, leaf: FileId, action: Action) -> Option<Suppressed>
         }
         // The window has elapsed, so emit with the held-back count and reset it.
         Some(prev) => {
-            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed(0)), 0);
+            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed::NONE), 0);
             Some(prev.suppressed)
         }
         // A first occurrence emits at once and starts the key's window.
         None => {
-            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed(0)), 0);
-            Some(Suppressed(0))
+            let _ = SUPPRESS.insert(&key, &SuppressVal::new(now, Suppressed::NONE), 0);
+            Some(Suppressed::NONE)
         }
     }
 }

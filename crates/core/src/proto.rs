@@ -381,22 +381,31 @@ impl Conn {
     }
 }
 
-/// Writes one newline-framed JSON message and flushes the writer.
+/// The byte that ends each JSON message on the wire. JSON escapes a newline inside a
+/// string, so the byte never occurs within a message.
+const FRAME_END: u8 = b'\n';
+
+/// Returns `value` as one framed JSON message.
+fn frame(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(FRAME_END);
+    Ok(bytes)
+}
+
+/// Writes one framed JSON message and flushes the writer.
 fn write_msg<W: Write>(w: &mut W, value: &impl Serialize) -> Result<()> {
-    let mut s = serde_json::to_string(value)?;
-    s.push('\n');
-    w.write_all(s.as_bytes())?;
+    w.write_all(&frame(value)?)?;
     w.flush()?;
     Ok(())
 }
 
-/// Reads one newline-framed JSON message. Returns `None` at a clean EOF.
+/// Reads one framed JSON message. Returns `None` at a clean EOF.
 fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
-    let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
+    let mut msg = Vec::new();
+    if r.read_until(FRAME_END, &mut msg)? == 0 {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_str(line.trim_end())?))
+    Ok(Some(serde_json::from_slice(&msg)?))
 }
 
 /// Returns the peer's uid and pid from one `SO_PEERCRED`.
@@ -416,7 +425,7 @@ fn peer_cred(_sock: &UnixStream) -> Result<(crate::Uid, Pid)> {
     Ok((crate::Uid(u32::MAX), Pid::from_raw(0)))
 }
 
-/// Sends one newline-framed JSON message with `fd` attached to it. The peer receives the
+/// Sends one framed JSON message with `fd` attached to it. The peer receives the
 /// descriptor at exactly this point in the byte stream.
 #[cfg(target_os = "linux")]
 fn send_msg_with_fd(
@@ -424,9 +433,7 @@ fn send_msg_with_fd(
     value: &impl Serialize,
     fd: std::os::fd::BorrowedFd<'_>,
 ) -> Result<()> {
-    let mut s = serde_json::to_string(value)?;
-    s.push('\n');
-    send_all_with_fd(sock, s.as_bytes(), fd)
+    send_all_with_fd(sock, &frame(value)?, fd)
 }
 
 /// Writes all of `bytes` to the socket, with `fd` attached to the first chunk only.
@@ -455,7 +462,7 @@ fn send_all_with_fd(
     Ok(())
 }
 
-/// Reads one newline-framed JSON message off a socket, along with an `SCM_RIGHTS` file
+/// Reads one framed JSON message off a socket, along with an `SCM_RIGHTS` file
 /// descriptor if the peer attached one. Returns `None` at a clean EOF. Errors when the
 /// peer closes in the middle of a message.
 ///
@@ -476,7 +483,7 @@ fn read_msg_with_fd<T: DeserializeOwned>(
     let mut fd = None;
     loop {
         match recv_byte_with_fd(sock, &mut fd)? {
-            Some(b'\n') => break,
+            Some(FRAME_END) => break,
             Some(b) => line.push(b),
             None if line.is_empty() => return Ok(None),
             None => return Err(crate::Error::msg("peer closed mid-message")),
@@ -630,7 +637,7 @@ mod tests {
     #[test]
     fn peer_uid_reports_the_other_end() {
         let (a, b) = UnixStream::pair().unwrap();
-        let me = crate::Uid(config::euid());
+        let me = config::euid();
         let a = Conn::new(a).unwrap();
         assert_eq!(a.peer_uid(), me);
         assert_eq!(Conn::new(b).unwrap().peer_uid(), me);

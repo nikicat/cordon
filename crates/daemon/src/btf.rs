@@ -42,9 +42,13 @@ const KIND_ENUM64: u32 = 19;
 /// offset. The bit offset is already masked free of any bitfield-width bits.
 struct Member {
     name_off: u32,
-    type_id: u32,
+    type_id: TypeId,
     bit_offset: u32,
 }
+
+/// A BTF type id, which indexes [`KernelBtf::types`]. Id 0 is the void placeholder.
+#[derive(Clone, Copy)]
+struct TypeId(u32);
 
 /// The part of a BTF type that offset resolution reads. A kind that resolution neither
 /// descends into nor follows (INT, PTR, ENUM, …) becomes `Other`, which keeps nothing.
@@ -57,7 +61,7 @@ enum Ty {
     /// A transparent wrapper (TYPEDEF, CONST, VOLATILE, RESTRICT or TYPE_TAG), which
     /// resolution follows through `ref_id` to reach the real type.
     Modifier {
-        ref_id: u32,
+        ref_id: TypeId,
     },
     Other,
 }
@@ -141,8 +145,8 @@ impl KernelBtf {
     /// Returns the member called `want` in the aggregate `agg_id`, or `None` when there is
     /// none. The member may sit inside an anonymous member, but a direct member of that
     /// name wins.
-    fn find_member(&self, agg_id: usize, want: &str) -> Option<MemberAt> {
-        let Ty::Aggregate { members, .. } = self.types.get(agg_id)? else {
+    fn find_member(&self, agg_id: TypeId, want: &str) -> Option<MemberAt> {
+        let Ty::Aggregate { members, .. } = self.ty(agg_id)? else {
             return None;
         };
         for m in members {
@@ -169,10 +173,10 @@ impl KernelBtf {
 
     /// Returns the id of the STRUCT or UNION that `type_id` names through any modifier
     /// wrappers, or `None` when it names another kind.
-    fn aggregate_of(&self, mut type_id: u32) -> Option<usize> {
+    fn aggregate_of(&self, mut type_id: TypeId) -> Option<TypeId> {
         for _ in 0..16 {
-            match self.types.get(type_id as usize)? {
-                Ty::Aggregate { .. } => return Some(type_id as usize),
+            match self.ty(type_id)? {
+                Ty::Aggregate { .. } => return Some(type_id),
                 Ty::Modifier { ref_id } => type_id = *ref_id,
                 Ty::Other => return None,
             }
@@ -181,10 +185,16 @@ impl KernelBtf {
     }
 
     /// Returns the id of the first STRUCT or UNION called `name`.
-    fn named_aggregate(&self, name: &str) -> Option<usize> {
-        self.types.iter().position(
+    fn named_aggregate(&self, name: &str) -> Option<TypeId> {
+        let i = self.types.iter().position(
             |t| matches!(t, Ty::Aggregate { name_off, .. } if self.name(*name_off) == name),
-        )
+        )?;
+        Some(TypeId(u32::try_from(i).ok()?))
+    }
+
+    /// Returns the type that `id` names, or `None` when it is out of range.
+    fn ty(&self, id: TypeId) -> Option<&Ty> {
+        self.types.get(id.0 as usize)
     }
 
     /// Returns the string at `off` in the string section. The string is empty for offset
@@ -201,25 +211,49 @@ impl KernelBtf {
 /// was looked up in.
 struct MemberAt {
     byte_offset: u32,
-    type_id: u32,
+    type_id: TypeId,
+}
+
+/// The byte order of a BTF blob, which its magic gives.
+#[derive(Clone, Copy)]
+enum ByteOrder {
+    Little,
+    Big,
+}
+
+impl ByteOrder {
+    /// Returns the order whose encoding of [`BTF_MAGIC`] is `magic`, or `None` when it is
+    /// neither.
+    fn of_magic(magic: &[u8]) -> Option<ByteOrder> {
+        if magic == BTF_MAGIC.to_le_bytes() {
+            Some(ByteOrder::Little)
+        } else if magic == BTF_MAGIC.to_be_bytes() {
+            Some(ByteOrder::Big)
+        } else {
+            None
+        }
+    }
+
+    fn u32(self, b: [u8; 4]) -> u32 {
+        match self {
+            ByteOrder::Little => u32::from_le_bytes(b),
+            ByteOrder::Big => u32::from_be_bytes(b),
+        }
+    }
 }
 
 /// A bounds-checked cursor over the blob, in either byte order.
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
-    le: bool,
+    order: ByteOrder,
 }
 
 impl<'a> Reader<'a> {
     fn u32(&mut self) -> Option<u32> {
         let b: [u8; 4] = self.buf.get(self.pos..self.pos + 4)?.try_into().ok()?;
         self.pos += 4;
-        Some(if self.le {
-            u32::from_le_bytes(b)
-        } else {
-            u32::from_be_bytes(b)
-        })
+        Some(self.order.u32(b))
     }
     fn skip(&mut self, n: usize) -> Option<()> {
         self.pos = self.pos.checked_add(n)?;
@@ -232,19 +266,12 @@ impl<'a> Reader<'a> {
 fn parse_btf(bytes: &[u8]) -> Option<KernelBtf> {
     // Detect byte order from the magic. The blob is the running kernel's, so it is
     // native, but honoring the magic costs little and avoids a latent assumption.
-    let magic = bytes.get(0..2)?;
-    let le = if magic == BTF_MAGIC.to_le_bytes() {
-        true
-    } else if magic == BTF_MAGIC.to_be_bytes() {
-        false
-    } else {
-        return None;
-    };
+    let order = ByteOrder::of_magic(bytes.get(0..2)?)?;
     // Skip the magic and the one-byte version and flags, which nothing here depends on.
     let mut hdr = Reader {
         buf: bytes,
         pos: 4,
-        le,
+        order,
     };
     let hdr_len = hdr.u32()?;
     let type_off = hdr.u32()?;
@@ -263,7 +290,7 @@ fn parse_btf(bytes: &[u8]) -> Option<KernelBtf> {
     let mut r = Reader {
         buf: bytes.get(..type_sec.end)?,
         pos: type_sec.start,
-        le,
+        order,
     };
     let mut types = Vec::new();
     types.push(Ty::Other); // id 0 == void
@@ -297,7 +324,7 @@ fn parse_type(r: &mut Reader) -> Option<Ty> {
                 let bit_offset = if kind_flag { raw & 0x00ff_ffff } else { raw };
                 members.push(Member {
                     name_off: m_name,
-                    type_id: m_type,
+                    type_id: TypeId(m_type),
                     bit_offset,
                 });
             }
@@ -305,7 +332,7 @@ fn parse_type(r: &mut Reader) -> Option<Ty> {
         }
         KIND_TYPEDEF | KIND_VOLATILE | KIND_CONST | KIND_RESTRICT | KIND_TYPE_TAG => {
             Some(Ty::Modifier {
-                ref_id: size_or_type,
+                ref_id: TypeId(size_or_type),
             })
         }
         // Resolution never looks inside the other kinds, but the reader must still step
