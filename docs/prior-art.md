@@ -42,20 +42,21 @@ why cordon assigns identity to the *object* instead and lets subjects stay anony
   Flatpak.
 - **macOS TCC** is the closest existing thing to this design. It gates on the object side,
   grants per app, and prompts on first access. It is mainstream and effective. Its two failure
-  modes are ours to avoid. The first is consent fatigue. [authoring flows](authoring.md)'s audit, admit, enforce flow
-  exists partly for this, because it admits from observed evidence rather than from a modal
-  prompt. The second is identity that rests on a code signature, which is the same question
-  that [ADR 0015](adr/0015-fixed-code-grants.md) works through.
+  modes are ours to avoid. The first is consent fatigue. [authoring flows](authoring.md)'s
+  audit, admit, enforce flow exists partly for this, because it admits from observed evidence
+  rather than from a modal prompt. The second is identity that rests on a code signature, which
+  is the same question that [ADR 0015](adr/0015-fixed-code-grants.md) works through.
 - **Windows has the right shape twice, and points it at the wrong verb both times.**
   *Controlled Folder Access* is almost exactly this design, with designated folders and an app
   allowlist. But it gates writes only, because it was built against ransomware. A scraper
   reads, so CFA never sees it. *WDAC/AppLocker* is genuinely default-deny. With DLL-level
-  enforcement it is the closest shipping analogue to the fixed-code invariant of [ADR 0015](adr/0015-fixed-code-grants.md), because an
-  unsigned DLL cannot load into a signed process. But it governs what may execute, not what a
-  running program may read, and consumer machines effectively never run it in enforcement
-  mode. *Credential Guard* shows that Microsoft can do hard isolation when a target matters
-  enough. VBS puts the LSA secrets in VTL1, out of reach of an admin. It also shows that this
-  was done for one target, not as a general mechanism.
+  enforcement it is the closest shipping analogue to the fixed-code invariant of [ADR
+  0015](adr/0015-fixed-code-grants.md), because an unsigned DLL cannot load into a signed
+  process. But it governs what may execute, not what a running program may read, and consumer
+  machines effectively never run it in enforcement mode. *Credential Guard* shows that
+  Microsoft can do hard isolation when a target matters enough. VBS puts the LSA secrets in
+  VTL1, out of reach of an admin. It also shows that this was done for one target, not as a
+  general mechanism.
 - **Chrome's app-bound encryption** (Windows, 2024) is the piece of prior art that tried
   *this* architecture, so it is the most instructive. It shipped because infostealers were
   reading the cookie DB, which shows that the threat is real and unaddressed at the OS layer.
@@ -122,12 +123,12 @@ policy."
   They are a complementary layer, not a substitute.
 
 #### Mandatory Access Control (the per-tool-policy family we reject as primary)
-- **AppArmor, SELinux and macOS Seatbelt (`sandbox-exec`)**: see [ADR 0001](adr/0001-object-centric-gating.md) and [ADR 0002](adr/0002-bpf-lsm-boundary.md). They are
-  subject-centric. Each program needs its own profile or policy, and a program without a
-  profile is unconfined, so an unknown scraper is unrestricted. SELinux *can* be
-  object-centric through labels. But its policy is compiled, it works through domain
-  transitions, and it is Linux-only. We want one object-centric rule that covers all subjects,
-  including unknown ones.
+- **AppArmor, SELinux and macOS Seatbelt (`sandbox-exec`)**: see [ADR
+  0001](adr/0001-object-centric-gating.md) and [ADR 0002](adr/0002-bpf-lsm-boundary.md). They
+  are subject-centric. Each program needs its own profile or policy, and a program without a
+  profile is unconfined, so an unknown scraper is unrestricted. SELinux *can* be object-centric
+  through labels. But its policy is compiled, it works through domain transitions, and it is
+  Linux-only. We want one object-centric rule that covers all subjects, including unknown ones.
 - **Landlock** (Linux, an unprivileged LSM) lets a process restrict its own file system access
   and its children's. It is modern and needs no root. But it is *self*-confinement, so it is
   useless against a scraper that won't opt in. It is the inverse of what we need.
@@ -198,6 +199,7 @@ resource?"
 
 #### Authorization-agent architecture
 - **polkit** pairs a privileged daemon with an unprivileged agent in each session that draws
-  the prompt. cordon's bless reuses that agent rather than copying it, because the
-  elevation tool's prompt is what proves a human is present ([ADR 0013](adr/0013-bless-authentication.md)). But polkit authorizes
-  privileged D-Bus *actions*, not file reads.
+  the prompt. cordon's bless reuses that agent rather than copying it, because the elevation
+  tool's prompt is what proves a human is present ([ADR
+  0013](adr/0013-bless-authentication.md)). But polkit authorizes privileged D-Bus *actions*,
+  not file reads.

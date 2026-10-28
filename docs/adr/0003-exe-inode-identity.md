@@ -26,11 +26,11 @@ Treat the immediate caller and the ancestry chain as different security objects:
   - **Removal.** A double fork reparents the process to init and erases the chain on Linux.
     macOS resists this, because `original_ppid` and the *responsible* audit token survive
     reparenting.
-  - **Construction.** The attacker runs `fork(scraper); exec(real blessed binary)` in the
-    parent. That builds a *genuine* ancestry whose ancestor really is the blessed tool. It
+  - **Construction.** The attacker runs `fork(scraper); exec(real trusted binary)` in the
+    parent. That builds a *genuine* ancestry whose ancestor really is the trusted tool. It
     defeats ancestry on both platforms. Stricter identity does not fix it, whether that is
     `path+inode`, `signature` or macOS code signing, because the binary is authentic and is
-    attested truthfully. Only a liveness window bounds it, where the blessed ancestor must be
+    attested truthfully. Only a liveness window bounds it, where the trusted ancestor must be
     alive at access time. The launcher can also influence macOS's "responsible process"
     attribution (through the `posix_spawn` disclaim attributes), so that is not unforgeable
     either.
@@ -40,17 +40,14 @@ Treat the immediate caller and the ancestry chain as different security objects:
   as on Linux.
 - **Conclusion.** Ancestry raises the cost and is never a boundary. The construction attacker
   belongs to the targeted reverse-engineering class that [threat model](../threat-model.md)
-concedes. The object-centric deny
-  is the boundary.
+concedes. The object-centric deny is the boundary.
 
 ## Consequences
 
-**Lineage lives in the backend.** The backend already runs in the kernel, so ancestry
-hardening is folded in rather than built as a separate proc-connector subsystem. A live walk
-of `task->real_parent` gives the same
-best-effort chain for free at decision time. Lineage that lasts past a process's exit only
-needs `sched_process_{fork,exec}` tracepoints that write `(pid, starttime)` to parent into a
-BPF
-map within this backend. The ceiling is unchanged. A real `exec` of a blessed binary (the
-construction attack, above) is still recorded faithfully, so ancestry stays best-effort and is
-never the boundary.
+**Lineage lives in the backend.** The backend already runs in the kernel, so ancestry hardening
+is folded in rather than built as a separate proc-connector subsystem. A live walk of
+`task->real_parent` gives the same best-effort chain for free at decision time. Lineage that
+lasts past a process's exit only needs `sched_process_{fork,exec}` tracepoints that fill a BPF
+map from `(pid, starttime)` to the parent, within this backend. The ceiling is unchanged. A
+real `exec` of a trusted binary (the construction attack, above) is still recorded faithfully,
+so ancestry stays best-effort and is never the boundary.

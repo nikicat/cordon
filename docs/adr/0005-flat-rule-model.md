@@ -7,14 +7,13 @@ Status: Accepted
 The first design had owners, explicit rules and trust-on-first-use claims, and its kernel
 backend enforced only part of them.
 
-The owner entity reduces to allow rules. `owner_match` means the same as "an allow rule
-exists for this caller exe and this subtree." Owner groups bought grouping, deduplication and
-naming. But a general group mechanism ([ADR 0009](0009-groups.md)) gives that on all axes,
-symmetrically, so a
-dedicated owner table was incidental complexity. Collapsing it also closed a real gap. The
-owner model's bpf-lsm backend enforced only `subtrees` and `owner_identities`, and not the
-`rules` table. So `cordon add` allow and deny rules and TOFU were silently not enforced in the
-kernel. Now there is one model, enforced uniformly.
+The owner entity reduces to allow rules. `owner_match` means the same as "an allow rule exists
+for this caller exe and this subtree." Owner groups bought grouping, deduplication and naming.
+But a general group mechanism ([ADR 0009](0009-groups.md)) gives that on all axes,
+symmetrically, so a dedicated owner table was incidental complexity. Collapsing it also closed
+a real gap. The owner model's bpf-lsm backend enforced only `subtrees` and `owner_identities`,
+and not the `rules` table. So `cordon add` allow and deny rules and TOFU were silently not
+enforced in the kernel. Now there is one model, enforced uniformly.
 
 ## Decision
 
@@ -25,11 +24,13 @@ it uniformly. The status of each milestone is in
 ### The rule
 
 A rule is `(who, where, action, policy)`:
-- **who** is the subject. It is a *conjunction of predicates*, not just an exe ([ADR 0006](0006-subject-predicates.md)).
+- **who** is the subject. It is a *conjunction of predicates*, not just an exe ([ADR
+  0006](0006-subject-predicates.md)).
 - **where** is the object. It is a file, a directory, or a recursive subtree. The kernel
   matches it with the walk over dentry ancestors, and the most specific object wins.
-- **action** is one of `read | write | create | execute | listdir | unlink | mkdir | rmdir |
-  rename | link`, and the list can grow. Each action maps to an LSM hook ([ADR
+-  **action** is one of
+  `read | write | create | execute | listdir | unlink | mkdir | rmdir | rename | link`, and the
+  list can grow. Each action maps to an LSM hook ([ADR
 0007](0007-action-hook-map.md)).
 - **policy** is one of `allow | deny | audit | silence`. The four are the product of
   `{allow,deny}` and `{log,silent}`. `allow` allows silently, `audit` allows and logs, `deny`

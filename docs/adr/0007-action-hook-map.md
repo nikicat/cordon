@@ -11,9 +11,9 @@ uniform: some fire on every open, some on a mutation, and some are hot paths.
 
 | action | LSM hook | notes |
 |---|---|---|
-| read / write / create | `file_open` | One program. `f_flags` and `f_mode` already encode RDONLY, WRONLY, RDWR and `O_CREAT`, so three actions come free at open time. |
+| read / write / create | `file_open` | `f_flags` and `f_mode` already encode RDONLY, WRONLY, RDWR and `O_CREAT`, so three actions come free at open time. |
 | execute | `bprm_check_security` | The exec of a binary. It is not implied by `read` (see below). |
-| unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | A second program. It fires on a mutation, which is cheap. |
+| unlink / rmdir / mkdir / rename | `inode_unlink/_rmdir/_mkdir/_rename` | One program per hook. Each fires only on a mutation, which is cheap. |
 | link | `inode_link` | A distinct hook. `rename` does not cover it (see below). |
 | listdir | `file_open` of a directory (coarse) | It compiles but never fires (see below). Anything finer needs the hot `file_permission` hook. |
 
@@ -95,15 +95,15 @@ running under `LD_PRELOAD` convert a scoped, logged grant into an unscoped, perm
 no subject may escape, not an allowed exe and not a blessed session. Blessing grants *read*,
 not re-parenting.
 
-The cost is deliberate and one-sided. This rule enforces on `audit` objects too, which
-otherwise never enforce. So renames *out of* `~/.config` now fail with `EPERM`, for example in
-an app's config migration or a manual `mv ~/.config/foo ~/backup/`. Renames inside the object
-are unaffected, and they are the common case. Whether an escape is *journaled* still follows
-the object's policy. So a `silence` object refuses it silently, and the split between
-`{allow,deny}` and `{log,silent}` holds. If the cost ever bites, a one-line softening would be
-to allow the escape where a `*` subject may already read the object. The journal cause is a
-distinct synthetic `escape-deny` (like `default-deny`), because "structurally refused" and "a
-rule of yours blocked it" need different fixes.
+The cost is deliberate and one-sided. This rule enforces even where the matching rule says
+`audit`, which otherwise never enforces. So renames *out of* `~/.config` now fail with `EPERM`,
+for example in an app's config migration or a manual `mv ~/.config/foo ~/backup/`. Renames
+inside the object are unaffected, and they are the common case. Whether an escape is
+*journaled* still follows the matching rule's policy. So under a `silence` rule it is refused
+silently, and the split between `{allow,deny}` and `{log,silent}` holds. If the cost ever
+bites, a one-line softening would be to allow the escape where a `*` subject may already read
+the object. The journal cause is a distinct synthetic `escape-deny` (like `default-deny`),
+because "structurally refused" and "a rule of yours blocked it" need different fixes.
 
 Also note an asymmetry that the walk creates. The leaf's own id is tested first. So a rule
 that names a file matches that inode under any name, and it was hardlink-proof even before
@@ -127,29 +127,26 @@ For contrast, these are *not* bypasses:
 
 **Why the destination is classified twice.** The destination directory answers the escape and
 clobber cases, but it cannot answer for the name being overwritten. `rename(2)` onto an
-existing name destroys that inode, and `security_inode_rename` is the only hook the kernel
-fires for it. `security_inode_unlink` is reachable only from `vfs_unlink`, and
-`do_renameat2`'s own target check is `may_delete()`, which checks DAC only. If the target were
-left unclassified, its sibling syscall could bypass the `inode_unlink` gate. `rm secret` would
+existing name destroys that inode, and `inode_rename` is the only hook the kernel fires for it
+(`decide_reparent` in `crates/bpf/src/main.rs` has the call path). If the target were left
+unclassified, its sibling syscall could bypass the `inode_unlink` gate. `rm secret` would
 be refused, while `mv anything secret` destroyed the same inode and left the `PROTECTED` entry
 dangling permanently. Two shapes are invisible to the classification by directory pair:
 
 - **The destination is an object whose parent is not.** Take `deny * * ~/.ssh/authorized_keys`
   with no rule on `~/.ssh`. Both directory walks miss, so the pair reads as `(None, None)`,
   meaning "nothing protected is moving".
-- **The destination is a nested object that is more specific.**
-  `mv ~/.aws/tmp ~/.aws/.danger-token` reads as an internal shuffle, because both sides
-  resolve to `~/.aws`. But the `silence` object it overwrites is a different and tighter one.
-  Precedence ([ADR 0008](0008-precedence.md)) says that the more specific object wins, and
-taking the directory's
-  verdict inverts that.
+-  **The destination is a nested object that is more specific.**
+  `mv ~/.aws/tmp ~/.aws/.danger-token` reads as an internal shuffle, because both sides resolve
+  to `~/.aws`. But the object it overwrites is a different and tighter one, under a `silence`
+  rule. Precedence ([ADR 0008](0008-precedence.md)) says that the more specific object wins,
+  and
+taking the directory's verdict inverts that.
 
 So `find_object` runs on `new_dentry` itself, first, before the shuffle short-circuit. A hit
 takes that object's own `write` verdict. That is the same treatment `inode_unlink` gives,
 because it is the same event. `link` is unaffected, because its target is always negative.
-`do_linkat` resolves with `LOOKUP_CREATE`, so an existing name fails with `EEXIST` before the
-hook runs. And `Dentry::inode` returns `None` on a NULL `d_inode`, so the walk yields nothing
-on its first step. Atomic save still works. A rename over a name in an object that the
+Atomic save still works. A rename over a name in an object that the
 subject may already write takes that same `allow`, so the shuffle proceeds. The check bites
 only where the destination carries a tighter rule, which is the case worth biting on.
 

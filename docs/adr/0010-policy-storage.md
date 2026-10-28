@@ -73,8 +73,8 @@ write it, and an edit in progress must never be half-enforced.
   > in the home.
 - **The policy is applied explicitly.** `cordon policy apply` parses, lints and compiles the
   policy, and then swaps the BPF maps atomically. There is no autoreload, and no inotify or
-  SIGHUP watch. Changes take effect only on an explicit apply, so an edit in progress is never
-  half-enforced.
+  SIGHUP watch. Changes take effect only on an explicit apply (`policy apply`, or `policy edit` on
+  save), so an edit in progress is never half-enforced.
 - **`cordon policy check`** is the linter and compiler, and it needs no daemon. It reports
   unknown group references and cycles. It warns about exes that don't resolve and drops their
   rules. It marks objects that don't resolve yet as pending, and it checks the cap on rules per
@@ -84,44 +84,43 @@ write it, and an edit in progress must never be half-enforced.
   copies the root-owned file to a private temp file and runs `$EDITOR` as the invoking user,
   never as root. `sudo $EDITOR policy.toml` would run the editor as root. Then a same-uid
   scraper ([threat model](../threat-model.md)) that wrote your `.vimrc` or your editor
-plugins would get root, which is a
-  self-inflicted escalation in cordon's own threat model. After the editor exits, the command
-  validates, applies and saves the policy in one step. Like visudo, it rejects a policy that
-  won't compile, shows the diagnostics and prompts again, rather than saving a broken file. It
-  writes the file only after the daemon accepts the policy, so the file on disk matches the
-  live policy. If the daemon is down, the file is saved with a warning that it was not
-  applied. The command manages its own privilege. The CLI stays root in the parent and drops
-  privilege only in the editor child. It reuses `PolicyApply` and needs no new IPC.
+plugins would get root, which is a self-inflicted escalation in cordon's own threat model.
+After the editor exits, the command validates, applies and saves the policy in one step. Like
+visudo, it rejects a policy that won't compile, shows the diagnostics and prompts again, rather
+than saving a broken file. It writes the file only after the daemon accepts the policy, so the
+file on disk matches the live policy. If the daemon is down, the file is saved with a warning
+that it was not applied. The command manages its own privilege. The CLI stays root in the
+parent and drops privilege only in the editor child. It reuses `PolicyApply` and needs no new
+IPC.
 
-  Bare `cordon policy edit` opens the invoker's own user tier. That is the common case, and
-  it is why the dangerous target is the explicit one. `--system` edits the system policy.
+  Bare `cordon policy edit` opens the invoker's own user tier. That is the common case, and it
+  is why the dangerous target is the explicit one. `--system` edits the system policy.
   `cordon policy edit FILE` edits a system file, and a bare name means that conf.d fragment.
   `cordon policy edit --user NAME` edits the user-tier file that a system `[[include]]` binds
-  to `NAME`, and that file is validated against the home scope. The invoker is `SUDO_UID`
-  under sudo, and the caller's own euid when unprivileged, which is what the future posture of
-  editing without sudo needs. Real root with neither has no tier of its own and must name a
-  target. When no include exists yet, `--user` bootstraps itself. It opens the file at the
-  conventional path (`…/users/NAME.toml`). Only after the edit validates and saves does it
+  to `NAME`, and that file is validated against the home scope. The invoker is `SUDO_UID` under
+  sudo, and the caller's own euid when unprivileged; the euid case is what a future edit
+  without sudo needs. Real root that is not running under sudo has no tier of its own and must
+  name a target. When no include exists yet, `--user` bootstraps itself. It opens the file at
+  the conventional path (`…/users/NAME.toml`). Only after the edit validates and saves does it
   register the `[[include]]` in `…/conf.d/00-users.toml`. So a cancelled or rejected edit never
   leaves a stale binding. It reaches the daemon only through `PolicyApply`, so the socket
   authorization below covers it.
 
 ## Consequences
 
-- **Socket authorization** (✅ B2). The gate is `authorize` in `crates/daemon/src/ipc.rs`. It
-  is a pure table over the peer's uid from `SO_PEERCRED`, with an exhaustive match, so nobody
-  can add a new verb without choosing a side. `PolicyApply` and `BlessApprove` (the
-  human-presence step, [ADR 0013](0013-bless-authentication.md)) require root. The reads
-(`Status`, `PolicyShow`, `BlessList`) are
-  open. So is `BlessRequest`, which does nothing until a root peer approves it. `BlessRevoke`
-  is open at the socket, and the backend checks ownership, because that is where the live
-  table is. Root may revoke anything, and anyone else may revoke only what they minted.
+- **Socket authorization** (✅ B2). The gate is `authorize` in `crates/daemon/src/ipc.rs`. It is
+  a pure table over the peer's uid from `SO_PEERCRED`, with an exhaustive match, so nobody can
+  add a new verb without choosing a side. `PolicyApply` and `BlessApprove` (the human-presence
+  step, [ADR 0013](0013-bless-authentication.md)) require root. The reads (`Status`,
+  `PolicyShow`, `BlessList`) are open. So is `BlessRequest`, which does nothing until a root
+  peer approves it. `BlessRevoke` is open at the socket, and the backend checks ownership,
+  because that is where the live table is. Root may revoke anything, and anyone else may revoke
+  only what they minted.
 
   The socket mode is `0666`, and this is deliberate. `connect(2)` on a Unix socket needs
   *write* permission. So a `root:root` socket would make every verb root-only in practice, and
   `cordon bless list` would be unusable from a user account ([ADR 0012](0012-blessing.md)).
-The file mode decides who
-  can *reach* the daemon, and `authorize` decides what they may do.
+The file mode decides who can *reach* the daemon, and `authorize` decides what they may do.
 
   **Deployment posture.** `0666` makes `PolicyShow` world-readable, which discloses protected
   *paths* to any local account. On a single-user workstation that is the intent. A multi-user
@@ -130,6 +129,7 @@ The file mode decides who
   and only the reach is narrower.
 - **The swap in the kernel is atomic.** The rule maps are banked, so an `apply` has no visible
   window (the double buffer in [ADR 0002](0002-bpf-lsm-boundary.md), and `Maps::seed`).
-- **Learned rules** live in a *separate* SQLite database, because they change often and a
-  machine manages them. They have lower precedence and never override a hand-written deny.
-  They are promoted into the text file on review ([ADR 0011](0011-autolearn.md)).
+- **Learned rules** (not built yet) will live in a *separate* SQLite database, because they
+  change often and a machine manages them. They have lower precedence and never override a
+  hand-written deny. They are promoted into the text file on review ([ADR
+  0011](0011-autolearn.md)).

@@ -35,8 +35,7 @@ object's catch-all rule, and there is no system-wide switch. This deliberately d
 `enforce|permissive|off`. cordon's user is the admin of their *own* policy, iterating live on
 one box, not an admin staging policy for a fleet. So a global "permissive" preview followed by
 an "enforce" cutover is just the progression from audit to deny ([authoring
-flows](../authoring.md)). "Off" is an empty
-policy, or `cordond --teardown`. Stopping the daemon leaves the pinned boundary enforcing
-([ADR 0002](0002-bpf-lsm-boundary.md)).
-The kernel blocks if and only if the matched rule's policy denies (`Policy::denies` in
+flows](../authoring.md)). "Off" is an empty policy, or `cordond --teardown`. Stopping the
+daemon leaves the pinned boundary enforcing ([ADR 0002](0002-bpf-lsm-boundary.md)). The kernel
+blocks if and only if the matched rule's policy denies (`Policy::denies` in
 `crates/bpf-common/src/policy_maps.rs`).

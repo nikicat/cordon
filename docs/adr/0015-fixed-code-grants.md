@@ -88,13 +88,13 @@ to be static.
 It must be an allowlist, not a blocklist. Enumerating interpreters is an unbounded task, and
 [ADR 0001](0001-object-centric-gating.md) rejects exactly that shape (*unprofiled means
 unconfined*). The dangerous cases are not the obvious ones. They are fixed ELF binaries with
-embedded interpreters, such as `gdb`,
-`vim +python` and anything that links lua. These look like ordinary compiled tools and fire
-no hook. So the check is inverted. A subject that appears in an `allow` rule must positively
-attest that it runs fixed code. It does so with the same `code =` token that the policy
-surface below introduces. Without an attestation, `cordon policy check` warns that the rule
-is a confused-deputy grant. This limits the vetting to the handful of exes that actually hold
-grants, rather than the whole system. The code-set enumeration makes the same argument.
+embedded interpreters, such as `gdb`, `vim +python` and anything that links lua. These look
+like ordinary compiled tools and fire no hook. So the check is inverted. A subject that appears
+in an `allow` rule must positively attest that it runs fixed code. It does so with the same
+`code =` token that the policy surface below introduces. Without an attestation,
+`cordon policy check` warns that the rule is a confused-deputy grant. This limits the vetting
+to the handful of exes that actually hold grants, rather than the whole system. The code-set
+enumeration makes the same argument.
 
 **A recorded consequence is that the shipped example policy loses `allow /usr/bin/aws`.** The
 aws CLI is Python, and the first audit run recorded `python3`, not `aws`, opening `~/.aws`.
@@ -334,11 +334,11 @@ compromised renderer can rewrite `mm->arg_start..arg_end` with a memcpy. So the 
 matches on the sandbox state itself, which is one-way kernel state that the task cannot shed.
 The tests are `task->seccomp.mode != 0` and `cred->user_ns != &init_user_ns`, the latter being
 Chrome's layer-1 namespace sandbox. That costs two dereferences, resolved through BTF like the
-existing chain from `file` to `inode` to `sb`, and one more `SubjectFlags` bit. [ADR
-0006](0006-subject-predicates.md) notes that a fifth predicate bit extends matching and
-specificity for free. The predicate is strictly fail-safe against an attacker, because it only
-ever narrows an `exe` grant. Someone who declines to sandbox themselves still fails the `exe`
-check.
+existing chain from `file` to `inode` to `sb`, and one more `SubjectFlags` bit, which extends
+matching and specificity for free (see `SubjectFlags` in
+`crates/bpf-common/src/policy_maps.rs`). The predicate is strictly fail-safe against an
+attacker, because it only ever narrows an `exe` grant. Someone who declines to sandbox
+themselves still fails the `exe` check.
 
 This was measured on 2026-07-27 (7.1.5-zen1-1-zen, Firefox 153.0, and Chrome
 150.0.7871.46 headless). The method was to find the processes holding the profile's
@@ -437,9 +437,9 @@ There are four conclusions, and only the first is the security property:
   and pay for the lookup. `CODE_SETS` also says whether the mode is `learn` or `strict`.
 - Taint: one bit, cleared on `execve`. The choice of map and the propagation across fork and
   threads are the open question in *The mechanism* above. Settle that before writing the hooks,
-  because it decides whether `task_alloc` is a fourth attach point. - `SubjectFlags` gains an
-  `UNTAINTED` bit. [ADR 0006](0006-subject-predicates.md) notes that a fifth predicate bit
-  extends matching and specificity for free.
+  because it decides whether `task_alloc` is a fourth attach point.
+- `SubjectFlags` gains an `UNTAINTED` bit. Its doc in `crates/bpf-common/src/policy_maps.rs`
+  notes that a fifth bit extends matching and specificity for free.
 - No new BTF offsets are needed. The hooks hand over a `struct file *`, and the existing chain
   from `file_f_inode` through `inode_i_ino` and `inode_i_sb` to `sb_s_dev` already yields a
   `FileId`.

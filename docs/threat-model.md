@@ -1,6 +1,7 @@
 # Threat model
 
-Who cordon defends against, and what it concedes. [ADR 0001](adr/0001-object-centric-gating.md) is the design that follows from it.
+Who cordon defends against, and what it concedes. [ADR 0001](adr/0001-object-centric-gating.md)
+is the design that follows from it.
 
 **In scope (defeat these).** One-shot scrapers, which run once, scan paths, exfiltrate and
 exit, with the same UID as you. They come in rungs: hardcoded path lists, directory walkers and

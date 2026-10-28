@@ -29,8 +29,8 @@ Unix permissions separate users, not programs. A `curl … | sh`, an npm `postin
 compromised editor extension and an infostealer all run at your uid, and any of them can scoop
 the lot in one pass. AppArmor and SELinux do essentially nothing here by default, and not by
 oversight. Confinement is a property of the program, and an unknown program is unconfined. A
-scraper is by definition an unknown program.
-([The long version, with what each incumbent actually does.](docs/prior-art.md#what-the-incumbents-actually-do-to-a-scraper))
+scraper is by definition an unknown program. ([The long version, with what each incumbent
+actually does.](docs/prior-art.md#what-the-incumbents-actually-do-to-a-scraper))
 
 ## What cordon does
 
@@ -43,7 +43,7 @@ user = "alice"                                          # the user whose ~ these
 
 rules = '''
 allow    @ssh-tools     read,write   ~/.ssh             # ssh/scp/sftp: unchanged
-allow    /usr/bin/aws   read,write   ~/.aws             # the aws CLI: unchanged
+allow    /usr/bin/gh    read,write   ~/.config/gh       # the GitHub CLI: unchanged
 audit    *              read         @cloud-creds       # everyone else: allowed, but logged
 '''
 
@@ -83,9 +83,9 @@ policy.toml ──parse──> resolve groups ──compile──> flat per-obje
 
 - **Root-owned text policy, compiled in userspace.** Groups, nesting and precedence resolve
   at compile time into a flat rule table for each protected object. The kernel side does a
-  first-match scan and nothing else. Precedence goes by object depth first, then by subject
-  specificity, then deny over allow. So a rule on `~/.aws/.danger-token` beats one on
-  `~/.aws`.
+  first-match scan and nothing else. The most specific rule wins
+  ([ADR 0008](docs/adr/0008-precedence.md)), so a rule on `~/.aws/.danger-token` beats one
+  on `~/.aws`.
 - **Enforced in the kernel.** The BPF-LSM program is written in Rust with
   [aya](https://github.com/aya-rs/aya). It hooks `file_open` for read, write and create, and
   `bprm_check_security` for exec. It also hooks `inode_link`, `inode_rename`, `inode_unlink`,
@@ -138,8 +138,8 @@ evaporates when the command exits, it reaches only the objects its rules name, a
 blessed access is journaled with its class.
 ([ADR 0012](docs/adr/0012-blessing.md))
 
-> Sudoers note. sudo caches authentication for about 15 minutes, so a second `bless` in that
-> window won't prompt. To require a human for every grant, add this line:
+> Sudoers note. sudo caches authentication (for 5 minutes by default), so a second `bless` in
+> that window won't prompt. To require a human for every grant, add this line:
 > `Defaults!/usr/bin/cordon timestamp_timeout=0`
 
 ## Enforcement outlives the daemon
@@ -246,9 +246,9 @@ These are stated plainly, because a security tool that oversells itself is worse
 - **`LD_PRELOAD` and interpreted subjects break `exe` identity.** `LD_PRELOAD=evil.so ssh -V`
   runs attacker code with `ssh`'s identity and inherits its grants. A script surfaces as its
   interpreter (`python3`, not `aws`). So today every static `allow` is a potential
-  confused-deputy grant. M6 ([ADR 0015](docs/adr/0015-fixed-code-grants.md)) closes this hole with a sticky load-time taint. Until it ships,
-  `bless` is the honest answer for anything sensitive, because it proves human presence rather
-  than code identity.
+  confused-deputy grant. M6 ([ADR 0015](docs/adr/0015-fixed-code-grants.md)) closes this hole
+  with a sticky load-time taint. Until it ships, `bless` is the honest answer for anything
+  sensitive, because it proves human presence rather than code identity.
 - **Root is out of scope.** So is a resident attacker who uses ptrace, waits for unlocks or
   replaces binaries. The design targets one-shot same-uid scrapers and bounds the blast radius.
   It does not claim to beat a persistent adversary already running as you.

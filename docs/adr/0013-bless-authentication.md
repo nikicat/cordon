@@ -1,6 +1,7 @@
 # ADR 0013: Bless authenticates by client-side elevation
 
-Status: Accepted (shipped in B2); PAM in the daemon is the planned upgrade (B3 in [todo.md](../../todo.md))
+Status: Accepted (shipped in B2); PAM in the daemon is the planned upgrade (B3 in
+[todo.md](../../todo.md))
 
 ## Context
 
@@ -10,16 +11,15 @@ daemon must never trust a client's claim about who it is.
 ## Decision
 
 The requirement from [ADR 0012](0012-blessing.md) is that a human at the keyboard proves
-presence at mint time. What
-satisfies it is reaching uid 0. The daemon refuses to approve a mint for any other peer, and
-every elevation tool worth the name puts a human in front of that transition. Which tool is
-used is not cordon's business, deliberately so, and `$CORDON_SUDO` is the seam.
+presence at mint time. What satisfies it is reaching uid 0. The daemon refuses to approve a
+mint for any other peer, and every elevation tool worth the name puts a human in front of that
+transition. Which tool is used is not cordon's business, deliberately so, and `$CORDON_SUDO` is
+the seam.
 
 - **The boundary is uid 0, as `SO_PEERCRED` reports it, on `BlessApprove`.** The kernel attests
   it, and the client never asserts it. The rest of the verb table is the socket authorization
   in [ADR 0010](0010-policy-storage.md). `BlessRequest` is open, because asking is not
-getting, and the backend checks
-  ownership for `BlessRevoke`.
+getting, and the backend checks ownership for `BlessRevoke`.
 
 - **The mint is a handshake over two connections**, because the two facts it needs come from
   two different peers:
@@ -57,17 +57,16 @@ getting, and the backend checks
   real daemon and answer the victim with that nonce. The human's authentication would then
   mint a carrier for the attacker. The human really did authenticate, just not for their own
   request. A blessing from a daemon that is not root could not grant anything anyway ([ADR
-0012](0012-blessing.md)),
-  so refusing costs nothing.
+0012](0012-blessing.md)), so refusing costs nothing.
 
 ## Consequences
 
 - **Known deltas, accepted:**
-  - **An elevation tool's authentication cache is a grace window.** [ADR 0012](0012-blessing.md) argues for *no*
-    cache, but sudo has one (about 15 minutes by default). So a resident adversary who runs
-    `cordon bless` inside that window mints without a human. *Deployment note:* setting
-    `Defaults!/usr/bin/cordon timestamp_timeout=0` in sudoers restores the no-grace property
-    for this command.
+  - **An elevation tool's authentication cache is a grace window.** [ADR
+    0012](0012-blessing.md) argues for *no* cache, but sudo has one (5 minutes by default). So
+    a resident adversary who runs `cordon bless` inside that window mints without a human.
+    *Deployment note:* setting `Defaults!/usr/bin/cordon timestamp_timeout=0` in sudoers
+    restores the no-grace property for this command.
   - **Only sudoers can bless.** A non-sudoer cannot bless their own tools, because they cannot
     reach uid 0 to approve. PAM in the daemon would authenticate *the requesting user* instead,
     and it needs no admin rights at all. That is why it remains the intended upgrade.

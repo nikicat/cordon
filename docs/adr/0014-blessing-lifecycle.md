@@ -34,18 +34,17 @@ and survive a daemon restart without granting anything new.
 
    A parent that is not root-owned is refused. `user@UID.service` and everything below it is
    delegated to the user. A parent owned by the user would let the invoker rmdir an empty
-   carrier and mkdir a replacement onto a recycled inode, which is a cgroup id that is still
-   registered. In that case the daemon falls back to its own cgroup, where the blessing still
-   *works*, but the blessed shell loses polkit. The daemon registers
+   carrier and mkdir a replacement that reuses its inode number, and so its cgroup id, which
+   `BLESSED` still has registered. In that case the daemon falls back to its own cgroup, where
+   the blessing still *works*, but the blessed shell loses polkit. The daemon registers
    `BLESSED[cgroup_id] = ClassId(NAME)` and sends the carrier's `cgroup.procs` descriptor back
    down the requester's connection ([ADR 0012](0012-blessing.md)).
 5. **The CLI is the spawner, and it is unprivileged throughout.** It forks, and the child's
    `pre_exec` writes the child's own pid through that descriptor and then execs. The child
-joins
-   *before* `exec`, so the target runs zero instructions unblessed. No privilege is dropped,
-   because there never was any privilege. The write succeeds on the credentials of the
-   descriptor's *opener*. The environment, cwd, tty, job control, signals and exit code are
-   inherited, because nothing ever moved them.
+joins *before* `exec`, so the target runs zero instructions unblessed. No privilege is dropped,
+because there never was any privilege. The write succeeds on the credentials of the
+descriptor's *opener*. The environment, cwd, tty, job control, signals and exit code are
+inherited, because nothing ever moved them.
 6. Descendants inherit the cgroup, and so they inherit the blessing. `bless -- bash` blesses
    the whole subtree.
 7. **GC on exit.** The daemon watches the `populated` flag in the carrier's `cgroup.events`.
@@ -60,15 +59,16 @@ joins
    because a user who minted one unprivileged must be able to revoke it the same way. A
    blessing adopted at restart (step 9) has no recorded minter, so only root may revoke it
    (`may_revoke`).
-9. **Restart reconciliation.** Only the LSM links are pinned ([ADR 0002](0002-bpf-lsm-boundary.md)), so a restarted daemon loads
-   a fresh, empty `BLESSED`, which fails closed. At startup the daemon scans every directory
-   that placement can choose for leftover carriers. That is its own cgroup, every
-   `user-*.slice` and every `session-*.scope` (`carrier_roots`). Empty carriers are removed.
-   A populated carrier is registered again if its class is still declared. A populated carrier
-   whose class vanished is adopted as inert, which means it is only garbage-collected, because
-   a live process tree is never killed for a policy change under it. Only root-owned
-   directories are adopted. Registering a carrier again is a *grant*, so it is held to the
-   same trust check as placement in step 4.
+9. **Restart reconciliation.** Only the LSM links are pinned ([ADR
+   0002](0002-bpf-lsm-boundary.md)), so a restarted daemon loads a fresh, empty `BLESSED`,
+   which fails closed. At startup the daemon scans every directory that placement can choose
+   for leftover carriers. That is its own cgroup, every `user-*.slice` and every
+   `session-*.scope` (`carrier_roots`). Empty carriers are removed. A populated carrier is
+   registered again if its class is still declared. A populated carrier whose class vanished is
+   adopted as inert, which means it is only garbage-collected, because a live process tree is
+   never killed for a policy change under it. Only root-owned directories are adopted.
+   Registering a carrier again is a *grant*, so it is held to the same trust check as placement
+   in step 4.
 
 ```mermaid
 sequenceDiagram

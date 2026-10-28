@@ -23,4 +23,5 @@ cites them as `ADR NNNN`.
 
 Reference material that is not a decision: the [threat model](../threat-model.md),
 [limitations](../limitations.md), [testing](../testing.md), [authoring flows](../authoring.md)
-and [prior art](../prior-art.md). What exists is in [STATUS](../../STATUS.md), and what is left in [todo.md](../../todo.md).
+and [prior art](../prior-art.md). What exists is in [STATUS](../../STATUS.md), and what is left
+in [todo.md](../../todo.md).

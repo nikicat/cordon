@@ -6,11 +6,6 @@ others keep their numbers. The decisions behind the work are in [docs/adr](docs/
 
 ## Cleanup
 
-6. Markdown:
-   - Fix the false claims.
-   - Replace README's example.
-   - Add the SANTA banner.
-   - Consolidate the duplicated facts.
 7. A fresh re-check over the touched files.
 8. `cordon policy check` prints each diagnostic's file twice (`policy.toml:policy.toml: error…`):
    it prefixes the path, and the diagnostic already names its source.
@@ -45,9 +40,8 @@ The last must-have; it closes the `LD_PRELOAD` hole. The design is
 ## Loose ends
 
 18. `cordon policy check` should warn on a rule whose actions name `listdir` without `read`:
-    such a rule denies the listing it appears to grant ([ADR 0007](docs/adr/0007-action-hook-map.md)).
-19. Compile-stage diagnostics (pending-path warnings) carry only `line:col`, not the conf.d
-    fragment. A source id on `Pos` closes it.
+    such a rule denies the listing it appears to grant ([ADR
+    0007](docs/adr/0007-action-hook-map.md)).
 20. Detect cgroup v1 and hybrid setups and refuse with a clear diagnostic; only the unified
     hierarchy is supported.
 21. VM coverage of the systemd packaging. The smoke runs under virtme-ng's init, so nothing
@@ -57,11 +51,11 @@ The last must-have; it closes the `LD_PRELOAD` hole. The design is
 
 ## Deferred until the core is sound
 
-22. B3: PAM in the daemon replaces the uid-0 mint gate ([ADR 0013](docs/adr/0013-bless-authentication.md)).
-    A non-sudoer can then bless their own tools, and every mint authenticates, which retires
-    the sudo grace window. B2 already ships the `SCM_RIGHTS` hand-off, so this only swaps what
-    proves a human is present. Open: whether some users may bless with less than a full PAM
-    conversation (`pam_u2f` only, or a group).
+22. B3: PAM in the daemon replaces the uid-0 mint gate ([ADR
+    0013](docs/adr/0013-bless-authentication.md)). A non-sudoer can then bless their own tools,
+    and every mint authenticates, which retires the sudo grace window. B2 already ships the
+    `SCM_RIGHTS` hand-off, so this only swaps what proves a human is present. Open: whether
+    some users may bless with less than a full PAM conversation (`pam_u2f` only, or a group).
 23. B4: blessing ergonomics. A richer `bless list`, a structured journal, `revoke` polish, a
     blessed-shell marker derived from cgroup membership (never the environment), an optional
     `--path P` that narrows one invocation, and an optional `pam_u2f` touch on every mint.
@@ -92,6 +86,7 @@ Taken when a real policy needs them ([ADR 0006](docs/adr/0006-subject-predicates
 Parked, with no step until something forces it:
 - `MAX_RULES_PER_OBJ = 32`. Raise it toward 64 if a verifier log demands it; `policy check`
   already errors on an oversized bucket.
-- A per-object default, instead of falling to the global default-deny ([ADR 0008](docs/adr/0008-precedence.md)).
+- A per-object default, instead of falling to the global default-deny ([ADR
+  0008](docs/adr/0008-precedence.md)).
 - Subject groups expand at compile time, so buckets grow with group size times nesting depth.
   If that binds, keep a `(GroupId, exe)` membership map instead.

@@ -6,11 +6,12 @@
 
 ## Where things stand
 
-The architecture is the flat rule model ([ADR 0005](docs/adr/0005-flat-rule-model.md)). A root-owned text policy of
-`(who, where, action, policy)` rules is compiled in userspace and enforced in the kernel by
-the `bpf-lsm` backend. M1, M3 and M5 are complete and VM-validated, and so are blessing stages
-B1 and B2 ([ADR 0012](docs/adr/0012-blessing.md)). The `bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12 kernel.
-The migration retired the earlier owner model, as *Pre-rule-model history* below describes.
+The architecture is the flat rule model ([ADR 0005](docs/adr/0005-flat-rule-model.md)). A
+root-owned text policy of `(who, where, action, policy)` rules is compiled in userspace and
+enforced in the kernel by the `bpf-lsm` backend. M1, M3 and M5 are complete and VM-validated,
+and so are blessing stages B1 and B2 ([ADR 0012](docs/adr/0012-blessing.md)). The
+`bpf-lsm-smoke.sh` suite is green on the CI-pinned v6.12 kernel. The migration retired the
+earlier owner model, as *Pre-rule-model history* below describes.
 
 Enforcement is now fail-safe. The LSM links are pinned to bpffs, so the boundary survives the
 daemon crashing, being killed, or being restarted. M6 is the last must-have.
@@ -19,20 +20,13 @@ What is left is in [`todo.md`](todo.md).
 
 ## What's implemented
 
-**The rule pipeline.** It runs in three stages. `parse` turns TOML into spans. It accepts both
-the verbose `[[rule]]` surface and the compact one-rule-per-line DSL, and normalizes both to
-one `ParsedRule`. `resolve` expands groups on all three axes, validates cycles and
-references, and expands `~`. `compile` takes the cross product, applies copy-down object
-precedence, and produces sorted, deduplicated per-object buckets with a size cap.
-Diagnostics carry a source `Pos`. The compiled form is the contract in
-`crates/bpf-common/src/policy_maps.rs`.
-
-**Precedence.** Precedence goes by object depth first, then by subject specificity, then deny
-over allow. There is no global mode. The per-rule `policy` is the only enforcement level, so
-`audit` observes an object and `deny` enforces it, one object at a time. That is what makes
-the audit, admit, enforce flow ([authoring flows](docs/authoring.md)) work object by object. "Off" means an empty policy or
-`cordond --teardown`. Stopping the daemon leaves enforcement up (see *Fail-safe pinning*
-below).
+**The rule pipeline** (`crates/core/src/policy`). `parse` turns TOML into a `ParsedPolicy`
+that keeps source spans, accepting both the verbose `[[rule]]` surface and the compact
+one-rule-per-line DSL. `resolve` expands groups on all three axes and expands `~`. `compile`
+applies copy-down precedence ([ADR 0008](docs/adr/0008-precedence.md)) and produces sorted,
+size-capped per-object buckets. The compiled form is the contract in
+`crates/bpf-common/src/policy_maps.rs`. There is no global mode: the per-rule `policy` is the
+only enforcement level, so "off" is an empty policy or `cordond --teardown`.
 
 **In the kernel** (`crates/bpf`, `file_open`). The program walks the dentry chain up to the
 deepest `PROTECTED` object and derives the action from `f_mode` and `f_flags`. It then scans
@@ -41,52 +35,33 @@ Records carry the actual opened path, rebuilt from `d_name` up to the matched ob
 (`fill_comps` in `crates/bpf/src/kernel.rs`), because `bpf_d_path` is unavailable at
 `file_open`.
 
-**Sound directory objects** (`inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir`). A
-directory protects its children by ancestry. So a second name for a protected inode, made by
-a hardlink or by a rename out of the directory, gives it an ancestry that avoids the object.
-The file would then be readable by everything, permanently and without a log line. The escape
-case, where a protected inode takes a name outside its object, is refused unconditionally.
-It gets no rule lookup and no blessing exemption. The clobber and destroy cases are ordinary
-writes and take the subject's verdict, so `audit` objects keep working. A rename inside the
-object short-circuits, and that is what keeps atomic save working inside a protected
-directory. `inode_mkdir` joins these hooks and classifies by the parent directory, because a
-dentry that is about to be created is negative and matches nothing itself. Every mutation
-program shares `find_object`, so each one enters with a dentry rather than a `struct file`.
-A rename over an existing name is a fourth case. It is classified by the destination dentry
-rather than by its directory. Such a rename destroys the inode at the destination, and
-`inode_rename` is the only hook the kernel fires for it. Without this case,
-`mv anything secret` would do what `rm secret` is refused (`decide_reparent` in
-`crates/bpf/src/main.rs`). See [ADR 0007](docs/adr/0007-action-hook-map.md).
+**Sound directory objects** (`inode_link`, `inode_rename`, `inode_unlink`, `inode_rmdir`,
+`inode_mkdir`). A directory protects its children by ancestry, so a hardlink or a rename out
+of it would give a secret an unguarded name. That escape is refused unconditionally. A
+clobber, a destroy (including a rename over an existing protected name) and a `mkdir` are
+ordinary writes and take the subject's verdict, so `audit` rules keep working. A rename
+inside one object short-circuits, which keeps atomic save working. The cases are
+[ADR 0007](docs/adr/0007-action-hook-map.md)'s, and `decide_reparent` in
+`crates/bpf/src/main.rs` implements them.
 
 **Volume control.** Tools re-open one config hundreds of times per run (helm opens
-`~/.kube/config` 464 times). So an in-kernel LRU suppressor emits at most one event per key
-per second and folds the rest into a `suppressed` count (`throttle` in
-`crates/bpf/src/kernel.rs`). The key is `SuppressKey`, which holds `(exe, opened file,
-action)`, so sibling files under one object surface separately. The daemon's `coalesce` then
-folds each drain batch into one journal line per key.
+`~/.kube/config` 464 times). So an in-kernel LRU suppressor emits at most one event per key per
+second and folds the rest into a `suppressed` count (`throttle` in `crates/bpf/src/kernel.rs`).
+The key is `SuppressKey`, which holds `(exe, opened file, action)`, so sibling files under one
+object surface separately. The daemon's `coalesce` then folds each drain batch into one journal
+line per key.
 
-**Atomic apply.** The three rule maps are banked, so a re-seed is never half-visible.
-`Maps::seed` in `crates/daemon/src/backend/bpf_lsm/seed.rs` fills the inactive bank and flips
-`Settings.active_bank`. There is a single writer by construction, because every map write goes
-through the one `ControlMsg` channel to the backend thread that owns the `&mut Ebpf`.
+**Atomic apply** (`Maps::seed` in `crates/daemon/src/backend/bpf_lsm/seed.rs`). The rule maps
+are banked, and an apply fills the inactive bank and flips one word.
 
-**Fail-safe pinning.** The seven LSM links are pinned to bpffs, and nothing else is. A pinned
-link holds its program, and a program holds its maps. So the boundary, including the seeded
-policy, stays up with no process holding it. A restarting daemon adopts nothing. That keeps
-the single-writer invariant, and it means an upgrade never drives the old kernel program.
-`PinDir::pin_links` in `crates/daemon/src/backend/bpf_lsm/pin.rs` owns the handover order and
-the generation directory made for each run. What the handover buys is that the previous
-boundary stands until the replacement is proven, so a daemon that aborts on a bad policy
-leaves enforcement up. Two consequences surprise people. `systemctl stop cordond` does not
-stop enforcement. `cordond --teardown` does, and it refuses to run while a daemon runs. And
-teardown is asynchronous (`PinDir::teardown`), so anything that must see the boundary down
-has to poll.
+**Fail-safe pinning** (`PinDir` in `crates/daemon/src/backend/bpf_lsm/pin.rs`,
+[ADR 0002](docs/adr/0002-bpf-lsm-boundary.md)). Only the LSM links are pinned, and they keep
+the programs and the seeded policy enforcing with no process holding them. Two consequences
+surprise people. `systemctl stop cordond` does not stop enforcement; `cordond --teardown`
+does, and it refuses while a daemon runs. And teardown is asynchronous, so anything that must
+see the boundary down has to poll.
 
-**One daemon per socket** (`acquire_singleton` in `crates/daemon/src/main.rs`). Pinning
-requires it, because two daemons would race over the pin paths. Removing a pin to place your
-own would also detach a boundary that its owner still believes in. The socket requires it
-too. `serve` unlinks any socket inode it finds, so without the lock a second daemon would
-silently steal the first one's live socket.
+**One daemon per socket** (`acquire_singleton` in `crates/daemon/src/main.rs`, which says why).
 
 **Policy tiers.** The effective policy is the system tier combined with the user tier. A
 system fragment pulls in a user-tier file with `[[include]] user = … path = …`. The included
@@ -94,19 +69,15 @@ file is home-scoped, which means its objects must resolve under that user's `~`,
 not include anything itself. A policy path may be one file or a conf.d directory of fragments
 merged in name order. Each fragment can expand `~` against its own `user =` header.
 
-**CLI.** The commands are `policy check` (a lint that needs no daemon), `apply`, `show`,
-`status`, and `policy edit`. `policy edit` is the sudoedit analog. It runs `$EDITOR` as the
-invoking user, because a root editor on a same-uid box is an escalation ([threat model](docs/threat-model.md)). It then
-validates the policy, and if the policy compiles, it applies and saves it in one step. Bare
-`edit` opens your own tier, and `--system` and `--user NAME` open the others.
+**CLI.** `cordon policy check|apply|show|edit`, `cordon status` and `cordon bless`.
+`policy check` is a lint that needs no daemon. `policy edit` is the sudoedit analog. It runs
+`$EDITOR` as the invoking user, because a root editor on a same-uid box is an escalation
+([threat model](docs/threat-model.md)), then applies and saves the policy in one step if it
+compiles. Bare `edit` opens your own tier, and `--system` and `--user NAME` open the others.
 
-**Socket authorization** (`authorize` in `crates/daemon/src/ipc.rs`). `PolicyApply` and
-`BlessApprove` require peer uid 0, as `SO_PEERCRED` reports it. Reads and `BlessRequest` are
-open, because a request does nothing until it is approved. `BlessRevoke` is open at the
-socket, and the backend checks ownership. The caller must be root or the uid that minted the
-blessing. The match is exhaustive, so nobody can add a new verb without picking a side. The
-socket mode is `0666`. The mode decides who can reach the daemon, and the table decides what
-they may do.
+**Socket authorization** (`authorize` in `crates/daemon/src/ipc.rs`,
+[ADR 0010](docs/adr/0010-policy-storage.md)). The socket is `0666`, and `PolicyApply` and
+`BlessApprove` need a root peer.
 
 **Blessing** (`cordon bless`). A blessing is one more `SubjectMatch` predicate, so a blessing
 rule is an ordinary rule, and its scope is the rule's object column. `cordon bless` runs
@@ -142,8 +113,8 @@ per-invocation grant has no standing exe rule to inject into.
   program holds a reference to it. So its stale grants persist exactly the same and merely
   become unreachable, which is strictly worse than pinning it. The point is moot under the
   link-only design. That design pins no maps at all, so `BLESSED` keeps its fail-closed
-  behaviour on restart exactly as [ADR 0014](docs/adr/0014-blessing-lifecycle.md) step 9 specifies. Do not "fix" this by pinning
-  maps.
+  behaviour on restart exactly as [ADR 0014](docs/adr/0014-blessing-lifecycle.md) step 9
+  specifies. Do not "fix" this by pinning maps.
 - **The daemon fast-allow tests both `daemon_pid` and `daemon_exe`, and it must stay that
   way.** `live_bank` returns `None` for the daemon's own pid, and that is a total bypass of
   every protected object with no log line. Pinning makes `SETTINGS` outlive the process that

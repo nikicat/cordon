@@ -1,18 +1,19 @@
 # Santa vs. cordon — analysis & reuse-vs-build
 
+> **Historical (2026-06-23).** The cordon side of this comparison is the retired owner model,
+> with TOFU creator-owns, interactive deny-and-learn, event-driven reload and a SQLite rule
+> store. None of that describes cordon today: the rule model
+> ([ADR 0005](adr/0005-flat-rule-model.md)) is a static root-owned text policy plus the
+> runtime `cordon bless` grant ([ADR 0012](adr/0012-blessing.md)). FAA's
+> static-policy model is much closer to that than the tables below suggest. The Santa findings
+> stand; [prior art](prior-art.md) has the current comparison.
+
 The research date is 2026-06-23. Santa is the macOS system for authorizing binaries and file
 access. North Pole Security (NPS) now maintains it, after forking it from Google in 2024. The
 repo is `github.com/northpolesec/santa`, the docs are at `northpole.dev`, and the license is
 Apache-2.0. The latest release is 2026.5 (2026-06-08), on a monthly CalVer cadence. Santa is
 the closest existing tool to cordon. This doc records what it does, where it overlaps with
 cordon, and why we still build cordon.
-
-> This is a dated comparison. The cordon side below is the owner model as of the research
-> date, which had TOFU creator-owns, an interactive prompt and a SQLite rule store. The rule
-> model in [ADR 0005](adr/0005-flat-rule-model.md) has since superseded it. That model has a static root-owned text policy
-> and no interactive prompt, plus the runtime `cordon bless` grant ([ADR 0012](adr/0012-blessing.md)). The Santa findings
-> stand. Read the cordon column against [ADR 0005](adr/0005-flat-rule-model.md), where FAA's static-policy model is much closer to
-> cordon's than this table suggests.
 
 ## TL;DR verdict
 - **Linux:** Santa is macOS-only and has no cross-platform plans, so it is irrelevant here.
@@ -78,11 +79,11 @@ and Santa has used only ES since.
   fail-safe. `AllowReadAccess` defaults to false in the source, so a rule covers both reads
   and writes unless it is set to true. The global override `OverrideFileAccessAction` takes
   `AUDIT_ONLY` or `DISABLE`.
-- **ES events.** FAA uses nine AUTH events: `OPEN, CLONE, COPYFILE, CREATE, EXCHANGEDATA, LINK,
-  RENAME, TRUNCATE, UNLINK`. It mediates at open() time and detects a write from
-  `FWRITE|O_APPEND|O_TRUNC`. It cannot mediate reads on an fd that is already open, because ES
-  has no event for `read(2)`. A reads cache kept for each process fast-allows repeated opens
-  that do not write.
+-  **ES events.** FAA uses nine AUTH events:
+  `OPEN, CLONE, COPYFILE, CREATE, EXCHANGEDATA, LINK, RENAME, TRUNCATE, UNLINK`. It mediates at
+  open() time and detects a write from `FWRITE|O_APPEND|O_TRUNC`. It cannot mediate reads on an
+  fd that is already open, because ES has no event for `read(2)`. A reads cache kept for each
+  process fast-allows repeated opens that do not write.
 - **Reload.** FAA polls at the interval `FileAccessPolicyUpdateIntervalSec`, which defaults to
   600 seconds and has a minimum of 15. Each poll re-reads the policy and re-expands the globs.
   Reload is not event-driven.
